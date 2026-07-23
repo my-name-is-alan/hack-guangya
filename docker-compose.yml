@@ -6,8 +6,11 @@ services:
     ports:
       - "8080:8080"
     environment:
+      HOST: "0.0.0.0"
       PORT: "8080"
       DATA_DIR: /data
+      GUANGYA_ADMIN_USERNAME: ${GUANGYA_ADMIN_USERNAME:-admin}
+      GUANGYA_ADMIN_PASSWORD: ${GUANGYA_ADMIN_PASSWORD:?请先在 .env 中设置强随机管理密码}
       GUANGYA_WATCH_ROOT: /watch
       GUANGYA_ARCHIVE_ROOT: /archive
       GUANGYA_FILE_ROOTS: /watch,/archive

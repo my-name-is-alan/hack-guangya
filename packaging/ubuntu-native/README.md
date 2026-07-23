@@ -5,19 +5,21 @@
 ## 安装
 
 ```bash
-tar -xzf guangya-sync-native-ubuntu-x64-0.1.12.tar.gz
-cd guangya-sync-native-ubuntu-x64-0.1.12
+tar -xzf guangya-sync-native-ubuntu-x64-0.1.13.tar.gz
+cd guangya-sync-native-ubuntu-x64-0.1.13
 sudo ./install.sh
 ```
 
-浏览器打开 `http://服务器IP:8080`。如有防火墙，请放行实际使用的端口。
+安装器会生成 48 位十六进制强随机管理密码，以 `0600` 权限写入 `/etc/guangya-sync.env`，并只在生成时显示一次；请当场保存。用户名默认是 `admin`。浏览器打开 `http://服务器IP:8080` 并使用这组管理账号登录。
+
+原生包默认设置 `HOST=0.0.0.0`，会监听所有网络接口。如有防火墙，只应向可信来源放行实际使用的端口；跨不可信网络应配置 HTTPS 反向代理。反向代理与服务位于同一台机器时，也可把 `HOST` 改为 `127.0.0.1`，避免直接暴露服务端口。非回环监听必须配置非空的 `GUANGYA_ADMIN_PASSWORD`，否则服务会拒绝启动。
 
 ## 配置服务器目录
 
 默认目录：
 
 - SQLite 和配置：`/var/lib/guangya-sync/data`
-- 网页服务器文件选择器：从 `/` 开始，可浏览 `guangya-sync` 服务用户有权限读取的目录；应用自身的 `DATA_DIR` 会被隐藏，以保护 SQLite 登录会话
+- 网页服务器文件选择器：默认仅可浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；应用自身的 `DATA_DIR` 会被隐藏，以保护 SQLite 登录会话
 - 默认监控目录：`/var/lib/guangya-sync/watch`
 - 上传后归档目录：`/var/lib/guangya-sync/archive`
 
@@ -34,6 +36,16 @@ GUANGYA_ARCHIVE_ROOT=/mnt/archive
 ```bash
 sudo guangya-sync restart
 ```
+
+管理账号和监听地址也保存在同一配置文件中：
+
+```bash
+HOST=0.0.0.0
+GUANGYA_ADMIN_USERNAME=admin
+GUANGYA_ADMIN_PASSWORD=安装时生成的强随机密码
+```
+
+修改管理密码后需要重启服务。不要把 `/etc/guangya-sync.env` 的内容粘贴到日志或问题报告中。
 
 弱网环境下，OSS 分片默认等待 10 分钟并自动重试 3 次。可在 `/etc/guangya-sync.env` 调整：
 
@@ -72,7 +84,7 @@ sudo guangya-sync logs
 guangya-sync version
 ```
 
-升级时重新执行新版 `sudo ./install.sh`，已有 `/etc/guangya-sync.env` 和 `/var/lib/guangya-sync/data/state.sqlite3` 不会被覆盖；旧配置缺少新增配置项时，安装器只会追加对应默认值。
+升级时重新执行新版 `sudo ./install.sh`，已有 `/etc/guangya-sync.env` 和 `/var/lib/guangya-sync/data/state.sqlite3` 不会被覆盖；旧配置缺少监听地址、管理用户名或管理密码等安全项时，安装器会补齐。仅当管理密码缺失或为空时才会生成并显示新密码，已有密码绝不会输出。旧版配置若仍是 `GUANGYA_FILE_ROOTS=/`，升级会尊重这项现有配置；建议手动改为实际需要的目录白名单。
 
 卸载但保留配置和数据：
 

@@ -8,7 +8,7 @@
 xcode-select --install
 ```
 
-安装 Node.js 20 或更高版本、Rust stable，然后启用项目锁定的 pnpm 版本：
+安装 Node.js 24 或更高版本、Rust stable，然后启用项目锁定的 pnpm 版本：
 
 ```bash
 corepack enable

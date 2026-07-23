@@ -21,6 +21,15 @@ INSTALL_DIR=/opt/guangya-sync
 STATE_DIR=/var/lib/guangya-sync
 SERVICE_USER=guangya-sync
 SERVICE_GROUP=guangya-sync
+ENV_FILE=/etc/guangya-sync.env
+
+append_env_default() {
+  local key="$1"
+  local value="$2"
+  if ! grep -q "^${key}=" "$ENV_FILE"; then
+    printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
+  fi
+}
 
 if ! getent group "$SERVICE_GROUP" >/dev/null; then
   groupadd --system "$SERVICE_GROUP"
@@ -37,16 +46,44 @@ chmod 0755 "$INSTALL_DIR/node/bin/node"
 install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 \
   "$STATE_DIR" "$STATE_DIR/data" "$STATE_DIR/watch" "$STATE_DIR/archive"
 
-if [ ! -f /etc/guangya-sync.env ]; then
-  install -o root -g root -m 0600 "$SOURCE_DIR/guangya-sync.env" /etc/guangya-sync.env
+if [ ! -f "$ENV_FILE" ]; then
+  install -o root -g root -m 0600 "$SOURCE_DIR/guangya-sync.env" "$ENV_FILE"
 else
-  grep -q '^GUANGYA_FILE_ROOTS=' /etc/guangya-sync.env || printf '\nGUANGYA_FILE_ROOTS=/\n' >> /etc/guangya-sync.env
-  grep -q '^GUANGYA_OSS_TIMEOUT_MS=' /etc/guangya-sync.env || printf 'GUANGYA_OSS_TIMEOUT_MS=600000\n' >> /etc/guangya-sync.env
-  grep -q '^GUANGYA_OSS_RETRY_MAX=' /etc/guangya-sync.env || printf 'GUANGYA_OSS_RETRY_MAX=3\n' >> /etc/guangya-sync.env
-  grep -q '^GUANGYA_OSS_PARALLEL=' /etc/guangya-sync.env || printf 'GUANGYA_OSS_PARALLEL=3\n' >> /etc/guangya-sync.env
-  grep -q '^GUANGYA_CLOUD_CONFIRM_TIMEOUT_MS=' /etc/guangya-sync.env || printf 'GUANGYA_CLOUD_CONFIRM_TIMEOUT_MS=600000\n' >> /etc/guangya-sync.env
-  grep -q '^GUANGYA_CLOUD_CONFIRM_POLL_MS=' /etc/guangya-sync.env || printf 'GUANGYA_CLOUD_CONFIRM_POLL_MS=1000\n' >> /etc/guangya-sync.env
+  # Ensure a following appended setting never joins an unterminated legacy line.
+  printf '\n' >> "$ENV_FILE"
 fi
+chown root:root "$ENV_FILE"
+chmod 0600 "$ENV_FILE"
+
+append_env_default HOST 0.0.0.0
+append_env_default GUANGYA_ADMIN_USERNAME admin
+append_env_default GUANGYA_WATCH_ROOT /var/lib/guangya-sync/watch
+append_env_default GUANGYA_ARCHIVE_ROOT /var/lib/guangya-sync/archive
+append_env_default GUANGYA_FILE_ROOTS /var/lib/guangya-sync/watch,/var/lib/guangya-sync/archive
+append_env_default GUANGYA_OSS_TIMEOUT_MS 600000
+append_env_default GUANGYA_OSS_RETRY_MAX 3
+append_env_default GUANGYA_OSS_PARALLEL 3
+append_env_default GUANGYA_CLOUD_CONFIRM_TIMEOUT_MS 600000
+append_env_default GUANGYA_CLOUD_CONFIRM_POLL_MS 1000
+
+generated_admin_password=
+existing_admin_password="$(sed -n 's/^GUANGYA_ADMIN_PASSWORD=//p' "$ENV_FILE" | tail -n 1)"
+if [[ "$existing_admin_password" =~ ^[[:space:]]*$ ||
+      "$existing_admin_password" =~ ^[[:space:]]*\"\"[[:space:]]*$ ||
+      "$existing_admin_password" =~ ^[[:space:]]*\'\'[[:space:]]*$ ]]; then
+  generated_admin_password="$(od -An -N 24 -tx1 /dev/urandom | tr -d ' \n')"
+  if [ "${#generated_admin_password}" -ne 48 ]; then
+    echo "无法生成 Web 管理密码，安装已中止。" >&2
+    exit 1
+  fi
+  if grep -q '^GUANGYA_ADMIN_PASSWORD=' "$ENV_FILE"; then
+    sed -i -E "s;^GUANGYA_ADMIN_PASSWORD=([[:space:]]*|[[:space:]]*\"\"[[:space:]]*|[[:space:]]*''[[:space:]]*)$;GUANGYA_ADMIN_PASSWORD=${generated_admin_password};" "$ENV_FILE"
+  else
+    printf 'GUANGYA_ADMIN_PASSWORD=%s\n' "$generated_admin_password" >> "$ENV_FILE"
+  fi
+  echo "已生成 Web 管理密码（仅显示本次，请立即保存）：${generated_admin_password}"
+fi
+
 install -o root -g root -m 0644 "$SOURCE_DIR/guangya-sync.service" /etc/systemd/system/guangya-sync.service
 install -o root -g root -m 0755 "$SOURCE_DIR/guangya-syncctl" /usr/local/bin/guangya-sync
 
