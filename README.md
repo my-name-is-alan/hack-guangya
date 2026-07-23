@@ -16,7 +16,7 @@
 - 备份任务：可创建多个监控目录，可视化选择云端目标文件夹，保留本地目录结构并自动创建子目录；同步范围直接按文件后缀配置，支持视频、图片、字幕、音频快捷填充，也可以输入任意自定义后缀，默认填入图片、视频、音频的常用后缀。本地磁盘使用系统文件事件，网盘映射盘、NAS 或同步盘可切换为每 5 秒轮询；重复文件事件不会再次加入正在上传的任务。
 - 账户概览：展示账号昵称、账号 ID、手机号、已用/剩余空间、VIP 状态和到期时间（接口返回哪些字段就展示哪些）。
 - 上传完成后的源文件策略：保留（默认）、移动到归档目录、删除源文件。删除策略只有显式选择后才执行，并且上传期间源文件发生变化时不会删除或移动。
-- 上传队列：最多两个并发上传，可暂停和继续；界面会显示准备目录、申请凭证、OSS 分片进度和云端入库状态；OSS 上传或秒传完成后立即把文件指纹和云端任务 ID 持久化到 SQLite，不依赖后续入库轮询，重启后不会重复上传未变更文件。
+- 上传队列：上传、下载并发数均可在 1–8 之间设置，可暂停和继续；界面会显示准备目录、申请凭证、OSS 分片进度和云端入库状态；OSS 上传或秒传完成后立即把文件指纹和云端任务 ID 持久化到 SQLite，不依赖后续入库轮询，重启后不会重复上传未变更文件。
 - 上传完成自动分享：按同步根目录第一层聚合。根目录单文件直接分享文件；`tvname/season 1/s01.mkv`、`tvname/season 2/s02.mkv` 始终复用 `tvname` 文件夹分享。目标无排队/上传且静默 30 秒后通知 Hdhive；现有任务升级后默认关闭，已有内容只通过“补建已有内容”显式处理。
 
 ## 开发和打包
@@ -29,9 +29,15 @@ pnpm tauri dev
 pnpm tauri build
 ```
 
-安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.13_x64-setup.exe`
+安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.15_x64-setup.exe`
 
 ## Docker Web
+
+Docker Hub 镜像：[`94xhzy/guangya-sync`](https://hub.docker.com/r/94xhzy/guangya-sync)，推荐固定使用版本标签：
+
+```bash
+docker pull 94xhzy/guangya-sync:0.1.15
+```
 
 先准备管理账号。用户名默认是 `admin`；请生成独立的强随机密码，复制 `.env.example` 为 `.env` 并填入 `GUANGYA_ADMIN_PASSWORD`：
 
@@ -87,7 +93,7 @@ pnpm web
 pnpm package:ubuntu
 ```
 
-输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.13.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
+输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.15.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
 
 ## 接口边界
 

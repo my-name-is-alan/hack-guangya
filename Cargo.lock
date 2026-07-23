@@ -293,6 +293,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
+ "gloo-timers",
+ "tokio",
+]
+
+[[package]]
 name = "base64"
 version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1629,6 +1640,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
+name = "gloo-timers"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "gobject-sys"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1693,7 +1716,7 @@ dependencies = [
 
 [[package]]
 name = "guangya-folder-sync"
-version = "0.1.13"
+version = "0.1.15"
 dependencies = [
  "hex",
  "hmac 0.12.1",
@@ -2856,6 +2879,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96c9c85ce253ff87225e7669979d877a20c98a06604ec9d6dd5f4473e08f1ae1"
 dependencies = [
  "opendal-core",
+ "opendal-layer-retry",
  "opendal-service-oss",
 ]
 
@@ -2885,6 +2909,17 @@ dependencies = [
  "url",
  "uuid",
  "web-time",
+]
+
+[[package]]
+name = "opendal-layer-retry"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b2a25a718afb81fad81cb9a0580a1cb989221fa2317f888c6a37f8dad408eb7"
+dependencies = [
+ "backon",
+ "log",
+ "opendal-core",
 ]
 
 [[package]]

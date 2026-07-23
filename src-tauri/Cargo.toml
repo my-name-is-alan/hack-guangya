@@ -1,6 +1,6 @@
 [package]
 name = "guangya-folder-sync"
-version = "0.1.13"
+version = "0.1.15"
 description = "光鸭云盘文件夹同步 Tauri 客户端"
 authors = ["hack-guangya"]
 edition = "2021"
@@ -11,7 +11,7 @@ tauri-build = { version = "2.5.0", features = [] }
 [dependencies]
 tauri = { version = "2.11.5", features = [] }
 tauri-plugin-dialog = "2.4.0"
-opendal = { version = "0.57", default-features = false, features = ["services-oss", "reqwest-rustls-tls", "executors-tokio"] }
+opendal = { version = "0.57", default-features = false, features = ["services-oss", "reqwest-rustls-tls", "executors-tokio", "layers-retry"] }
 notify = "8.0.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

@@ -1,7 +1,10 @@
 node_modules
 target
 dist
-src-tauri
+src-tauri/*
+!src-tauri/icons/
+src-tauri/icons/*
+!src-tauri/icons/128x128.png
 .git
 docker-data
 watch

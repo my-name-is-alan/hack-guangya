@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { formatUploadSpeed, nextUploadProgress } from './uploadProgress.js';
+import {
+  formatUploadSpeed,
+  nextUploadProgress,
+  orderUploadProgress,
+  uploadProgressStatus,
+} from './uploadProgress.js';
 
 test('a delayed progress event cannot regress a completed upload', () => {
   const done = { percent: 100, state: 'done', stage: '上传完成', updatedAt: 10 };
@@ -47,4 +52,19 @@ test('a busy file remains pending without becoming an upload error', () => {
   assert.equal(next.state, 'waiting-file');
   assert.equal(next.percent, 0);
   assert.match(next.stage, /另外的程序正在使用该文件/);
+});
+
+test('active uploads use a static progress bar', () => {
+  assert.equal(uploadProgressStatus('uploading'), 'normal');
+  assert.equal(uploadProgressStatus('processing'), 'normal');
+  assert.equal(uploadProgressStatus('done'), 'success');
+  assert.equal(uploadProgressStatus('error'), 'exception');
+});
+
+test('progress updates do not reorder uploads that are already visible', () => {
+  const ordered = orderUploadProgress([
+    { filePath: 'older.mp4', startedAt: 10, updatedAt: 40 },
+    { filePath: 'newer.mp4', startedAt: 20, updatedAt: 30 },
+  ]);
+  assert.deepEqual(ordered.map((upload) => upload.filePath), ['newer.mp4', 'older.mp4']);
 });

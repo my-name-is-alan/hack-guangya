@@ -75,6 +75,9 @@ database.exec(`
     remote_file_id TEXT,
     status TEXT NOT NULL DEFAULT 'cloud_confirmed',
     item_json TEXT,
+    remote_parent_id TEXT NOT NULL DEFAULT '',
+    remote_dir TEXT NOT NULL DEFAULT '',
+    relative_path TEXT NOT NULL DEFAULT '',
     uploaded_at INTEGER NOT NULL,
     PRIMARY KEY (mapping_id, file_path)
   );
@@ -137,6 +140,15 @@ if (!database.prepare("PRAGMA table_info(uploaded_files)").all().some((column) =
 }
 database.exec("UPDATE uploaded_files SET status = CASE WHEN remote_file_id IS NOT NULL AND remote_file_id <> '' THEN 'cloud_confirmed' ELSE 'oss_complete' END WHERE status IS NULL OR status NOT IN ('oss_complete', 'cloud_confirmed')");
 if (!database.prepare("PRAGMA table_info(uploaded_files)").all().some((column) => column.name === 'item_json')) database.exec('ALTER TABLE uploaded_files ADD COLUMN item_json TEXT');
+for (const [column, definition] of [
+  ['remote_parent_id', "TEXT NOT NULL DEFAULT ''"],
+  ['remote_dir', "TEXT NOT NULL DEFAULT ''"],
+  ['relative_path', "TEXT NOT NULL DEFAULT ''"],
+]) {
+  if (!database.prepare("PRAGMA table_info(uploaded_files)").all().some((entry) => entry.name === column)) {
+    database.exec(`ALTER TABLE uploaded_files ADD COLUMN ${column} ${definition}`);
+  }
+}
 const storedDevice = database.prepare("SELECT value FROM app_state WHERE key = 'device_id'").get();
 const deviceId = storedDevice?.value || crypto.randomUUID();
 database.prepare("INSERT INTO app_state (key, value, updated_at) VALUES ('device_id', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at").run(deviceId, Math.floor(Date.now() / 1000));
@@ -144,7 +156,7 @@ const clients = new Set();
 const watchers = new Map();
 const queue = new Map();
 const history = new Map(database.prepare("SELECT mapping_id, file_path, size, modified_ms FROM uploaded_files WHERE status = 'cloud_confirmed'").all().map((row) => [`${row.mapping_id}::${path.resolve(row.file_path)}`, `${row.size}:${row.modified_ms}`]));
-const pendingUploads = new Map(database.prepare("SELECT mapping_id, file_path, size, modified_ms, task_id, item_json FROM uploaded_files WHERE status = 'oss_complete'").all().map((row) => [`${row.mapping_id}::${path.resolve(row.file_path)}`, row]));
+const pendingUploads = new Map(database.prepare("SELECT mapping_id, file_path, size, modified_ms, task_id, item_json, remote_parent_id, remote_dir, relative_path FROM uploaded_files WHERE status = 'oss_complete'").all().map((row) => [`${row.mapping_id}::${path.resolve(row.file_path)}`, row]));
 const inflight = new Map();
 const inflightItems = new Map();
 const waitingFiles = new Map();
@@ -256,10 +268,10 @@ function uploadEventPath(item) { return item.event_path || item.file_path; }
 function savePendingUploadRecord(item, taskData) {
   const filePath = path.resolve(uploadHistoryPath(item));
   const itemJson = JSON.stringify(item);
-  database.prepare("INSERT INTO uploaded_files (mapping_id, file_path, size, modified_ms, task_id, remote_file_id, status, item_json, uploaded_at) VALUES (?, ?, ?, ?, ?, NULL, 'oss_complete', ?, ?) ON CONFLICT(mapping_id, file_path) DO UPDATE SET size = excluded.size, modified_ms = excluded.modified_ms, task_id = excluded.task_id, remote_file_id = NULL, status = 'oss_complete', item_json = excluded.item_json, uploaded_at = excluded.uploaded_at").run(item.mapping_id, filePath, item.size, String(item.mtime), taskData.taskId || null, itemJson, Math.floor(Date.now() / 1000));
+  database.prepare("INSERT INTO uploaded_files (mapping_id, file_path, size, modified_ms, task_id, remote_file_id, status, item_json, remote_parent_id, remote_dir, relative_path, uploaded_at) VALUES (?, ?, ?, ?, ?, NULL, 'oss_complete', ?, ?, ?, ?, ?) ON CONFLICT(mapping_id, file_path) DO UPDATE SET size = excluded.size, modified_ms = excluded.modified_ms, task_id = excluded.task_id, remote_file_id = NULL, status = 'oss_complete', item_json = excluded.item_json, remote_parent_id = excluded.remote_parent_id, remote_dir = excluded.remote_dir, relative_path = excluded.relative_path, uploaded_at = excluded.uploaded_at").run(item.mapping_id, filePath, item.size, String(item.mtime), taskData.taskId || null, itemJson, item.remote_parent_id || '', item.remote_dir || '', item.relative_path || '', Math.floor(Date.now() / 1000));
   const key = queueKey(item.mapping_id, filePath);
   history.delete(key);
-  pendingUploads.set(key, { mapping_id: item.mapping_id, file_path: filePath, size: item.size, modified_ms: String(item.mtime), task_id: taskData.taskId || null, item_json: itemJson });
+  pendingUploads.set(key, { mapping_id: item.mapping_id, file_path: filePath, size: item.size, modified_ms: String(item.mtime), task_id: taskData.taskId || null, item_json: itemJson, remote_parent_id: item.remote_parent_id || '', remote_dir: item.remote_dir || '', relative_path: item.relative_path || '' });
 }
 function confirmPendingUploadRecord(key, taskId, remoteFileId) {
   const row = pendingUploads.get(key);
@@ -276,7 +288,69 @@ function clearPendingUpload(key) {
   database.prepare("DELETE FROM uploaded_files WHERE mapping_id = ? AND file_path = ? AND status = 'oss_complete'").run(row.mapping_id, row.file_path);
   pendingUploads.delete(key);
 }
-function deleteMappingHistory(mappingId) { database.prepare('DELETE FROM uploaded_files WHERE mapping_id = ?').run(mappingId); for (const key of pendingUploads.keys()) if (key.startsWith(`${mappingId}::`)) pendingUploads.delete(key); }
+function deleteMappingTransientUploads(mappingId) { database.prepare("DELETE FROM uploaded_files WHERE mapping_id = ? AND status <> 'cloud_confirmed'").run(mappingId); for (const key of pendingUploads.keys()) if (key.startsWith(`${mappingId}::`)) pendingUploads.delete(key); }
+function reuseMatchingConfirmedUpload(item) {
+  const filePath = path.resolve(uploadHistoryPath(item));
+  const matched = database.prepare(`
+    SELECT mapping_id, task_id, remote_file_id
+    FROM uploaded_files
+    WHERE status = 'cloud_confirmed'
+      AND substr(mapping_id, 1, 2) <> '__'
+      AND file_path = ?
+      AND size = ?
+      AND modified_ms = ?
+      AND remote_parent_id = ?
+      AND remote_dir = ?
+      AND relative_path = ?
+    ORDER BY uploaded_at DESC
+    LIMIT 1
+  `).get(filePath, item.size, String(item.mtime), item.remote_parent_id || '', item.remote_dir || '', item.relative_path || '');
+  if (!matched) return null;
+  database.prepare(`
+    INSERT INTO uploaded_files
+      (mapping_id, file_path, size, modified_ms, task_id, remote_file_id, status, item_json,
+       remote_parent_id, remote_dir, relative_path, uploaded_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'cloud_confirmed', NULL, ?, ?, ?, ?)
+    ON CONFLICT(mapping_id, file_path) DO UPDATE SET
+      size = excluded.size,
+      modified_ms = excluded.modified_ms,
+      task_id = excluded.task_id,
+      remote_file_id = excluded.remote_file_id,
+      status = excluded.status,
+      item_json = NULL,
+      remote_parent_id = excluded.remote_parent_id,
+      remote_dir = excluded.remote_dir,
+      relative_path = excluded.relative_path,
+      uploaded_at = excluded.uploaded_at
+  `).run(item.mapping_id, filePath, item.size, String(item.mtime), matched.task_id || null, matched.remote_file_id || null, item.remote_parent_id || '', item.remote_dir || '', item.relative_path || '', Math.floor(Date.now() / 1000));
+  history.set(queueKey(item.mapping_id, filePath), `${item.size}:${item.mtime}`);
+  return { sourceMappingId: matched.mapping_id, taskId: matched.task_id || '', remoteFileId: matched.remote_file_id || null };
+}
+function reuseAutoShareBinding(item, sourceMappingId) {
+  const target = autoShareTarget(item);
+  if (!target) return false;
+  const stored = database.prepare(`
+    SELECT target_type, remote_target_id, title, share_id, share_url
+    FROM auto_share_targets
+    WHERE target_key = ? AND mapping_id IN (?, ?)
+    ORDER BY CASE WHEN mapping_id = ? THEN 0 ELSE 1 END, updated_at DESC
+    LIMIT 1
+  `).get(target.key, item.mapping_id, sourceMappingId, item.mapping_id);
+  if (!stored) return false;
+  database.prepare(`
+    INSERT INTO auto_share_targets
+      (mapping_id, target_key, target_type, remote_target_id, title, share_id, share_url, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(mapping_id, target_key) DO UPDATE SET
+      target_type = excluded.target_type,
+      remote_target_id = excluded.remote_target_id,
+      title = excluded.title,
+      share_id = excluded.share_id,
+      share_url = excluded.share_url,
+      updated_at = excluded.updated_at
+  `).run(item.mapping_id, target.key, stored.target_type, stored.remote_target_id, stored.title, stored.share_id, stored.share_url, Math.floor(Date.now() / 1000));
+  return true;
+}
 function isWithinRoot(root, candidate) { const relative = path.relative(root, candidate); return !relative.startsWith('..') && !path.isAbsolute(relative); }
 function allowedPath(value) { const resolved = canonicalizePathSync(String(value || fileRoots[0])); if (!fileRoots.some((root) => isWithinRoot(root, resolved))) throw new Error(`路径超出允许范围：${fileRoots.join(', ')}`); if (isWithinRoot(dataDir, resolved)) throw new Error('应用状态目录不可浏览或上传'); return resolved; }
 function allowedArchivePath(value) { return allowedPath(value || archiveRoot); }
@@ -1231,7 +1305,19 @@ async function enqueue(mapping, file) {
   if (queued && `${queued.size}:${queued.mtime}` === mark) return;
   const relative = path.relative(mapping.local_path, file).replaceAll('\\', '/');
   const relativeDir = path.posix.dirname(relative) === '.' ? '' : path.posix.dirname(relative);
-  queue.set(key, { mapping_id: mapping.id, file_path: file, relative_path: relative, change_kind: history.has(key) ? 'changed' : 'added', remote_parent_id: mapping.remote_parent_id || '', remote_dir: [mapping.remote_parent_id ? '' : mapping.remote_path, relativeDir].filter(Boolean).join('/'), size: stat.size, mtime: stat.mtimeMs });
+  const item = { mapping_id: mapping.id, file_path: file, relative_path: relative, change_kind: history.has(key) ? 'changed' : 'added', remote_parent_id: mapping.remote_parent_id || '', remote_dir: [mapping.remote_parent_id ? '' : mapping.remote_path, relativeDir].filter(Boolean).join('/'), size: stat.size, mtime: stat.mtimeMs };
+  let reused = null;
+  try { reused = reuseMatchingConfirmedUpload(item); }
+  catch (error) { status('warning', error.message); }
+  if (reused) {
+    if (mapping.auto_share && !reuseAutoShareBinding(item, reused.sourceMappingId)) {
+      try { await scheduleAutoShare(item, reused); }
+      catch (error) { status('error', `历史文件无需重复上传，但自动分享排队失败：${error.message}`); }
+    }
+    publishState();
+    return;
+  }
+  queue.set(key, item);
   publish({ type: 'file', state: token ? 'queued' : 'waiting-login', file_path: file });
   pump();
 }
@@ -1239,7 +1325,7 @@ async function collectExistingFiles(root, syncTypes) { const result = []; async 
 async function enqueueDirectory(mapping, directory) { const files = await collectExistingFiles(directory, mapping.sync_types); for (const file of files) await enqueue(mapping, file); }
 async function startWatcher(mapping) { await watchers.get(mapping.id)?.close(); watchers.delete(mapping.id); if (!mapping.enabled) return; const polling = mapping.monitor_mode === 'polling'; const watcher = chokidar.watch(mapping.local_path, { ignoreInitial: true, persistent: true, usePolling: polling, interval: polling ? 5000 : 100, binaryInterval: polling ? 5000 : 300, awaitWriteFinish: { stabilityThreshold: 1200, pollInterval: polling ? 1000 : 200 } }); watcher.on('add', (file) => enqueue(mapping, file)); watcher.on('change', (file) => enqueue(mapping, file)); watcher.on('addDir', (directory) => { void enqueueDirectory(mapping, directory); }); watcher.on('error', (error) => { mapping.watch_error = error.message; status('error', `监控失败：${error.message}`); }); watchers.set(mapping.id, watcher); await new Promise((resolve, reject) => { watcher.once('ready', resolve); watcher.once('error', reject); }); mapping.watch_error = null; if (mapping.scan_existing) { const existing = await collectExistingFiles(mapping.local_path, mapping.sync_types); status('info', `正在扫描已有文件：${existing.length} 个`); for (const file of existing) await enqueue(mapping, file); if (existing.length) publishState(); } }
 async function restartWatchers() { for (const watcher of watchers.values()) await watcher.close(); watchers.clear(); for (const mapping of mappings) { if (!mapping.enabled) continue; try { await startWatcher(mapping); } catch (error) { mapping.enabled = false; mapping.watch_error = error.message; console.error(`备份任务监控启动失败：${mapping.local_path}：${error.message}`); } } await saveConfig(); }
-async function routeApi(request, response, url) { if (request.method === 'GET' && url.pathname === '/api/state') return json(response, 200, state()); if (request.method === 'GET' && url.pathname === '/api/events') { response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' }); response.write(`data: ${JSON.stringify({ type: 'state', state: state() })}\n\n`); clients.add(response); request.on('close', () => clients.delete(response)); return; } if (request.method === 'POST' && url.pathname === '/api/auth') { const body = await readBody(request); token = String(body.token || '').trim().replace(/^Bearer\s+/i, '') || null; saveAuthToken(token); publishState(); pump(); return json(response, 200, state()); } if (request.method === 'POST' && url.pathname === '/api/mappings') { const body = await readBody(request); const mapping = { id: crypto.randomUUID(), local_path: allowedPath(body.local_path), remote_path: normalizeRemote(body.remote_path), enabled: true }; const stat = await fsp.stat(mapping.local_path); if (!stat.isDirectory()) throw new Error('监控路径不是目录'); mappings.push(mapping); await saveConfig(); await startWatcher(mapping); publishState(); return json(response, 200, mapping); } if (request.method === 'DELETE' && url.pathname.startsWith('/api/mappings/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); await watchers.get(id)?.close(); watchers.delete(id); mappings = mappings.filter((item) => item.id !== id); deleteMappingHistory(id); await saveConfig(); publishState(); return json(response, 200, {}); } if (request.method === 'PATCH' && url.pathname.startsWith('/api/mappings/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); const body = await readBody(request); const mapping = mappings.find((item) => item.id === id); if (!mapping) return json(response, 404, { error: '监控目录不存在' }); mapping.enabled = Boolean(body.enabled); await saveConfig(); await startWatcher(mapping); publishState(); return json(response, 200, mapping); } if (request.method === 'POST' && url.pathname === '/api/queue/pause') { paused = true; publishState(); return json(response, 200, state()); } if (request.method === 'POST' && url.pathname === '/api/queue/resume') { paused = false; pump(); return json(response, 200, state()); } json(response, 404, { error: 'not found' }); }
+async function routeApi(request, response, url) { if (request.method === 'GET' && url.pathname === '/api/state') return json(response, 200, state()); if (request.method === 'GET' && url.pathname === '/api/events') { response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' }); response.write(`data: ${JSON.stringify({ type: 'state', state: state() })}\n\n`); clients.add(response); request.on('close', () => clients.delete(response)); return; } if (request.method === 'POST' && url.pathname === '/api/auth') { const body = await readBody(request); token = String(body.token || '').trim().replace(/^Bearer\s+/i, '') || null; saveAuthToken(token); publishState(); pump(); return json(response, 200, state()); } if (request.method === 'POST' && url.pathname === '/api/mappings') { const body = await readBody(request); const mapping = { id: crypto.randomUUID(), local_path: allowedPath(body.local_path), remote_path: normalizeRemote(body.remote_path), enabled: true }; const stat = await fsp.stat(mapping.local_path); if (!stat.isDirectory()) throw new Error('监控路径不是目录'); mappings.push(mapping); await saveConfig(); await startWatcher(mapping); publishState(); return json(response, 200, mapping); } if (request.method === 'DELETE' && url.pathname.startsWith('/api/mappings/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); await watchers.get(id)?.close(); watchers.delete(id); mappings = mappings.filter((item) => item.id !== id); deleteMappingTransientUploads(id); await saveConfig(); publishState(); return json(response, 200, {}); } if (request.method === 'PATCH' && url.pathname.startsWith('/api/mappings/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); const body = await readBody(request); const mapping = mappings.find((item) => item.id === id); if (!mapping) return json(response, 404, { error: '监控目录不存在' }); mapping.enabled = Boolean(body.enabled); await saveConfig(); await startWatcher(mapping); publishState(); return json(response, 200, mapping); } if (request.method === 'POST' && url.pathname === '/api/queue/pause') { paused = true; publishState(); return json(response, 200, state()); } if (request.method === 'POST' && url.pathname === '/api/queue/resume') { paused = false; pump(); return json(response, 200, state()); } json(response, 404, { error: 'not found' }); }
 async function apiOverview() { const assets = await apiPost('/assets/v1/get_assets', {}); let profile = {}; try { profile = await accountGet('/v1/user/me'); } catch { try { profile = (await apiPost('/activity/v1/get_user_data', {})).data || {}; } catch {} } return { assets: assets.data || {}, profile: profile?.data || profile || {} }; }
 
 function validateFileIds(fileIds) { if (!Array.isArray(fileIds) || !fileIds.length) throw new Error('请至少选择一个文件或文件夹'); return fileIds.map(String); }
@@ -1324,7 +1410,7 @@ async function routeApiV2(request, response, url) {
   if (request.method === 'POST' && url.pathname === '/api/share-links') { const body = await readBody(request); const value = { id: crypto.randomUUID(), label: String(body.label || '未命名分享').trim() || '未命名分享', url: String(body.url || '').trim(), created_at: Math.floor(Date.now() / 1000) }; if (!/^https?:\/\//i.test(value.url)) throw new Error('分享链接必须以 http:// 或 https:// 开头'); savedShares.unshift(value); await saveConfig(); publishState(); return json(response, 200, value); }
   if (request.method === 'DELETE' && url.pathname.startsWith('/api/share-links/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); savedShares = savedShares.filter((item) => item.id !== id); await saveConfig(); publishState(); return json(response, 200, {}); }
   if (request.method === 'POST' && url.pathname === '/api/mappings') { const body = await readBody(request); const localPath = allowedPath(body.local_path); const sourcePolicy = ['keep', 'archive', 'delete'].includes(body.source_policy) ? body.source_policy : 'keep'; const archivePath = sourcePolicy === 'archive' ? allowedArchivePath(body.archive_path || archiveRoot) : null; if (archivePath && (archivePath === localPath || archivePath.startsWith(`${localPath}${path.sep}`))) throw new Error('归档目录不能位于被监控目录内部'); if (body.auto_share && (!hdhiveBaseUrl || !hdhiveSecret)) throw new Error('开启自动分享前请先配置 Hdhive 地址和密钥'); const mapping = { id: crypto.randomUUID(), local_path: localPath, remote_path: normalizeRemote(body.remote_path), remote_parent_id: String(body.remote_parent_id || ''), enabled: true, source_policy: sourcePolicy, archive_path: archivePath, scan_existing: body.scan_existing !== false, sync_types: normalizeSyncTypes(body.sync_types), monitor_mode: normalizeMonitorMode(body.monitor_mode), auto_share: body.auto_share === true, watch_error: null }; const stat = await fsp.stat(mapping.local_path); if (!stat.isDirectory()) throw new Error('监控路径不是目录'); mappings.push(mapping); await fsp.mkdir(archiveRoot, { recursive: true }); await saveConfig(); try { await startWatcher(mapping); } catch (error) { mappings = mappings.filter((item) => item.id !== mapping.id); await saveConfig(); throw new Error(`创建目录监控失败：${error.message}`); } publishState(); return json(response, 200, mapping); }
-  if (request.method === 'DELETE' && url.pathname.startsWith('/api/mappings/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); await watchers.get(id)?.close(); watchers.delete(id); mappings = mappings.filter((item) => item.id !== id); for (const [key, item] of queue) if (item.mapping_id === id) queue.delete(key); for (const [key, item] of waitingFiles) if (item.mapping_id === id) waitingFiles.delete(key); for (const key of history.keys()) if (key.startsWith(`${id}::`)) history.delete(key); for (const key of inflight.keys()) if (key.startsWith(`${id}::`)) inflight.delete(key); deleteMappingHistory(id); await saveConfig(); publishState(); return json(response, 200, {}); }
+  if (request.method === 'DELETE' && url.pathname.startsWith('/api/mappings/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); await watchers.get(id)?.close(); watchers.delete(id); mappings = mappings.filter((item) => item.id !== id); for (const [key, item] of queue) if (item.mapping_id === id) queue.delete(key); for (const [key, item] of waitingFiles) if (item.mapping_id === id) waitingFiles.delete(key); for (const key of history.keys()) if (key.startsWith(`${id}::`)) history.delete(key); for (const key of inflight.keys()) if (key.startsWith(`${id}::`)) inflight.delete(key); deleteMappingTransientUploads(id); await saveConfig(); publishState(); return json(response, 200, {}); }
   if (request.method === 'POST' && /^\/api\/mappings\/[^/]+\/auto-share-backfill$/.test(url.pathname)) { const id = decodeURIComponent(url.pathname.split('/')[3]); return json(response, 202, await backfillAutoShares(id)); }
   if (request.method === 'PATCH' && url.pathname.startsWith('/api/mappings/')) {
     const id = decodeURIComponent(url.pathname.split('/').pop());

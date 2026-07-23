@@ -3,9 +3,15 @@ import { computed, h, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
 import { message } from 'antdv-next';
 import appLogo from '../src-tauri/icons/128x128.png';
 import { buildRenamePreview } from './renameRules.js';
-import { formatUploadSpeed, nextUploadProgress } from './uploadProgress.js';
+import {
+  formatUploadSpeed,
+  nextUploadProgress,
+  orderUploadProgress,
+  uploadProgressStatus,
+} from './uploadProgress.js';
 import { readJsonResponse } from './httpResponse.js';
 import { parseGuangyaShareLink } from './shareLink.js';
+import { createConcurrencyQueue, normalizeTransferConcurrency } from './transferQueue.js';
 import {
   ArrowDownOutlined,
   ArrowUpOutlined,
@@ -35,6 +41,7 @@ import {
   ReloadOutlined,
   SafetyCertificateOutlined,
   ScissorOutlined,
+  SettingOutlined,
   ShareAltOutlined,
   SwapOutlined,
   SyncOutlined,
@@ -164,7 +171,7 @@ const extensionPresets = [
 const defaultSyncExtensions = [...extensionPresets.find((item) => item.key === 'image').extensions, ...extensionPresets.find((item) => item.key === 'video').extensions, ...extensionPresets.find((item) => item.key === 'audio').extensions];
 
 const activeView = ref('cloud');
-const appState = reactive({ logged_in: false, paused: false, pending: 0, active_uploads: 0, mappings: [], saved_shares: [], hdhive: { configured: false, base_url: '', instance_id: '' }, auto_share_receipts: [] });
+const appState = reactive({ logged_in: false, paused: false, pending: 0, active_uploads: 0, upload_concurrency: 2, download_concurrency: 2, mappings: [], saved_shares: [], hdhive: { configured: false, base_url: '', instance_id: '' }, auto_share_receipts: [] });
 const overview = reactive({ profile: {}, assets: {} });
 const files = ref([]);
 const filesLoading = ref(false);
@@ -187,6 +194,9 @@ const loginToken = ref('');
 const lastShare = reactive({ label: '', url: '', code: '', reused: false, hdhiveStatus: '', hdhiveMessage: '', hdhiveEventId: '' });
 const backupForm = reactive({ local_path: '', remote_path: '', remote_parent_id: '', source_policy: 'keep', archive_path: '', scan_existing: true, sync_types: [...defaultSyncExtensions], monitor_mode: 'native', auto_share: false });
 const hdhiveForm = reactive({ base_url: '', secret: '' });
+const transferSettingsOpen = ref(false);
+const transferSettingsSaving = ref(false);
+const transferForm = reactive({ upload_concurrency: 2, download_concurrency: 2 });
 const hdhiveSubmitting = ref(false);
 const autoShareBusy = reactive({});
 const receiptReview = reactive({});
@@ -224,6 +234,7 @@ let unsubscribeDrag = null;
 let ruleId = 0;
 let refreshTimer = null;
 const uploadRemovalTimers = new Map();
+const localDownloadQueue = createConcurrencyQueue(() => appState.download_concurrency);
 
 const pageTitle = computed(() => pageMeta[activeView.value][0]);
 const pageSubtitle = computed(() => pageMeta[activeView.value][1]);
@@ -251,10 +262,11 @@ const vipExpireTime = computed(() => pick(overview.assets, ['vipExpireTime', 'vi
 const vipLabel = computed(() => isVip.value ? 'VIP会员' : vipExpired.value ? 'VIP已过期' : '普通用户');
 const vipExpireLabel = computed(() => vipExpireTime.value ? formatTime(vipExpireTime.value) : isVip.value ? '未返回到期时间' : '未开通 VIP');
 const queueText = computed(() => appState.paused ? '队列已暂停' : appState.active_uploads ? '正在上传' : appState.pending ? '等待上传' : '队列空闲');
-const recentUploads = computed(() => Object.values(uploadProgress.value).sort((left, right) => right.updatedAt - left.updatedAt).slice(0, 8));
+const recentUploads = computed(() => orderUploadProgress(Object.values(uploadProgress.value)).slice(0, 8));
 const totalUploadSpeed = computed(() => recentUploads.value.reduce((total, upload) => total + (upload.state === 'uploading' ? Number(upload.bytesPerSecond || 0) : 0), 0));
 const selectedFiles = computed(() => files.value.filter((item) => selectedFileIds.value.includes(fileId(item))));
 const activeDownloadCount = computed(() => downloadTasks.value.filter((task) => ['preparing', 'downloading'].includes(task.status)).length);
+const queuedDownloadCount = computed(() => downloadTasks.value.filter((task) => task.status === 'queued').length);
 const currentFolderPath = computed(() => currentPath.value.length ? `根目录 / ${currentPath.value.map((item) => item.name).join(' / ')}` : '根目录');
 const clipboardLabel = computed(() => clipboard.items.length ? `${clipboard.mode === 'move' ? '剪切' : '复制'} ${clipboard.items.length} 项` : '');
 const lastShareReceipt = computed(() => appState.auto_share_receipts.find((receipt) => receipt.event_id === lastShare.hdhiveEventId) || null);
@@ -405,6 +417,7 @@ function updateUploadProgress(payload) {
     [filePath]: {
       filePath,
       fileName: uploadFileName(filePath),
+      startedAt: previous.startedAt || next.updatedAt,
       ...next,
     },
   };
@@ -424,6 +437,9 @@ function updateUploadProgress(payload) {
 }
 function applyState(next = {}) {
   Object.assign(appState, next);
+  appState.upload_concurrency = normalizeTransferConcurrency(appState.upload_concurrency);
+  appState.download_concurrency = normalizeTransferConcurrency(appState.download_concurrency);
+  localDownloadQueue.pump();
   if (next.mappings) appState.mappings = next.mappings;
   if (next.saved_shares) appState.saved_shares = next.saved_shares;
   if (next.auto_share_receipts) {
@@ -601,6 +617,7 @@ function downloadStatus(task) {
   if (task.status === 'completed') return ['已完成', 'success'];
   if (task.status === 'failed') return ['下载失败', 'error'];
   if (task.status === 'downloading') return ['下载中', 'processing'];
+  if (task.status === 'queued') return ['等待下载', 'default'];
   return [task.packaged ? '云端打包中' : '准备下载', 'warning'];
 }
 function clearFinishedDownloads() {
@@ -614,20 +631,22 @@ async function chooseDownloadDirectory() {
   return bridge.selectFolder();
 }
 function queueLocalDownload(command, args, task) {
-  downloadTasks.value = [task, ...downloadTasks.value];
+  downloadTasks.value = [{ ...task, status: 'queued' }, ...downloadTasks.value];
   activeView.value = 'downloads';
-  bridge.invoke(command, { ...args, destination_dir: task.destination, download_id: task.id })
-    .then((payload) => {
+  localDownloadQueue.enqueue(async () => {
+    updateDownloadTask(task.id, { status: 'preparing' });
+    try {
+      const payload = await bridge.invoke(command, { ...args, destination_dir: task.destination, download_id: task.id });
       const data = unwrapData(payload);
       if (!data.file_path) throw new Error('客户端下载完成，但没有返回本地文件位置');
       updateDownloadTask(task.id, { status: 'completed', progress: 100, filePath: data.file_path, downloadedBytes: data.bytes || task.downloadedBytes });
       message.success(`下载完成：${data.file_path}`, 8);
-    })
-    .catch((error) => {
+    } catch (error) {
       const text = errorText(error);
       updateDownloadTask(task.id, { status: 'failed', error: text });
       message.error(text);
-    });
+    }
+  });
 }
 async function downloadCloudFiles(items = selectedFiles.value) {
   const targets = [...items];
@@ -868,6 +887,27 @@ async function retryAutoShareReceipt(receipt) {
 async function removeMapping(mapping) {
   try { await bridge.invoke('remove_mapping', { id: mapping.id }); message.success('备份任务已移除'); }
   catch (error) { message.error(errorText(error)); }
+}
+function openTransferSettings() {
+  transferForm.upload_concurrency = normalizeTransferConcurrency(appState.upload_concurrency);
+  transferForm.download_concurrency = normalizeTransferConcurrency(appState.download_concurrency);
+  transferSettingsOpen.value = true;
+}
+async function saveTransferSettings() {
+  transferSettingsSaving.value = true;
+  try {
+    const next = unwrapData(await bridge.invoke('update_transfer_settings', {
+      upload_concurrency: normalizeTransferConcurrency(transferForm.upload_concurrency),
+      download_concurrency: normalizeTransferConcurrency(transferForm.download_concurrency),
+    }));
+    applyState(next);
+    transferSettingsOpen.value = false;
+    message.success('传输并发设置已保存');
+  } catch (error) {
+    message.error(errorText(error));
+  } finally {
+    transferSettingsSaving.value = false;
+  }
 }
 async function toggleQueue() {
   try { await bridge.invoke(appState.paused ? 'resume_queue' : 'pause_queue'); }
@@ -1460,7 +1500,7 @@ onBeforeUnmount(() => {
                       <div><strong>{{ upload.fileName }}</strong><span :title="upload.filePath">{{ upload.filePath }}</span></div>
                       <span>{{ upload.stage }}<template v-if="upload.state === 'uploading'"> · {{ formatUploadSpeed(upload.bytesPerSecond) }}</template></span>
                     </div>
-                    <a-progress :percent="upload.percent" :status="upload.state === 'error' ? 'exception' : upload.state === 'done' ? 'success' : 'active'" size="small" />
+                    <a-progress :percent="upload.percent" :status="uploadProgressStatus(upload.state)" size="small" />
                   </div>
                 </div>
               </a-card>
@@ -1470,7 +1510,7 @@ onBeforeUnmount(() => {
             <template v-else-if="activeView === 'backup'">
               <div class="section-toolbar">
                 <div><h2>自动备份</h2><p>每个任务独立监控一个文件夹，并保留原始目录结构。</p></div>
-                <a-space><a-button @click="toggleQueue"><template #icon><PlayCircleOutlined v-if="appState.paused" /><PauseCircleOutlined v-else /></template>{{ appState.paused ? '继续队列' : '暂停队列' }}</a-button><a-button type="primary" @click="openBackupForm"><template #icon><PlusOutlined /></template>新建备份任务</a-button></a-space>
+                <a-space><a-button v-if="isTauri" @click="openTransferSettings"><template #icon><SettingOutlined /></template>并发设置</a-button><a-button @click="toggleQueue"><template #icon><PlayCircleOutlined v-if="appState.paused" /><PauseCircleOutlined v-else /></template>{{ appState.paused ? '继续队列' : '暂停队列' }}</a-button><a-button type="primary" @click="openBackupForm"><template #icon><PlusOutlined /></template>新建备份任务</a-button></a-space>
               </div>
 
               <a-card class="content-card hdhive-config-card" :bordered="false" title="Hdhive 自动投稿">
@@ -1525,7 +1565,7 @@ onBeforeUnmount(() => {
                     </div>
                     <a-progress
                       :percent="upload.percent"
-                      :status="upload.state === 'error' ? 'exception' : upload.state === 'done' ? 'success' : 'active'"
+                      :status="uploadProgressStatus(upload.state)"
                       size="small"
                     />
                   </div>
@@ -1542,7 +1582,7 @@ onBeforeUnmount(() => {
             <template v-else-if="activeView === 'downloads'">
               <div class="section-toolbar">
                 <div><h2>本机下载</h2><p>下载前选择保存目录，任务由客户端直接代理并写入本地文件。</p></div>
-                <a-space><a-tag v-if="activeDownloadCount" color="processing">{{ activeDownloadCount }} 个进行中</a-tag><a-button :disabled="!downloadTasks.some(task => ['completed', 'failed'].includes(task.status))" @click="clearFinishedDownloads">清除已结束</a-button></a-space>
+                <a-space><a-tag v-if="activeDownloadCount" color="processing">{{ activeDownloadCount }} 个进行中</a-tag><a-tag v-if="queuedDownloadCount">{{ queuedDownloadCount }} 个等待</a-tag><a-button v-if="isTauri" @click="openTransferSettings"><template #icon><SettingOutlined /></template>并发设置</a-button><a-button :disabled="!downloadTasks.some(task => ['completed', 'failed'].includes(task.status))" @click="clearFinishedDownloads">清除已结束</a-button></a-space>
               </div>
               <a-card class="content-card download-manager-card" :bordered="false">
                 <a-empty v-if="!downloadTasks.length" description="还没有本机下载任务；请在云盘文件或接收分享中点击下载。" />
@@ -1556,9 +1596,10 @@ onBeforeUnmount(() => {
                       </div>
                       <div class="download-task-path"><FolderOutlined /><span :title="task.filePath || task.destination">{{ task.filePath || task.destination }}</span></div>
                       <div v-if="task.status === 'downloading' && !task.totalBytes" class="download-indeterminate" title="服务器未返回总大小，正在持续下载"><span></span></div>
-                      <a-progress v-else :percent="task.progress" :status="task.status === 'failed' ? 'exception' : task.status === 'completed' ? 'success' : 'active'" size="small" />
+                      <a-progress v-else :percent="task.progress" :status="task.status === 'failed' ? 'exception' : task.status === 'completed' ? 'success' : 'normal'" size="small" />
                       <div class="download-task-meta">
-                        <span v-if="task.status === 'preparing'">{{ task.packaged ? '等待光鸭完成云端打包' : '正在获取下载地址' }}</span>
+                        <span v-if="task.status === 'queued'">等待下载并发空位（最多 {{ appState.download_concurrency }} 个）</span>
+                        <span v-else-if="task.status === 'preparing'">{{ task.packaged ? '等待光鸭完成云端打包' : '正在获取下载地址' }}</span>
                         <span v-else-if="task.status === 'downloading'">{{ task.totalBytes ? `${formatSize(task.downloadedBytes)} / ${formatSize(task.totalBytes)}` : `已下载 ${formatSize(task.downloadedBytes)}` }}<template v-if="task.bytesPerSecond"> · {{ formatUploadSpeed(task.bytesPerSecond) }}</template></span>
                         <span v-else>{{ formatSize(task.downloadedBytes) }}</span>
                         <span>{{ formatTime(task.createdAt) }}</span>
@@ -1644,6 +1685,26 @@ onBeforeUnmount(() => {
           <a-button type="primary" block :loading="backupSubmitting" @click="addBackup"><template #icon><PlusOutlined /></template>创建备份任务</a-button>
         </a-form>
       </a-drawer>
+
+      <a-modal
+        v-if="isTauri"
+        v-model:open="transferSettingsOpen"
+        title="传输并发设置"
+        ok-text="保存"
+        cancel-text="取消"
+        :confirm-loading="transferSettingsSaving"
+        @ok="saveTransferSettings"
+      >
+        <a-alert class="drawer-alert" type="info" show-icon message="调整后立即生效" description="降低并发不会中断正在传输的文件，只会限制后续任务。建议网络不稳定时保持 1–2。" />
+        <a-form layout="vertical">
+          <a-form-item label="同时上传文件数">
+            <a-input-number v-model:value="transferForm.upload_concurrency" :min="1" :max="8" :precision="0" style="width: 100%" />
+          </a-form-item>
+          <a-form-item label="同时下载任务数">
+            <a-input-number v-model:value="transferForm.download_concurrency" :min="1" :max="8" :precision="0" style="width: 100%" />
+          </a-form-item>
+        </a-form>
+      </a-modal>
 
       <a-modal v-model:open="folderPicker.open" :title="folderPicker.title" :width="620" ok-text="选择当前目录" cancel-text="取消" :confirm-loading="folderPicker.loading" @ok="confirmPicker" @cancel="folderPicker.onConfirm = null">
         <div class="folder-picker-path">

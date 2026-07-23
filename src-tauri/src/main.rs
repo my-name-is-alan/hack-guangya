@@ -3,7 +3,11 @@
 use hmac::{Hmac, Mac};
 use md5::Md5;
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use opendal::{services::Oss, Operator};
+use opendal::{
+    layers::{RetryEvent, RetryLayer},
+    services::Oss,
+    Operator,
+};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -29,7 +33,10 @@ const API_BASE: &str = "https://api.guangyapan.com";
 const ACCOUNT_BASE: &str = "https://account.guangyapan.com";
 const OAUTH_CLIENT_ID: &str = "aMe-8VSlkrbQXpUR";
 const AUTH_URL: &str = "https://www.guangyapan.com/#/";
-const MAX_UPLOADS: usize = 2;
+const DEFAULT_UPLOAD_CONCURRENCY: usize = 2;
+const DEFAULT_DOWNLOAD_CONCURRENCY: usize = 2;
+const MAX_TRANSFER_CONCURRENCY: usize = 8;
+const OSS_WRITE_RETRY_TIMES: usize = 5;
 const FILE_STABILITY_WAIT_MS: u64 = 1_200;
 const FILE_BUSY_RETRY_SECS: u64 = 3;
 const POLL_INTERVAL_SECS: u64 = 5;
@@ -90,12 +97,26 @@ struct SavedShare {
     url: String,
     created_at: u64,
 }
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct AppConfig {
     #[serde(default)]
     mappings: Vec<Mapping>,
     #[serde(default)]
     saved_shares: Vec<SavedShare>,
+    #[serde(default = "default_upload_concurrency")]
+    upload_concurrency: usize,
+    #[serde(default = "default_download_concurrency")]
+    download_concurrency: usize,
+}
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            mappings: Vec::new(),
+            saved_shares: Vec::new(),
+            upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
+            download_concurrency: DEFAULT_DOWNLOAD_CONCURRENCY,
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize)]
 struct Snapshot {
@@ -103,6 +124,8 @@ struct Snapshot {
     paused: bool,
     pending: usize,
     active_uploads: usize,
+    upload_concurrency: usize,
+    download_concurrency: usize,
     mappings: Vec<Mapping>,
     saved_shares: Vec<SavedShare>,
     hdhive: HdhivePublicConfig,
@@ -149,6 +172,8 @@ struct RuntimeState {
     event_tx: UnboundedSender<FsEvent>,
     paused: bool,
     active_uploads: usize,
+    upload_concurrency: usize,
+    download_concurrency: usize,
     device_id: String,
     hdhive_base_url: String,
     hdhive_secret: String,
@@ -286,6 +311,8 @@ fn snapshot(state: &RuntimeState) -> Snapshot {
         paused: state.paused,
         pending: state.queue.len() + state.waiting_files.len() + state.pending_cloud.len(),
         active_uploads: state.active_uploads,
+        upload_concurrency: state.upload_concurrency,
+        download_concurrency: state.download_concurrency,
         mappings: state.mappings.clone(),
         saved_shares: state.saved_shares.clone(),
         hdhive: HdhivePublicConfig {
@@ -298,6 +325,19 @@ fn snapshot(state: &RuntimeState) -> Snapshot {
 }
 fn default_source_policy() -> String {
     "keep".to_string()
+}
+fn default_upload_concurrency() -> usize {
+    DEFAULT_UPLOAD_CONCURRENCY
+}
+fn default_download_concurrency() -> usize {
+    DEFAULT_DOWNLOAD_CONCURRENCY
+}
+fn normalize_transfer_concurrency(value: usize, fallback: usize) -> usize {
+    if (1..=MAX_TRANSFER_CONCURRENCY).contains(&value) {
+        value
+    } else {
+        fallback
+    }
 }
 fn default_true() -> bool {
     true
@@ -477,7 +517,12 @@ fn save_config(state: &RuntimeState) {
     if let Some(parent) = state.config_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let payload = json!({ "mappings": state.mappings, "saved_shares": state.saved_shares });
+    let payload = json!({
+        "mappings": state.mappings,
+        "saved_shares": state.saved_shares,
+        "upload_concurrency": state.upload_concurrency,
+        "download_concurrency": state.download_concurrency
+    });
     let _ = fs::write(
         &state.config_path,
         serde_json::to_vec_pretty(&payload).unwrap_or_default(),
@@ -533,6 +578,14 @@ fn init_database(path: &Path) -> Result<(), String> {
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL,
                updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS file_fingerprints (
+               file_path TEXT NOT NULL,
+               size INTEGER NOT NULL,
+               modified_ms TEXT NOT NULL,
+               gcid TEXT NOT NULL,
+               computed_at INTEGER NOT NULL,
+               PRIMARY KEY (file_path, size, modified_ms)
              );
              CREATE TABLE IF NOT EXISTS auto_share_targets (
                mapping_id TEXT NOT NULL,
@@ -609,6 +662,71 @@ fn init_database(path: &Path) -> Result<(), String> {
             params![UPLOAD_STATE_OSS_COMPLETE, UPLOAD_STATE_CLOUD_CONFIRMED],
         )
         .map_err(|e| format!("迁移上传状态失败：{e}"))?;
+    Ok(())
+}
+
+fn load_cached_file_gcid(
+    database: &Path,
+    file_path: &Path,
+    size: u64,
+    modified_ms: u128,
+) -> Result<Option<String>, String> {
+    let size = i64::try_from(size).map_err(|_| "文件过大，无法缓存秒传指纹".to_string())?;
+    let connection = open_database(database)?;
+    let gcid = connection
+        .query_row(
+            "SELECT gcid FROM file_fingerprints
+             WHERE file_path = ?1 AND size = ?2 AND modified_ms = ?3",
+            params![
+                file_path.to_string_lossy().as_ref(),
+                size,
+                modified_ms.to_string()
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取秒传指纹缓存失败：{error}"))?;
+    Ok(
+        gcid.filter(|value| {
+            value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }),
+    )
+}
+
+fn save_cached_file_gcid(
+    database: &Path,
+    file_path: &Path,
+    size: u64,
+    modified_ms: u128,
+    gcid: &str,
+) -> Result<(), String> {
+    let size = i64::try_from(size).map_err(|_| "文件过大，无法缓存秒传指纹".to_string())?;
+    let connection = open_database(database)?;
+    let file_path = file_path.to_string_lossy();
+    let modified_ms = modified_ms.to_string();
+    connection
+        .execute(
+            "DELETE FROM file_fingerprints
+             WHERE file_path = ?1 AND (size <> ?2 OR modified_ms <> ?3)",
+            params![file_path.as_ref(), size, modified_ms],
+        )
+        .map_err(|error| format!("清理旧秒传指纹失败：{error}"))?;
+    connection
+        .execute(
+            "INSERT INTO file_fingerprints
+               (file_path, size, modified_ms, gcid, computed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(file_path, size, modified_ms)
+             DO UPDATE SET gcid = excluded.gcid, computed_at = excluded.computed_at",
+            params![
+                file_path.as_ref(),
+                size,
+                modified_ms,
+                gcid,
+                unix_timestamp()
+            ],
+        )
+        .map_err(|error| format!("保存秒传指纹缓存失败：{error}"))?;
     Ok(())
 }
 
@@ -694,6 +812,53 @@ fn load_upload_history(path: &Path) -> Result<HashMap<String, Stamp>, String> {
         );
     }
     Ok(history)
+}
+
+fn reuse_matching_confirmed_upload(
+    path: &Path,
+    item: &UploadItem,
+) -> Result<Option<(String, UploadOutcome)>, String> {
+    let connection = open_database(path)?;
+    let matched = connection
+        .query_row(
+            "SELECT mapping_id, task_id, remote_file_id
+             FROM uploaded_files
+             WHERE upload_state = ?1
+               AND substr(mapping_id, 1, 2) <> '__'
+               AND file_path = ?2
+               AND size = ?3
+               AND modified_ms = ?4
+               AND remote_parent_id = ?5
+               AND remote_dir = ?6
+               AND relative_path = ?7
+             ORDER BY uploaded_at DESC
+             LIMIT 1",
+            params![
+                UPLOAD_STATE_CLOUD_CONFIRMED,
+                item.file_path.to_string_lossy().as_ref(),
+                item.size,
+                item.modified_ms.to_string(),
+                item.remote_parent_id,
+                item.remote_dir,
+                item.relative_path
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    UploadOutcome {
+                        task_id: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        remote_file_id: row.get(2)?,
+                    },
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("复用历史上传记录失败：{error}"))?;
+    drop(connection);
+    if let Some((_, outcome)) = matched.as_ref() {
+        save_upload_record(path, item, outcome, UPLOAD_STATE_CLOUD_CONFIRMED)?;
+    }
+    Ok(matched)
 }
 
 fn load_pending_uploads(path: &Path) -> Result<Vec<PendingUpload>, String> {
@@ -876,14 +1041,15 @@ fn delete_pending_upload(path: &Path, pending: &PendingUpload) -> Result<bool, S
         .map_err(|e| format!("清理待确认上传记录失败：{e}"))
 }
 
-fn remove_mapping_history(path: &Path, mapping_id: &str) -> Result<(), String> {
+fn remove_mapping_transient_uploads(path: &Path, mapping_id: &str) -> Result<(), String> {
     let connection = open_database(path)?;
     connection
         .execute(
-            "DELETE FROM uploaded_files WHERE mapping_id = ?1",
-            params![mapping_id],
+            "DELETE FROM uploaded_files
+             WHERE mapping_id = ?1 AND upload_state <> ?2",
+            params![mapping_id, UPLOAD_STATE_CLOUD_CONFIRMED],
         )
-        .map_err(|e| format!("删除任务上传记录失败：{e}"))?;
+        .map_err(|e| format!("清理任务待确认上传记录失败：{e}"))?;
     Ok(())
 }
 
@@ -978,6 +1144,64 @@ fn auto_share_target(item: &UploadItem) -> Option<AutoShareTarget> {
         title,
         relative_path: parts.join("/"),
     })
+}
+
+fn reuse_auto_share_binding(
+    path: &Path,
+    current_mapping_id: &str,
+    source_mapping_id: &str,
+    target_key: &str,
+) -> Result<bool, String> {
+    let connection = open_database(path)?;
+    let stored = connection
+        .query_row(
+            "SELECT target_type, remote_target_id, title, share_id, share_url
+             FROM auto_share_targets
+             WHERE target_key = ?1
+               AND mapping_id IN (?2, ?3)
+             ORDER BY CASE WHEN mapping_id = ?2 THEN 0 ELSE 1 END, updated_at DESC
+             LIMIT 1",
+            params![target_key, current_mapping_id, source_mapping_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取历史分享绑定失败：{error}"))?;
+    let Some((target_type, remote_target_id, title, share_id, share_url)) = stored else {
+        return Ok(false);
+    };
+    connection
+        .execute(
+            "INSERT INTO auto_share_targets
+               (mapping_id, target_key, target_type, remote_target_id, title, share_id, share_url, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(mapping_id, target_key) DO UPDATE SET
+               target_type = excluded.target_type,
+               remote_target_id = excluded.remote_target_id,
+               title = excluded.title,
+               share_id = excluded.share_id,
+               share_url = excluded.share_url,
+               updated_at = excluded.updated_at",
+            params![
+                current_mapping_id,
+                target_key,
+                target_type,
+                remote_target_id,
+                title,
+                share_id,
+                share_url,
+                unix_timestamp()
+            ],
+        )
+        .map_err(|error| format!("迁移历史分享绑定失败：{error}"))?;
+    Ok(true)
 }
 
 fn target_has_work(state: &RuntimeState, mapping_id: &str, target_key: &str) -> bool {
@@ -2243,8 +2467,31 @@ async fn upload_oss(
         .access_key_id(&credentials.access_key_id)
         .access_key_secret(&credentials.secret_access_key)
         .security_token(&credentials.session_token);
+    let retry_app = app.clone();
+    let retry_file_path = path.to_path_buf();
+    let retry_layer = RetryLayer::new()
+        .with_min_delay(Duration::from_secs(1))
+        .with_max_delay(Duration::from_secs(15))
+        .with_max_times(OSS_WRITE_RETRY_TIMES)
+        .with_jitter()
+        .with_notify(move |event: RetryEvent<'_>| {
+            emit(
+                &retry_app,
+                json!({
+                    "type": "progress",
+                    "file_path": retry_file_path.to_string_lossy(),
+                    "bytes_per_second": 0,
+                    "stage": format!(
+                        "OSS 临时错误，{:.1} 秒后进行第 {} 次重试",
+                        event.retry_after.as_secs_f64(),
+                        event.attempt
+                    )
+                }),
+            );
+        });
     let operator = Operator::new(builder)
         .map_err(|error| format!("初始化 OSS 客户端失败：{error}"))?
+        .layer(retry_layer)
         .finish();
     let size = fs::metadata(path).map_err(|e| e.to_string())?.len();
     let part_size = oss_part_size(size);
@@ -2510,7 +2757,7 @@ async fn upload_item(
     state: &SharedState,
     item: &UploadItem,
 ) -> Result<UploadOutcome, String> {
-    let (token, device_id) = {
+    let (token, device_id, db_path) = {
         let guard = state.lock().map_err(|e| e.to_string())?;
         (
             guard
@@ -2518,6 +2765,7 @@ async fn upload_item(
                 .clone()
                 .ok_or_else(|| "尚未登录光鸭云盘".to_string())?,
             guard.device_id.clone(),
+            guard.db_path.clone(),
         )
     };
     emit(
@@ -2569,7 +2817,42 @@ async fn upload_item(
             app,
             json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 0, "stage": "正在校验秒传" }),
         );
-        match calculate_file_gcid(app, &item.file_path, item.size).await {
+        let cached_gcid =
+            match load_cached_file_gcid(&db_path, &item.file_path, item.size, item.modified_ms) {
+                Ok(value) => value,
+                Err(error) => {
+                    status(app, "warning", error);
+                    None
+                }
+            };
+        let gcid_result = if let Some(gcid) = cached_gcid {
+            emit(
+                app,
+                json!({
+                    "type": "progress",
+                    "file_path": item.file_path.to_string_lossy(),
+                    "percent": 0,
+                    "bytes_per_second": 0,
+                    "stage": "已复用本地秒传指纹"
+                }),
+            );
+            Ok(gcid)
+        } else {
+            let result = calculate_file_gcid(app, &item.file_path, item.size).await;
+            if let Ok(gcid) = &result {
+                if let Err(error) = save_cached_file_gcid(
+                    &db_path,
+                    &item.file_path,
+                    item.size,
+                    item.modified_ms,
+                    gcid,
+                ) {
+                    status(app, "warning", error);
+                }
+            }
+            result
+        };
+        match gcid_result {
             Ok(gcid) => match api_post(
                 &token,
                 &device_id,
@@ -2900,7 +3183,10 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                 Ok(value) => value,
                 Err(_) => return,
             };
-            if guard.paused || guard.token.is_none() || guard.active_uploads >= MAX_UPLOADS {
+            if guard.paused
+                || guard.token.is_none()
+                || guard.active_uploads >= guard.upload_concurrency
+            {
                 None
             } else {
                 let item = guard.queue.pop_front();
@@ -3104,6 +3390,7 @@ async fn enqueue_path(app: &tauri::AppHandle, state: &SharedState, event: FsEven
     .filter(|part| !part.is_empty())
     .collect::<Vec<_>>()
     .join("/");
+    let auto_share_enabled = mapping.auto_share;
     let mut item = UploadItem {
         mapping_id: mapping.id,
         file_path: event.path.clone(),
@@ -3113,6 +3400,31 @@ async fn enqueue_path(app: &tauri::AppHandle, state: &SharedState, event: FsEven
         change_kind: "added".to_string(),
         size: meta.len(),
         modified_ms: modified_ms(&meta),
+    };
+    if let Ok(guard) = state.lock() {
+        if upload_already_scheduled(
+            &guard.history,
+            &guard.pending_cloud,
+            &guard.inflight,
+            &guard.queue,
+            &guard.waiting_files,
+            &item,
+        ) {
+            return;
+        }
+    } else {
+        return;
+    }
+    let db_path = match state.lock() {
+        Ok(guard) => guard.db_path.clone(),
+        Err(_) => return,
+    };
+    let reused_upload = match reuse_matching_confirmed_upload(&db_path, &item) {
+        Ok(value) => value,
+        Err(error) => {
+            status(app, "warning", error);
+            None
+        }
     };
     let waiting_for_login = if let Ok(mut guard) = state.lock() {
         let waiting_for_login = guard.token.is_none();
@@ -3127,17 +3439,57 @@ async fn enqueue_path(app: &tauri::AppHandle, state: &SharedState, event: FsEven
         ) {
             return;
         }
-        if guard.history.contains_key(&key) {
-            item.change_kind = "changed".to_string();
+        if reused_upload.is_some() {
+            guard.history.insert(
+                key,
+                Stamp {
+                    size: item.size,
+                    modified_ms: item.modified_ms,
+                },
+            );
+            false
+        } else {
+            if guard.history.contains_key(&key) {
+                item.change_kind = "changed".to_string();
+            }
+            guard
+                .queue
+                .retain(|queued| item_key(&queued.mapping_id, &queued.file_path) != key);
+            guard.queue.push_back(item.clone());
+            waiting_for_login
         }
-        guard
-            .queue
-            .retain(|queued| item_key(&queued.mapping_id, &queued.file_path) != key);
-        guard.queue.push_back(item);
-        waiting_for_login
     } else {
         return;
     };
+    if let Some((source_mapping_id, outcome)) = reused_upload {
+        if auto_share_enabled {
+            let target = auto_share_target(&item);
+            let binding_reused = match target.as_ref() {
+                Some(target) => reuse_auto_share_binding(
+                    &db_path,
+                    &item.mapping_id,
+                    &source_mapping_id,
+                    &target.key,
+                ),
+                None => Ok(false),
+            };
+            match binding_reused {
+                Ok(true) => {}
+                Ok(false) => {
+                    if let Err(error) = schedule_auto_share(state, &item, &outcome).await {
+                        status(
+                            app,
+                            "error",
+                            format!("历史文件无需重复上传，但自动分享排队失败：{error}"),
+                        );
+                    }
+                }
+                Err(error) => status(app, "error", error),
+            }
+        }
+        emit_state(app, state);
+        return;
+    }
     emit(
         app,
         json!({ "type": "file", "state": if waiting_for_login { "waiting-login" } else { "queued" }, "file_path": event.path.to_string_lossy() }),
@@ -3542,6 +3894,8 @@ fn get_state(state: tauri::State<'_, SharedState>) -> Snapshot {
             paused: false,
             pending: 0,
             active_uploads: 0,
+            upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
+            download_concurrency: DEFAULT_DOWNLOAD_CONCURRENCY,
             mappings: vec![],
             saved_shares: vec![],
             hdhive: HdhivePublicConfig {
@@ -5140,7 +5494,7 @@ fn remove_mapping(
     save_config(&guard);
     let db_path = guard.db_path.clone();
     drop(guard);
-    remove_mapping_history(&db_path, &id)?;
+    remove_mapping_transient_uploads(&db_path, &id)?;
     emit_state(&app, state.inner());
     Ok(())
 }
@@ -5539,6 +5893,31 @@ fn pause_queue(app: tauri::AppHandle, state: tauri::State<'_, SharedState>) {
     emit_state(&app, state.inner());
 }
 #[tauri::command]
+fn update_transfer_settings(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+    upload_concurrency: usize,
+    download_concurrency: usize,
+) -> Result<Snapshot, String> {
+    if !(1..=MAX_TRANSFER_CONCURRENCY).contains(&upload_concurrency)
+        || !(1..=MAX_TRANSFER_CONCURRENCY).contains(&download_concurrency)
+    {
+        return Err(format!(
+            "上传和下载并发数必须在 1–{MAX_TRANSFER_CONCURRENCY} 之间"
+        ));
+    }
+    let next = {
+        let mut guard = state.lock().map_err(|error| error.to_string())?;
+        guard.upload_concurrency = upload_concurrency;
+        guard.download_concurrency = download_concurrency;
+        save_config(&guard);
+        snapshot(&guard)
+    };
+    emit_state(&app, state.inner());
+    drain_queue(app, state.inner().clone());
+    Ok(next)
+}
+#[tauri::command]
 async fn resume_queue(
     app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
@@ -5600,6 +5979,14 @@ fn run() {
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
             save_app_state(&db_path, "hdhive_instance_id", &hdhive_instance_id)?;
             let config = load_config(&config_path);
+            let upload_concurrency = normalize_transfer_concurrency(
+                config.upload_concurrency,
+                DEFAULT_UPLOAD_CONCURRENCY,
+            );
+            let download_concurrency = normalize_transfer_concurrency(
+                config.download_concurrency,
+                DEFAULT_DOWNLOAD_CONCURRENCY,
+            );
             let mappings = config
                 .mappings
                 .into_iter()
@@ -5628,6 +6015,8 @@ fn run() {
                 event_tx,
                 paused: false,
                 active_uploads: 0,
+                upload_concurrency,
+                download_concurrency,
                 device_id,
                 hdhive_base_url,
                 hdhive_secret,
@@ -5736,6 +6125,7 @@ fn run() {
             backfill_auto_shares,
             retry_auto_share_event,
             pause_queue,
+            update_transfer_settings,
             resume_queue
         ])
         .run(tauri::generate_context!())
@@ -6063,6 +6453,52 @@ mod tests {
     }
 
     #[test]
+    fn transfer_concurrency_defaults_and_bounds_are_stable() {
+        let config: AppConfig = serde_json::from_str("{}").expect("deserialize defaults");
+        assert_eq!(config.upload_concurrency, DEFAULT_UPLOAD_CONCURRENCY);
+        assert_eq!(config.download_concurrency, DEFAULT_DOWNLOAD_CONCURRENCY);
+        assert_eq!(
+            normalize_transfer_concurrency(0, DEFAULT_UPLOAD_CONCURRENCY),
+            DEFAULT_UPLOAD_CONCURRENCY
+        );
+        assert_eq!(
+            normalize_transfer_concurrency(MAX_TRANSFER_CONCURRENCY, DEFAULT_UPLOAD_CONCURRENCY),
+            MAX_TRANSFER_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn file_gcid_cache_is_reused_only_for_an_unchanged_file_stamp() {
+        let root = std::env::temp_dir().join(format!("guangya-gcid-cache-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create gcid cache test root");
+        let database = root.join("state.sqlite3");
+        let file = root.join("movie.mkv");
+        init_database(&database).expect("initialize gcid cache database");
+        fs::write(&file, b"fixture").expect("write gcid fixture");
+        let gcid = "0123456789ABCDEF0123456789ABCDEF01234567";
+
+        assert_eq!(
+            load_cached_file_gcid(&database, &file, 7, 100).expect("load empty cache"),
+            None
+        );
+        save_cached_file_gcid(&database, &file, 7, 100, gcid).expect("save gcid cache");
+        assert_eq!(
+            load_cached_file_gcid(&database, &file, 7, 100).expect("load cached gcid"),
+            Some(gcid.to_string())
+        );
+        assert_eq!(
+            load_cached_file_gcid(&database, &file, 7, 101).expect("reject changed mtime"),
+            None
+        );
+        assert_eq!(
+            load_cached_file_gcid(&database, &file, 8, 100).expect("reject changed size"),
+            None
+        );
+
+        fs::remove_dir_all(root).expect("remove gcid cache test root");
+    }
+
+    #[test]
     fn cloud_index_processing_messages_are_retried() {
         assert!(is_cloud_index_pending_message("文件上传中"));
         assert!(is_cloud_index_pending_message("任务处理中，请稍后再试"));
@@ -6248,10 +6684,24 @@ mod tests {
         assert!(load_upload_history(&database)
             .expect("confirmed rows should reload")
             .contains_key(&item_key(&pending_item.mapping_id, &pending_item.file_path)));
-        remove_mapping_history(&database, &item.mapping_id).expect("history should be removable");
+        let mut recreated_item = item.clone();
+        recreated_item.mapping_id = "mapping-2".into();
+        let reused = reuse_matching_confirmed_upload(&database, &recreated_item)
+            .expect("confirmed upload history should be reusable")
+            .expect("matching history should exist");
+        assert_eq!(reused.0, item.mapping_id);
+        assert_eq!(reused.1.remote_file_id.as_deref(), Some("file-1"));
         assert!(load_upload_history(&database)
-            .expect("history should reload")
-            .is_empty());
+            .expect("reused history should reload")
+            .contains_key(&item_key(
+                &recreated_item.mapping_id,
+                &recreated_item.file_path
+            )));
+        remove_mapping_transient_uploads(&database, &item.mapping_id)
+            .expect("transient uploads should be removable");
+        let history = load_upload_history(&database).expect("history should reload");
+        assert!(history.contains_key(&item_key(&item.mapping_id, &item.file_path)));
+        assert!(history.contains_key(&item_key(&pending_item.mapping_id, &pending_item.file_path)));
         fs::remove_dir_all(root).expect("test database should be removable");
     }
 

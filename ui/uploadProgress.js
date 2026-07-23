@@ -45,3 +45,17 @@ export function formatUploadSpeed(bytesPerSecond) {
   const value = Number(bytesPerSecond);
   return `${((Number.isFinite(value) && value > 0 ? value : 0) / (1024 * 1024)).toFixed(2)} MB/s`;
 }
+
+export function uploadProgressStatus(state) {
+  if (state === 'error') return 'exception';
+  if (state === 'done') return 'success';
+  return 'normal';
+}
+
+export function orderUploadProgress(uploads) {
+  return [...uploads].sort((left, right) => {
+    const leftStartedAt = Number(left?.startedAt ?? left?.updatedAt ?? 0);
+    const rightStartedAt = Number(right?.startedAt ?? right?.updatedAt ?? 0);
+    return rightStartedAt - leftStartedAt;
+  });
+}

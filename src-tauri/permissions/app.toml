@@ -38,6 +38,7 @@ commands.allow = [
   "backfill_auto_shares",
   "retry_auto_share_event",
   "pause_queue",
+  "update_transfer_settings",
   "resume_queue"
 ]
 

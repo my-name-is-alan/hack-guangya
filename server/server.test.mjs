@@ -134,6 +134,111 @@ test('备份任务扫描已有文件并只监控所选类型', async () => {
   }
 });
 
+test('重建同一备份任务会复用已确认上传和分享绑定', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-sync-history-reuse-test-'));
+  const watchRoot = path.join(root, 'watch');
+  const archiveRoot = path.join(root, 'archive');
+  const dataDir = path.join(root, 'data');
+  const filePath = path.join(watchRoot, 'existing.jpg');
+  await Promise.all([
+    fsp.mkdir(watchRoot, { recursive: true }),
+    fsp.mkdir(archiveRoot, { recursive: true }),
+    fsp.mkdir(dataDir, { recursive: true }),
+  ]);
+  await fsp.writeFile(filePath, 'already uploaded');
+
+  async function startServer(port) {
+    const child = spawn(process.execPath, [path.join(here, 'server.mjs')], {
+      cwd: path.resolve(here, '..'),
+      env: {
+        ...process.env,
+        PORT: String(port),
+        DATA_DIR: dataDir,
+        GUANGYA_WATCH_ROOT: watchRoot,
+        GUANGYA_ARCHIVE_ROOT: archiveRoot,
+        GUANGYA_TOKEN: '',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = '';
+    child.stdout.on('data', (chunk) => { output += chunk; });
+    child.stderr.on('data', (chunk) => { output += chunk; });
+    await waitUntil(() => output.includes('Guangya Web listening'));
+    return child;
+  }
+
+  async function stopServer(child) {
+    child.kill();
+    await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 2_000))]);
+  }
+
+  let child;
+  try {
+    child = await startServer(await freePort());
+    await stopServer(child);
+    child = null;
+
+    const oldMappingId = 'mapping-old';
+    const currentMappingId = 'mapping-current';
+    const stat = await fsp.stat(filePath);
+    const database = new DatabaseSync(path.join(dataDir, 'state.sqlite3'));
+    database.prepare(`
+      INSERT INTO uploaded_files
+        (mapping_id, file_path, size, modified_ms, task_id, remote_file_id, status, item_json,
+         remote_parent_id, remote_dir, relative_path, uploaded_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'cloud_confirmed', NULL, ?, '', ?, ?)
+    `).run(
+      oldMappingId,
+      path.resolve(filePath),
+      stat.size,
+      String(stat.mtimeMs),
+      'task-old',
+      'file-old',
+      'parent-1',
+      'existing.jpg',
+      Math.floor(Date.now() / 1000),
+    );
+    database.prepare(`
+      INSERT INTO auto_share_targets
+        (mapping_id, target_key, target_type, remote_target_id, title, share_id, share_url, updated_at)
+      VALUES (?, 'existing.jpg', 'file', 'file-old', 'existing.jpg', 'share-old', 'https://www.guangyapan.com/s/share-old', ?)
+    `).run(oldMappingId, Math.floor(Date.now() / 1000));
+    database.close();
+    await fsp.writeFile(path.join(dataDir, 'config.json'), JSON.stringify({
+      mappings: [{
+        id: currentMappingId,
+        local_path: watchRoot,
+        remote_path: '',
+        remote_parent_id: 'parent-1',
+        enabled: true,
+        source_policy: 'keep',
+        scan_existing: true,
+        sync_types: ['jpg'],
+        monitor_mode: 'native',
+        auto_share: true,
+      }],
+      saved_shares: [],
+    }, null, 2));
+
+    const port = await freePort();
+    child = await startServer(port);
+    const restored = await fetch(`http://127.0.0.1:${port}/api/state`).then((value) => value.json());
+    assert.equal(restored.pending, 0);
+
+    const verified = new DatabaseSync(path.join(dataDir, 'state.sqlite3'));
+    assert.equal(verified.prepare("SELECT COUNT(*) AS count FROM uploaded_files WHERE mapping_id = ? AND status = 'cloud_confirmed'").get(currentMappingId).count, 1);
+    assert.equal(verified.prepare('SELECT share_id FROM auto_share_targets WHERE mapping_id = ? AND target_key = ?').get(currentMappingId, 'existing.jpg').share_id, 'share-old');
+
+    const removed = await fetch(`http://127.0.0.1:${port}/api/mappings/${currentMappingId}`, { method: 'DELETE' });
+    assert.equal(removed.status, 200, await removed.text());
+    assert.equal(verified.prepare("SELECT COUNT(*) AS count FROM uploaded_files WHERE mapping_id = ? AND status = 'cloud_confirmed'").get(currentMappingId).count, 1);
+    verified.close();
+  } finally {
+    if (child) await stopServer(child);
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('Docker Web 会话保存到 SQLite 并在重启后恢复', async () => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-sync-session-test-'));
   const watchRoot = path.join(root, 'watch');
