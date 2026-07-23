@@ -6,6 +6,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { signHdhiveRequest } from './auto-share.mjs';
 
@@ -749,6 +750,259 @@ test('Web 接收分享可读取目录并转存到指定云盘目录', async () =
   } finally {
     child.kill();
     await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 2_000))]);
+    await new Promise((resolve) => apiServer.close(resolve));
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Web 管理端鉴权覆盖静态页面和 API，并拒绝跨站变更请求', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-admin-auth-test-'));
+  const watchRoot = path.join(root, 'watch');
+  const archiveRoot = path.join(root, 'archive');
+  const dataDir = path.join(root, 'data');
+  await Promise.all([fsp.mkdir(watchRoot, { recursive: true }), fsp.mkdir(archiveRoot, { recursive: true })]);
+  const port = await freePort();
+  const child = spawn(process.execPath, [path.join(here, 'server.mjs')], {
+    cwd: path.resolve(here, '..'),
+    env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, GUANGYA_WATCH_ROOT: watchRoot, GUANGYA_ARCHIVE_ROOT: archiveRoot, LISTEN_HOST: '127.0.0.1', GUANGYA_ADMIN_USERNAME: 'operator', GUANGYA_ADMIN_PASSWORD: 'correct horse battery staple' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+  const authorization = `Basic ${Buffer.from('operator:correct horse battery staple').toString('base64')}`;
+  try {
+    await waitUntil(() => output.includes('Guangya Web listening'));
+    const staticUnauthorized = await fetch(`http://127.0.0.1:${port}/`);
+    assert.equal(staticUnauthorized.status, 401);
+    assert.match(staticUnauthorized.headers.get('www-authenticate') || '', /^Basic /);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/state`)).status, 401);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/state`, { headers: { authorization: `Basic ${Buffer.from('operator:wrong').toString('base64')}` } })).status, 401);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/state`, { headers: { authorization } })).status, 200);
+
+    const crossOrigin = await fetch(`http://127.0.0.1:${port}/api/queue/pause`, { method: 'POST', headers: { authorization, origin: 'https://evil.example' } });
+    assert.equal(crossOrigin.status, 403);
+    const sameOrigin = await fetch(`http://127.0.0.1:${port}/api/queue/pause`, { method: 'POST', headers: { authorization, origin: `http://127.0.0.1:${port}` } });
+    assert.equal(sameOrigin.status, 200, await sameOrigin.text());
+  } finally {
+    child.kill();
+    await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 2_000))]);
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+
+  const unsafePort = await freePort();
+  const unsafeChild = spawn(process.execPath, [path.join(here, 'server.mjs')], {
+    cwd: path.resolve(here, '..'),
+    env: { ...process.env, PORT: String(unsafePort), DATA_DIR: path.join(root, 'unsafe-data'), GUANGYA_WATCH_ROOT: path.join(root, 'unsafe-watch'), GUANGYA_ARCHIVE_ROOT: path.join(root, 'unsafe-archive'), LISTEN_HOST: '0.0.0.0', GUANGYA_ADMIN_PASSWORD: '' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let unsafeOutput = '';
+  unsafeChild.stderr.on('data', (chunk) => { unsafeOutput += chunk; });
+  await once(unsafeChild, 'exit');
+  assert.match(unsafeOutput, /只允许监听回环地址/);
+});
+
+test('Web 无密码回环模式拒绝非回环 Host header', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-loopback-host-test-'));
+  const watchRoot = path.join(root, 'watch');
+  const archiveRoot = path.join(root, 'archive');
+  const dataDir = path.join(root, 'data');
+  await Promise.all([fsp.mkdir(watchRoot), fsp.mkdir(archiveRoot)]);
+  const port = await freePort();
+  const child = spawn(process.execPath, [path.join(here, 'server.mjs')], {
+    cwd: path.resolve(here, '..'),
+    env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, GUANGYA_WATCH_ROOT: watchRoot, GUANGYA_ARCHIVE_ROOT: archiveRoot, LISTEN_HOST: '127.0.0.1', GUANGYA_ADMIN_PASSWORD: '' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+  const requestWithHost = (host) => new Promise((resolve, reject) => {
+    const request = http.request({ hostname: '127.0.0.1', port, path: '/api/state', headers: { host } }, (response) => {
+      let body = '';
+      response.on('data', (chunk) => { body += chunk; });
+      response.on('end', () => resolve({ status: response.statusCode, body }));
+    });
+    request.on('error', reject);
+    request.end();
+  });
+  try {
+    await waitUntil(() => output.includes('Guangya Web listening'));
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/state`)).status, 200);
+    assert.equal((await requestWithHost(`localhost:${port}`)).status, 200);
+    assert.equal((await requestWithHost(`[::1]:${port}`)).status, 200);
+    const rebound = await requestWithHost(`attacker.example:${port}`);
+    assert.equal(rebound.status, 403);
+    assert.match(JSON.parse(rebound.body).error, /回环 Host/);
+    assert.equal((await requestWithHost(`127.0.0.2:${port}`)).status, 403);
+  } finally {
+    child.kill();
+    await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 2_000))]);
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Web 文件根目录使用真实路径并阻止符号链接越界', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-realpath-test-'));
+  const realRoot = path.join(root, 'real-root');
+  const aliasRoot = path.join(root, 'root-alias');
+  const outsideRoot = path.join(root, 'outside');
+  const dataDir = path.join(root, 'data');
+  await Promise.all([fsp.mkdir(realRoot), fsp.mkdir(outsideRoot)]);
+  await Promise.all([fsp.writeFile(path.join(realRoot, 'inside.txt'), 'inside'), fsp.writeFile(path.join(outsideRoot, 'secret.txt'), 'secret')]);
+  await Promise.all([fsp.symlink(realRoot, aliasRoot), fsp.symlink(outsideRoot, path.join(realRoot, 'escape'))]);
+  const port = await freePort();
+  const child = spawn(process.execPath, [path.join(here, 'server.mjs')], {
+    cwd: path.resolve(here, '..'),
+    env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, GUANGYA_WATCH_ROOT: realRoot, GUANGYA_ARCHIVE_ROOT: realRoot, GUANGYA_FILE_ROOTS: aliasRoot, GUANGYA_TOKEN: 'test-token' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+  try {
+    await waitUntil(() => output.includes('Guangya Web listening'));
+    const canonical = await fetch(`http://127.0.0.1:${port}/api/server-files?path=${encodeURIComponent(realRoot)}`).then((response) => response.json());
+    assert.equal(canonical.path, await fsp.realpath(realRoot));
+    assert.equal(canonical.roots[0], await fsp.realpath(aliasRoot));
+    assert.equal(canonical.items.some((item) => item.name === 'inside.txt'), true);
+    assert.equal(canonical.items.some((item) => item.name === 'escape'), false);
+    const escaped = await fetch(`http://127.0.0.1:${port}/api/server-files?path=${encodeURIComponent(path.join(aliasRoot, 'escape'))}`);
+    assert.equal(escaped.status, 400);
+  } finally {
+    child.kill();
+    await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 2_000))]);
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Web 归档为每次冲突生成唯一名称且绝不覆盖旧文件', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-archive-collision-test-'));
+  const watchRoot = path.join(root, 'watch');
+  const archiveRoot = path.join(root, 'archive');
+  const dataDir = path.join(root, 'data');
+  await Promise.all([fsp.mkdir(watchRoot), fsp.mkdir(archiveRoot)]);
+  const source = path.join(watchRoot, 'episode.txt');
+  await fsp.writeFile(source, 'new upload');
+  const sourceStat = await fsp.stat(source);
+  const timestamp = Math.round(sourceStat.mtimeMs);
+  const originalArchive = path.join(archiveRoot, 'episode.txt');
+  const timestampArchive = path.join(archiveRoot, `episode-${timestamp}.txt`);
+  await Promise.all([fsp.writeFile(originalArchive, 'old one'), fsp.writeFile(timestampArchive, 'old two')]);
+  const apiServer = http.createServer(async (request, response) => {
+    const body = JSON.parse(await new Promise((resolve) => { let value = ''; request.on('data', (chunk) => { value += chunk; }); request.on('end', () => resolve(value || '{}')); }));
+    response.setHeader('content-type', 'application/json');
+    if (request.url === '/userres/v1/get_res_center_token') response.end(JSON.stringify({ code: 156, data: { taskId: `task-${body.name}` } }));
+    else if (request.url === '/userres/v1/file/get_info_by_task_id') response.end(JSON.stringify({ code: 0, data: { fileId: 'remote-episode' } }));
+    else { response.statusCode = 404; response.end(JSON.stringify({ code: 404, msg: 'not found' })); }
+  });
+  apiServer.listen(0, '127.0.0.1');
+  await once(apiServer, 'listening');
+  const port = await freePort();
+  const child = spawn(process.execPath, [path.join(here, 'server.mjs')], {
+    cwd: path.resolve(here, '..'),
+    env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, GUANGYA_WATCH_ROOT: watchRoot, GUANGYA_ARCHIVE_ROOT: archiveRoot, GUANGYA_FILE_ROOTS: root, GUANGYA_API_BASE: `http://127.0.0.1:${apiServer.address().port}`, GUANGYA_TOKEN: 'test-token', GUANGYA_FILE_STABILITY_MS: '200' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+  try {
+    await waitUntil(() => output.includes('Guangya Web listening'));
+    const mappingResponse = await fetch(`http://127.0.0.1:${port}/api/mappings`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ local_path: watchRoot, remote_path: '', archive_path: archiveRoot, source_policy: 'archive', scan_existing: true, sync_types: ['txt'] }) });
+    assert.equal(mappingResponse.status, 200, await mappingResponse.text());
+    const uniqueArchive = path.join(archiveRoot, `episode-${timestamp}-2.txt`);
+    await waitUntil(async () => { try { return (await fsp.readFile(uniqueArchive, 'utf8')) === 'new upload'; } catch { return false; } }, 10_000).catch((error) => { throw new Error(`${error.message}\n${output}`); });
+    assert.equal(await fsp.readFile(originalArchive, 'utf8'), 'old one');
+    assert.equal(await fsp.readFile(timestampArchive, 'utf8'), 'old two');
+    await assert.rejects(fsp.access(source));
+  } finally {
+    child.kill();
+    await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 2_000))]);
+    await new Promise((resolve) => apiServer.close(resolve));
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Web 重启后先恢复未确认任务，再重新上传期间变化的源文件', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-pending-recovery-test-'));
+  const watchRoot = path.join(root, 'watch');
+  const archiveRoot = path.join(root, 'archive');
+  const dataDir = path.join(root, 'data');
+  await Promise.all([fsp.mkdir(watchRoot), fsp.mkdir(archiveRoot)]);
+  const sourceFile = path.join(watchRoot, 'pending.txt');
+  await fsp.writeFile(sourceFile, 'pending upload');
+  let cloudConfirmed = false;
+  let uploadTokenRequests = 0;
+  let confirmRequests = 0;
+  const apiServer = http.createServer(async (request, response) => {
+    const body = JSON.parse(await new Promise((resolve) => { let value = ''; request.on('data', (chunk) => { value += chunk; }); request.on('end', () => resolve(value || '{}')); }));
+    response.setHeader('content-type', 'application/json');
+    if (request.url === '/userres/v1/get_res_center_token') {
+      uploadTokenRequests += 1;
+      response.end(JSON.stringify({ code: 156, data: { taskId: `pending-task-${uploadTokenRequests}` } }));
+    } else if (request.url === '/userres/v1/file/get_info_by_task_id') {
+      assert.match(body.taskId, /^pending-task-\d+$/);
+      confirmRequests += 1;
+      response.end(JSON.stringify(cloudConfirmed ? { code: 0, data: { fileId: `confirmed-${body.taskId}` } } : { code: 999, msg: '文件上传中' }));
+    } else { response.statusCode = 404; response.end(JSON.stringify({ code: 404, msg: 'not found' })); }
+  });
+  apiServer.listen(0, '127.0.0.1');
+  await once(apiServer, 'listening');
+
+  async function startServer(port) {
+    const child = spawn(process.execPath, [path.join(here, 'server.mjs')], {
+      cwd: path.resolve(here, '..'),
+      env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, GUANGYA_WATCH_ROOT: watchRoot, GUANGYA_ARCHIVE_ROOT: archiveRoot, GUANGYA_FILE_ROOTS: root, GUANGYA_API_BASE: `http://127.0.0.1:${apiServer.address().port}`, GUANGYA_TOKEN: 'test-token', GUANGYA_CLOUD_CONFIRM_TIMEOUT_MS: '1000', GUANGYA_CLOUD_CONFIRM_POLL_MS: '10', GUANGYA_FILE_STABILITY_MS: '200' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = '';
+    child.stdout.on('data', (chunk) => { output += chunk; });
+    child.stderr.on('data', (chunk) => { output += chunk; });
+    await waitUntil(() => output.includes('Guangya Web listening'));
+    return { child, output: () => output };
+  }
+  async function stopServer(child) { child.kill(); await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 2_000))]); }
+
+  let running;
+  try {
+    const firstPort = await freePort();
+    running = await startServer(firstPort);
+    const mappingResponse = await fetch(`http://127.0.0.1:${firstPort}/api/mappings`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ local_path: watchRoot, remote_path: '', source_policy: 'delete', scan_existing: true, sync_types: ['txt'] }) });
+    assert.equal(mappingResponse.status, 200, await mappingResponse.text());
+    await waitUntil(async () => {
+      const current = await fetch(`http://127.0.0.1:${firstPort}/api/state`).then((response) => response.json());
+      return uploadTokenRequests === 1 && current.pending === 1 && current.active_uploads === 0;
+    }, 10_000).catch((error) => { throw new Error(`${error.message}\n${running.output()}`); });
+    await fsp.access(sourceFile);
+    await fsp.writeFile(sourceFile, 'pending upload changed while confirming');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal(uploadTokenRequests, 1);
+    await stopServer(running.child);
+    running = null;
+    const pendingDb = new DatabaseSync(path.join(dataDir, 'state.sqlite3'));
+    assert.equal(pendingDb.prepare('SELECT status FROM uploaded_files').get().status, 'oss_complete');
+    pendingDb.close();
+
+    cloudConfirmed = true;
+    const secondPort = await freePort();
+    running = await startServer(secondPort);
+    await waitUntil(async () => {
+      const current = await fetch(`http://127.0.0.1:${secondPort}/api/state`).then((response) => response.json());
+      return uploadTokenRequests === 2 && current.pending === 0 && current.active_uploads === 0;
+    }, 10_000).catch((error) => { throw new Error(`${error.message}\n${running.output()}`); });
+    assert.equal(uploadTokenRequests, 2);
+    assert.ok(confirmRequests > 1);
+    await assert.rejects(fsp.access(sourceFile));
+    await stopServer(running.child);
+    running = null;
+    const confirmedDb = new DatabaseSync(path.join(dataDir, 'state.sqlite3'));
+    const confirmed = confirmedDb.prepare('SELECT status, remote_file_id FROM uploaded_files').get();
+    assert.equal(confirmed.status, 'cloud_confirmed');
+    assert.equal(confirmed.remote_file_id, 'confirmed-pending-task-2');
+    confirmedDb.close();
+  } finally {
+    if (running) await stopServer(running.child);
     await new Promise((resolve) => apiServer.close(resolve));
     await fsp.rm(root, { recursive: true, force: true });
   }
