@@ -1,0 +1,36 @@
+# Dependencies and build outputs
+node_modules/
+dist/
+release/
+target/
+ui/target/
+src-tauri/gen/schemas/
+
+# Runtime data and user-selected folders
+docker-data/
+.web-data/
+.web-data-*/
+watch/
+archive/
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Logs, temporary files, and local tooling
+*.log
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

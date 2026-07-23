@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1
+
+FROM node:24-bookworm-slim AS ui-build
+WORKDIR /app
+RUN corepack enable
+ENV PNPM_CONFIG_MINIMUM_RELEASE_AGE=0
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile --config.minimumReleaseAge=0
+COPY vite.config.mjs ./
+COPY ui ./ui
+RUN pnpm ui:build
+
+FROM node:24-bookworm-slim AS package-build
+ARG VERSION
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tar \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY packaging/ubuntu-native/runtime-package.json ./package.json
+RUN npm install --omit=dev --ignore-scripts
+COPY server ./server
+COPY --from=ui-build /app/dist ./dist
+COPY packaging/ubuntu-native /packaging
+RUN set -eux; \
+    bundle="guangya-sync-native-ubuntu-x64-${VERSION}"; \
+    root="/bundle/${bundle}"; \
+    mkdir -p "${root}/app/node/bin" /release; \
+    cp /usr/local/bin/node "${root}/app/node/bin/node"; \
+    if [ -f /usr/local/LICENSE ]; then cp /usr/local/LICENSE "${root}/app/node/LICENSE"; fi; \
+    cp -a /build/node_modules "${root}/app/node_modules"; \
+    cp -a /build/server "${root}/app/server"; \
+    cp -a /build/dist "${root}/app/dist"; \
+    cp /packaging/install.sh /packaging/uninstall.sh /packaging/guangya-syncctl "${root}/"; \
+    cp /packaging/guangya-sync.service /packaging/guangya-sync.env "${root}/"; \
+    cp /packaging/README.md "${root}/README.md"; \
+    printf '%s\n' "${VERSION}" > "${root}/app/VERSION"; \
+    chmod 0755 "${root}/install.sh" "${root}/uninstall.sh" "${root}/guangya-syncctl" "${root}/app/node/bin/node"; \
+    tar -czf "/release/${bundle}.tar.gz" -C /bundle "${bundle}"; \
+    cd /release; \
+    sha256sum "${bundle}.tar.gz" > "${bundle}.tar.gz.sha256"
+
+FROM scratch AS export
+COPY --from=package-build /release/ /

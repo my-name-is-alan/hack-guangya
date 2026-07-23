@@ -1,0 +1,23 @@
+[Unit]
+Description=Guangya Folder Sync Web Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=guangya-sync
+Group=guangya-sync
+WorkingDirectory=/opt/guangya-sync
+EnvironmentFile=/etc/guangya-sync.env
+ExecStart=/opt/guangya-sync/node/bin/node /opt/guangya-sync/server/server.mjs
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

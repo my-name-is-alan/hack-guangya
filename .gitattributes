@@ -1,0 +1,7 @@
+* text=auto
+
+# Files executed or consumed on Linux must keep LF line endings.
+*.sh text eol=lf
+*.service text eol=lf
+Dockerfile* text eol=lf
+packaging/ubuntu-native/guangya-syncctl text eol=lf

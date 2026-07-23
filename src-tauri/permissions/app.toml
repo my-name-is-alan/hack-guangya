@@ -1,0 +1,47 @@
+[[permission]]
+identifier = "allow-main-commands"
+description = "允许主窗口管理登录、监控目录和上传队列"
+commands.allow = [
+  "get_state",
+  "start_device_login",
+  "poll_device_login",
+  "get_overview",
+  "list_files",
+  "select_upload_files",
+  "select_upload_folder",
+  "queue_upload_paths",
+  "copy_files",
+  "move_files",
+  "delete_files",
+  "batch_rename_files",
+  "create_share",
+  "list_shares",
+  "delete_shares",
+  "open_received_share",
+  "list_received_share_files",
+  "restore_received_share",
+  "get_received_share_download",
+  "get_cloud_download",
+  "create_offline_task",
+  "list_offline_tasks",
+  "save_share_link",
+  "remove_share_link",
+  "open_login",
+  "select_folder",
+  "add_mapping",
+  "remove_mapping",
+  "toggle_mapping",
+  "update_mapping_sync_types",
+  "update_mapping_monitor_mode",
+  "update_mapping_auto_share",
+  "update_hdhive_config",
+  "backfill_auto_shares",
+  "retry_auto_share_event",
+  "pause_queue",
+  "resume_queue"
+]
+
+[[permission]]
+identifier = "allow-capture-token"
+description = "允许官方光鸭登录页提交短期 Bearer 会话"
+commands.allow = ["capture_token"]

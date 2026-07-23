@@ -1,0 +1,31 @@
+{
+  "name": "guangya-folder-sync",
+  "version": "0.1.13",
+  "type": "module",
+  "packageManager": "pnpm@11.15.1",
+  "private": true,
+  "description": "Tauri 光鸭云盘文件夹同步客户端",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "ui:dev": "vite --host 127.0.0.1 --port 1420",
+    "ui:build": "vite build",
+    "ui:test": "node --test ui/*.test.js",
+    "server:test": "node --test server/*.test.mjs",
+    "package:ubuntu": "node scripts/package-ubuntu-native.mjs",
+    "web": "node server/server.mjs"
+  },
+  "dependencies": {
+    "@antdv-next/icons": "^1.1.1",
+    "ali-oss": "^6.23.0",
+    "antdv-next": "^1.4.5",
+    "chokidar": "^4.0.3",
+    "vue": "^3.5.40"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.5.0",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "vite": "^7.0.0"
+  }
+}

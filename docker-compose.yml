@@ -1,0 +1,27 @@
+services:
+  guangya-sync:
+    build: .
+    container_name: guangya-sync
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      DATA_DIR: /data
+      GUANGYA_WATCH_ROOT: /watch
+      GUANGYA_ARCHIVE_ROOT: /archive
+      GUANGYA_FILE_ROOTS: /watch,/archive
+      GUANGYA_OSS_TIMEOUT_MS: "600000"
+      GUANGYA_OSS_RETRY_MAX: "3"
+      GUANGYA_OSS_PARALLEL: "3"
+      GUANGYA_CLOUD_CONFIRM_TIMEOUT_MS: "600000"
+      GUANGYA_CLOUD_CONFIRM_POLL_MS: "1000"
+      GUANGYA_AUTO_SHARE_QUIET_MS: "30000"
+      HDHIVE_BASE_URL: ${HDHIVE_BASE_URL:-}
+      HDHIVE_GUANGYA_SYNC_SECRET: ${HDHIVE_GUANGYA_SYNC_SECRET:-}
+      HDHIVE_GUANGYA_SYNC_INSTANCE_ID: ${HDHIVE_GUANGYA_SYNC_INSTANCE_ID:-}
+      GUANGYA_TOKEN: ${GUANGYA_TOKEN:-}
+    volumes:
+      - ./docker-data:/data
+      - ./watch:/watch
+      - ./archive:/archive

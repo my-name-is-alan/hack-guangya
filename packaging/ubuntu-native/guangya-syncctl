@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-status}" in
+  start|stop|restart)
+    systemctl "$1" guangya-sync.service
+    ;;
+  status)
+    systemctl status guangya-sync.service --no-pager
+    ;;
+  logs)
+    exec journalctl -u guangya-sync.service -f -n 200
+    ;;
+  version)
+    cat /opt/guangya-sync/VERSION
+    ;;
+  *)
+    echo "用法：guangya-sync {start|stop|restart|status|logs|version}" >&2
+    exit 2
+    ;;
+esac

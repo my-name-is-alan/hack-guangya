@@ -1,0 +1,9 @@
+node_modules
+target
+dist
+src-tauri
+.git
+docker-data
+watch
+archive
+*.log

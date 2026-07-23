@@ -1,0 +1,10 @@
+{
+  "name": "guangya-sync-native-runtime",
+  "version": "0.1.12",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "ali-oss": "6.23.0",
+    "chokidar": "4.0.3"
+  }
+}
