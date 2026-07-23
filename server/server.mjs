@@ -14,10 +14,31 @@ import { parseGuangyaShareLink } from '../ui/shareLink.js';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const uiRoot = path.resolve(here, '..', 'dist');
 const port = Number(process.env.PORT || 8080);
-const dataDir = path.resolve(process.env.DATA_DIR || path.join(here, '..', '.web-data'));
-const watchRoot = path.resolve(process.env.GUANGYA_WATCH_ROOT || path.join(here, '..', 'watch'));
-const archiveRoot = path.resolve(process.env.GUANGYA_ARCHIVE_ROOT || path.join(here, '..', 'archive'));
-const fileRoots = (process.env.GUANGYA_FILE_ROOTS || watchRoot).split(',').map((value) => path.resolve(value.trim())).filter(Boolean);
+const adminUsername = String(process.env.GUANGYA_ADMIN_USERNAME || 'admin');
+const adminPassword = String(process.env.GUANGYA_ADMIN_PASSWORD || '');
+const requestedListenHost = String(process.env.LISTEN_HOST || process.env.HOST || (adminPassword ? '0.0.0.0' : '127.0.0.1')).trim();
+const loopbackHosts = new Set(['127.0.0.1', '::1', 'localhost']);
+if (!adminPassword && !loopbackHosts.has(requestedListenHost.toLowerCase())) throw new Error('未配置 GUANGYA_ADMIN_PASSWORD 时只允许监听回环地址');
+const listenHost = requestedListenHost;
+const configuredDataDir = path.resolve(process.env.DATA_DIR || path.join(here, '..', '.web-data'));
+const configuredWatchRoot = path.resolve(process.env.GUANGYA_WATCH_ROOT || path.join(here, '..', 'watch'));
+const configuredArchiveRoot = path.resolve(process.env.GUANGYA_ARCHIVE_ROOT || path.join(here, '..', 'archive'));
+for (const directory of [configuredDataDir, configuredWatchRoot, configuredArchiveRoot]) fs.mkdirSync(directory, { recursive: true });
+function canonicalizePathSync(value) {
+  const resolved = path.resolve(String(value));
+  let existing = resolved;
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) break;
+    existing = parent;
+  }
+  const realExisting = fs.realpathSync(existing);
+  return path.resolve(realExisting, path.relative(existing, resolved));
+}
+const dataDir = canonicalizePathSync(configuredDataDir);
+const watchRoot = canonicalizePathSync(configuredWatchRoot);
+const archiveRoot = canonicalizePathSync(configuredArchiveRoot);
+const fileRoots = (process.env.GUANGYA_FILE_ROOTS || watchRoot).split(',').map((value) => value.trim()).filter(Boolean).map(canonicalizePathSync);
 const configFile = path.join(dataDir, 'config.json');
 const databaseFile = path.join(dataDir, 'state.sqlite3');
 const manualUploadRoot = path.join(dataDir, 'manual-uploads');
@@ -34,8 +55,7 @@ const autoShareQuietMs = envInteger('GUANGYA_AUTO_SHARE_QUIET_MS', 30_000, 1_000
 const tokenRefreshIntervalMs = envInteger('GUANGYA_TOKEN_REFRESH_MS', 20 * 60_000, 60_000, 60 * 60_000);
 let hdhiveBaseUrl = String(process.env.HDHIVE_BASE_URL || '').trim().replace(/\/$/, '');
 let hdhiveSecret = String(process.env.HDHIVE_GUANGYA_SYNC_SECRET || '').trim();
-fs.mkdirSync(dataDir, { recursive: true });
-const protectedDataRoot = fs.realpathSync(dataDir);
+const protectedDataRoot = dataDir;
 const database = new DatabaseSync(databaseFile);
 database.exec(`
   PRAGMA journal_mode = WAL;
@@ -53,6 +73,8 @@ database.exec(`
     modified_ms TEXT NOT NULL,
     task_id TEXT,
     remote_file_id TEXT,
+    status TEXT NOT NULL DEFAULT 'cloud_confirmed',
+    item_json TEXT,
     uploaded_at INTEGER NOT NULL,
     PRIMARY KEY (mapping_id, file_path)
   );
@@ -110,13 +132,19 @@ database.exec(`
 `);
 if (!database.prepare("PRAGMA table_info(auth_session)").all().some((column) => column.name === 'refresh_token')) database.exec('ALTER TABLE auth_session ADD COLUMN refresh_token TEXT');
 if (!database.prepare("PRAGMA table_info(auto_share_events)").all().some((column) => column.name === 'notification_status')) database.exec('ALTER TABLE auto_share_events ADD COLUMN notification_status TEXT');
+if (!database.prepare("PRAGMA table_info(uploaded_files)").all().some((column) => column.name === 'status')) {
+  database.exec("ALTER TABLE uploaded_files ADD COLUMN status TEXT");
+}
+database.exec("UPDATE uploaded_files SET status = CASE WHEN remote_file_id IS NOT NULL AND remote_file_id <> '' THEN 'cloud_confirmed' ELSE 'oss_complete' END WHERE status IS NULL OR status NOT IN ('oss_complete', 'cloud_confirmed')");
+if (!database.prepare("PRAGMA table_info(uploaded_files)").all().some((column) => column.name === 'item_json')) database.exec('ALTER TABLE uploaded_files ADD COLUMN item_json TEXT');
 const storedDevice = database.prepare("SELECT value FROM app_state WHERE key = 'device_id'").get();
 const deviceId = storedDevice?.value || crypto.randomUUID();
 database.prepare("INSERT INTO app_state (key, value, updated_at) VALUES ('device_id', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at").run(deviceId, Math.floor(Date.now() / 1000));
 const clients = new Set();
 const watchers = new Map();
 const queue = new Map();
-const history = new Map(database.prepare('SELECT mapping_id, file_path, size, modified_ms FROM uploaded_files').all().map((row) => [`${row.mapping_id}::${path.resolve(row.file_path)}`, `${row.size}:${row.modified_ms}`]));
+const history = new Map(database.prepare("SELECT mapping_id, file_path, size, modified_ms FROM uploaded_files WHERE status = 'cloud_confirmed'").all().map((row) => [`${row.mapping_id}::${path.resolve(row.file_path)}`, `${row.size}:${row.modified_ms}`]));
+const pendingUploads = new Map(database.prepare("SELECT mapping_id, file_path, size, modified_ms, task_id, item_json FROM uploaded_files WHERE status = 'oss_complete'").all().map((row) => [`${row.mapping_id}::${path.resolve(row.file_path)}`, row]));
 const inflight = new Map();
 const inflightItems = new Map();
 const waitingFiles = new Map();
@@ -165,11 +193,59 @@ function syncType(file) {
 function shouldSync(file, syncTypes) { const extension = syncType(file); return Boolean(extension) && normalizeSyncTypes(syncTypes).includes(extension); }
 function queueKey(mappingId, file) { return `${mappingId}::${path.resolve(file)}`; }
 function autoShareReceipts() { return database.prepare('SELECT event_id, mapping_id, target_key, share_url, status, action, message, resource_url, notification_status, updated_at FROM auto_share_events ORDER BY updated_at DESC LIMIT 50').all(); }
-function state() { return { logged_in: Boolean(token), paused, pending: queue.size + waitingFiles.size, active_uploads: active, mappings, saved_shares: savedShares, hdhive: { configured: Boolean(hdhiveBaseUrl && hdhiveSecret), base_url: hdhiveBaseUrl, instance_id: hdhiveInstanceId }, auto_share_receipts: autoShareReceipts() }; }
+function state() { return { logged_in: Boolean(token), paused, pending: queue.size + waitingFiles.size + pendingUploads.size, active_uploads: active, mappings, saved_shares: savedShares, hdhive: { configured: Boolean(hdhiveBaseUrl && hdhiveSecret), base_url: hdhiveBaseUrl, instance_id: hdhiveInstanceId }, auto_share_receipts: autoShareReceipts() }; }
 function publish(payload) { const line = `data: ${JSON.stringify(payload)}\n\n`; for (const response of clients) response.write(line); }
 function publishState() { publish({ type: 'state', state: state() }); }
 function status(level, message) { publish({ type: 'status', level, message }); }
 function json(response, code, payload) { response.writeHead(code, { 'content-type': 'application/json; charset=utf-8' }); response.end(JSON.stringify(payload)); }
+function constantTimeEqual(left, right) {
+  const leftBuffer = crypto.createHash('sha256').update(String(left)).digest();
+  const rightBuffer = crypto.createHash('sha256').update(String(right)).digest();
+  return crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+function authorizeManagementRequest(request, response) {
+  if (!adminPassword) return true;
+  const authorization = String(request.headers.authorization || '');
+  let username = '';
+  let password = '';
+  if (authorization.startsWith('Basic ')) {
+    try {
+      const decoded = Buffer.from(authorization.slice(6), 'base64').toString('utf8');
+      const separator = decoded.indexOf(':');
+      if (separator >= 0) { username = decoded.slice(0, separator); password = decoded.slice(separator + 1); }
+    } catch {}
+  }
+  const usernameMatches = constantTimeEqual(username, adminUsername);
+  const passwordMatches = constantTimeEqual(password, adminPassword);
+  if (usernameMatches && passwordMatches) return true;
+  response.writeHead(401, { 'content-type': 'application/json; charset=utf-8', 'www-authenticate': 'Basic realm="Guangya Sync", charset="UTF-8"', 'cache-control': 'no-store' });
+  response.end(JSON.stringify({ error: '需要管理员身份验证' }));
+  return false;
+}
+function enforceLoopbackHost(request, response) {
+  if (adminPassword) return true;
+  try {
+    const hostname = new URL(`http://${request.headers.host || ''}`).hostname.toLowerCase();
+    if (['localhost', '127.0.0.1', '[::1]'].includes(hostname)) return true;
+  } catch {}
+  json(response, 403, { error: '无密码本地模式仅接受回环 Host' });
+  return false;
+}
+function hasSameOrigin(request) {
+  const origin = request.headers.origin;
+  if (!origin) return true;
+  try {
+    const originUrl = new URL(origin);
+    const forwardedProtocol = String(request.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+    const protocol = forwardedProtocol || (request.socket.encrypted ? 'https' : 'http');
+    return originUrl.origin === new URL(`${protocol}://${request.headers.host}`).origin;
+  } catch { return false; }
+}
+function enforceMutationOrigin(request, response) {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method) || hasSameOrigin(request)) return true;
+  json(response, 403, { error: '拒绝非同源的变更请求' });
+  return false;
+}
 async function readBody(request) { const chunks = []; for await (const chunk of request) chunks.push(chunk); return chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}; }
 async function saveConfig() { await fsp.mkdir(dataDir, { recursive: true }); await fsp.writeFile(configFile, JSON.stringify({ mappings, saved_shares: savedShares }, null, 2)); }
 function saveAuthSession(accessToken, nextRefreshToken = null) { database.prepare('INSERT INTO auth_session (id, access_token, refresh_token, updated_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET access_token = excluded.access_token, refresh_token = COALESCE(excluded.refresh_token, auth_session.refresh_token), updated_at = excluded.updated_at').run(accessToken || null, nextRefreshToken || null, Math.floor(Date.now() / 1000)); }
@@ -177,16 +253,38 @@ function replaceAuthSession(accessToken, nextRefreshToken = null) { database.pre
 function saveAuthToken(value) { saveAuthSession(value, null); }
 function uploadHistoryPath(item) { return item.history_path || item.file_path; }
 function uploadEventPath(item) { return item.event_path || item.file_path; }
-function saveUploadRecord(item, taskData) { database.prepare('INSERT INTO uploaded_files (mapping_id, file_path, size, modified_ms, task_id, remote_file_id, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(mapping_id, file_path) DO UPDATE SET size = excluded.size, modified_ms = excluded.modified_ms, task_id = excluded.task_id, remote_file_id = excluded.remote_file_id, uploaded_at = excluded.uploaded_at').run(item.mapping_id, path.resolve(uploadHistoryPath(item)), item.size, String(item.mtime), taskData.taskId || null, taskData.remoteFileId || null, Math.floor(Date.now() / 1000)); }
-function deleteMappingHistory(mappingId) { database.prepare('DELETE FROM uploaded_files WHERE mapping_id = ?').run(mappingId); }
+function savePendingUploadRecord(item, taskData) {
+  const filePath = path.resolve(uploadHistoryPath(item));
+  const itemJson = JSON.stringify(item);
+  database.prepare("INSERT INTO uploaded_files (mapping_id, file_path, size, modified_ms, task_id, remote_file_id, status, item_json, uploaded_at) VALUES (?, ?, ?, ?, ?, NULL, 'oss_complete', ?, ?) ON CONFLICT(mapping_id, file_path) DO UPDATE SET size = excluded.size, modified_ms = excluded.modified_ms, task_id = excluded.task_id, remote_file_id = NULL, status = 'oss_complete', item_json = excluded.item_json, uploaded_at = excluded.uploaded_at").run(item.mapping_id, filePath, item.size, String(item.mtime), taskData.taskId || null, itemJson, Math.floor(Date.now() / 1000));
+  const key = queueKey(item.mapping_id, filePath);
+  history.delete(key);
+  pendingUploads.set(key, { mapping_id: item.mapping_id, file_path: filePath, size: item.size, modified_ms: String(item.mtime), task_id: taskData.taskId || null, item_json: itemJson });
+}
+function confirmPendingUploadRecord(key, taskId, remoteFileId) {
+  const row = pendingUploads.get(key);
+  if (!row || String(row.task_id || '') !== String(taskId || '')) return null;
+  const result = database.prepare("UPDATE uploaded_files SET remote_file_id = ?, status = 'cloud_confirmed', item_json = NULL, uploaded_at = ? WHERE mapping_id = ? AND file_path = ? AND status = 'oss_complete' AND task_id = ?").run(remoteFileId || null, Math.floor(Date.now() / 1000), row.mapping_id, row.file_path, taskId);
+  if (Number(result.changes || 0) !== 1) return null;
+  pendingUploads.delete(key);
+  history.set(key, `${row.size}:${row.modified_ms}`);
+  return row;
+}
+function clearPendingUpload(key) {
+  const row = pendingUploads.get(key);
+  if (!row) return;
+  database.prepare("DELETE FROM uploaded_files WHERE mapping_id = ? AND file_path = ? AND status = 'oss_complete'").run(row.mapping_id, row.file_path);
+  pendingUploads.delete(key);
+}
+function deleteMappingHistory(mappingId) { database.prepare('DELETE FROM uploaded_files WHERE mapping_id = ?').run(mappingId); for (const key of pendingUploads.keys()) if (key.startsWith(`${mappingId}::`)) pendingUploads.delete(key); }
 function isWithinRoot(root, candidate) { const relative = path.relative(root, candidate); return !relative.startsWith('..') && !path.isAbsolute(relative); }
-function allowedPath(value) { const resolved = path.resolve(String(value || fileRoots[0])); if (!fileRoots.some((root) => isWithinRoot(root, resolved))) throw new Error(`路径超出允许范围：${fileRoots.join(', ')}`); if (isWithinRoot(dataDir, resolved)) throw new Error('应用状态目录不可浏览或上传'); return resolved; }
+function allowedPath(value) { const resolved = canonicalizePathSync(String(value || fileRoots[0])); if (!fileRoots.some((root) => isWithinRoot(root, resolved))) throw new Error(`路径超出允许范围：${fileRoots.join(', ')}`); if (isWithinRoot(dataDir, resolved)) throw new Error('应用状态目录不可浏览或上传'); return resolved; }
 function allowedArchivePath(value) { return allowedPath(value || archiveRoot); }
 async function resolveServerPath(value, expectedType = null) {
   const resolved = allowedPath(value || fileRoots[0]);
   const resolvedReal = await fsp.realpath(resolved);
   if (isWithinRoot(protectedDataRoot, resolvedReal)) throw new Error('应用状态目录不可浏览或上传');
-  const rootReals = await Promise.all(fileRoots.map((root) => fsp.realpath(root)));
+  const rootReals = fileRoots;
   if (!rootReals.some((root) => isWithinRoot(root, resolvedReal))) throw new Error('服务器文件路径超出允许范围');
   const stat = await fsp.stat(resolvedReal);
   if (expectedType === 'directory' && !stat.isDirectory()) throw new Error('服务器路径不是目录');
@@ -248,7 +346,7 @@ async function queueServerUploads(values, parentId) {
     const item = { mapping_id: mappingId, file_path: file.absolute, remote_parent_id: String(parentId || ''), remote_dir: file.remoteDir, size: stat.size, mtime: stat.mtimeMs };
     const key = queueKey(mappingId, file.absolute);
     const stamp = `${item.size}:${item.mtime}`;
-    if (history.get(key) === stamp || inflight.get(key) === stamp || (queue.has(key) && `${queue.get(key).size}:${queue.get(key).mtime}` === stamp) || waitingFiles.has(key)) { skipped += 1; continue; }
+    if (history.get(key) === stamp || pendingUploads.has(key) || inflight.get(key) === stamp || (queue.has(key) && `${queue.get(key).size}:${queue.get(key).mtime}` === stamp) || waitingFiles.has(key)) { skipped += 1; continue; }
     queue.set(key, item);
     queued += 1;
     publish({ type: 'file', state: token ? 'queued' : 'waiting-login', file_path: item.file_path, mapping_id: mappingId });
@@ -277,7 +375,13 @@ async function apiPost(endpoint, body, allowed = [], allowRefresh = true) {
     publishState();
     throw new Error('登录态已失效，且自动续期失败，请重新扫码登录');
   }
-  if (!response.ok || (code !== 0 && !allowed.includes(code))) throw new Error(payload.msg || `光鸭接口失败 ${response.status}/${code}`);
+  if (!response.ok || (code !== 0 && !allowed.includes(code))) {
+    const error = new Error(payload.msg || `光鸭接口失败 ${response.status}/${code}`);
+    error.httpStatus = response.status;
+    error.apiCode = code;
+    error.retryable = response.status >= 500 || response.status === 429;
+    throw error;
+  }
   return payload;
 }
 
@@ -623,7 +727,7 @@ async function backfillAutoShares(mappingId) {
   const mapping = mappings.find((entry) => entry.id === mappingId);
   if (!mapping) throw new Error('备份任务不存在');
   if (!mapping.auto_share) throw new Error('请先开启该任务的自动分享');
-  const rows = database.prepare('SELECT file_path, remote_file_id FROM uploaded_files WHERE mapping_id = ? AND remote_file_id IS NOT NULL AND remote_file_id <> ?').all(mappingId, '');
+  const rows = database.prepare("SELECT file_path, remote_file_id FROM uploaded_files WHERE mapping_id = ? AND status = 'cloud_confirmed' AND remote_file_id IS NOT NULL AND remote_file_id <> ?").all(mappingId, '');
   let scheduled = 0;
   for (const row of rows) {
     const relative = path.relative(mapping.local_path, row.file_path).replaceAll('\\', '/');
@@ -676,6 +780,7 @@ async function pollDeviceLogin(deviceCode) {
     status('success', '扫码登录成功，可以开始使用云盘和备份任务');
     publishState();
     pump();
+    schedulePendingUploadRecovery(0);
     return { authenticated: true };
   }
   if ([400, 202, 428].includes(statusCode)) {
@@ -697,6 +802,7 @@ async function refreshSavedSession() {
     saveAuthSession(token, refreshToken);
     publishState();
     pump();
+    schedulePendingUploadRecovery(0);
     return true;
   })().finally(() => { refreshPromise = null; });
   return refreshPromise;
@@ -704,6 +810,9 @@ async function refreshSavedSession() {
 async function findFolder(parentId, name) { for (let page = 0; page < 100; page += 1) { const response = await apiPost('/userres/v1/file/get_file_list', { page, pageSize: 100, parentId, resType: 2, needSubFolderStat: true }); const list = response.data?.list || []; const found = list.find((item) => item.resType === 2 && item.fileName === name); if (found?.fileId) return String(found.fileId); if (!list.length || (page + 1) * 100 >= Number(response.data?.total || 0)) break; } return null; }
 async function ensureRemote(baseParentId, remotePath) { const normalized = normalizeRemote(remotePath); if (!normalized) return String(baseParentId || ''); let parentId = String(baseParentId || ''); let prefix = ''; for (const part of normalized.split('/')) { prefix = prefix ? `${prefix}/${part}` : part; const cacheKey = `${baseParentId || ''}::${prefix}`; if (remoteCache.has(cacheKey)) { parentId = remoteCache.get(cacheKey); continue; } const response = await apiPost('/userres/v1/file/create_dir', { parentId, dirName: part, failIfNameExist: true }, [159]); const fileId = response.data?.fileId || (response.code === 159 ? await findFolder(parentId, part) : null); if (!fileId) throw new Error(`无法创建远程目录 ${prefix}`); parentId = String(fileId); remoteCache.set(cacheKey, parentId); } return parentId; }
 function isCloudIndexPendingMessage(message) { return /文件上传中|上传处理中|正在上传|正在处理|正在入库|任务处理中|任务未完成|稍后再试/.test(String(message || '')); }
+function isExplicitPermanentCloudTaskFailure(error) {
+  return error?.retryable === false && (Number.isFinite(error?.apiCode) || Number.isFinite(error?.httpStatus));
+}
 async function waitTask(taskId, eventPath) {
   const deadline = Date.now() + cloudConfirmTimeoutMs;
   let attempt = 0;
@@ -712,14 +821,19 @@ async function waitTask(taskId, eventPath) {
       const response = await apiPost('/userres/v1/file/get_info_by_task_id', { taskId }, [145, 146, 155, 163]);
       if (response.data?.fileId) return response.data;
     } catch (error) {
-      if (!isCloudIndexPendingMessage(error.message)) throw error;
+      if (!isCloudIndexPendingMessage(error.message)) {
+        if (isExplicitPermanentCloudTaskFailure(error)) error.permanentCloudTaskFailure = true;
+        throw error;
+      }
     }
     attempt += 1;
     publish({ type: 'progress', file_path: eventPath, percent: 100, bytes_per_second: 0, stage: '文件已上传，云端正在入库' });
     const delayMs = Math.min(cloudConfirmPollMs * Math.max(1, Math.ceil(attempt / 5)), 5_000, Math.max(0, deadline - Date.now()));
     if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
-  throw new Error(`云端入库超过 ${Math.round(cloudConfirmTimeoutMs / 1000)} 秒仍未完成，请稍后刷新云盘确认`);
+  const error = new Error(`云端入库超过 ${Math.round(cloudConfirmTimeoutMs / 1000)} 秒仍未完成，请稍后刷新云盘确认`);
+  error.retryable = true;
+  throw error;
 }
 async function waitOperation(taskId) { if (!taskId) return; for (let index = 0; index < 90; index += 1) { const response = await apiPost('/userres/v1/get_task_status', { taskId }); const statusCode = Number(response.data?.status); const detail = response.data?.detail || {}; if ([2, 3].includes(statusCode) && detail.code && Number(detail.code) !== 0) throw new Error(detail.msg || '文件操作失败'); if (statusCode === 2) return; if (statusCode === 3) throw new Error(detail.msg || '文件操作失败'); await new Promise((resolve) => setTimeout(resolve, 1000)); } throw new Error('文件操作长时间未完成'); }
 function uploadPartSize(size) { if (size <= 100 * 1024 * 1024) return 1024 * 1024; if (size <= 1024 * 1024 * 1024) return 2 * 1024 * 1024; if (size <= 10 * 1024 * 1024 * 1024) return 4 * 1024 * 1024; return 8 * 1024 * 1024; }
@@ -795,7 +909,7 @@ function scheduleBusyUploadRetry(key, item) {
       if (!item.mapping_id.startsWith('__') && !mappings.some((mapping) => mapping.id === item.mapping_id && mapping.enabled)) return;
       const refreshed = { ...item, size: stat.size, mtime: item.history_path ? item.mtime : stat.mtimeMs };
       const stamp = `${refreshed.size}:${refreshed.mtime}`;
-      if (history.get(key) === stamp || inflight.get(key) === stamp || (queue.has(key) && `${queue.get(key).size}:${queue.get(key).mtime}` === stamp)) return;
+      if (history.get(key) === stamp || pendingUploads.has(key) || inflight.get(key) === stamp || (queue.has(key) && `${queue.get(key).size}:${queue.get(key).mtime}` === stamp)) return;
       queue.set(key, refreshed);
       publish({ type: 'file', state: 'waiting-file', file_path: uploadEventPath(refreshed), stage: '另外的程序正在使用该文件，释放后将自动上传' });
     } catch {
@@ -863,17 +977,202 @@ async function upload(item) {
   }
   if (item.mapping_id) {
     const pendingTask = { taskId, remoteFileId: null };
-    saveUploadRecord(item, pendingTask);
-    history.set(queueKey(item.mapping_id, uploadHistoryPath(item)), `${item.size}:${item.mtime}`);
+    savePendingUploadRecord(item, pendingTask);
   }
   publish({ type: 'progress', file_path: eventPath, percent: 100, bytes_per_second: 0, stage: '已上传，正在等待云端入库' });
   publish({ type: 'file', state: 'processing', file_path: eventPath, stage: '已上传，正在等待云端入库' });
   let taskData;
   try { taskData = await waitTask(taskId, eventPath); }
-  catch (error) { throw new Error(`文件已上传并已写入记录，不会重复上传；云端入库确认失败：${error.message}`); }
+  catch (error) {
+    const key = queueKey(item.mapping_id, uploadHistoryPath(item));
+    if (error.permanentCloudTaskFailure) {
+      clearPendingUpload(key);
+      error.requeueUpload = true;
+      throw error;
+    }
+    schedulePendingUploadRecovery();
+    return { taskId, remoteFileId: null, pending: true, pendingError: error.message };
+  }
   return { taskId, remoteFileId: taskData?.fileId || null };
 }
-async function applySourcePolicy(item) { const mapping = mappings.find((entry) => entry.id === item.mapping_id); if (!mapping || mapping.source_policy === 'keep') return null; const stat = await fsp.stat(item.file_path); if (stat.size !== item.size || stat.mtimeMs !== item.mtime) throw new Error('上传期间源文件发生变化，已保留源文件且不会执行上传后策略'); if (mapping.source_policy === 'delete') { await fsp.rm(item.file_path); return '已按任务策略删除源文件'; } if (mapping.source_policy !== 'archive' || !mapping.archive_path) throw new Error('归档策略没有配置归档目录'); const relative = path.relative(mapping.local_path, item.file_path); let destination = path.join(mapping.archive_path, relative); await fsp.mkdir(path.dirname(destination), { recursive: true }); try { await fsp.access(destination); const parsed = path.parse(destination); destination = path.join(parsed.dir, `${parsed.name}-${Math.round(item.mtime)}${parsed.ext}`); } catch {} try { await fsp.rename(item.file_path, destination); } catch { await fsp.copyFile(item.file_path, destination); await fsp.rm(item.file_path); } return `已移动到归档目录：${destination}`; }
+function archiveDestination(baseDestination, modifiedMs, attempt) {
+  if (attempt === 0) return baseDestination;
+  const parsed = path.parse(baseDestination);
+  const counter = attempt === 1 ? '' : `-${attempt}`;
+  return path.join(parsed.dir, `${parsed.name}-${Math.round(modifiedMs)}${counter}${parsed.ext}`);
+}
+async function moveFileExclusive(source, destination, sourceStat) {
+  try {
+    await fsp.link(source, destination);
+  } catch (error) {
+    if (error.code === 'EEXIST') throw error;
+    if (!['EXDEV', 'EPERM', 'EACCES', 'ENOTSUP'].includes(error.code)) throw error;
+    await fsp.copyFile(source, destination, fs.constants.COPYFILE_EXCL);
+    try {
+      const [currentSource, copied] = await Promise.all([fsp.stat(source), fsp.stat(destination)]);
+      if (currentSource.size !== sourceStat.size || currentSource.mtimeMs !== sourceStat.mtimeMs) throw new Error('跨卷归档期间源文件发生变化，已保留源文件');
+      if (!copied.isFile() || copied.size !== sourceStat.size) throw new Error('跨卷归档校验失败，已保留源文件');
+      await fsp.utimes(destination, sourceStat.atime, sourceStat.mtime);
+      await fsp.unlink(source);
+    } catch (copyError) {
+      await fsp.unlink(destination).catch(() => {});
+      throw copyError;
+    }
+    return;
+  }
+  try {
+    const currentSource = await fsp.stat(source);
+    if (currentSource.size !== sourceStat.size || currentSource.mtimeMs !== sourceStat.mtimeMs) throw new Error('归档期间源文件发生变化，已保留源文件');
+    await fsp.unlink(source);
+  } catch (error) {
+    await fsp.unlink(destination).catch(() => {});
+    throw error;
+  }
+}
+async function applySourcePolicy(item) {
+  const mapping = mappings.find((entry) => entry.id === item.mapping_id);
+  if (!mapping || mapping.source_policy === 'keep') return null;
+  const stat = await fsp.stat(item.file_path);
+  if (stat.size !== item.size || stat.mtimeMs !== item.mtime) throw new Error('上传期间源文件发生变化，已保留源文件且不会执行上传后策略');
+  if (mapping.source_policy === 'delete') { await fsp.rm(item.file_path); return '已按任务策略删除源文件'; }
+  if (mapping.source_policy !== 'archive' || !mapping.archive_path) throw new Error('归档策略没有配置归档目录');
+  const relative = path.relative(mapping.local_path, item.file_path);
+  const baseDestination = path.join(mapping.archive_path, relative);
+  await fsp.mkdir(path.dirname(baseDestination), { recursive: true });
+  for (let attempt = 0; attempt < 100_000; attempt += 1) {
+    const destination = archiveDestination(baseDestination, item.mtime, attempt);
+    try {
+      await moveFileExclusive(item.file_path, destination, stat);
+      return `已移动到归档目录：${destination}`;
+    } catch (error) {
+      if (error.code === 'EEXIST') continue;
+      throw error;
+    }
+  }
+  throw new Error('归档目录中同名文件过多，已保留源文件');
+}
+function rebuildPendingItem(row) {
+  if (row.item_json) {
+    try {
+      const item = JSON.parse(row.item_json);
+      if (item && typeof item === 'object') return { ...item, mapping_id: row.mapping_id, size: Number(row.size), mtime: Number(row.modified_ms) };
+    } catch {}
+  }
+  const mapping = mappings.find((entry) => entry.id === row.mapping_id);
+  if (!mapping) return null;
+  const relative = path.relative(mapping.local_path, row.file_path).replaceAll('\\', '/');
+  if (!relative || relative.startsWith('../') || path.isAbsolute(relative)) return null;
+  const relativeDir = path.posix.dirname(relative) === '.' ? '' : path.posix.dirname(relative);
+  return { mapping_id: mapping.id, file_path: row.file_path, relative_path: relative, change_kind: 'added', remote_parent_id: mapping.remote_parent_id || '', remote_dir: [mapping.remote_parent_id ? '' : mapping.remote_path, relativeDir].filter(Boolean).join('/'), size: Number(row.size), mtime: Number(row.modified_ms) };
+}
+async function finalizeConfirmedUpload(key, item, taskData, recovered = false) {
+  if (!confirmPendingUploadRecord(key, taskData.taskId, taskData.remoteFileId)) return false;
+  clearAutoShareFailure(item);
+  try { await scheduleAutoShare(item, taskData); }
+  catch (error) { status('error', `文件已确认入库，但自动分享排队失败：${error.message}`); }
+  try {
+    const action = await applySourcePolicy(item);
+    if (action) status('success', action);
+  } catch (error) {
+    if (error.code !== 'ENOENT') status('warning', `文件已确认入库，但上传后策略执行失败：${error.message}`);
+  }
+  if (recovered && item.cleanup_path && isWithinRoot(manualUploadRoot, item.cleanup_path)) await fsp.rm(item.cleanup_path, { recursive: true, force: true });
+  publish({ type: 'file', state: 'done', file_path: uploadEventPath(item) });
+  const mapping = mappings.find((entry) => entry.id === item.mapping_id && entry.enabled);
+  if (mapping) {
+    try {
+      const current = await fsp.stat(item.file_path);
+      if (current.isFile() && (current.size !== item.size || current.mtimeMs !== item.mtime)) await enqueue(mapping, item.file_path);
+    } catch {}
+  }
+  return true;
+}
+function scheduleCloudUploadRetry(key, item, reason) {
+  if (!item?.file_path) {
+    status('error', `云端明确拒绝上传任务，且本地源文件信息不足，无法自动重传：${reason}`);
+    return;
+  }
+  waitingFiles.set(key, item);
+  publish({ type: 'file', state: 'waiting-file', file_path: uploadEventPath(item), stage: '云端入库失败，稍后将重新上传' });
+  setTimeout(async () => {
+    waitingFiles.delete(key);
+    try {
+      const stat = await fsp.stat(item.file_path);
+      if (!stat.isFile()) throw new Error('本地源文件已不存在');
+      const refreshed = { ...item, size: stat.size, mtime: item.history_path ? item.mtime : stat.mtimeMs };
+      queue.set(key, refreshed);
+      publish({ type: 'file', state: 'queued', file_path: uploadEventPath(refreshed), stage: '正在重新上传' });
+    } catch (error) {
+      status('error', `云端明确拒绝上传任务，无法自动重传：${uploadEventPath(item)}：${error.message}`);
+      if (item.cleanup_path && isWithinRoot(manualUploadRoot, item.cleanup_path)) await fsp.rm(item.cleanup_path, { recursive: true, force: true });
+    } finally {
+      publishState();
+      pump();
+    }
+  }, fileBusyRetryMs);
+}
+let pendingRecoveryPromise = null;
+let pendingRecoveryTimer = null;
+function schedulePendingUploadRecovery(delayMs = Math.max(1_000, cloudConfirmPollMs * 5)) {
+  if (!token || !pendingUploads.size || pendingRecoveryPromise || pendingRecoveryTimer) return;
+  pendingRecoveryTimer = setTimeout(() => {
+    pendingRecoveryTimer = null;
+    void recoverPendingUploads();
+  }, delayMs);
+}
+async function recoverPendingUploads() {
+  if (!token || pendingRecoveryPromise) return pendingRecoveryPromise;
+  pendingRecoveryPromise = (async () => {
+    for (const [key, row] of [...pendingUploads]) {
+      if (!token || inflight.has(key) || !pendingUploads.has(key)) continue;
+      const item = rebuildPendingItem(row);
+      const eventPath = item ? uploadEventPath(item) : row.file_path;
+      if (!row.task_id) {
+        clearPendingUpload(key);
+        if (item) scheduleCloudUploadRetry(key, item, '缺少云端任务 ID');
+        else status('error', `未确认上传记录缺少任务 ID，已清除但无法自动重传：${eventPath}`);
+        continue;
+      }
+      publish({ type: 'file', state: 'processing', file_path: eventPath, stage: '正在恢复云端入库确认' });
+      try {
+        const data = await waitTask(row.task_id, eventPath);
+        if (!item) {
+          if (!confirmPendingUploadRecord(key, row.task_id, data.fileId)) continue;
+          status('warning', `已恢复云端入库确认，但旧记录缺少任务上下文，未执行自动分享和源文件策略：${eventPath}`);
+        } else {
+          await finalizeConfirmedUpload(key, item, { taskId: row.task_id, remoteFileId: data.fileId }, true);
+        }
+      } catch (error) {
+        if (error.permanentCloudTaskFailure) {
+          clearPendingUpload(key);
+          if (item) scheduleCloudUploadRetry(key, item, error.message);
+          else status('error', `云端明确拒绝未确认上传任务，已清除记录但无法自动重传：${eventPath}：${error.message}`);
+        } else {
+          status('warning', `云端入库仍未确认，将保留记录并稍后重试：${eventPath}：${error.message}`);
+        }
+      }
+    }
+  })().finally(() => {
+    pendingRecoveryPromise = null;
+    publishState();
+    if (token && pendingUploads.size) schedulePendingUploadRecovery();
+  });
+  return pendingRecoveryPromise;
+}
+async function cleanupUnreferencedManualUploads() {
+  const retained = new Set();
+  for (const row of pendingUploads.values()) {
+    if (!row.item_json) continue;
+    try {
+      const cleanupPath = path.resolve(JSON.parse(row.item_json)?.cleanup_path || '');
+      if (isWithinRoot(manualUploadRoot, cleanupPath)) retained.add(cleanupPath);
+    } catch {}
+  }
+  for (const entry of await fsp.readdir(manualUploadRoot, { withFileTypes: true })) {
+    const candidate = path.join(manualUploadRoot, entry.name);
+    if (!retained.has(candidate)) await fsp.rm(candidate, { recursive: true, force: true });
+  }
+}
 function pump() {
   if (paused || !token) { publishState(); return; }
   while (active < 2 && queue.size) {
@@ -883,29 +1182,33 @@ function pump() {
     inflightItems.set(key, item);
     active += 1;
     publish({ type: 'file', state: 'preparing', file_path: uploadEventPath(item) });
-    let waitingForFile = false;
+    let preserveSource = false;
     prepareUploadItem(item).then((ready) => {
       Object.assign(item, ready);
       return upload(item);
     }).then(async (taskData) => {
-      history.set(key, `${item.size}:${item.mtime}`);
-      saveUploadRecord(item, taskData);
-      clearAutoShareFailure(item);
-      try { await scheduleAutoShare(item, taskData); } catch (error) { status('error', `文件已上传，但自动分享排队失败：${error.message}`); }
-      const action = await applySourcePolicy(item);
-      if (action) status('success', action);
-      publish({ type: 'file', state: 'done', file_path: uploadEventPath(item) });
+      if (taskData.pending) {
+        preserveSource = true;
+        status('warning', `文件已上传到 OSS，云端尚未确认入库；已保留记录并会自动重试：${uploadEventPath(item)}：${taskData.pendingError}`);
+        publish({ type: 'file', state: 'processing', file_path: uploadEventPath(item), stage: '等待云端入库，下次将自动恢复确认' });
+        return;
+      }
+      await finalizeConfirmedUpload(key, item, taskData);
     }).catch((error) => {
       if (isFileBusyError(error)) {
-        waitingForFile = true;
+        preserveSource = true;
         scheduleBusyUploadRetry(key, item);
         return;
+      }
+      if (error.requeueUpload) {
+        preserveSource = true;
+        scheduleCloudUploadRetry(key, item, error.message);
       }
       recordAutoShareFailure(item, error);
       console.error(`上传失败：${item.file_path}：${error.stack || error.message}`);
       publish({ type: 'file', state: 'error', file_path: uploadEventPath(item), error: error.message });
     }).finally(async () => {
-      if (!waitingForFile && item.cleanup_path && isWithinRoot(manualUploadRoot, item.cleanup_path)) await fsp.rm(item.cleanup_path, { recursive: true, force: true });
+      if (!preserveSource && item.cleanup_path && isWithinRoot(manualUploadRoot, item.cleanup_path)) await fsp.rm(item.cleanup_path, { recursive: true, force: true });
       inflight.delete(key);
       inflightItems.delete(key);
       active -= 1;
@@ -922,7 +1225,7 @@ async function enqueue(mapping, file) {
   if (!stat.isFile()) return;
   const key = queueKey(mapping.id, file);
   const mark = `${stat.size}:${stat.mtimeMs}`;
-  if (history.get(key) === mark || inflight.get(key) === mark) return;
+  if (history.get(key) === mark || pendingUploads.has(key) || inflight.get(key) === mark) return;
   if (waitingFiles.has(key)) return;
   const queued = queue.get(key);
   if (queued && `${queued.size}:${queued.mtime}` === mark) return;
@@ -973,7 +1276,7 @@ async function handleWebUpload(request, response, url) {
     const historyKey = queueKey(mappingId, uploadHistoryPath(item));
     const stamp = `${item.size}:${item.mtime}`;
     const waiting = queue.get(historyKey);
-    if (history.get(historyKey) === stamp || inflight.get(historyKey) === stamp || (waiting && `${waiting.size}:${waiting.mtime}` === stamp) || waitingFiles.has(historyKey)) return json(response, 200, { queued: 0, skipped: 1, fileName });
+    if (history.get(historyKey) === stamp || pendingUploads.has(historyKey) || inflight.get(historyKey) === stamp || (waiting && `${waiting.size}:${waiting.mtime}` === stamp) || waitingFiles.has(historyKey)) return json(response, 200, { queued: 0, skipped: 1, fileName });
     queue.set(historyKey, item);
     queued = true;
     publish({ type: 'file', state: 'queued', file_path: uploadEventPath(item), mapping_id: mappingId });
@@ -988,7 +1291,7 @@ async function routeApiV2(request, response, url) {
   if (request.method === 'GET' && url.pathname === '/api/events') { response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' }); response.write(`data: ${JSON.stringify({ type: 'state', state: state() })}\n\n`); clients.add(response); request.on('close', () => clients.delete(response)); return; }
   if (request.method === 'POST' && url.pathname === '/api/auth/device/start') return json(response, 200, await startDeviceLogin());
   if (request.method === 'POST' && url.pathname === '/api/auth/device/poll') { const body = await readBody(request); return json(response, 200, await pollDeviceLogin(body.device_code)); }
-  if (request.method === 'POST' && url.pathname === '/api/auth') { const body = await readBody(request); token = String(body.token || '').trim().replace(/^Bearer\s+/i, '') || null; refreshToken = null; replaceAuthSession(token, null); publishState(); pump(); return json(response, 200, state()); }
+  if (request.method === 'POST' && url.pathname === '/api/auth') { const body = await readBody(request); token = String(body.token || '').trim().replace(/^Bearer\s+/i, '') || null; refreshToken = null; replaceAuthSession(token, null); publishState(); pump(); schedulePendingUploadRecovery(0); return json(response, 200, state()); }
   if (request.method === 'GET' && url.pathname === '/api/overview') return json(response, 200, await apiOverview());
   if (request.method === 'GET' && url.pathname === '/api/files') return json(response, 200, await apiPost('/userres/v1/file/get_file_list', { page: Number(url.searchParams.get('page') || 0), pageSize: 100, parentId: url.searchParams.get('parentId') || '', orderBy: 0, sortType: 0, needSubFolderStat: true }));
   if (request.method === 'POST' && url.pathname === '/api/upload') return handleWebUpload(request, response, url);
@@ -1060,19 +1363,27 @@ async function routeApiV2(request, response, url) {
 }
 async function serveStatic(response, url) { const requested = url.pathname === '/' ? '/index.html' : url.pathname; const file = path.resolve(uiRoot, `.${requested}`); if (!file.startsWith(uiRoot + path.sep)) return json(response, 403, { error: 'forbidden' }); try { const content = await fsp.readFile(file); const type = file.endsWith('.html') ? 'text/html; charset=utf-8' : file.endsWith('.js') ? 'text/javascript; charset=utf-8' : file.endsWith('.css') ? 'text/css; charset=utf-8' : file.endsWith('.svg') ? 'image/svg+xml' : 'application/octet-stream'; response.writeHead(200, { 'content-type': type }); response.end(content); } catch { json(response, 404, { error: 'not found' }); } }
 
-await fsp.mkdir(dataDir, { recursive: true }); await fsp.rm(manualUploadRoot, { recursive: true, force: true }); await fsp.mkdir(manualUploadRoot, { recursive: true }); await fsp.mkdir(watchRoot, { recursive: true }); await fsp.mkdir(archiveRoot, { recursive: true });
+await fsp.mkdir(dataDir, { recursive: true }); await fsp.mkdir(manualUploadRoot, { recursive: true }); await cleanupUnreferencedManualUploads(); await fsp.mkdir(watchRoot, { recursive: true }); await fsp.mkdir(archiveRoot, { recursive: true });
 try { const config = JSON.parse(await fsp.readFile(configFile, 'utf8')); mappings = Array.isArray(config.mappings) ? config.mappings.map((item) => ({ source_policy: 'keep', archive_path: null, scan_existing: true, remote_parent_id: '', sync_types: DEFAULT_SYNC_TYPES, monitor_mode: 'native', auto_share: false, watch_error: null, ...item, local_path: allowedPath(item.local_path), archive_path: item.archive_path ? allowedArchivePath(item.archive_path) : null, sync_types: normalizeSyncTypes(item.sync_types), monitor_mode: normalizeMonitorMode(item.monitor_mode), auto_share: item.auto_share === true })) : []; savedShares = Array.isArray(config.saved_shares) ? config.saved_shares : []; } catch { mappings = []; savedShares = []; }
 await restartWatchers();
 restorePendingAutoShares();
-const server = http.createServer(async (request, response) => { const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`); try { if (url.pathname.startsWith('/api/')) await routeApiV2(request, response, url); else await serveStatic(response, url); } catch (error) { json(response, 400, { error: error.message }); } });
-server.listen(port, '0.0.0.0', async () => {
-  console.log(`Guangya Web listening on http://0.0.0.0:${port}, file roots: ${fileRoots.join(', ')}, OSS timeout: ${ossTimeoutMs}ms, retries: ${ossRetryMax}, parallel: ${ossParallel}, cloud confirm timeout: ${cloudConfirmTimeoutMs}ms`);
+const server = http.createServer(async (request, response) => {
+  if (!enforceLoopbackHost(request, response) || !authorizeManagementRequest(request, response) || !enforceMutationOrigin(request, response)) return;
+  const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+  try { if (url.pathname.startsWith('/api/')) await routeApiV2(request, response, url); else await serveStatic(response, url); }
+  catch (error) { json(response, 400, { error: error.message }); }
+});
+server.listen(port, listenHost, async () => {
+  const displayHost = listenHost.includes(':') ? `[${listenHost}]` : listenHost;
+  console.log(`Guangya Web listening on http://${displayHost}:${port}, file roots: ${fileRoots.join(', ')}, OSS timeout: ${ossTimeoutMs}ms, retries: ${ossRetryMax}, parallel: ${ossParallel}, cloud confirm timeout: ${cloudConfirmTimeoutMs}ms, admin auth: ${adminPassword ? `enabled (${adminUsername})` : 'disabled (loopback only)'}`);
   if (refreshToken) {
     try { await refreshSavedSession(); }
     catch (error) { status('warning', `已恢复上次登录，但刷新会话失败：${error.message}`); }
   }
+  if (token) schedulePendingUploadRecovery(0);
   if (process.env.SELF_TEST === '1') {
-    const response = await fetch(`http://127.0.0.1:${port}/api/state`);
+    const selfTestHeaders = adminPassword ? { authorization: `Basic ${Buffer.from(`${adminUsername}:${adminPassword}`).toString('base64')}` } : {};
+    const response = await fetch(`http://127.0.0.1:${port}/api/state`, { headers: selfTestHeaders });
     console.log(`SELF_TEST ${response.status} ${await response.text()}`);
     server.close();
     for (const watcher of watchers.values()) await watcher.close();

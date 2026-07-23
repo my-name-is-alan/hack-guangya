@@ -34,3 +34,6 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Local design source; the exported PNG is tracked instead.
+/logo.psd

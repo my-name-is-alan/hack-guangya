@@ -12,7 +12,8 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs,
+    fs::{self, OpenOptions},
+    io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -36,6 +37,9 @@ const API_CONNECT_TIMEOUT_SECS: u64 = 15;
 const API_REQUEST_TIMEOUT_SECS: u64 = 120;
 const OSS_REQUEST_TIMEOUT_SECS: u64 = 600;
 const CLOUD_CONFIRM_TIMEOUT_SECS: u64 = 600;
+const PENDING_UPLOAD_RETRY_SECS: u64 = 15;
+const UPLOAD_STATE_OSS_COMPLETE: &str = "oss_complete";
+const UPLOAD_STATE_CLOUD_CONFIRMED: &str = "cloud_confirmed";
 const AUTO_SHARE_QUIET_SECS: i64 = 30;
 const TOKEN_REFRESH_INTERVAL_SECS: u64 = 20 * 60;
 const DEFAULT_MEDIA_EXTENSIONS: &[&str] = &[
@@ -136,6 +140,8 @@ struct RuntimeState {
     queue: VecDeque<UploadItem>,
     waiting_files: HashMap<String, UploadItem>,
     history: HashMap<String, Stamp>,
+    pending_cloud: HashMap<String, Stamp>,
+    recovering_pending: HashSet<String>,
     inflight: HashMap<String, Stamp>,
     inflight_items: HashMap<String, UploadItem>,
     remote_cache: HashMap<String, String>,
@@ -231,6 +237,32 @@ struct UploadOutcome {
     remote_file_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingUpload {
+    item: UploadItem,
+    task_id: String,
+}
+
+#[derive(Debug)]
+enum CloudTaskCheck {
+    Confirmed(Value),
+    Pending,
+}
+
+#[derive(Debug)]
+enum CloudConfirmError {
+    Retryable(String),
+    Permanent(String),
+}
+
+impl CloudConfirmError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Retryable(message) | Self::Permanent(message) => message,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RenameRequest {
@@ -252,7 +284,7 @@ fn snapshot(state: &RuntimeState) -> Snapshot {
     Snapshot {
         logged_in: state.token.is_some(),
         paused: state.paused,
-        pending: state.queue.len() + state.waiting_files.len(),
+        pending: state.queue.len() + state.waiting_files.len() + state.pending_cloud.len(),
         active_uploads: state.active_uploads,
         mappings: state.mappings.clone(),
         saved_shares: state.saved_shares.clone(),
@@ -327,6 +359,7 @@ fn stamp_matches(item: &UploadItem, stamp: &Stamp) -> bool {
 }
 fn upload_already_scheduled(
     history: &HashMap<String, Stamp>,
+    pending_cloud: &HashMap<String, Stamp>,
     inflight: &HashMap<String, Stamp>,
     queue: &VecDeque<UploadItem>,
     waiting_files: &HashMap<String, UploadItem>,
@@ -336,6 +369,7 @@ fn upload_already_scheduled(
     history
         .get(&key)
         .is_some_and(|stamp| stamp_matches(item, stamp))
+        || pending_cloud.contains_key(&key)
         || inflight
             .get(&key)
             .is_some_and(|stamp| stamp_matches(item, stamp))
@@ -487,6 +521,11 @@ fn init_database(path: &Path) -> Result<(), String> {
                modified_ms TEXT NOT NULL,
                task_id TEXT,
                remote_file_id TEXT,
+               upload_state TEXT NOT NULL DEFAULT 'cloud_confirmed',
+               remote_parent_id TEXT NOT NULL DEFAULT '',
+               remote_dir TEXT NOT NULL DEFAULT '',
+               relative_path TEXT NOT NULL DEFAULT '',
+               change_kind TEXT NOT NULL DEFAULT 'added',
                uploaded_at INTEGER NOT NULL,
                PRIMARY KEY (mapping_id, file_path)
              );
@@ -547,6 +586,29 @@ fn init_database(path: &Path) -> Result<(), String> {
         "ALTER TABLE auto_share_events ADD COLUMN notification_status TEXT",
         [],
     );
+    for migration in [
+        "ALTER TABLE uploaded_files ADD COLUMN upload_state TEXT NOT NULL DEFAULT 'cloud_confirmed'",
+        "ALTER TABLE uploaded_files ADD COLUMN remote_parent_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE uploaded_files ADD COLUMN remote_dir TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE uploaded_files ADD COLUMN relative_path TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE uploaded_files ADD COLUMN change_kind TEXT NOT NULL DEFAULT 'added'",
+    ] {
+        let _ = connection.execute(migration, []);
+    }
+    connection
+        .execute(
+            "UPDATE uploaded_files
+             SET upload_state = CASE
+               WHEN task_id IS NOT NULL AND TRIM(task_id) <> ''
+                 AND (remote_file_id IS NULL OR TRIM(remote_file_id) = '')
+               THEN ?1 ELSE ?2 END
+             WHERE upload_state IS NULL OR upload_state = ''
+                OR upload_state NOT IN (?1, ?2)
+                OR (upload_state = ?2 AND task_id IS NOT NULL AND TRIM(task_id) <> ''
+                    AND (remote_file_id IS NULL OR TRIM(remote_file_id) = ''))",
+            params![UPLOAD_STATE_OSS_COMPLETE, UPLOAD_STATE_CLOUD_CONFIRMED],
+        )
+        .map_err(|e| format!("迁移上传状态失败：{e}"))?;
     Ok(())
 }
 
@@ -607,10 +669,13 @@ fn clear_persisted_access_token(path: &Path) -> Result<(), String> {
 fn load_upload_history(path: &Path) -> Result<HashMap<String, Stamp>, String> {
     let connection = open_database(path)?;
     let mut statement = connection
-        .prepare("SELECT mapping_id, file_path, size, modified_ms FROM uploaded_files")
+        .prepare(
+            "SELECT mapping_id, file_path, size, modified_ms FROM uploaded_files
+             WHERE upload_state = ?1",
+        )
         .map_err(|e| format!("读取上传记录失败：{e}"))?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map(params![UPLOAD_STATE_CLOUD_CONFIRMED], |row| {
             let mapping_id: String = row.get(0)?;
             let file_path: String = row.get(1)?;
             let size: u64 = row.get(2)?;
@@ -631,22 +696,76 @@ fn load_upload_history(path: &Path) -> Result<HashMap<String, Stamp>, String> {
     Ok(history)
 }
 
-fn save_upload_history(
+fn load_pending_uploads(path: &Path) -> Result<Vec<PendingUpload>, String> {
+    let connection = open_database(path)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT mapping_id, file_path, size, modified_ms, task_id,
+                    remote_parent_id, remote_dir, relative_path, change_kind
+             FROM uploaded_files
+             WHERE upload_state = ?1 AND task_id IS NOT NULL AND TRIM(task_id) <> ''",
+        )
+        .map_err(|e| format!("读取待确认上传记录失败：{e}"))?;
+    let rows = statement
+        .query_map(params![UPLOAD_STATE_OSS_COMPLETE], |row| {
+            let modified_raw: String = row.get(3)?;
+            Ok(PendingUpload {
+                item: UploadItem {
+                    mapping_id: row.get(0)?,
+                    file_path: PathBuf::from(row.get::<_, String>(1)?),
+                    size: row.get(2)?,
+                    modified_ms: modified_raw.parse::<u128>().unwrap_or(0),
+                    remote_parent_id: row.get(5)?,
+                    remote_dir: row.get(6)?,
+                    relative_path: row.get(7)?,
+                    change_kind: row.get(8)?,
+                },
+                task_id: row.get(4)?,
+            })
+        })
+        .map_err(|e| format!("查询待确认上传记录失败：{e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("解析待确认上传记录失败：{e}"))
+}
+
+fn pending_upload_stamps(path: &Path) -> Result<HashMap<String, Stamp>, String> {
+    Ok(load_pending_uploads(path)?
+        .into_iter()
+        .map(|pending| {
+            (
+                item_key(&pending.item.mapping_id, &pending.item.file_path),
+                Stamp {
+                    size: pending.item.size,
+                    modified_ms: pending.item.modified_ms,
+                },
+            )
+        })
+        .collect())
+}
+
+fn save_upload_record(
     path: &Path,
     item: &UploadItem,
     outcome: &UploadOutcome,
+    upload_state: &str,
 ) -> Result<(), String> {
     let connection = open_database(path)?;
     connection
         .execute(
             "INSERT INTO uploaded_files
-               (mapping_id, file_path, size, modified_ms, task_id, remote_file_id, uploaded_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+               (mapping_id, file_path, size, modified_ms, task_id, remote_file_id,
+                upload_state, remote_parent_id, remote_dir, relative_path, change_kind, uploaded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(mapping_id, file_path) DO UPDATE SET
                size = excluded.size,
                modified_ms = excluded.modified_ms,
                task_id = excluded.task_id,
                remote_file_id = excluded.remote_file_id,
+               upload_state = excluded.upload_state,
+               remote_parent_id = excluded.remote_parent_id,
+               remote_dir = excluded.remote_dir,
+               relative_path = excluded.relative_path,
+               change_kind = excluded.change_kind,
                uploaded_at = excluded.uploaded_at",
             params![
                 item.mapping_id,
@@ -655,6 +774,11 @@ fn save_upload_history(
                 item.modified_ms.to_string(),
                 outcome.task_id,
                 outcome.remote_file_id,
+                upload_state,
+                item.remote_parent_id,
+                item.remote_dir,
+                item.relative_path,
+                item.change_kind,
                 unix_timestamp()
             ],
         )
@@ -662,21 +786,94 @@ fn save_upload_history(
     Ok(())
 }
 
-fn remember_uploaded_item(
+fn remember_pending_upload(
     state: &SharedState,
     item: &UploadItem,
     outcome: &UploadOutcome,
 ) -> Result<(), String> {
     let database = state.lock().map_err(|e| e.to_string())?.db_path.clone();
-    save_upload_history(&database, item, outcome)?;
-    state.lock().map_err(|e| e.to_string())?.history.insert(
-        item_key(&item.mapping_id, &item.file_path),
+    save_upload_record(&database, item, outcome, UPLOAD_STATE_OSS_COMPLETE)?;
+    state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .pending_cloud
+        .insert(
+            item_key(&item.mapping_id, &item.file_path),
+            Stamp {
+                size: item.size,
+                modified_ms: item.modified_ms,
+            },
+        );
+    Ok(())
+}
+
+fn confirm_pending_record(
+    database: &Path,
+    item: &UploadItem,
+    outcome: &UploadOutcome,
+) -> Result<bool, String> {
+    open_database(database)?
+        .execute(
+            "UPDATE uploaded_files SET remote_file_id = ?1, upload_state = ?2,
+                    remote_parent_id = ?3, remote_dir = ?4, relative_path = ?5,
+                    change_kind = ?6, uploaded_at = ?7
+             WHERE mapping_id = ?8 AND file_path = ?9 AND task_id = ?10
+               AND upload_state = ?11",
+            params![
+                outcome.remote_file_id,
+                UPLOAD_STATE_CLOUD_CONFIRMED,
+                item.remote_parent_id,
+                item.remote_dir,
+                item.relative_path,
+                item.change_kind,
+                unix_timestamp(),
+                item.mapping_id,
+                item.file_path.to_string_lossy(),
+                outcome.task_id,
+                UPLOAD_STATE_OSS_COMPLETE
+            ],
+        )
+        .map(|changed| changed > 0)
+        .map_err(|e| format!("更新云端确认状态失败：{e}"))
+}
+
+fn remember_confirmed_upload(
+    state: &SharedState,
+    item: &UploadItem,
+    outcome: &UploadOutcome,
+) -> Result<(), String> {
+    let database = state.lock().map_err(|e| e.to_string())?.db_path.clone();
+    if !confirm_pending_record(&database, item, outcome)? {
+        return Err("待确认上传记录已被移除或已由其他任务更新".into());
+    }
+    let key = item_key(&item.mapping_id, &item.file_path);
+    let mut guard = state.lock().map_err(|e| e.to_string())?;
+    guard.pending_cloud.remove(&key);
+    guard.history.insert(
+        key,
         Stamp {
             size: item.size,
             modified_ms: item.modified_ms,
         },
     );
     Ok(())
+}
+
+fn delete_pending_upload(path: &Path, pending: &PendingUpload) -> Result<bool, String> {
+    let connection = open_database(path)?;
+    connection
+        .execute(
+            "DELETE FROM uploaded_files
+             WHERE mapping_id = ?1 AND file_path = ?2 AND task_id = ?3 AND upload_state = ?4",
+            params![
+                pending.item.mapping_id,
+                pending.item.file_path.to_string_lossy(),
+                pending.task_id,
+                UPLOAD_STATE_OSS_COMPLETE
+            ],
+        )
+        .map(|changed| changed > 0)
+        .map_err(|e| format!("清理待确认上传记录失败：{e}"))
 }
 
 fn remove_mapping_history(path: &Path, mapping_id: &str) -> Result<(), String> {
@@ -1889,32 +2086,77 @@ fn is_cloud_index_pending_message(message: &str) -> bool {
     .any(|pending| message.contains(pending))
 }
 
+fn is_cloud_index_permanent_message(message: &str) -> bool {
+    [
+        "文件违规",
+        "违规文件",
+        "禁止上传",
+        "不允许上传",
+        "上传失败",
+        "入库失败",
+        "任务失败",
+        "任务不存在",
+        "文件不存在",
+        "任务已取消",
+        "任务被取消",
+        "任务已过期",
+    ]
+    .iter()
+    .any(|permanent| message.contains(permanent))
+}
+
+async fn check_upload_task(
+    token: &str,
+    device_id: &str,
+    task_id: &str,
+) -> Result<CloudTaskCheck, CloudConfirmError> {
+    match api_post(
+        token,
+        device_id,
+        "/userres/v1/file/get_info_by_task_id",
+        json!({ "taskId": task_id }),
+        &[145, 146, 155, 163],
+    )
+    .await
+    {
+        Ok(result) if is_cloud_index_permanent_message(&result.msg) => {
+            Err(CloudConfirmError::Permanent(result.msg))
+        }
+        Ok(result) => Ok(result
+            .data
+            .filter(|data| {
+                data.get("fileId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|file_id| !file_id.is_empty())
+            })
+            .map(CloudTaskCheck::Confirmed)
+            .unwrap_or(CloudTaskCheck::Pending)),
+        Err(message) if is_cloud_index_pending_message(&message) => Ok(CloudTaskCheck::Pending),
+        Err(message) if is_cloud_index_permanent_message(&message) => {
+            Err(CloudConfirmError::Permanent(message))
+        }
+        Err(message) => Err(CloudConfirmError::Retryable(message)),
+    }
+}
+
 async fn wait_upload_task(
     app: &tauri::AppHandle,
     token: &str,
     device_id: &str,
     task_id: &str,
     file_path: &Path,
-) -> Result<Value, String> {
+) -> Result<Value, CloudConfirmError> {
     let deadline = Instant::now() + Duration::from_secs(CLOUD_CONFIRM_TIMEOUT_SECS);
     let mut attempt = 0_u64;
     while Instant::now() < deadline {
-        match api_post(
-            token,
-            device_id,
-            "/userres/v1/file/get_info_by_task_id",
-            json!({ "taskId": task_id }),
-            &[145, 146, 155, 163],
-        )
-        .await
-        {
-            Ok(result) => {
-                if let Some(data) = result.data.filter(|data| data.get("fileId").is_some()) {
-                    return Ok(data);
-                }
+        match check_upload_task(token, device_id, task_id).await {
+            Ok(CloudTaskCheck::Confirmed(data)) => return Ok(data),
+            Ok(CloudTaskCheck::Pending) => {}
+            Err(CloudConfirmError::Retryable(message)) if message.contains("登录态已失效") => {
+                return Err(CloudConfirmError::Retryable(message));
             }
-            Err(message) if is_cloud_index_pending_message(&message) => {}
-            Err(message) => return Err(message),
+            Err(CloudConfirmError::Retryable(_)) => {}
+            Err(error @ CloudConfirmError::Permanent(_)) => return Err(error),
         }
         attempt += 1;
         emit(
@@ -1924,9 +2166,9 @@ async fn wait_upload_task(
         let delay = Duration::from_secs(attempt.div_ceil(5).clamp(1, 5));
         sleep(delay.min(deadline.saturating_duration_since(Instant::now()))).await;
     }
-    Err(format!(
+    Err(CloudConfirmError::Retryable(format!(
         "云端入库超过 {CLOUD_CONFIRM_TIMEOUT_SECS} 秒仍未完成，请稍后刷新云盘确认"
-    ))
+    )))
 }
 
 async fn wait_operation_task(token: &str, device_id: &str, task_id: &str) -> Result<(), String> {
@@ -2228,6 +2470,7 @@ async fn requeue_busy_upload(app: tauri::AppHandle, state: SharedState, mut item
             false
         } else if upload_already_scheduled(
             &guard.history,
+            &guard.pending_cloud,
             &guard.inflight,
             &guard.queue,
             &guard.waiting_files,
@@ -2385,7 +2628,7 @@ async fn upload_item(
         task_id: data.task_id.clone(),
         remote_file_id: None,
     };
-    remember_uploaded_item(state, item, &pending_outcome)
+    remember_pending_upload(state, item, &pending_outcome)
         .map_err(|message| format!("文件已上传，但写入本地上传记录失败：{message}"))?;
     emit(
         app,
@@ -2397,16 +2640,185 @@ async fn upload_item(
     );
     let task_data = wait_upload_task(app, &token, &device_id, &data.task_id, &item.file_path)
         .await
-        .map_err(|message| {
-            format!("文件已上传并已写入记录，不会重复上传；云端入库确认失败：{message}")
+        .map_err(|error| {
+            format!(
+                "文件已上传并已写入待确认记录，不会重复上传；后台将继续确认云端入库：{}",
+                error.message()
+            )
         })?;
-    Ok(UploadOutcome {
+    let outcome = UploadOutcome {
         task_id: data.task_id,
         remote_file_id: task_data
             .get("fileId")
             .and_then(Value::as_str)
             .map(str::to_owned),
-    })
+    };
+    remember_confirmed_upload(state, item, &outcome)
+        .map_err(|message| format!("云端已入库，但更新本地确认状态失败：{message}"))?;
+    Ok(outcome)
+}
+
+fn archive_candidate(base: &Path, modified_ms: u128, collision: u64) -> PathBuf {
+    if collision == 0 {
+        return base.to_path_buf();
+    }
+    let stem = base
+        .file_stem()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let suffix = if collision == 1 {
+        format!("-{modified_ms}")
+    } else {
+        format!("-{modified_ms}-{collision}")
+    };
+    let extension = base
+        .extension()
+        .map(|value| format!(".{}", value.to_string_lossy()))
+        .unwrap_or_default();
+    base.with_file_name(format!("{stem}{suffix}{extension}"))
+}
+
+fn remove_partial_archive(path: &Path, original_error: String) -> String {
+    match fs::remove_file(path) {
+        Ok(()) => original_error,
+        Err(cleanup_error) if cleanup_error.kind() == io::ErrorKind::NotFound => original_error,
+        Err(cleanup_error) => {
+            format!("{original_error}；清理未完成的归档副本也失败：{cleanup_error}")
+        }
+    }
+}
+
+fn copy_archive_exclusive(
+    source: &Path,
+    destination: &Path,
+    expected_size: u64,
+    expected_modified_ms: u128,
+) -> Result<bool, String> {
+    let mut source_file = fs::File::open(source).map_err(|e| format!("打开源文件失败：{e}"))?;
+    let before = source_file
+        .metadata()
+        .map_err(|e| format!("读取源文件元数据失败：{e}"))?;
+    if before.len() != expected_size || modified_ms(&before) != expected_modified_ms {
+        return Err("归档前源文件发生变化，已保留源文件".into());
+    }
+    let mut destination_file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(format!("创建排他归档文件失败：{error}")),
+    };
+    let copied = match io::copy(&mut source_file, &mut destination_file) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            drop(destination_file);
+            return Err(remove_partial_archive(
+                destination,
+                format!("复制到归档目录失败：{error}"),
+            ));
+        }
+    };
+    if let Err(error) = destination_file.sync_all() {
+        drop(destination_file);
+        return Err(remove_partial_archive(
+            destination,
+            format!("同步归档文件失败：{error}"),
+        ));
+    }
+    let destination_size = match destination_file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            drop(destination_file);
+            return Err(remove_partial_archive(
+                destination,
+                format!("核对归档文件失败：{error}"),
+            ));
+        }
+    };
+    let after = match source_file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            drop(destination_file);
+            return Err(remove_partial_archive(
+                destination,
+                format!("复制后核对源文件失败：{error}"),
+            ));
+        }
+    };
+    if copied != expected_size || destination_size != expected_size {
+        drop(destination_file);
+        return Err(remove_partial_archive(
+            destination,
+            format!(
+                "归档复制字节数不一致（预期 {expected_size}，读取 {copied}，写入 {destination_size}），已保留源文件"
+            ),
+        ));
+    }
+    if after.len() != expected_size || modified_ms(&after) != expected_modified_ms {
+        drop(destination_file);
+        return Err(remove_partial_archive(
+            destination,
+            "归档复制期间源文件发生变化，已保留源文件".into(),
+        ));
+    }
+    drop(destination_file);
+    if let Err(error) = fs::remove_file(source) {
+        return Err(remove_partial_archive(
+            destination,
+            format!("归档副本已核对，但移除源文件失败：{error}"),
+        ));
+    }
+    Ok(true)
+}
+
+fn archive_file_without_overwrite(
+    source: &Path,
+    requested_destination: &Path,
+    expected_size: u64,
+    expected_modified_ms: u128,
+) -> Result<PathBuf, String> {
+    for collision in 0..u64::MAX {
+        let destination = archive_candidate(requested_destination, expected_modified_ms, collision);
+        match fs::hard_link(source, &destination) {
+            Ok(()) => {
+                let source_metadata = fs::metadata(source).map_err(|e| {
+                    remove_partial_archive(&destination, format!("核对源文件失败：{e}"))
+                })?;
+                let destination_metadata = fs::metadata(&destination).map_err(|e| {
+                    remove_partial_archive(&destination, format!("核对归档文件失败：{e}"))
+                })?;
+                if source_metadata.len() != expected_size
+                    || modified_ms(&source_metadata) != expected_modified_ms
+                    || destination_metadata.len() != expected_size
+                {
+                    return Err(remove_partial_archive(
+                        &destination,
+                        "归档期间源文件发生变化，已保留源文件".into(),
+                    ));
+                }
+                if let Err(error) = fs::remove_file(source) {
+                    return Err(remove_partial_archive(
+                        &destination,
+                        format!("创建归档链接后移除源文件失败：{error}"),
+                    ));
+                }
+                return Ok(destination);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => match copy_archive_exclusive(
+                source,
+                &destination,
+                expected_size,
+                expected_modified_ms,
+            )? {
+                true => return Ok(destination),
+                false => continue,
+            },
+        }
+    }
+    Err("无法生成唯一的归档文件名".into())
 }
 
 fn apply_source_policy(state: &SharedState, item: &UploadItem) -> Result<Option<String>, String> {
@@ -2448,27 +2860,37 @@ fn apply_source_policy(state: &SharedState, item: &UploadItem) -> Result<Option<
         .file_path
         .strip_prefix(&source_root)
         .map_err(|_| "无法计算源文件的相对路径".to_string())?;
-    let mut destination = archive_root.join(relative);
-    if destination.exists() {
-        let stem = destination
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("file");
-        let extension = destination
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|value| format!(".{value}"))
-            .unwrap_or_default();
-        destination.set_file_name(format!("{stem}-{}{}", item.modified_ms, extension));
-    }
-    if let Some(parent) = destination.parent() {
+    let requested_destination = archive_root.join(relative);
+    if let Some(parent) = requested_destination.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建归档目录失败：{e}"))?;
     }
-    if fs::rename(&item.file_path, &destination).is_err() {
-        fs::copy(&item.file_path, &destination).map_err(|e| format!("复制到归档目录失败：{e}"))?;
-        fs::remove_file(&item.file_path).map_err(|e| format!("移除归档后的源文件失败：{e}"))?;
-    }
+    let destination = archive_file_without_overwrite(
+        &item.file_path,
+        &requested_destination,
+        item.size,
+        item.modified_ms,
+    )?;
     Ok(Some(format!("已移动到归档目录：{}", destination.display())))
+}
+
+fn resubmit_source_if_changed(state: &SharedState, item: &UploadItem) {
+    if item.mapping_id == "__manual__" {
+        return;
+    }
+    let changed = fs::metadata(&item.file_path)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .is_some_and(|metadata| {
+            metadata.len() != item.size || modified_ms(&metadata) != item.modified_ms
+        });
+    if changed {
+        if let Ok(guard) = state.lock() {
+            let _ = guard.event_tx.send(FsEvent {
+                mapping_id: item.mapping_id.clone(),
+                path: item.file_path.clone(),
+            });
+        }
+    }
 }
 
 fn drain_queue(app: tauri::AppHandle, state: SharedState) {
@@ -2527,6 +2949,7 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
             let outcome = result.as_ref().ok().and_then(|value| value.clone());
             let error_message = result.as_ref().err().cloned();
             let mut db_path = None;
+            let mut cloud_pending = false;
             if let Ok(mut guard) = state2.lock() {
                 guard.active_uploads = guard.active_uploads.saturating_sub(1);
                 guard.inflight.remove(&upload_key);
@@ -2535,15 +2958,8 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                 if auth_expired {
                     guard.token = None;
                 }
-                if outcome.is_some() {
-                    guard.history.insert(
-                        upload_key,
-                        Stamp {
-                            size: item.size,
-                            modified_ms: item.modified_ms,
-                        },
-                    );
-                } else if waiting_for_file {
+                cloud_pending = guard.pending_cloud.contains_key(&upload_key);
+                if waiting_for_file {
                     guard.waiting_files.insert(upload_key.clone(), item.clone());
                 }
             }
@@ -2572,13 +2988,6 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                 ));
             } else if let Some(outcome) = outcome {
                 if let Some(path) = db_path.as_deref() {
-                    if let Err(message) = save_upload_history(path, &item, &outcome) {
-                        status(
-                            &app2,
-                            "error",
-                            format!("文件已上传，但本地记录保存失败：{message}"),
-                        );
-                    }
                     if let Err(message) = clear_auto_share_failure(path, &item) {
                         status(&app2, "error", message);
                     }
@@ -2593,7 +3002,10 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                 match apply_source_policy(&state2, &item) {
                     Ok(Some(message)) => status(&app2, "success", message),
                     Ok(None) => {}
-                    Err(message) => status(&app2, "error", message),
+                    Err(message) => {
+                        status(&app2, "error", message);
+                        resubmit_source_if_changed(&state2, &item);
+                    }
                 }
                 emit(
                     &app2,
@@ -2601,6 +3013,22 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                 );
             } else {
                 let message = error_message.unwrap_or_else(|| "上传失败".into());
+                if cloud_pending {
+                    emit(
+                        &app2,
+                        json!({
+                            "type": "file",
+                            "state": "processing",
+                            "file_path": item.file_path.to_string_lossy(),
+                            "mapping_id": item.mapping_id,
+                            "stage": "OSS 已完成，后台将继续确认云端入库"
+                        }),
+                    );
+                    status(&app2, "warning", message);
+                    emit_state(&app2, &state2);
+                    drain_queue(app2, state2);
+                    return;
+                }
                 let auto_share_enabled = state2.lock().ok().is_some_and(|guard| {
                     guard
                         .mappings
@@ -2691,6 +3119,7 @@ async fn enqueue_path(app: &tauri::AppHandle, state: &SharedState, event: FsEven
         let key = item_key(&item.mapping_id, &item.file_path);
         if upload_already_scheduled(
             &guard.history,
+            &guard.pending_cloud,
             &guard.inflight,
             &guard.queue,
             &guard.waiting_files,
@@ -2835,6 +3264,233 @@ fn seed_existing_files(state: &SharedState, mapping: &Mapping) {
                         modified_ms: modified_ms(&metadata),
                     },
                 );
+            }
+        }
+    }
+}
+
+fn hydrate_pending_item(state: &SharedState, pending: &PendingUpload) -> UploadItem {
+    let mut item = pending.item.clone();
+    if item.mapping_id == "__manual__" {
+        return item;
+    }
+    let mapping = state.lock().ok().and_then(|guard| {
+        guard
+            .mappings
+            .iter()
+            .find(|mapping| mapping.id == item.mapping_id)
+            .cloned()
+    });
+    let Some(mapping) = mapping else {
+        return item;
+    };
+    let relative = item
+        .file_path
+        .strip_prefix(&mapping.local_path)
+        .ok()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| item.relative_path.clone());
+    let relative_dir = Path::new(&relative)
+        .parent()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    item.remote_parent_id = mapping.remote_parent_id.clone();
+    item.remote_dir = [
+        if mapping.remote_parent_id.is_empty() {
+            normalize_remote_path(&mapping.remote_path)
+        } else {
+            String::new()
+        },
+        relative_dir,
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join("/");
+    item.relative_path = relative;
+    item
+}
+
+fn queue_rejected_pending_upload(state: &SharedState, pending: &PendingUpload) -> bool {
+    let mut item = hydrate_pending_item(state, pending);
+    let key = item_key(&item.mapping_id, &item.file_path);
+    if let Ok(mut guard) = state.lock() {
+        guard.pending_cloud.remove(&key);
+    } else {
+        return false;
+    }
+    let Ok(metadata) = fs::metadata(&item.file_path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    item.size = metadata.len();
+    item.modified_ms = modified_ms(&metadata);
+    let Ok(mut guard) = state.lock() else {
+        return false;
+    };
+    if item.mapping_id != "__manual__"
+        && !guard
+            .mappings
+            .iter()
+            .any(|mapping| mapping.id == item.mapping_id && mapping.enabled)
+    {
+        return false;
+    }
+    if upload_already_scheduled(
+        &guard.history,
+        &guard.pending_cloud,
+        &guard.inflight,
+        &guard.queue,
+        &guard.waiting_files,
+        &item,
+    ) {
+        return false;
+    }
+    guard
+        .queue
+        .retain(|queued| item_key(&queued.mapping_id, &queued.file_path) != key);
+    guard.queue.push_back(item);
+    true
+}
+
+async fn recover_pending_upload(app: tauri::AppHandle, state: SharedState, pending: PendingUpload) {
+    let key = item_key(&pending.item.mapping_id, &pending.item.file_path);
+    let (token, device_id, db_path) = match state.lock() {
+        Ok(guard) => {
+            let Some(token) = guard.token.clone() else {
+                drop(guard);
+                if let Ok(mut guard) = state.lock() {
+                    guard.recovering_pending.remove(&key);
+                }
+                return;
+            };
+            (token, guard.device_id.clone(), guard.db_path.clone())
+        }
+        Err(_) => return,
+    };
+    match check_upload_task(&token, &device_id, &pending.task_id).await {
+        Ok(CloudTaskCheck::Confirmed(task_data)) => {
+            let item = hydrate_pending_item(&state, &pending);
+            let outcome = UploadOutcome {
+                task_id: pending.task_id.clone(),
+                remote_file_id: task_data
+                    .get("fileId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            };
+            match remember_confirmed_upload(&state, &item, &outcome) {
+                Ok(()) => {
+                    if let Err(message) = clear_auto_share_failure(&db_path, &item) {
+                        status(&app, "error", message);
+                    }
+                    if let Err(message) = schedule_auto_share(&state, &item, &outcome).await {
+                        status(
+                            &app,
+                            "error",
+                            format!("云端已确认，但自动分享排队失败：{message}"),
+                        );
+                    }
+                    match apply_source_policy(&state, &item) {
+                        Ok(Some(message)) => status(&app, "success", message),
+                        Ok(None) => status(
+                            &app,
+                            "success",
+                            format!("已恢复并确认云端入库：{}", item.file_path.display()),
+                        ),
+                        Err(message) => {
+                            status(&app, "error", message);
+                            resubmit_source_if_changed(&state, &item);
+                        }
+                    }
+                    emit(
+                        &app,
+                        json!({
+                            "type": "file",
+                            "state": "done",
+                            "file_path": item.file_path.to_string_lossy(),
+                            "mapping_id": item.mapping_id
+                        }),
+                    );
+                }
+                Err(message) => status(&app, "warning", message),
+            }
+        }
+        Ok(CloudTaskCheck::Pending) => {}
+        Err(CloudConfirmError::Retryable(message)) => {
+            if message.contains("登录态已失效") {
+                if let Ok(mut guard) = state.lock() {
+                    guard.token = None;
+                }
+                if let Err(error) = clear_persisted_access_token(&db_path) {
+                    status(&app, "error", error);
+                }
+            } else {
+                status(
+                    &app,
+                    "warning",
+                    format!("待确认上传将在后台重试：{message}"),
+                );
+            }
+        }
+        Err(CloudConfirmError::Permanent(message)) => {
+            match delete_pending_upload(&db_path, &pending) {
+                Ok(true) => {
+                    let queued = queue_rejected_pending_upload(&state, &pending);
+                    status(
+                        &app,
+                        "error",
+                        if queued {
+                            format!("云端明确拒绝入库，已清理待确认记录并重新排队：{message}")
+                        } else {
+                            format!("云端明确拒绝入库，已清理待确认记录；源文件当前无法重新排队：{message}")
+                        },
+                    );
+                    if queued {
+                        drain_queue(app.clone(), state.clone());
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => status(&app, "error", error),
+            }
+        }
+    }
+    if let Ok(mut guard) = state.lock() {
+        guard.recovering_pending.remove(&key);
+    }
+    emit_state(&app, &state);
+}
+
+async fn pending_upload_recovery_loop(app: tauri::AppHandle, state: SharedState) {
+    loop {
+        sleep(Duration::from_secs(PENDING_UPLOAD_RETRY_SECS)).await;
+        let (db_path, can_recover) = match state.lock() {
+            Ok(guard) => (guard.db_path.clone(), guard.token.is_some()),
+            Err(_) => continue,
+        };
+        if !can_recover {
+            continue;
+        }
+        let pending_uploads = match load_pending_uploads(&db_path) {
+            Ok(pending) => pending,
+            Err(message) => {
+                status(&app, "error", message);
+                continue;
+            }
+        };
+        for pending in pending_uploads {
+            let key = item_key(&pending.item.mapping_id, &pending.item.file_path);
+            let should_start = state.lock().ok().is_some_and(|mut guard| {
+                !guard.inflight.contains_key(&key) && guard.recovering_pending.insert(key.clone())
+            });
+            if should_start {
+                tauri::async_runtime::spawn(recover_pending_upload(
+                    app.clone(),
+                    state.clone(),
+                    pending,
+                ));
             }
         }
     }
@@ -4474,6 +5130,12 @@ fn remove_mapping(
     guard.waiting_files.retain(|_, item| item.mapping_id != id);
     let prefix = format!("{id}::");
     guard.history.retain(|key, _| !key.starts_with(&prefix));
+    guard
+        .pending_cloud
+        .retain(|key, _| !key.starts_with(&prefix));
+    guard
+        .recovering_pending
+        .retain(|key| !key.starts_with(&prefix));
     guard.inflight.retain(|key, _| !key.starts_with(&prefix));
     save_config(&guard);
     let db_path = guard.db_path.clone();
@@ -4693,11 +5355,12 @@ async fn backfill_auto_shares(
         let mut statement = connection
             .prepare(
                 "SELECT file_path, size, modified_ms, remote_file_id FROM uploaded_files
-                 WHERE mapping_id=?1 AND remote_file_id IS NOT NULL AND remote_file_id <> ''",
+                 WHERE mapping_id=?1 AND upload_state=?2
+                   AND remote_file_id IS NOT NULL AND remote_file_id <> ''",
             )
             .map_err(|error| format!("读取已有上传记录失败：{error}"))?;
         let rows = statement
-            .query_map(params![id], |row| {
+            .query_map(params![id, UPLOAD_STATE_CLOUD_CONFIRMED], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, u64>(1)?,
@@ -4916,6 +5579,7 @@ fn run() {
             init_database(&db_path)?;
             let auth_session = load_auth_session(&db_path)?;
             let upload_history = load_upload_history(&db_path)?;
+            let pending_cloud = pending_upload_stamps(&db_path)?;
             let device_id = load_or_create_device_id(&db_path)?;
             let hdhive_base_url = std::env::var("HDHIVE_BASE_URL")
                 .ok()
@@ -4955,6 +5619,8 @@ fn run() {
                 queue: VecDeque::new(),
                 waiting_files: HashMap::new(),
                 history: upload_history,
+                pending_cloud,
+                recovering_pending: HashSet::new(),
                 inflight: HashMap::new(),
                 inflight_items: HashMap::new(),
                 remote_cache: HashMap::from([(String::new(), String::new())]),
@@ -5023,6 +5689,10 @@ fn run() {
                 }
             }
             tauri::async_runtime::spawn(polling_loop(app_handle.clone(), state.clone()));
+            tauri::async_runtime::spawn(pending_upload_recovery_loop(
+                app_handle.clone(),
+                state.clone(),
+            ));
             tauri::async_runtime::spawn(auto_share_loop(app_handle.clone(), state.clone()));
             tauri::async_runtime::spawn(token_refresh_loop(app_handle.clone(), state.clone()));
             emit_state(&app_handle, &state);
@@ -5275,11 +5945,13 @@ mod tests {
             modified_ms: 42,
         };
         let history = HashMap::new();
+        let mut pending_cloud = HashMap::new();
         let mut inflight = HashMap::new();
         let queue = VecDeque::new();
         let mut waiting_files = HashMap::new();
         assert!(!upload_already_scheduled(
             &history,
+            &pending_cloud,
             &inflight,
             &queue,
             &waiting_files,
@@ -5295,6 +5967,7 @@ mod tests {
         );
         assert!(upload_already_scheduled(
             &history,
+            &pending_cloud,
             &inflight,
             &queue,
             &waiting_files,
@@ -5305,6 +5978,7 @@ mod tests {
         changed.modified_ms += 1;
         assert!(!upload_already_scheduled(
             &history,
+            &pending_cloud,
             &inflight,
             &queue,
             &waiting_files,
@@ -5312,9 +5986,26 @@ mod tests {
         ));
 
         inflight.clear();
+        pending_cloud.insert(
+            item_key(&item.mapping_id, &item.file_path),
+            Stamp {
+                size: item.size,
+                modified_ms: item.modified_ms,
+            },
+        );
+        assert!(upload_already_scheduled(
+            &history,
+            &pending_cloud,
+            &inflight,
+            &queue,
+            &waiting_files,
+            &changed
+        ));
+        pending_cloud.clear();
         waiting_files.insert(item_key(&item.mapping_id, &item.file_path), item.clone());
         assert!(upload_already_scheduled(
             &history,
+            &pending_cloud,
             &inflight,
             &queue,
             &waiting_files,
@@ -5376,6 +6067,67 @@ mod tests {
         assert!(is_cloud_index_pending_message("文件上传中"));
         assert!(is_cloud_index_pending_message("任务处理中，请稍后再试"));
         assert!(!is_cloud_index_pending_message("文件违规，无法入库"));
+        assert!(is_cloud_index_permanent_message("文件违规，无法入库"));
+        assert!(!is_cloud_index_permanent_message("operation timed out"));
+    }
+
+    #[test]
+    fn archive_collisions_never_overwrite_existing_files() {
+        let root = std::env::temp_dir().join(format!("guangya-archive-test-{}", Uuid::new_v4()));
+        let source_dir = root.join("source");
+        let archive_dir = root.join("archive");
+        fs::create_dir_all(&source_dir).expect("source directory");
+        fs::create_dir_all(&archive_dir).expect("archive directory");
+        let source = source_dir.join("episode.mkv");
+        fs::write(&source, b"new upload").expect("source fixture");
+        let metadata = fs::metadata(&source).expect("source metadata");
+        let modified = modified_ms(&metadata);
+        let requested = archive_dir.join("episode.mkv");
+        let first_collision = archive_candidate(&requested, modified, 1);
+        fs::write(&requested, b"old archive").expect("base collision");
+        fs::write(&first_collision, b"older archive").expect("suffix collision");
+
+        let archived =
+            archive_file_without_overwrite(&source, &requested, metadata.len(), modified)
+                .expect("archive should find a unique name");
+        assert_eq!(archived, archive_candidate(&requested, modified, 2));
+        assert_eq!(fs::read(&requested).unwrap(), b"old archive");
+        assert_eq!(fs::read(&first_collision).unwrap(), b"older archive");
+        assert_eq!(fs::read(&archived).unwrap(), b"new upload");
+        assert!(!source.exists());
+        fs::remove_dir_all(root).expect("archive fixture cleanup");
+    }
+
+    #[test]
+    fn exclusive_archive_copy_preserves_source_on_collision_or_mismatch() {
+        let root = std::env::temp_dir().join(format!("guangya-copy-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("copy directory");
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+        fs::write(&source, b"source bytes").expect("source fixture");
+        fs::write(&destination, b"existing bytes").expect("destination fixture");
+        let metadata = fs::metadata(&source).expect("source metadata");
+        assert!(!copy_archive_exclusive(
+            &source,
+            &destination,
+            metadata.len(),
+            modified_ms(&metadata),
+        )
+        .expect("collision should not be an error"));
+        assert_eq!(fs::read(&destination).unwrap(), b"existing bytes");
+        assert!(source.exists());
+
+        let mismatch_destination = root.join("mismatch.bin");
+        assert!(copy_archive_exclusive(
+            &source,
+            &mismatch_destination,
+            metadata.len() + 1,
+            modified_ms(&metadata),
+        )
+        .is_err());
+        assert!(source.exists());
+        assert!(!mismatch_destination.exists());
+        fs::remove_dir_all(root).expect("copy fixture cleanup");
     }
 
     #[test]
@@ -5422,13 +6174,14 @@ mod tests {
             size: 128,
             modified_ms: 42,
         };
-        save_upload_history(
+        save_upload_record(
             &database,
             &item,
             &UploadOutcome {
                 task_id: "task-1".into(),
                 remote_file_id: Some("file-1".into()),
             },
+            UPLOAD_STATE_CLOUD_CONFIRMED,
         )
         .expect("upload history should persist");
         let history = load_upload_history(&database).expect("upload history should load");
@@ -5439,31 +6192,102 @@ mod tests {
                 modified_ms: 42
             })
         );
-        save_upload_history(
+        let mut pending_item = item.clone();
+        pending_item.file_path = PathBuf::from("H:/test/pending.png");
+        pending_item.relative_path = "pending.png".into();
+        save_upload_record(
             &database,
-            &item,
+            &pending_item,
             &UploadOutcome {
                 task_id: "task-pending".into(),
                 remote_file_id: None,
             },
+            UPLOAD_STATE_OSS_COMPLETE,
         )
         .expect("OSS-complete history should persist before cloud indexing");
         let connection = open_database(&database).expect("database should reopen");
-        let (task_id, remote_file_id): (String, Option<String>) = connection
+        let (task_id, remote_file_id, upload_state): (String, Option<String>, String) = connection
             .query_row(
-                "SELECT task_id, remote_file_id FROM uploaded_files WHERE mapping_id = ?1 AND file_path = ?2",
-                params![item.mapping_id, item.file_path.to_string_lossy()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT task_id, remote_file_id, upload_state FROM uploaded_files WHERE mapping_id = ?1 AND file_path = ?2",
+                params![pending_item.mapping_id, pending_item.file_path.to_string_lossy()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("pending upload should be queryable");
         assert_eq!(task_id, "task-pending");
         assert_eq!(remote_file_id, None);
+        assert_eq!(upload_state, UPLOAD_STATE_OSS_COMPLETE);
         drop(connection);
+        let pending = load_pending_uploads(&database).expect("pending uploads should load");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].task_id, "task-pending");
+        assert_eq!(pending[0].item.relative_path, "pending.png");
+        let history = load_upload_history(&database).expect("confirmed history should load");
+        assert!(history.contains_key(&item_key(&item.mapping_id, &item.file_path)));
+        assert!(!history.contains_key(&item_key(&pending_item.mapping_id, &pending_item.file_path)));
+        assert!(!confirm_pending_record(
+            &database,
+            &pending_item,
+            &UploadOutcome {
+                task_id: "stale-task".into(),
+                remote_file_id: Some("wrong-file".into()),
+            },
+        )
+        .expect("a stale task must not replace the pending record"));
+        assert!(confirm_pending_record(
+            &database,
+            &pending_item,
+            &UploadOutcome {
+                task_id: "task-pending".into(),
+                remote_file_id: Some("file-pending".into()),
+            },
+        )
+        .expect("pending record should transition to confirmed"));
+        assert!(load_pending_uploads(&database)
+            .expect("pending rows should reload")
+            .is_empty());
+        assert!(load_upload_history(&database)
+            .expect("confirmed rows should reload")
+            .contains_key(&item_key(&pending_item.mapping_id, &pending_item.file_path)));
         remove_mapping_history(&database, &item.mapping_id).expect("history should be removable");
         assert!(load_upload_history(&database)
             .expect("history should reload")
             .is_empty());
         fs::remove_dir_all(root).expect("test database should be removable");
+    }
+
+    #[test]
+    fn sqlite_migrates_legacy_null_remote_ids_to_pending_state() {
+        let root = std::env::temp_dir().join(format!("guangya-migration-test-{}", Uuid::new_v4()));
+        let database = root.join("state.sqlite3");
+        fs::create_dir_all(&root).expect("migration directory");
+        let connection = open_database(&database).expect("legacy database");
+        connection
+            .execute_batch(
+                "CREATE TABLE uploaded_files (
+                   mapping_id TEXT NOT NULL,
+                   file_path TEXT NOT NULL,
+                   size INTEGER NOT NULL,
+                   modified_ms TEXT NOT NULL,
+                   task_id TEXT,
+                   remote_file_id TEXT,
+                   uploaded_at INTEGER NOT NULL,
+                   PRIMARY KEY (mapping_id, file_path)
+                 );
+                 INSERT INTO uploaded_files VALUES
+                   ('mapping-1', '/watch/confirmed.mkv', 10, '20', 'task-1', 'file-1', 1),
+                   ('mapping-1', '/watch/pending.mkv', 11, '21', 'task-2', NULL, 1);",
+            )
+            .expect("legacy schema fixture");
+        drop(connection);
+
+        init_database(&database).expect("legacy database should migrate");
+        let history = load_upload_history(&database).expect("confirmed history");
+        assert!(history.contains_key(&item_key("mapping-1", Path::new("/watch/confirmed.mkv"))));
+        assert!(!history.contains_key(&item_key("mapping-1", Path::new("/watch/pending.mkv"))));
+        let pending = load_pending_uploads(&database).expect("pending migration");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].task_id, "task-2");
+        fs::remove_dir_all(root).expect("migration fixture cleanup");
     }
 }
 

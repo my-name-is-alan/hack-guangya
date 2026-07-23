@@ -1,6 +1,7 @@
 <script setup>
 import { computed, h, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
 import { message } from 'antdv-next';
+import appLogo from '../src-tauri/icons/128x128.png';
 import { buildRenamePreview } from './renameRules.js';
 import { formatUploadSpeed, nextUploadProgress } from './uploadProgress.js';
 import { readJsonResponse } from './httpResponse.js';
@@ -1350,7 +1351,7 @@ onBeforeUnmount(() => {
       <a-layout class="app-shell">
         <a-layout-sider :width="240" class="sidebar" theme="light">
           <div class="brand">
-            <div class="brand-mark"><CloudSyncOutlined /></div>
+            <div class="brand-mark"><img :src="appLogo" alt="光鸭文件夹同步" /></div>
             <div><strong>光鸭云盘</strong><span>GUANGYA SYNC</span></div>
           </div>
 
