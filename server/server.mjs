@@ -291,20 +291,23 @@ function clearPendingUpload(key) {
 function deleteMappingTransientUploads(mappingId) { database.prepare("DELETE FROM uploaded_files WHERE mapping_id = ? AND status <> 'cloud_confirmed'").run(mappingId); for (const key of pendingUploads.keys()) if (key.startsWith(`${mappingId}::`)) pendingUploads.delete(key); }
 function reuseMatchingConfirmedUpload(item) {
   const filePath = path.resolve(uploadHistoryPath(item));
-  const matched = database.prepare(`
-    SELECT mapping_id, task_id, remote_file_id
+  const candidates = database.prepare(`
+    SELECT mapping_id, file_path, task_id, remote_file_id
     FROM uploaded_files
     WHERE status = 'cloud_confirmed'
       AND substr(mapping_id, 1, 2) <> '__'
-      AND file_path = ?
       AND size = ?
       AND modified_ms = ?
       AND remote_parent_id = ?
       AND remote_dir = ?
       AND relative_path = ?
     ORDER BY uploaded_at DESC
-    LIMIT 1
-  `).get(filePath, item.size, String(item.mtime), item.remote_parent_id || '', item.remote_dir || '', item.relative_path || '');
+  `).all(item.size, String(item.mtime), item.remote_parent_id || '', item.remote_dir || '', item.relative_path || '');
+  const canonicalFilePath = canonicalizePathSync(filePath);
+  const matched = candidates.find((candidate) => {
+    try { return canonicalizePathSync(candidate.file_path) === canonicalFilePath; }
+    catch { return path.resolve(candidate.file_path) === filePath; }
+  });
   if (!matched) return null;
   database.prepare(`
     INSERT INTO uploaded_files
