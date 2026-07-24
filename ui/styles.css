@@ -115,15 +115,16 @@ button, input, textarea { font: inherit; }
 .form-help { margin-top: 6px; color: #98a2b3; font-size: 11px; line-height: 1.5; }
 .mapping-error { margin-top: 12px; }
 .backup-login-alert { margin-bottom: 16px; }
-.upload-progress-card { margin-top: 16px; }
-.upload-progress-list { display: grid; gap: 12px; }
-.upload-progress-item { padding: 12px 14px 8px; border: 1px solid #e9edf4; border-radius: 10px; background: #fafcff; }
-.upload-progress-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 6px; }
-.upload-progress-heading > div { min-width: 0; }
+.upload-progress-card { min-width: 0; max-width: 100%; margin-top: 16px; }
+.upload-progress-card .ant-card-body { min-width: 0; }
+.upload-progress-list { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; gap: 12px; }
+.upload-progress-item { min-width: 0; padding: 12px 14px 8px; border: 1px solid #e9edf4; border-radius: 10px; background: #fafcff; }
+.upload-progress-heading { display: flex; min-width: 0; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 6px; }
+.upload-progress-heading > div { min-width: 0; flex: 1 1 0%; overflow: hidden; }
 .upload-progress-heading strong, .upload-progress-heading > div > span { display: block; }
 .upload-progress-heading strong { overflow: hidden; color: #344054; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .upload-progress-heading > div > span { margin-top: 2px; overflow: hidden; color: #98a2b3; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
-.upload-progress-heading > span { flex: 0 0 auto; color: #667085; font-size: 10px; }
+.upload-progress-heading > span { max-width: 45%; flex: 0 1 auto; overflow: hidden; color: #667085; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .mapping-type-editor { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 10px; align-items: center; margin-top: 12px; }
 .mapping-type-editor > span { color: #667085; font-size: 12px; }
 .mapping-type-editor .ant-select { width: 100%; }

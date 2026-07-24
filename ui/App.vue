@@ -1497,7 +1497,7 @@ onBeforeUnmount(() => {
                 <div class="upload-progress-list">
                   <div v-for="upload in recentUploads" :key="upload.filePath" class="upload-progress-item">
                     <div class="upload-progress-heading">
-                      <div><strong>{{ upload.fileName }}</strong><span :title="upload.filePath">{{ upload.filePath }}</span></div>
+                      <div><strong :title="upload.fileName">{{ upload.fileName }}</strong><span :title="upload.filePath">{{ upload.filePath }}</span></div>
                       <span>{{ upload.stage }}<template v-if="upload.state === 'uploading'"> · {{ formatUploadSpeed(upload.bytesPerSecond) }}</template></span>
                     </div>
                     <a-progress :percent="upload.percent" :status="uploadProgressStatus(upload.state)" size="small" />
@@ -1560,7 +1560,7 @@ onBeforeUnmount(() => {
                 <div class="upload-progress-list">
                   <div v-for="upload in recentUploads" :key="upload.filePath" class="upload-progress-item">
                     <div class="upload-progress-heading">
-                      <div><strong>{{ upload.fileName }}</strong><span :title="upload.filePath">{{ upload.filePath }}</span></div>
+                      <div><strong :title="upload.fileName">{{ upload.fileName }}</strong><span :title="upload.filePath">{{ upload.filePath }}</span></div>
                       <span>{{ upload.stage }}<template v-if="upload.state === 'uploading'"> · {{ formatUploadSpeed(upload.bytesPerSecond) }}</template></span>
                     </div>
                     <a-progress
