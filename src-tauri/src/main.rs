@@ -19,7 +19,10 @@ use std::{
     fs::{self, OpenOptions},
     io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::{
@@ -43,12 +46,18 @@ const POLL_INTERVAL_SECS: u64 = 5;
 const API_CONNECT_TIMEOUT_SECS: u64 = 15;
 const API_REQUEST_TIMEOUT_SECS: u64 = 120;
 const OSS_REQUEST_TIMEOUT_SECS: u64 = 600;
+const OSS_MULTIPART_TARGET_PARTS: u64 = 9_000;
+const OSS_MIB: u64 = 1024 * 1024;
+const OSS_LARGE_FILE_PART_SIZE: u64 = 16 * OSS_MIB;
 const CLOUD_CONFIRM_TIMEOUT_SECS: u64 = 600;
 const PENDING_UPLOAD_RETRY_SECS: u64 = 15;
 const UPLOAD_STATE_OSS_COMPLETE: &str = "oss_complete";
 const UPLOAD_STATE_CLOUD_CONFIRMED: &str = "cloud_confirmed";
 const AUTO_SHARE_QUIET_SECS: i64 = 30;
 const TOKEN_REFRESH_INTERVAL_SECS: u64 = 20 * 60;
+const MAX_GCID_IMPORT_CONCURRENCY: usize = 16;
+const MAX_GCID_IMPORT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_GCID_IMPORT_ATTEMPTS: i64 = 5;
 const DEFAULT_MEDIA_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "heic", "heif", "avif", "tif", "tiff",
     "raw", "cr2", "nef", "arw", "dng", "mp4", "mov", "mkv", "avi", "wmv", "flv", "webm", "m4v",
@@ -179,6 +188,7 @@ struct RuntimeState {
     hdhive_secret: String,
     hdhive_instance_id: String,
     auto_share_processing: HashSet<String>,
+    gcid_import_running: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -260,6 +270,82 @@ struct AuthSession {
 struct UploadOutcome {
     task_id: String,
     remote_file_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GcidExport {
+    source: String,
+    hash_type: String,
+    #[serde(default)]
+    uses_gcid_in_export: bool,
+    #[serde(default)]
+    common_path: String,
+    #[serde(default)]
+    total_files_count: Option<u64>,
+    #[serde(default)]
+    total_size: Option<Value>,
+    files: Vec<GcidExportFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GcidExportFile {
+    path: String,
+    size: Value,
+    gcid: String,
+}
+
+#[derive(Debug, Clone)]
+struct GcidImportFile {
+    path: String,
+    folder_path: String,
+    name: String,
+    size: u64,
+    gcid: String,
+    attempts: i64,
+}
+
+#[derive(Debug)]
+enum GcidImportOutcome {
+    Imported { task_id: String, file_id: String },
+    Existing { file_id: String },
+    Missed { task_id: String },
+    Conflict(String),
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GcidImportSourceInfo {
+    path: String,
+    name: String,
+    size: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct GcidImportCounts {
+    pending: u64,
+    processing: u64,
+    imported: u64,
+    existing: u64,
+    missed: u64,
+    conflict: u64,
+    failed: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GcidImportStatus {
+    job_id: String,
+    source_path: String,
+    source_name: String,
+    destination_parent_id: String,
+    destination_name: String,
+    total_files: u64,
+    total_size: String,
+    status: String,
+    current_path: String,
+    error: Option<String>,
+    counts: GcidImportCounts,
+    finished: u64,
+    updated_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -373,16 +459,22 @@ fn normalize_oss_endpoint_url(endpoint: &str, bucket: &str) -> String {
     };
     format!("{scheme}://{}", normalize_oss_endpoint(endpoint, bucket))
 }
-fn oss_part_size(size: u64) -> usize {
-    if size <= 100 * 1024 * 1024 {
-        1024 * 1024
+fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
+    value / divisor + u64::from(value % divisor != 0)
+}
+fn oss_part_size(size: u64) -> u64 {
+    let tier_size = if size <= 100 * 1024 * 1024 {
+        OSS_MIB
     } else if size <= 1024 * 1024 * 1024 {
-        2 * 1024 * 1024
+        2 * OSS_MIB
     } else if size <= 10 * 1024 * 1024 * 1024 {
-        4 * 1024 * 1024
+        4 * OSS_MIB
     } else {
-        8 * 1024 * 1024
-    }
+        OSS_LARGE_FILE_PART_SIZE
+    };
+    let minimum_size = ceil_div_u64(size, OSS_MULTIPART_TARGET_PARTS);
+    let aligned_minimum_size = ceil_div_u64(minimum_size, OSS_MIB) * OSS_MIB;
+    tier_size.max(aligned_minimum_size)
 }
 fn normalize_monitor_mode(value: &str) -> String {
     if value.eq_ignore_ascii_case("polling") {
@@ -632,9 +724,50 @@ fn init_database(path: &Path) -> Result<(), String> {
                error TEXT NOT NULL,
                updated_at INTEGER NOT NULL,
                PRIMARY KEY (mapping_id, target_key, relative_path)
+             );
+             CREATE TABLE IF NOT EXISTS gcid_import_jobs (
+               job_id TEXT PRIMARY KEY,
+               source_path TEXT NOT NULL,
+               source_name TEXT NOT NULL,
+               destination_parent_id TEXT NOT NULL,
+               destination_name TEXT NOT NULL,
+               total_files INTEGER NOT NULL,
+               total_size TEXT NOT NULL,
+               status TEXT NOT NULL,
+               current_path TEXT NOT NULL DEFAULT '',
+               error TEXT,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS gcid_import_files (
+               job_id TEXT NOT NULL,
+               path TEXT NOT NULL,
+               folder_path TEXT NOT NULL,
+               file_name TEXT NOT NULL,
+               file_size INTEGER NOT NULL,
+               gcid TEXT NOT NULL,
+               status TEXT NOT NULL DEFAULT 'pending',
+               attempts INTEGER NOT NULL DEFAULT 0,
+               task_id TEXT,
+               file_id TEXT,
+               error TEXT,
+               updated_at INTEGER NOT NULL,
+               PRIMARY KEY (job_id, path)
              );",
         )
         .map_err(|e| format!("初始化 SQLite 失败：{e}"))?;
+    connection
+        .execute_batch(
+            "CREATE INDEX IF NOT EXISTS gcid_import_files_status
+               ON gcid_import_files(job_id, status, path);
+             UPDATE gcid_import_files
+               SET status = 'pending', error = '应用上次退出，已等待继续'
+               WHERE status = 'processing';
+             UPDATE gcid_import_jobs
+               SET status = 'paused', error = '应用上次退出，点击继续导入'
+               WHERE status IN ('preparing', 'running');",
+        )
+        .map_err(|e| format!("初始化 GCID 导入状态失败：{e}"))?;
     let _ = connection.execute(
         "ALTER TABLE auto_share_events ADD COLUMN notification_status TEXT",
         [],
@@ -1561,6 +1694,838 @@ async fn ensure_remote_path(
         parent = file_id;
     }
     Ok(parent)
+}
+
+fn parse_gcid_file_size(value: &Value) -> Result<u64, String> {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .filter(|size| *size > 0)
+            .ok_or_else(|| "文件大小必须是正整数".to_string()),
+        Value::String(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|size| *size > 0)
+            .ok_or_else(|| "文件大小必须是正整数字符串".to_string()),
+        _ => Err("文件大小格式无效".to_string()),
+    }
+}
+
+fn normalize_gcid_relative_path(value: &str) -> Result<String, String> {
+    let normalized = value.replace('\\', "/");
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized
+            .as_bytes()
+            .get(1)
+            .is_some_and(|value| *value == b':')
+    {
+        return Err(format!("不是合法的相对路径：{value}"));
+    }
+    let parts = normalized.split('/').collect::<Vec<_>>();
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || *part == "." || *part == "..")
+    {
+        return Err(format!("路径包含空目录或越界片段：{value}"));
+    }
+    if parts.iter().any(|part| part.chars().any(char::is_control)) {
+        return Err(format!("路径包含控制字符：{value}"));
+    }
+    Ok(parts.join("/"))
+}
+
+fn parse_gcid_export(raw: &[u8]) -> Result<(Vec<GcidImportFile>, u128, String), String> {
+    let export: GcidExport =
+        serde_json::from_slice(raw).map_err(|error| format!("JSON 格式无效：{error}"))?;
+    if export.source != "guangya" || export.hash_type != "gcid" || !export.uses_gcid_in_export {
+        return Err("只支持光鸭 GCID 导出格式".to_string());
+    }
+    if export.files.is_empty() {
+        return Err("导入文件不包含 files 记录".to_string());
+    }
+    if export
+        .total_files_count
+        .is_some_and(|total| total != export.files.len() as u64)
+    {
+        return Err(format!(
+            "文件总数不一致：声明 {}，实际 {}",
+            export.total_files_count.unwrap_or_default(),
+            export.files.len()
+        ));
+    }
+    let mut seen = HashSet::with_capacity(export.files.len());
+    let mut total_size = 0_u128;
+    let mut files = Vec::with_capacity(export.files.len());
+    for (index, item) in export.files.into_iter().enumerate() {
+        let relative_path = normalize_gcid_relative_path(&item.path)
+            .map_err(|error| format!("第 {} 条记录：{error}", index + 1))?;
+        if !seen.insert(relative_path.clone()) {
+            return Err(format!("存在重复路径：{relative_path}"));
+        }
+        let size = parse_gcid_file_size(&item.size)
+            .map_err(|error| format!("第 {} 条记录：{error}", index + 1))?;
+        let gcid = item.gcid.to_ascii_lowercase();
+        if gcid.len() != 40 || !gcid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!("第 {} 条记录的 GCID 无效", index + 1));
+        }
+        let (folder_path, name) = relative_path
+            .rsplit_once('/')
+            .map(|(folder, name)| (folder.to_string(), name.to_string()))
+            .unwrap_or_else(|| (String::new(), relative_path.clone()));
+        total_size = total_size
+            .checked_add(size as u128)
+            .ok_or_else(|| "导入文件总大小溢出".to_string())?;
+        files.push(GcidImportFile {
+            path: relative_path,
+            folder_path,
+            name,
+            size,
+            gcid,
+            attempts: 0,
+        });
+    }
+    if let Some(declared) = export.total_size.as_ref() {
+        let declared = match declared {
+            Value::Number(number) => number.as_u64().map(u128::from),
+            Value::String(value) => value.parse::<u128>().ok(),
+            _ => None,
+        };
+        if declared.is_some_and(|declared| declared != total_size) {
+            return Err(format!(
+                "文件总大小不一致：声明 {}，实际 {total_size}",
+                declared.unwrap_or_default()
+            ));
+        }
+    }
+    Ok((files, total_size, export.common_path))
+}
+
+fn validate_gcid_destination(value: &str) -> Result<String, String> {
+    let destination = value.trim();
+    if destination.is_empty()
+        || destination == "."
+        || destination == ".."
+        || destination.contains('/')
+        || destination.contains('\\')
+        || destination.chars().any(char::is_control)
+    {
+        return Err("目标文件夹名称不能为空，也不能包含斜杠、控制字符或越界片段".to_string());
+    }
+    Ok(destination.to_string())
+}
+
+fn gcid_import_job_id(raw: &[u8], destination_parent_id: &str, destination_name: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw);
+    hasher.update(b"\0");
+    hasher.update(destination_parent_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(destination_name.as_bytes());
+    hex::encode(hasher.finalize())[..32].to_string()
+}
+
+fn prepare_gcid_import_database(
+    database_path: &Path,
+    raw: &[u8],
+    source_path: &Path,
+    destination_parent_id: &str,
+    destination_name: &str,
+) -> Result<String, String> {
+    let destination_name = validate_gcid_destination(destination_name)?;
+    let (files, total_size, _) = parse_gcid_export(raw)?;
+    let job_id = gcid_import_job_id(raw, destination_parent_id, &destination_name);
+    let source_name = source_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("GCID 导入.json")
+        .to_string();
+    let source_path = source_path.to_string_lossy().to_string();
+    let now = unix_timestamp();
+    let mut connection = open_database(database_path)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开始导入事务失败：{error}"))?;
+    transaction
+        .execute(
+            "INSERT INTO gcid_import_jobs
+               (job_id, source_path, source_name, destination_parent_id, destination_name,
+                total_files, total_size, status, current_path, error, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ready', '', NULL, ?8, ?8)
+             ON CONFLICT(job_id) DO UPDATE SET
+               source_path = excluded.source_path,
+               source_name = excluded.source_name,
+               destination_parent_id = excluded.destination_parent_id,
+               destination_name = excluded.destination_name,
+               total_files = excluded.total_files,
+               total_size = excluded.total_size,
+               status = CASE
+                 WHEN gcid_import_jobs.status IN ('completed', 'completed_with_errors')
+                   THEN gcid_import_jobs.status
+                 ELSE 'ready'
+               END,
+               error = NULL,
+               updated_at = excluded.updated_at",
+            params![
+                job_id,
+                source_path,
+                source_name,
+                destination_parent_id,
+                destination_name,
+                files.len() as i64,
+                total_size.to_string(),
+                now
+            ],
+        )
+        .map_err(|error| format!("保存导入任务失败：{error}"))?;
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO gcid_import_files
+                   (job_id, path, folder_path, file_name, file_size, gcid,
+                    status, attempts, task_id, file_id, error, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, NULL, NULL, NULL, ?7)
+                 ON CONFLICT(job_id, path) DO UPDATE SET
+                   folder_path = excluded.folder_path,
+                   file_name = excluded.file_name,
+                   file_size = excluded.file_size,
+                   gcid = excluded.gcid
+                 WHERE gcid_import_files.status NOT IN ('imported', 'existing')",
+            )
+            .map_err(|error| format!("准备导入记录失败：{error}"))?;
+        for file in files {
+            let size = i64::try_from(file.size).map_err(|_| format!("文件过大：{}", file.path))?;
+            insert
+                .execute(params![
+                    job_id,
+                    file.path,
+                    file.folder_path,
+                    file.name,
+                    size,
+                    file.gcid,
+                    now
+                ])
+                .map_err(|error| format!("保存导入记录失败：{error}"))?;
+        }
+    }
+    transaction
+        .execute(
+            "UPDATE gcid_import_files
+             SET status = 'pending', error = '上次任务中断，已等待继续', updated_at = ?2
+             WHERE job_id = ?1 AND status = 'processing'",
+            params![job_id, now],
+        )
+        .map_err(|error| format!("恢复导入记录失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交导入任务失败：{error}"))?;
+    Ok(job_id)
+}
+
+fn load_gcid_import_counts(
+    connection: &Connection,
+    job_id: &str,
+) -> Result<GcidImportCounts, String> {
+    let mut counts = GcidImportCounts::default();
+    let mut statement = connection
+        .prepare(
+            "SELECT status, COUNT(*)
+             FROM gcid_import_files
+             WHERE job_id = ?1
+             GROUP BY status",
+        )
+        .map_err(|error| format!("读取导入统计失败：{error}"))?;
+    let rows = statement
+        .query_map(params![job_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })
+        .map_err(|error| format!("查询导入统计失败：{error}"))?;
+    for row in rows {
+        let (status, count) = row.map_err(|error| format!("解析导入统计失败：{error}"))?;
+        match status.as_str() {
+            "pending" => counts.pending = count,
+            "processing" => counts.processing = count,
+            "imported" => counts.imported = count,
+            "existing" => counts.existing = count,
+            "missed" => counts.missed = count,
+            "conflict" => counts.conflict = count,
+            "failed" => counts.failed = count,
+            _ => {}
+        }
+    }
+    Ok(counts)
+}
+
+fn load_gcid_import_status(
+    database_path: &Path,
+    job_id: Option<&str>,
+) -> Result<Option<GcidImportStatus>, String> {
+    let connection = open_database(database_path)?;
+    let query = if job_id.is_some() {
+        "SELECT job_id, source_path, source_name, destination_parent_id, destination_name,
+                total_files, total_size, status, current_path, error, updated_at
+         FROM gcid_import_jobs WHERE job_id = ?1"
+    } else {
+        "SELECT job_id, source_path, source_name, destination_parent_id, destination_name,
+                total_files, total_size, status, current_path, error, updated_at
+         FROM gcid_import_jobs ORDER BY updated_at DESC LIMIT 1"
+    };
+    let load = |row: &rusqlite::Row<'_>| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, u64>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, i64>(10)?,
+        ))
+    };
+    let record = if let Some(job_id) = job_id {
+        connection
+            .query_row(query, params![job_id], load)
+            .optional()
+    } else {
+        connection.query_row(query, [], load).optional()
+    }
+    .map_err(|error| format!("读取导入任务失败：{error}"))?;
+    let Some((
+        job_id,
+        source_path,
+        source_name,
+        destination_parent_id,
+        destination_name,
+        total_files,
+        total_size,
+        status,
+        current_path,
+        error,
+        updated_at,
+    )) = record
+    else {
+        return Ok(None);
+    };
+    let counts = load_gcid_import_counts(&connection, &job_id)?;
+    let finished =
+        counts.imported + counts.existing + counts.missed + counts.conflict + counts.failed;
+    Ok(Some(GcidImportStatus {
+        job_id,
+        source_path,
+        source_name,
+        destination_parent_id,
+        destination_name,
+        total_files,
+        total_size,
+        status,
+        current_path,
+        error,
+        counts,
+        finished,
+        updated_at,
+    }))
+}
+
+fn emit_gcid_import_status(app: &tauri::AppHandle, database_path: &Path, job_id: &str) {
+    if let Ok(Some(import_status)) = load_gcid_import_status(database_path, Some(job_id)) {
+        emit(
+            app,
+            json!({ "type": "gcid-import", "status": import_status }),
+        );
+    }
+}
+
+fn claim_gcid_import_file(
+    database_path: &Path,
+    job_id: &str,
+) -> Result<Option<GcidImportFile>, String> {
+    let mut connection = open_database(database_path)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开始领取导入记录失败：{error}"))?;
+    let record = transaction
+        .query_row(
+            "SELECT path, folder_path, file_name, file_size, gcid, attempts
+             FROM gcid_import_files
+             WHERE job_id = ?1 AND status = 'pending'
+             ORDER BY path
+             LIMIT 1",
+            params![job_id],
+            |row| {
+                Ok(GcidImportFile {
+                    path: row.get(0)?,
+                    folder_path: row.get(1)?,
+                    name: row.get(2)?,
+                    size: row.get(3)?,
+                    gcid: row.get(4)?,
+                    attempts: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("领取导入记录失败：{error}"))?;
+    if let Some(record) = record.as_ref() {
+        let changed = transaction
+            .execute(
+                "UPDATE gcid_import_files
+                 SET status = 'processing', error = NULL, updated_at = ?3
+                 WHERE job_id = ?1 AND path = ?2 AND status = 'pending'",
+                params![job_id, record.path, unix_timestamp()],
+            )
+            .map_err(|error| format!("锁定导入记录失败：{error}"))?;
+        if changed == 0 {
+            transaction
+                .rollback()
+                .map_err(|error| format!("回滚导入记录失败：{error}"))?;
+            return claim_gcid_import_file(database_path, job_id);
+        }
+        transaction
+            .execute(
+                "UPDATE gcid_import_jobs
+                 SET current_path = ?2, updated_at = ?3
+                 WHERE job_id = ?1",
+                params![job_id, record.path, unix_timestamp()],
+            )
+            .map_err(|error| format!("更新当前导入文件失败：{error}"))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("提交导入记录失败：{error}"))?;
+    Ok(record)
+}
+
+fn update_gcid_import_attempt(
+    database_path: &Path,
+    job_id: &str,
+    path: &str,
+    attempt: i64,
+    error: Option<&str>,
+) -> Result<(), String> {
+    open_database(database_path)?
+        .execute(
+            "UPDATE gcid_import_files
+             SET attempts = ?3, error = ?4, updated_at = ?5
+             WHERE job_id = ?1 AND path = ?2",
+            params![job_id, path, attempt, error, unix_timestamp()],
+        )
+        .map_err(|error| format!("更新导入重试状态失败：{error}"))?;
+    Ok(())
+}
+
+fn finish_gcid_import_file(
+    database_path: &Path,
+    job_id: &str,
+    path: &str,
+    status: &str,
+    task_id: Option<&str>,
+    file_id: Option<&str>,
+    error: Option<&str>,
+) -> Result<(), String> {
+    open_database(database_path)?
+        .execute(
+            "UPDATE gcid_import_files
+             SET status = ?3, task_id = ?4, file_id = ?5, error = ?6, updated_at = ?7
+             WHERE job_id = ?1 AND path = ?2",
+            params![
+                job_id,
+                path,
+                status,
+                task_id,
+                file_id,
+                error,
+                unix_timestamp()
+            ],
+        )
+        .map_err(|error| format!("保存导入结果失败：{error}"))?;
+    Ok(())
+}
+
+fn value_as_u64(value: Option<&Value>) -> Option<u64> {
+    value.and_then(|value| match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(value) => value.parse::<u64>().ok(),
+        _ => None,
+    })
+}
+
+async fn find_remote_file(
+    token: &str,
+    device_id: &str,
+    parent_id: &str,
+    name: &str,
+) -> Result<Option<(String, u64, i64)>, String> {
+    for page in 0..1000 {
+        let result = api_post(
+            token,
+            device_id,
+            "/userres/v1/file/get_file_list",
+            json!({
+                "page": page,
+                "pageSize": 100,
+                "parentId": parent_id,
+                "orderBy": 0,
+                "sortType": 0,
+                "needSubFolderStat": true
+            }),
+            &[],
+        )
+        .await?;
+        let data = result.data.unwrap_or_default();
+        let list = data
+            .get("list")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(found) = list
+            .iter()
+            .find(|item| item.get("fileName").and_then(Value::as_str) == Some(name))
+        {
+            let file_id = found
+                .get("fileId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let file_size = value_as_u64(found.get("fileSize")).unwrap_or_default();
+            let res_type = found
+                .get("resType")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            if !file_id.is_empty() {
+                return Ok(Some((file_id, file_size, res_type)));
+            }
+        }
+        let total = data.get("total").and_then(Value::as_u64).unwrap_or(0);
+        if list.is_empty() || ((page + 1) * 100) as u64 >= total {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+async fn wait_gcid_import_task(
+    token: &str,
+    device_id: &str,
+    task_id: &str,
+) -> Result<String, String> {
+    let deadline = Instant::now() + Duration::from_secs(CLOUD_CONFIRM_TIMEOUT_SECS);
+    let mut attempt = 0_u64;
+    while Instant::now() < deadline {
+        match check_upload_task(token, device_id, task_id).await {
+            Ok(CloudTaskCheck::Confirmed(data)) => {
+                return data
+                    .get("fileId")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| "云端入库完成但没有返回文件 ID".to_string());
+            }
+            Ok(CloudTaskCheck::Pending) => {}
+            Err(CloudConfirmError::Retryable(message)) => {
+                if message.contains("登录态已失效") {
+                    return Err(message);
+                }
+            }
+            Err(CloudConfirmError::Permanent(message)) => return Err(message),
+        }
+        attempt += 1;
+        let wait = Duration::from_millis((500 * attempt.div_ceil(5)).clamp(500, 5_000));
+        sleep(wait.min(deadline.saturating_duration_since(Instant::now()))).await;
+    }
+    Err(format!(
+        "云端入库超过 {CLOUD_CONFIRM_TIMEOUT_SECS} 秒仍未完成"
+    ))
+}
+
+async fn process_gcid_import_file(
+    state: &SharedState,
+    destination_parent_id: &str,
+    destination_name: &str,
+    record: &GcidImportFile,
+) -> Result<GcidImportOutcome, String> {
+    let (token, device_id) = {
+        let guard = state.lock().map_err(|error| error.to_string())?;
+        (
+            guard
+                .token
+                .clone()
+                .ok_or_else(|| "请先登录光鸭云盘".to_string())?,
+            guard.device_id.clone(),
+        )
+    };
+    let remote_path = if record.folder_path.is_empty() {
+        destination_name.to_string()
+    } else {
+        format!("{destination_name}/{}", record.folder_path)
+    };
+    let parent_id = ensure_remote_path(
+        state,
+        &token,
+        &device_id,
+        destination_parent_id,
+        &remote_path,
+    )
+    .await?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/userres/v1/get_res_center_token",
+        json!({
+            "capacity": 2,
+            "name": record.name,
+            "res": { "fileSize": record.size },
+            "parentId": parent_id
+        }),
+        &[156, 159],
+    )
+    .await?;
+    if response.code == 159 {
+        return match find_remote_file(&token, &device_id, &parent_id, &record.name).await? {
+            Some((file_id, file_size, 1)) if file_size == record.size => {
+                Ok(GcidImportOutcome::Existing { file_id })
+            }
+            Some((_, file_size, 1)) => Ok(GcidImportOutcome::Conflict(format!(
+                "同名文件大小不一致：云端 {file_size}，导入 {}",
+                record.size
+            ))),
+            Some(_) => Ok(GcidImportOutcome::Conflict("同名项是文件夹".to_string())),
+            None => Err("光鸭返回名称冲突，但未找到同名文件".to_string()),
+        };
+    }
+    let mut task_id = response
+        .data
+        .as_ref()
+        .and_then(|data| data.get("taskId"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "光鸭没有返回上传任务 ID".to_string())?;
+    let mut instant = response.code == 156;
+    if !instant {
+        let flash = api_post(
+            &token,
+            &device_id,
+            "/userres/v1/check_can_flash_upload",
+            json!({ "taskId": task_id, "gcid": record.gcid }),
+            &[],
+        )
+        .await?;
+        let data = flash.data.unwrap_or_default();
+        instant = data
+            .get("canFlashUpload")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if let Some(next_task_id) = data
+            .get("taskId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            task_id = next_task_id.to_string();
+        }
+    }
+    if !instant {
+        return Ok(GcidImportOutcome::Missed { task_id });
+    }
+    let file_id = wait_gcid_import_task(&token, &device_id, &task_id).await?;
+    Ok(GcidImportOutcome::Imported { task_id, file_id })
+}
+
+async fn gcid_import_worker(
+    app: tauri::AppHandle,
+    state: SharedState,
+    database_path: PathBuf,
+    job_id: String,
+    destination_parent_id: String,
+    destination_name: String,
+    completed_since_emit: Arc<AtomicUsize>,
+) {
+    loop {
+        let record = match claim_gcid_import_file(&database_path, &job_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => break,
+            Err(error) => {
+                status(&app, "error", error);
+                break;
+            }
+        };
+        let first_attempt = (record.attempts + 1).clamp(1, MAX_GCID_IMPORT_ATTEMPTS);
+        let mut terminal = false;
+        for attempt in first_attempt..=MAX_GCID_IMPORT_ATTEMPTS {
+            let _ =
+                update_gcid_import_attempt(&database_path, &job_id, &record.path, attempt, None);
+            match process_gcid_import_file(
+                &state,
+                &destination_parent_id,
+                &destination_name,
+                &record,
+            )
+            .await
+            {
+                Ok(GcidImportOutcome::Imported { task_id, file_id }) => {
+                    let _ = finish_gcid_import_file(
+                        &database_path,
+                        &job_id,
+                        &record.path,
+                        "imported",
+                        Some(&task_id),
+                        Some(&file_id),
+                        None,
+                    );
+                    terminal = true;
+                    break;
+                }
+                Ok(GcidImportOutcome::Existing { file_id }) => {
+                    let _ = finish_gcid_import_file(
+                        &database_path,
+                        &job_id,
+                        &record.path,
+                        "existing",
+                        None,
+                        Some(&file_id),
+                        None,
+                    );
+                    terminal = true;
+                    break;
+                }
+                Ok(GcidImportOutcome::Missed { task_id }) => {
+                    let message = "光鸭未命中该 GCID，且没有本地源文件可普通上传";
+                    let _ = finish_gcid_import_file(
+                        &database_path,
+                        &job_id,
+                        &record.path,
+                        "missed",
+                        Some(&task_id),
+                        None,
+                        Some(message),
+                    );
+                    terminal = true;
+                    break;
+                }
+                Ok(GcidImportOutcome::Conflict(error)) => {
+                    let _ = finish_gcid_import_file(
+                        &database_path,
+                        &job_id,
+                        &record.path,
+                        "conflict",
+                        None,
+                        None,
+                        Some(&error),
+                    );
+                    terminal = true;
+                    break;
+                }
+                Err(error) if attempt < MAX_GCID_IMPORT_ATTEMPTS => {
+                    let _ = update_gcid_import_attempt(
+                        &database_path,
+                        &job_id,
+                        &record.path,
+                        attempt,
+                        Some(&error),
+                    );
+                    sleep(Duration::from_secs((attempt as u64).clamp(1, 5))).await;
+                }
+                Err(error) => {
+                    let _ = finish_gcid_import_file(
+                        &database_path,
+                        &job_id,
+                        &record.path,
+                        "failed",
+                        None,
+                        None,
+                        Some(&error),
+                    );
+                    status(
+                        &app,
+                        "error",
+                        format!("GCID 导入失败：{}：{error}", record.path),
+                    );
+                    terminal = true;
+                    break;
+                }
+            }
+        }
+        if !terminal {
+            let _ = finish_gcid_import_file(
+                &database_path,
+                &job_id,
+                &record.path,
+                "failed",
+                None,
+                None,
+                Some("达到最大重试次数"),
+            );
+        }
+        let completed = completed_since_emit.fetch_add(1, Ordering::Relaxed) + 1;
+        if completed % 50 == 0 {
+            emit_gcid_import_status(&app, &database_path, &job_id);
+        }
+    }
+}
+
+async fn run_gcid_import(
+    app: tauri::AppHandle,
+    state: SharedState,
+    database_path: PathBuf,
+    job_id: String,
+    destination_parent_id: String,
+    destination_name: String,
+    concurrency: usize,
+) {
+    let completed_since_emit = Arc::new(AtomicUsize::new(0));
+    let mut workers = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        workers.push(tauri::async_runtime::spawn(gcid_import_worker(
+            app.clone(),
+            state.clone(),
+            database_path.clone(),
+            job_id.clone(),
+            destination_parent_id.clone(),
+            destination_name.clone(),
+            completed_since_emit.clone(),
+        )));
+    }
+    for worker in workers {
+        let _ = worker.await;
+    }
+    let final_status = load_gcid_import_status(&database_path, Some(&job_id))
+        .ok()
+        .flatten();
+    let (status_value, error_value) = match final_status.as_ref() {
+        Some(result) if result.counts.pending > 0 || result.counts.processing > 0 => {
+            ("paused", Some("仍有未处理记录，可点击继续导入".to_string()))
+        }
+        Some(result)
+            if result.counts.failed > 0
+                || result.counts.missed > 0
+                || result.counts.conflict > 0 =>
+        {
+            (
+                "completed_with_errors",
+                Some("导入完成，但存在异常记录".to_string()),
+            )
+        }
+        Some(_) => ("completed", None),
+        None => ("failed", Some("无法读取导入任务状态".to_string())),
+    };
+    if let Ok(connection) = open_database(&database_path) {
+        let _ = connection.execute(
+            "UPDATE gcid_import_jobs
+             SET status = ?2, current_path = '', error = ?3, updated_at = ?4
+             WHERE job_id = ?1",
+            params![job_id, status_value, error_value, unix_timestamp()],
+        );
+    }
+    if let Ok(mut guard) = state.lock() {
+        guard.gcid_import_running.remove(&job_id);
+    }
+    emit_gcid_import_status(&app, &database_path, &job_id);
+    if status_value == "completed" {
+        status(&app, "success", "GCID JSON 秒传导入完成");
+    } else {
+        status(&app, "warning", "GCID JSON 秒传导入结束，请查看导入统计");
+    }
 }
 
 fn load_due_auto_shares(path: &Path) -> Result<Vec<PendingAutoShare>, String> {
@@ -2494,7 +3459,8 @@ async fn upload_oss(
         .layer(retry_layer)
         .finish();
     let size = fs::metadata(path).map_err(|e| e.to_string())?.len();
-    let part_size = oss_part_size(size);
+    let part_size = usize::try_from(oss_part_size(size))
+        .map_err(|_| "文件过大，当前平台无法设置 OSS 分片大小".to_string())?;
     let writer_future = operator
         .writer_with(object_path)
         .chunk(part_size)
@@ -3987,6 +4953,176 @@ fn collect_manual_uploads(path: &Path, remote_prefix: &str, files: &mut Vec<(Pat
     for entry in entries.flatten() {
         collect_manual_uploads(&entry.path(), &folder_prefix, files);
     }
+}
+
+#[tauri::command]
+fn select_gcid_import_file() -> Option<String> {
+    rfd::FileDialog::new()
+        .add_filter("光鸭 GCID JSON", &["json"])
+        .pick_file()
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn stage_gcid_import_text(
+    state: tauri::State<'_, SharedState>,
+    content: String,
+) -> Result<GcidImportSourceInfo, String> {
+    if content.trim().is_empty() {
+        return Err("请先粘贴 JSON 内容".to_string());
+    }
+    let size = content.len() as u64;
+    if size > MAX_GCID_IMPORT_BYTES {
+        return Err(format!(
+            "粘贴内容超过 {} MB，请改用文件导入",
+            MAX_GCID_IMPORT_BYTES / 1024 / 1024
+        ));
+    }
+    let hash = hex::encode(Sha256::digest(content.as_bytes()));
+    let database_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    let directory = database_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("imports");
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .map_err(|error| format!("创建导入暂存目录失败：{error}"))?;
+    let file_name = format!("粘贴导入-{}.json", &hash[..12]);
+    let file_path = directory.join(&file_name);
+    tokio::fs::write(&file_path, content.as_bytes())
+        .await
+        .map_err(|error| format!("写入粘贴 JSON 文件失败：{error}"))?;
+    Ok(GcidImportSourceInfo {
+        path: file_path.to_string_lossy().to_string(),
+        name: file_name,
+        size,
+    })
+}
+
+#[tauri::command]
+async fn prepare_gcid_import(
+    state: tauri::State<'_, SharedState>,
+    source_path: String,
+    destination_parent_id: String,
+    destination_name: String,
+) -> Result<GcidImportStatus, String> {
+    let source_path = PathBuf::from(source_path);
+    let metadata = tokio::fs::metadata(&source_path)
+        .await
+        .map_err(|error| format!("读取 JSON 文件失败：{error}"))?;
+    if !metadata.is_file() {
+        return Err("导入来源不是文件".to_string());
+    }
+    if metadata.len() > MAX_GCID_IMPORT_BYTES {
+        return Err(format!(
+            "JSON 文件超过 {} MB，拒绝载入",
+            MAX_GCID_IMPORT_BYTES / 1024 / 1024
+        ));
+    }
+    let raw = tokio::fs::read(&source_path)
+        .await
+        .map_err(|error| format!("读取 JSON 文件失败：{error}"))?;
+    let database_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    let job_id = prepare_gcid_import_database(
+        &database_path,
+        &raw,
+        &source_path,
+        &destination_parent_id,
+        &destination_name,
+    )?;
+    load_gcid_import_status(&database_path, Some(&job_id))?
+        .ok_or_else(|| "创建导入任务后无法读取状态".to_string())
+}
+
+#[tauri::command]
+fn get_gcid_import_status(
+    state: tauri::State<'_, SharedState>,
+    job_id: Option<String>,
+) -> Result<Option<GcidImportStatus>, String> {
+    let database_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    load_gcid_import_status(&database_path, job_id.as_deref())
+}
+
+#[tauri::command]
+fn start_gcid_import(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+    job_id: String,
+    concurrency: usize,
+) -> Result<GcidImportStatus, String> {
+    if !(1..=MAX_GCID_IMPORT_CONCURRENCY).contains(&concurrency) {
+        return Err(format!(
+            "秒传导入并发数必须在 1–{MAX_GCID_IMPORT_CONCURRENCY} 之间"
+        ));
+    }
+    let (database_path, has_token) = {
+        let guard = state.lock().map_err(|error| error.to_string())?;
+        (guard.db_path.clone(), guard.token.is_some())
+    };
+    if !has_token {
+        return Err("请先登录光鸭云盘".to_string());
+    }
+    let current = load_gcid_import_status(&database_path, Some(&job_id))?
+        .ok_or_else(|| "导入任务不存在，请重新选择 JSON".to_string())?;
+    if current.counts.pending == 0 && current.counts.processing == 0 && current.counts.failed == 0 {
+        return Ok(current);
+    }
+    {
+        let mut guard = state.lock().map_err(|error| error.to_string())?;
+        if !guard.gcid_import_running.insert(job_id.clone()) {
+            return Err("这个导入任务已经在运行".to_string());
+        }
+    }
+    let connection = open_database(&database_path)?;
+    if let Err(error) = connection.execute(
+        "UPDATE gcid_import_files
+         SET status = 'pending', attempts = 0, error = NULL, updated_at = ?2
+         WHERE job_id = ?1 AND status IN ('processing', 'failed')",
+        params![job_id, unix_timestamp()],
+    ) {
+        if let Ok(mut guard) = state.lock() {
+            guard.gcid_import_running.remove(&job_id);
+        }
+        return Err(format!("恢复未完成导入记录失败：{error}"));
+    }
+    if let Err(error) = connection.execute(
+        "UPDATE gcid_import_jobs
+         SET status = 'running', error = NULL, updated_at = ?2
+         WHERE job_id = ?1",
+        params![job_id, unix_timestamp()],
+    ) {
+        if let Ok(mut guard) = state.lock() {
+            guard.gcid_import_running.remove(&job_id);
+        }
+        return Err(format!("启动导入任务失败：{error}"));
+    }
+    let running = load_gcid_import_status(&database_path, Some(&job_id))?
+        .ok_or_else(|| "启动后无法读取导入任务".to_string())?;
+    let destination_parent_id = running.destination_parent_id.clone();
+    let destination_name = running.destination_name.clone();
+    emit_gcid_import_status(&app, &database_path, &job_id);
+    tauri::async_runtime::spawn(run_gcid_import(
+        app,
+        state.inner().clone(),
+        database_path,
+        job_id,
+        destination_parent_id,
+        destination_name,
+        concurrency,
+    ));
+    Ok(running)
 }
 
 #[tauri::command]
@@ -6022,6 +7158,7 @@ fn run() {
                 hdhive_secret,
                 hdhive_instance_id,
                 auto_share_processing: HashSet::new(),
+                gcid_import_running: HashSet::new(),
             }));
             app.manage(state.clone());
             let app_handle = app.handle().clone();
@@ -6093,6 +7230,11 @@ fn run() {
             poll_device_login,
             get_overview,
             list_files,
+            select_gcid_import_file,
+            stage_gcid_import_text,
+            prepare_gcid_import,
+            get_gcid_import_status,
+            start_gcid_import,
             select_upload_files,
             select_upload_folder,
             queue_upload_paths,
@@ -6445,11 +7587,29 @@ mod tests {
     }
 
     #[test]
-    fn multipart_part_size_matches_the_official_upload_tiers() {
+    fn multipart_part_size_uses_safe_tiers_and_stays_below_the_oss_part_limit() {
         assert_eq!(oss_part_size(100 * 1024 * 1024), 1024 * 1024);
-        assert_eq!(oss_part_size(101 * 1024 * 1024), 2 * 1024 * 1024);
-        assert_eq!(oss_part_size(2 * 1024 * 1024 * 1024), 4 * 1024 * 1024);
-        assert_eq!(oss_part_size(11 * 1024 * 1024 * 1024), 8 * 1024 * 1024);
+        assert_eq!(oss_part_size(100 * 1024 * 1024 + 1), 2 * 1024 * 1024);
+        assert_eq!(oss_part_size(1024 * 1024 * 1024), 2 * 1024 * 1024);
+        assert_eq!(oss_part_size(1024 * 1024 * 1024 + 1), 4 * 1024 * 1024);
+        assert_eq!(oss_part_size(10 * 1024 * 1024 * 1024), 4 * 1024 * 1024);
+        assert_eq!(
+            oss_part_size(10 * 1024 * 1024 * 1024 + 1),
+            OSS_LARGE_FILE_PART_SIZE
+        );
+
+        let failed_file_size = 96_220_456_048;
+        let part_size = oss_part_size(failed_file_size);
+        assert_eq!(part_size, OSS_LARGE_FILE_PART_SIZE);
+        assert_eq!(ceil_div_u64(failed_file_size, part_size), 5_736);
+        assert!(ceil_div_u64(failed_file_size, part_size) <= OSS_MULTIPART_TARGET_PARTS);
+
+        let tier_boundary = OSS_LARGE_FILE_PART_SIZE * OSS_MULTIPART_TARGET_PARTS;
+        assert_eq!(oss_part_size(tier_boundary), OSS_LARGE_FILE_PART_SIZE);
+        assert_eq!(
+            oss_part_size(tier_boundary + 1),
+            OSS_LARGE_FILE_PART_SIZE + OSS_MIB
+        );
     }
 
     #[test]
@@ -6738,6 +7898,138 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].task_id, "task-2");
         fs::remove_dir_all(root).expect("migration fixture cleanup");
+    }
+
+    #[test]
+    fn gcid_export_parser_accepts_numbers_and_strings() {
+        let raw = br#"{
+          "source": "guangya",
+          "hashType": "gcid",
+          "usesGcidInExport": true,
+          "commonPath": "H:/Media",
+          "totalFilesCount": 2,
+          "totalSize": "30",
+          "files": [
+            {
+              "path": "Movies/Film.mkv",
+              "size": 10,
+              "gcid": "0123456789ABCDEF0123456789ABCDEF01234567"
+            },
+            {
+              "path": "Shows\\Episode.mkv",
+              "size": "20",
+              "gcid": "89abcdef0123456789abcdef0123456789abcdef"
+            }
+          ]
+        }"#;
+        let (files, total_size, common_path) =
+            parse_gcid_export(raw).expect("valid Guangya export");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].folder_path, "Movies");
+        assert_eq!(files[0].name, "Film.mkv");
+        assert_eq!(files[0].gcid, "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(files[1].path, "Shows/Episode.mkv");
+        assert_eq!(total_size, 30);
+        assert_eq!(common_path, "H:/Media");
+    }
+
+    #[test]
+    fn gcid_export_parser_rejects_unsafe_and_duplicate_paths() {
+        let unsafe_raw = br#"{
+          "source": "guangya",
+          "hashType": "gcid",
+          "usesGcidInExport": true,
+          "files": [{
+            "path": "../secret.mkv",
+            "size": 1,
+            "gcid": "0123456789abcdef0123456789abcdef01234567"
+          }]
+        }"#;
+        assert!(parse_gcid_export(unsafe_raw)
+            .expect_err("parent traversal must be rejected")
+            .contains("越界"));
+
+        let duplicate_raw = br#"{
+          "source": "guangya",
+          "hashType": "gcid",
+          "usesGcidInExport": true,
+          "files": [
+            {
+              "path": "Movies/Film.mkv",
+              "size": 1,
+              "gcid": "0123456789abcdef0123456789abcdef01234567"
+            },
+            {
+              "path": "Movies\\Film.mkv",
+              "size": 1,
+              "gcid": "89abcdef0123456789abcdef0123456789abcdef"
+            }
+          ]
+        }"#;
+        assert!(parse_gcid_export(duplicate_raw)
+            .expect_err("normalized duplicate paths must be rejected")
+            .contains("重复路径"));
+    }
+
+    #[test]
+    fn gcid_import_jobs_are_scoped_to_destination() {
+        let raw = br#"{"source":"guangya"}"#;
+        let first = gcid_import_job_id(raw, "", "Media Library");
+        assert_eq!(first, gcid_import_job_id(raw, "", "Media Library"));
+        assert_ne!(first, gcid_import_job_id(raw, "parent-1", "Media Library"));
+        assert_ne!(first, gcid_import_job_id(raw, "", "Other Library"));
+        assert_eq!(first.len(), 32);
+        assert!(validate_gcid_destination("Media Library").is_ok());
+        assert!(validate_gcid_destination("../Media Library").is_err());
+    }
+
+    #[test]
+    fn completed_gcid_import_is_idempotent_when_prepared_again() {
+        let root = std::env::temp_dir().join(format!("guangya-gcid-test-{}", Uuid::new_v4()));
+        let database = root.join("state.sqlite3");
+        let source = root.join("library.json");
+        init_database(&database).expect("database should initialize");
+        let raw = br#"{
+          "source": "guangya",
+          "hashType": "gcid",
+          "usesGcidInExport": true,
+          "totalFilesCount": 1,
+          "totalSize": 10,
+          "files": [{
+            "path": "Movies/Film.mkv",
+            "size": 10,
+            "gcid": "0123456789abcdef0123456789abcdef01234567"
+          }]
+        }"#;
+        let job_id = prepare_gcid_import_database(&database, raw, &source, "", "Media Library")
+            .expect("job should be prepared");
+        let connection = open_database(&database).expect("database should reopen");
+        connection
+            .execute(
+                "UPDATE gcid_import_files SET status = 'imported' WHERE job_id = ?1",
+                params![job_id],
+            )
+            .expect("file should become imported");
+        connection
+            .execute(
+                "UPDATE gcid_import_jobs SET status = 'completed' WHERE job_id = ?1",
+                params![job_id],
+            )
+            .expect("job should become completed");
+        drop(connection);
+
+        assert_eq!(
+            prepare_gcid_import_database(&database, raw, &source, "", "Media Library")
+                .expect("same job should be reusable"),
+            job_id
+        );
+        let status = load_gcid_import_status(&database, Some(&job_id))
+            .expect("status should load")
+            .expect("status should exist");
+        assert_eq!(status.status, "completed");
+        assert_eq!(status.counts.imported, 1);
+        assert_eq!(status.counts.pending, 0);
+        fs::remove_dir_all(root).expect("GCID fixture cleanup");
     }
 }
 

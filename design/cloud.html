@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>光鸭云盘 · 云盘文件 (Liquid Glass 预览)</title>
+  <link rel="stylesheet" href="./glass.css" />
+</head>
+<body>
+  <!-- 图标符号库 (inline svg) -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <g id="i-cloud"><path d="M6.5 18a4 4 0 0 1-.5-7.97A5.5 5.5 0 0 1 17 9.5a3.5 3.5 0 0 1-.5 6.98" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></g>
+      <g id="i-folder"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4l1.5 2h5.5A1.5 1.5 0 0 1 17 8.5v8A1.5 1.5 0 0 1 15.5 18h-11A1.5 1.5 0 0 1 3 16.5z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></g>
+      <g id="i-video"><rect x="3" y="5" width="14" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 8.5v3l3-1.5z" fill="currentColor"/></g>
+      <g id="i-image"><rect x="3" y="4.5" width="14" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="7.5" cy="8.5" r="1.3" fill="currentColor"/><path d="M4 14l4-4 3 3 2-2 3 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></g>
+      <g id="i-doc"><path d="M5 3.5h6l4 4v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-12a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M11 3.5v4h4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></g>
+      <g id="i-back"><path d="M12 5l-6 5 6 5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></g>
+      <g id="i-up"><path d="M10 15V5m0 0l-4 4m4-4l4 4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></g>
+      <g id="i-down"><path d="M10 5v10m0 0l-4-4m4 4l4-4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></g>
+      <g id="i-caret"><path d="M6 8l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></g>
+      <g id="i-reload"><path d="M15.5 6.5A6 6 0 1 0 16 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M16 4v3h-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></g>
+      <g id="i-inbox"><path d="M3 11l2-6h10l2 6v4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M3 11h4l1 2h4l1-2h4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></g>
+      <g id="i-link"><path d="M8 12l4-4m-3 6l-1.5 1.5a2.8 2.8 0 0 1-4-4L5 10m6-6l1.5-1.5a2.8 2.8 0 0 1 4 4L15 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></g>
+      <g id="i-json"><path d="M5 3.5h6l4 4v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-12a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M7 12l1.5-2L7 8m6 4l-1.5-2L13 8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></g>
+      <g id="i-edit"><path d="M4 16l1-3.5L13 4.5a1.5 1.5 0 0 1 2 2L6.5 15z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></g>
+      <g id="i-copy"><rect x="7" y="7" width="9" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M4 13V5a1 1 0 0 1 1-1h8" fill="none" stroke="currentColor" stroke-width="1.5"/></g>
+      <g id="i-move"><path d="M4 10h12m0 0l-4-4m4 4l-4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></g>
+      <g id="i-share"><circle cx="15" cy="5" r="2" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="5" cy="10" r="2" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="15" cy="15" r="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M6.8 9l6.4-3M6.8 11l6.4 3" stroke="currentColor" stroke-width="1.5"/></g>
+      <g id="i-trash"><path d="M4.5 6h11M8 6V4.5h4V6m-6 0l.7 10h6.6L15 6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></g>
+      <g id="i-pause"><path d="M7 5v10M13 5v10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></g>
+      <g id="i-check"><path d="M4 10l4 4 8-9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></g>
+      <g id="i-info"><circle cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 9v4.5M10 6.5v.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></g>
+      <g id="i-settings"><circle cx="10" cy="10" r="2.4" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 2.6v2.2M10 15.2v2.2M17.4 10h-2.2M4.8 10H2.6M15.2 4.8l-1.6 1.6M6.4 13.6l-1.6 1.6M15.2 15.2l-1.6-1.6M6.4 6.4 4.8 4.8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></g>
+      <g id="i-close"><path d="M5 5l10 10M15 5L5 15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></g>
+      <g id="i-duck" fill-rule="evenodd" clip-rule="evenodd"><path d="M8 3.4A3.6 3.6 0 0 0 4.6 8C3.3 8.4 2.4 9.6 2.4 11c0 2.9 3 5.2 7.4 5.2h3.8c3.2 0 5.8-2 5.8-4.8 0-1.2-.5-2.2-1-2.8.9-.2 1.6-.9 1.9-1.8-1 .1-2 .1-2 .1A5 5 0 0 0 8 3.4Zm-1 3.2a1 1 0 1 1 0 2 1 1 0 0 1 0-2Z" fill="currentColor"/></g>
+    </defs>
+  </svg>
+
+  <div class="app">
+    <!-- ============ 侧栏 ============ -->
+    <aside class="sidebar glass">
+      <div class="brand">
+        <div class="brand-mark"><svg width="24" height="24" aria-hidden="true"><use href="#i-duck"/></svg></div>
+        <div class="brand-name"><strong>光鸭云盘</strong><span>GUANGYA SYNC</span></div>
+      </div>
+
+      <nav class="menu">
+        <button class="menu-item active"><span class="ic"><svg width="18" height="18"><use href="#i-cloud"/></svg></span>云盘文件</button>
+        <button class="menu-item"><span class="ic"><svg width="18" height="18"><use href="#i-folder"/></svg></span>备份任务</button>
+        <button class="menu-item"><span class="ic"><svg width="18" height="18"><use href="#i-up"/></svg></span>传输管理</button>
+        <button class="menu-item"><span class="ic"><svg width="18" height="18"><use href="#i-down"/></svg></span>离线下载</button>
+        <button class="menu-item"><span class="ic"><svg width="18" height="18"><use href="#i-share"/></svg></span>分享管理</button>
+        <button class="menu-item"><span class="ic"><svg width="18" height="18"><use href="#i-settings"/></svg></span>设置</button>
+      </nav>
+
+      <div class="side-foot">
+        <div class="status-chip"><span class="dot on"></span><div class="st"><strong>云盘已连接</strong><span>中国移动云盘</span></div></div>
+        <div class="status-chip"><span class="dot on"></span><div class="st"><strong>桌面监控运行中</strong><span>2 个备份任务</span></div></div>
+      </div>
+
+      <!-- 账号信息移到底部 -->
+      <div class="profile">
+        <div class="profile-head">
+          <div class="avatar">鸭</div>
+          <div class="profile-id"><strong>光鸭用户</strong><span>138****6688</span></div>
+          <span class="vip-tag">VIP</span>
+        </div>
+        <div class="quota">
+          <div class="quota-row"><span>已用 1.24 TB</span><strong>2 TB</strong></div>
+          <div class="quota-bar"><i></i></div>
+          <small>剩余 780 GB · VIP 2026-12-31 到期</small>
+        </div>
+      </div>
+      <div class="version">v0.1.15 · 桌面端</div>
+    </aside>
+
+    <!-- ============ 主区域 ============ -->
+    <section class="main glass">
+      <!-- 顶栏 -->
+      <header class="topbar">
+        <div class="page-title">
+          <span class="ic"><svg width="18" height="18"><use href="#i-cloud"/></svg></span>
+          <h1>云盘文件</h1>
+        </div>
+        <div class="queue-pill" id="queuePill">
+          <div class="queue-stat"><span class="ic"><svg width="14" height="14"><use href="#i-up"/></svg></span>上传中 <b>3</b></div>
+          <div class="queue-sep"></div>
+          <div class="queue-stat">等待 <b>12</b></div>
+          <div class="queue-sep"></div>
+          <div class="queue-stat queue-speed">2.4 MB/s</div>
+          <button class="queue-btn" title="暂停队列" aria-label="暂停上传队列"><svg width="14" height="14" aria-hidden="true"><use href="#i-pause"/></svg></button>
+        </div>
+      </header>
+
+      <!-- 内容 -->
+      <div class="content">
+        <div class="file-card">
+          <!-- 工具栏 -->
+          <div class="toolbar">
+            <div class="toolbar-group">
+              <button class="btn ghost" disabled><span class="ic"><svg width="14" height="14"><use href="#i-back"/></svg></span>返回</button>
+              <div class="crumbs">
+                <button>全部文件</button>
+                <span class="sep">›</span>
+                <button>影视资源</button>
+                <span class="sep">›</span>
+                <button class="here">2026 蓝光收藏</button>
+              </div>
+            </div>
+            <div class="toolbar-group">
+              <button class="btn"><span class="ic"><svg width="14" height="14"><use href="#i-inbox"/></svg></span>接收分享</button>
+              <button class="btn"><span class="ic"><svg width="14" height="14"><use href="#i-link"/></svg></span>收藏链接</button>
+              <button class="btn" onclick="openModal()"><span class="ic"><svg width="14" height="14"><use href="#i-json"/></svg></span>JSON 秒传</button>
+              <div class="split">
+                <button class="btn primary"><span class="ic"><svg width="14" height="14"><use href="#i-up"/></svg></span>上传文件</button>
+                <button class="btn primary split-caret" aria-label="更多上传方式"><svg width="14" height="14" aria-hidden="true"><use href="#i-caret"/></svg></button>
+              </div>
+              <button class="btn"><span class="ic"><svg width="14" height="14"><use href="#i-reload"/></svg></span>刷新</button>
+            </div>
+          </div>
+
+          <!-- 批量操作栏：选中文件时出现 -->
+          <div class="selbar" id="selBar">
+            <span class="sel-count"><span class="badge-n">2</span>已选中</span>
+            <div class="sel-divider"></div>
+            <div class="sel-actions">
+              <button class="sel-act"><span class="ic"><svg width="15" height="15"><use href="#i-down"/></svg></span>下载</button>
+              <button class="sel-act"><span class="ic"><svg width="15" height="15"><use href="#i-edit"/></svg></span>重命名</button>
+              <button class="sel-act"><span class="ic"><svg width="15" height="15"><use href="#i-copy"/></svg></span>复制到</button>
+              <button class="sel-act"><span class="ic"><svg width="15" height="15"><use href="#i-move"/></svg></span>移动到</button>
+              <button class="sel-act"><span class="ic"><svg width="15" height="15"><use href="#i-share"/></svg></span>分享</button>
+              <button class="sel-act danger"><span class="ic"><svg width="15" height="15"><use href="#i-trash"/></svg></span>删除</button>
+            </div>
+            <button class="sel-act sel-close" title="取消选择" aria-label="取消选择" onclick="clearSelection()"><svg width="15" height="15" aria-hidden="true"><use href="#i-close"/></svg></button>
+          </div>
+
+          <!-- 上传进度（传输中态显示） -->
+          <div class="upload-progress hidden" id="uploadProgress">
+            <span class="ic"><svg width="18" height="18"><use href="#i-cloud"/></svg></span>
+            <div class="upload-progress-body">
+              <strong>正在上传 The.Movie.2026.2160p.mkv · 3 / 15</strong>
+              <div class="up-bar"><i></i></div>
+            </div>
+          </div>
+
+          <!-- 文件表格 (默认已登录态) -->
+          <div class="file-table" id="viewNormal">
+            <div class="thead">
+              <div>名称</div>
+              <div class="col-r">大小</div>
+              <div class="col-r">修改时间</div>
+            </div>
+            <div class="tbody">
+              <div class="row" oncontextmenu="showMenu(event); return false;">
+                <div class="cell-name">
+                  <span class="checkbox"></span>
+                  <div class="file-icon folder"><svg width="17" height="17"><use href="#i-folder"/></svg></div>
+                  <div class="name-wrap"><a class="nm" href="javascript:void 0">杜比视界原盘</a></div>
+                </div>
+                <div class="cell-size">—</div>
+                <div class="cell-time">2026-07-20 14:02</div>
+              </div>
+              <div class="row sel" oncontextmenu="showMenu(event); return false;">
+                <div class="cell-name">
+                  <span class="checkbox"><svg width="10" height="10"><use href="#i-check"/></svg></span>
+                  <div class="file-icon video"><svg width="17" height="17"><use href="#i-video"/></svg></div>
+                  <div class="name-wrap"><span class="nm">The.Movie.2026.2160p.BluRay.x265.mkv</span><span class="ext-tag">mkv</span></div>
+                </div>
+                <div class="cell-size">42.8 GB</div>
+                <div class="cell-time">2026-07-19 21:47</div>
+              </div>
+              <div class="row sel" oncontextmenu="showMenu(event); return false;">
+                <div class="cell-name">
+                  <span class="checkbox"><svg width="10" height="10"><use href="#i-check"/></svg></span>
+                  <div class="file-icon video"><svg width="17" height="17"><use href="#i-video"/></svg></div>
+                  <div class="name-wrap"><span class="nm">Documentary.S01E03.1080p.mp4</span><span class="ext-tag">mp4</span></div>
+                </div>
+                <div class="cell-size">3.2 GB</div>
+                <div class="cell-time">2026-07-18 09:15</div>
+              </div>
+              <div class="row" oncontextmenu="showMenu(event); return false;">
+                <div class="cell-name">
+                  <span class="checkbox"></span>
+                  <div class="file-icon image"><svg width="17" height="17"><use href="#i-image"/></svg></div>
+                  <div class="name-wrap"><span class="nm">封面海报-4K.png</span><span class="ext-tag">png</span></div>
+                </div>
+                <div class="cell-size">8.4 MB</div>
+                <div class="cell-time">2026-07-17 16:33</div>
+              </div>
+              <div class="row" oncontextmenu="showMenu(event); return false;">
+                <div class="cell-name">
+                  <span class="checkbox"></span>
+                  <div class="file-icon doc"><svg width="17" height="17"><use href="#i-doc"/></svg></div>
+                  <div class="name-wrap"><span class="nm">字幕合集-简繁英.zip</span><span class="ext-tag">zip</span></div>
+                </div>
+                <div class="cell-size">1.1 MB</div>
+                <div class="cell-time">2026-07-15 11:20</div>
+              </div>
+              <div class="row" oncontextmenu="showMenu(event); return false;">
+                <div class="cell-name">
+                  <span class="checkbox"></span>
+                  <div class="file-icon file"><svg width="17" height="17"><use href="#i-doc"/></svg></div>
+                  <div class="name-wrap"><span class="nm">这是一个非常长的文件名用于演示长名称在窄列里的省略号截断效果.txt</span><span class="ext-tag">txt</span></div>
+                </div>
+                <div class="cell-size">12 KB</div>
+                <div class="cell-time">2026-07-12 08:00</div>
+              </div>
+            </div>
+            <div class="file-foot">
+              <span>6 个项目 · 已选 2 项</span>
+              <span class="hint"><svg width="13" height="13"><use href="#i-up"/></svg> 拖拽文件到此处可直接上传</span>
+            </div>
+          </div>
+
+          <!-- 空状态 -->
+          <div class="file-table hidden" id="viewEmpty">
+            <div class="thead"><div>名称</div><div class="col-r">大小</div><div class="col-r">修改时间</div></div>
+            <div class="state-block">
+              <div class="state-icon"><svg width="34" height="34"><use href="#i-folder"/></svg></div>
+              <h3>此文件夹为空</h3>
+              <p>拖拽文件到窗口，或点击右上角「上传文件」开始使用。</p>
+              <button class="btn primary"><span class="ic"><svg width="14" height="14"><use href="#i-up"/></svg></span>上传文件</button>
+            </div>
+          </div>
+
+          <!-- 加载中 -->
+          <div class="file-table hidden" id="viewLoading">
+            <div class="thead"><div>名称</div><div class="col-r">大小</div><div class="col-r">修改时间</div></div>
+            <div class="tbody">
+              <div class="skeleton-row"><div class="cell-name"><span class="sk avatar"></span><span class="sk" style="width:60%"></span></div><span class="sk" style="width:60px;margin-left:auto"></span><span class="sk" style="width:110px;margin-left:auto"></span></div>
+              <div class="skeleton-row"><div class="cell-name"><span class="sk avatar"></span><span class="sk" style="width:75%"></span></div><span class="sk" style="width:50px;margin-left:auto"></span><span class="sk" style="width:110px;margin-left:auto"></span></div>
+              <div class="skeleton-row"><div class="cell-name"><span class="sk avatar"></span><span class="sk" style="width:45%"></span></div><span class="sk" style="width:70px;margin-left:auto"></span><span class="sk" style="width:110px;margin-left:auto"></span></div>
+              <div class="skeleton-row"><div class="cell-name"><span class="sk avatar"></span><span class="sk" style="width:68%"></span></div><span class="sk" style="width:55px;margin-left:auto"></span><span class="sk" style="width:110px;margin-left:auto"></span></div>
+            </div>
+          </div>
+
+          <!-- 未登录 -->
+          <div class="file-table hidden" id="viewGuest">
+            <div class="thead"><div>名称</div><div class="col-r">大小</div><div class="col-r">修改时间</div></div>
+            <div class="state-block">
+              <div class="state-icon"><svg width="34" height="34"><use href="#i-cloud"/></svg></div>
+              <h3>登录后查看云盘文件</h3>
+              <p>桌面端使用扫码授权登录，登录状态会保存在本机。</p>
+              <button class="btn primary">扫码登录</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ============ 右键菜单示意 ============ -->
+  <div class="context-menu hidden" id="ctxMenu">
+    <button><span class="ic"><svg width="14" height="14"><use href="#i-down"/></svg></span>下载</button>
+    <div class="context-sep"></div>
+    <button><span class="ic"><svg width="14" height="14"><use href="#i-edit"/></svg></span>重命名<kbd>F2</kbd></button>
+    <div class="context-sep"></div>
+    <button><span class="ic"><svg width="14" height="14"><use href="#i-copy"/></svg></span>复制到…</button>
+    <button><span class="ic"><svg width="14" height="14"><use href="#i-move"/></svg></span>移动到…</button>
+    <div class="context-sep"></div>
+    <button><span class="ic"><svg width="14" height="14"><use href="#i-share"/></svg></span>创建分享</button>
+    <button class="danger"><span class="ic"><svg width="14" height="14"><use href="#i-trash"/></svg></span>删除<kbd>Del</kbd></button>
+  </div>
+
+  <!-- ============ GCID JSON 秒传弹窗 ============ -->
+  <div class="scrim hidden" id="scrim" onclick="if(event.target===this)closeModal()">
+    <div class="modal">
+      <div class="modal-head">
+        <span class="ic"><svg width="18" height="18"><use href="#i-json"/></svg></span>
+        <div><h2>JSON 秒传导入</h2><p>粘贴包含 GCID 信息的 JSON，秒传到当前目录</p></div>
+      </div>
+      <div class="modal-body">
+        <div class="tip"><span class="ic"><svg width="15" height="15"><use href="#i-info"/></svg></span><span>支持选择 GCID JSON 文件或直接粘贴内容，匹配成功即秒传，无需重新上传。</span></div>
+        <div class="field">
+          <label>目标文件夹</label>
+          <input class="input" value="全部文件 / 影视资源 / 2026 蓝光收藏" readonly />
+        </div>
+        <div class="field-row">
+          <div class="field" style="margin:0"><label>并发数 (1–16)</label>
+            <div class="stepper"><button>−</button><div class="val">8</div><button>+</button></div>
+          </div>
+        </div>
+        <div class="field">
+          <label>JSON 内容</label>
+          <textarea class="textarea" rows="7" placeholder='[{"file_name":"…","gcid":"…","size":123}]'>[
+  { "file_name": "The.Movie.2026.2160p.mkv", "gcid": "A1B2C3…", "size": 45902847521 },
+  { "file_name": "Documentary.S01E03.1080p.mp4", "gcid": "D4E5F6…", "size": 3435973836 }
+]</textarea>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn ghost" onclick="closeModal()">取消</button>
+        <button class="btn primary" onclick="closeModal()">开始导入</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 状态切换条 (仅预览用) ============ -->
+  <div class="preview-switch">
+    <button class="on" data-view="viewNormal" onclick="setView(this)">已登录</button>
+    <button data-view="viewEmpty" onclick="setView(this)">空状态</button>
+    <button data-view="viewLoading" onclick="setView(this)">加载中</button>
+    <button data-view="viewGuest" onclick="setView(this)">未登录</button>
+    <button onclick="toggleTransfer(this)">传输中</button>
+  </div>
+
+  <script>
+    const views = ['viewNormal', 'viewEmpty', 'viewLoading', 'viewGuest'];
+    function setView(btn) {
+      document.querySelectorAll('.preview-switch button[data-view]').forEach(b => b.classList.remove('on'));
+      btn.classList.add('on');
+      views.forEach(v => document.getElementById(v).classList.toggle('hidden', v !== btn.dataset.view));
+      // 批量操作栏仅在“已登录”且有选中项时出现
+      document.getElementById('selBar').classList.toggle('hidden', btn.dataset.view !== 'viewNormal');
+    }
+    function toggleTransfer(btn) {
+      btn.classList.toggle('on');
+      document.getElementById('uploadProgress').classList.toggle('hidden');
+    }
+    function clearSelection() {
+      document.getElementById('selBar').classList.add('hidden');
+      document.querySelectorAll('#viewNormal .row.sel').forEach(r => {
+        r.classList.remove('sel');
+        r.querySelector('.checkbox').innerHTML = '';
+      });
+    }
+    function openModal() { document.getElementById('scrim').classList.remove('hidden'); }
+    function closeModal() { document.getElementById('scrim').classList.add('hidden'); }
+    const ctx = document.getElementById('ctxMenu');
+    function showMenu(e) {
+      ctx.classList.remove('hidden');
+      const x = Math.min(e.clientX, innerWidth - 216);
+      const y = Math.min(e.clientY, innerHeight - ctx.offsetHeight - 12);
+      ctx.style.left = x + 'px';
+      ctx.style.top = y + 'px';
+    }
+    addEventListener('click', e => { if (!e.target.closest('#ctxMenu')) ctx.classList.add('hidden'); });
+    addEventListener('keydown', e => { if (e.key === 'Escape') { closeModal(); ctx.classList.add('hidden'); } });
+  </script>
+</body>
+</html>

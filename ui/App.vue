@@ -12,6 +12,7 @@ import {
 import { readJsonResponse } from './httpResponse.js';
 import { parseGuangyaShareLink } from './shareLink.js';
 import { createConcurrencyQueue, normalizeTransferConcurrency } from './transferQueue.js';
+import { gcidImportPercent, shouldConvertPasteToFile } from './gcidImport.js';
 import {
   ArrowDownOutlined,
   ArrowUpOutlined,
@@ -129,35 +130,35 @@ const theme = {
     colorSuccess: '#16a672',
     colorWarning: '#f59e0b',
     colorError: '#e5484d',
-    borderRadius: 8,
-    borderRadiusLG: 12,
+    borderRadius: 6,
+    borderRadiusLG: 8,
     controlHeight: 28,
     controlHeightSM: 22,
     controlHeightLG: 34,
     fontSize: 13,
     colorBgLayout: '#f5f7fb',
     colorText: '#172033',
-    colorTextSecondary: '#6f7a8a',
+    colorTextSecondary: '#667085',
     fontFamily: "Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif",
   },
   components: {
     Layout: { bodyBg: '#f5f7fb', siderBg: '#ffffff', headerBg: '#f5f7fb' },
-    Menu: { itemBorderRadius: 8, itemHeight: 38, itemMarginInline: 10 },
-    Table: { headerBg: '#fafbfc', headerColor: '#667085', rowHoverBg: '#f5f9ff' },
+    Menu: { itemBorderRadius: 6, itemHeight: 36, itemMarginInline: 8 },
+    Table: { headerBg: '#f8fafc', headerColor: '#667085', rowHoverBg: '#f5f9ff' },
   },
 };
 
 const navigation = [
   { key: 'cloud', label: '云盘文件', icon: () => h(CloudOutlined) },
   { key: 'backup', label: '备份任务', icon: () => h(CloudSyncOutlined) },
-  { key: 'downloads', label: '下载管理', icon: () => h(DownloadOutlined) },
+  { key: 'downloads', label: '传输管理', icon: () => h(SwapOutlined) },
   { key: 'offline', label: '离线下载', icon: () => h(DownloadOutlined) },
   { key: 'shares', label: '分享管理', icon: () => h(ShareAltOutlined) },
 ];
 const pageMeta = {
   cloud: ['云盘文件', '浏览、整理和分享云端内容'],
   backup: ['备份任务', '持续监控本地文件夹并自动上传'],
-  downloads: ['下载管理', '查看保存到本机的下载任务和实时进度'],
+  downloads: ['传输管理', '统一查看上传与下载任务、进度和速度'],
   offline: ['离线下载', '让云端代你下载链接资源'],
   shares: ['分享管理', '查询、复制和取消当前账号创建的分享'],
 };
@@ -191,6 +192,16 @@ const shareOpen = ref(false);
 const loginOpen = ref(false);
 const shareResultOpen = ref(false);
 const loginToken = ref('');
+const gcidImport = reactive({
+  open: false,
+  loading: false,
+  sourcePath: '',
+  sourceName: '',
+  pastedJson: '',
+  destinationName: '',
+  concurrency: 4,
+  status: null,
+});
 const lastShare = reactive({ label: '', url: '', code: '', reused: false, hdhiveStatus: '', hdhiveMessage: '', hdhiveEventId: '' });
 const backupForm = reactive({ local_path: '', remote_path: '', remote_parent_id: '', source_policy: 'keep', archive_path: '', scan_existing: true, sync_types: [...defaultSyncExtensions], monitor_mode: 'native', auto_share: false });
 const hdhiveForm = reactive({ base_url: '', secret: '' });
@@ -229,11 +240,11 @@ const activeServerRoot = computed(() => [...serverFilePicker.roots]
   .find((root) => serverFilePicker.path === root || serverFilePicker.path.startsWith(root.endsWith('/') || root.endsWith('\\') ? root : `${root}${root.includes('\\') ? '\\' : '/'}`)) || serverFilePicker.roots[0]);
 let devicePollTimer = null;
 let deviceExpiryTimer = null;
+let gcidImportPollTimer = null;
 let unsubscribe = null;
 let unsubscribeDrag = null;
 let ruleId = 0;
 let refreshTimer = null;
-const uploadRemovalTimers = new Map();
 const localDownloadQueue = createConcurrencyQueue(() => appState.download_concurrency);
 
 const pageTitle = computed(() => pageMeta[activeView.value][0]);
@@ -262,11 +273,16 @@ const vipExpireTime = computed(() => pick(overview.assets, ['vipExpireTime', 'vi
 const vipLabel = computed(() => isVip.value ? 'VIP会员' : vipExpired.value ? 'VIP已过期' : '普通用户');
 const vipExpireLabel = computed(() => vipExpireTime.value ? formatTime(vipExpireTime.value) : isVip.value ? '未返回到期时间' : '未开通 VIP');
 const queueText = computed(() => appState.paused ? '队列已暂停' : appState.active_uploads ? '正在上传' : appState.pending ? '等待上传' : '队列空闲');
-const recentUploads = computed(() => orderUploadProgress(Object.values(uploadProgress.value)).slice(0, 8));
+const recentUploads = computed(() => orderUploadProgress(Object.values(uploadProgress.value)).slice(0, 30));
 const totalUploadSpeed = computed(() => recentUploads.value.reduce((total, upload) => total + (upload.state === 'uploading' ? Number(upload.bytesPerSecond || 0) : 0), 0));
+const activeUploadCount = computed(() => recentUploads.value.filter((upload) => !['done', 'error'].includes(upload.state)).length);
+const finishedUploadCount = computed(() => recentUploads.value.filter((upload) => ['done', 'error'].includes(upload.state)).length);
 const selectedFiles = computed(() => files.value.filter((item) => selectedFileIds.value.includes(fileId(item))));
 const activeDownloadCount = computed(() => downloadTasks.value.filter((task) => ['preparing', 'downloading'].includes(task.status)).length);
 const queuedDownloadCount = computed(() => downloadTasks.value.filter((task) => task.status === 'queued').length);
+const finishedDownloadCount = computed(() => downloadTasks.value.filter((task) => ['completed', 'failed'].includes(task.status)).length);
+const gcidImportRunning = computed(() => ['preparing', 'running'].includes(gcidImport.status?.status));
+const gcidImportProgress = computed(() => gcidImportPercent(gcidImport.status));
 const currentFolderPath = computed(() => currentPath.value.length ? `根目录 / ${currentPath.value.map((item) => item.name).join(' / ')}` : '根目录');
 const clipboardLabel = computed(() => clipboard.items.length ? `${clipboard.mode === 'move' ? '剪切' : '复制'} ${clipboard.items.length} 项` : '');
 const lastShareReceipt = computed(() => appState.auto_share_receipts.find((receipt) => receipt.event_id === lastShare.hdhiveEventId) || null);
@@ -303,8 +319,8 @@ function offlineStatus(record) {
 const fileColumns = [
   { title: '名称', key: 'name', dataIndex: 'fileName' },
   { title: '类型', key: 'type', width: 110 },
-  { title: '大小', key: 'size', width: 120 },
-  { title: '更新时间', key: 'time', width: 180 },
+  { title: '大小', key: 'size', width: 110 },
+  { title: '更新时间', key: 'time', width: 170 },
 ];
 const offlineColumns = [
   { title: '任务名称', key: 'name' },
@@ -407,11 +423,6 @@ function updateUploadProgress(payload) {
   const previous = uploadProgress.value[filePath] || { percent: 0, state: 'queued', stage: '排队等待' };
   const next = nextUploadProgress(previous, payload);
   if (next === previous) return;
-  const pendingRemoval = uploadRemovalTimers.get(filePath);
-  if (pendingRemoval) {
-    clearTimeout(pendingRemoval);
-    uploadRemovalTimers.delete(filePath);
-  }
   uploadProgress.value = {
     ...uploadProgress.value,
     [filePath]: {
@@ -421,19 +432,10 @@ function updateUploadProgress(payload) {
       ...next,
     },
   };
-  const entries = Object.entries(uploadProgress.value).sort((left, right) => right[1].updatedAt - left[1].updatedAt).slice(0, 30);
+  const entries = Object.entries(uploadProgress.value)
+    .sort((left, right) => right[1].updatedAt - left[1].updatedAt)
+    .slice(0, 50);
   uploadProgress.value = Object.fromEntries(entries);
-  if (next.state === 'done') {
-    const completedAt = next.updatedAt;
-    uploadRemovalTimers.set(filePath, setTimeout(() => {
-      const current = uploadProgress.value[filePath];
-      uploadRemovalTimers.delete(filePath);
-      if (current?.state !== 'done' || current.updatedAt !== completedAt) return;
-      const remaining = { ...uploadProgress.value };
-      delete remaining[filePath];
-      uploadProgress.value = remaining;
-    }, 3000));
-  }
 }
 function applyState(next = {}) {
   Object.assign(appState, next);
@@ -585,6 +587,125 @@ function openShareForm() {
   shareForm.url = '';
   shareOpen.value = true;
 }
+function stopGcidImportPolling() {
+  clearInterval(gcidImportPollTimer);
+  gcidImportPollTimer = null;
+}
+function resetGcidImportDraft() {
+  stopGcidImportPolling();
+  Object.assign(gcidImport, {
+    loading: false,
+    sourcePath: '',
+    sourceName: '',
+    pastedJson: '',
+    destinationName: '',
+    concurrency: 4,
+    status: null,
+  });
+}
+function applyGcidImportStatus(status) {
+  if (!status) return;
+  gcidImport.status = status;
+  if (status.source_path) {
+    gcidImport.sourcePath = status.source_path;
+    gcidImport.sourceName = status.source_name || uploadFileName(status.source_path);
+  }
+  if (status.destination_name) gcidImport.destinationName = status.destination_name;
+  if (!['preparing', 'running'].includes(status.status)) {
+    stopGcidImportPolling();
+  }
+}
+async function refreshGcidImportStatus(jobId = gcidImport.status?.job_id) {
+  const status = unwrapData(await bridge.invoke('get_gcid_import_status', { job_id: jobId || null }));
+  if (status) applyGcidImportStatus(status);
+  return status;
+}
+function startGcidImportPolling() {
+  stopGcidImportPolling();
+  gcidImportPollTimer = setInterval(async () => {
+    try {
+      const previousStatus = gcidImport.status?.status;
+      const status = await refreshGcidImportStatus();
+      if (
+        ['preparing', 'running'].includes(previousStatus)
+        && status
+        && !['preparing', 'running'].includes(status.status)
+      ) {
+        await loadFiles();
+        if (status.status === 'completed') message.success('GCID JSON 秒传导入完成');
+        else message.warning(status.error || 'GCID 导入结束，部分记录需要处理');
+      }
+    } catch {
+      // 状态事件仍会继续推送；短暂轮询失败无需打断后台任务。
+    }
+  }, 1000);
+}
+async function openGcidImport() {
+  gcidImport.open = true;
+  if (!gcidImport.destinationName) gcidImport.destinationName = 'GCID 导入';
+  try {
+    const latest = await refreshGcidImportStatus();
+    if (latest && ['preparing', 'running'].includes(latest.status)) startGcidImportPolling();
+  } catch {
+    // 没有历史任务时保持新建表单。
+  }
+}
+async function selectGcidImportFile() {
+  try {
+    const path = await bridge.invoke('select_gcid_import_file');
+    if (!path) return;
+    gcidImport.sourcePath = path;
+    gcidImport.sourceName = uploadFileName(path);
+    gcidImport.pastedJson = '';
+    if (!gcidImport.destinationName || gcidImport.destinationName === 'GCID 导入') {
+      gcidImport.destinationName = gcidImport.sourceName.replace(/\.json$/i, '') || 'GCID 导入';
+    }
+  } catch (error) {
+    message.error(errorText(error));
+  }
+}
+async function submitGcidImport() {
+  if (!gcidImport.sourcePath && !gcidImport.pastedJson.trim()) {
+    message.warning('请选择 GCID JSON 文件或粘贴 JSON 内容');
+    return;
+  }
+  if (!gcidImport.destinationName.trim()) {
+    message.warning('请输入云端目标文件夹名称');
+    return;
+  }
+  gcidImport.loading = true;
+  try {
+    let sourcePath = gcidImport.sourcePath;
+    if (!sourcePath) {
+      const staged = unwrapData(await bridge.invoke('stage_gcid_import_text', {
+        content: gcidImport.pastedJson,
+      }));
+      sourcePath = staged.path;
+      gcidImport.sourcePath = staged.path;
+      gcidImport.sourceName = staged.name;
+    }
+    let status = gcidImport.status;
+    if (!status || status.source_path !== sourcePath || status.destination_parent_id !== currentParentId.value || status.destination_name !== gcidImport.destinationName.trim()) {
+      status = unwrapData(await bridge.invoke('prepare_gcid_import', {
+        source_path: sourcePath,
+        destination_parent_id: currentParentId.value,
+        destination_name: gcidImport.destinationName.trim(),
+      }));
+      applyGcidImportStatus(status);
+    }
+    status = unwrapData(await bridge.invoke('start_gcid_import', {
+      job_id: status.job_id,
+      concurrency: Math.min(16, Math.max(1, Math.round(Number(gcidImport.concurrency) || 4))),
+    }));
+    applyGcidImportStatus(status);
+    startGcidImportPolling();
+    message.success('GCID 导入已启动，可在后台继续运行');
+  } catch (error) {
+    message.error(errorText(error));
+  } finally {
+    gcidImport.loading = false;
+  }
+}
 async function saveShareLink() {
   if (!shareForm.url.trim()) return;
   try {
@@ -622,6 +743,15 @@ function downloadStatus(task) {
 }
 function clearFinishedDownloads() {
   downloadTasks.value = downloadTasks.value.filter((task) => !['completed', 'failed'].includes(task.status));
+}
+function clearFinishedUploads() {
+  uploadProgress.value = Object.fromEntries(
+    Object.entries(uploadProgress.value).filter(([, upload]) => !['done', 'error'].includes(upload.state)),
+  );
+}
+function clearFinishedTransfers() {
+  clearFinishedUploads();
+  clearFinishedDownloads();
 }
 async function chooseDownloadDirectory() {
   if (!isTauri) {
@@ -1341,6 +1471,7 @@ async function initialize() {
       if (payload.type === 'state') applyState(payload.state);
       if (payload.type === 'status') appendEvent(payload.level || 'info', payload.message);
       if (payload.type === 'progress' || payload.type === 'file') updateUploadProgress(payload);
+      if (payload.type === 'gcid-import' && payload.status) applyGcidImportStatus(payload.status);
       if (payload.type === 'download' && payload.download_id) {
         const changes = {
           status: payload.state === 'done' ? 'completed' : payload.state === 'error' ? 'failed' : 'downloading',
@@ -1375,9 +1506,8 @@ onMounted(() => {
 });
 onBeforeUnmount(() => {
   clearLoginTimers();
+  stopGcidImportPolling();
   clearTimeout(refreshTimer);
-  uploadRemovalTimers.forEach((timer) => clearTimeout(timer));
-  uploadRemovalTimers.clear();
   document.removeEventListener('click', hideContextMenu);
   window.removeEventListener('keydown', handleShortcut);
   if (typeof unsubscribe === 'function') unsubscribe();
@@ -1445,6 +1575,7 @@ onBeforeUnmount(() => {
                   <a-space>
                     <a-button @click="openReceivedShare"><template #icon><InboxOutlined /></template>接收分享</a-button>
                     <a-button @click="openShareForm"><template #icon><LinkOutlined /></template>收藏链接</a-button>
+                    <a-button v-if="isTauri" :disabled="!appState.logged_in" @click="openGcidImport"><template #icon><FileAddOutlined /></template>JSON 秒传</a-button>
                     <a-button type="primary" @click="triggerUpload('files')" :disabled="!appState.logged_in"><template #icon><UploadOutlined /></template>上传文件</a-button>
                   </a-space>
                 </template>
@@ -1581,10 +1712,45 @@ onBeforeUnmount(() => {
 
             <template v-else-if="activeView === 'downloads'">
               <div class="section-toolbar">
-                <div><h2>本机下载</h2><p>下载前选择保存目录，任务由客户端直接代理并写入本地文件。</p></div>
-                <a-space><a-tag v-if="activeDownloadCount" color="processing">{{ activeDownloadCount }} 个进行中</a-tag><a-tag v-if="queuedDownloadCount">{{ queuedDownloadCount }} 个等待</a-tag><a-button v-if="isTauri" @click="openTransferSettings"><template #icon><SettingOutlined /></template>并发设置</a-button><a-button :disabled="!downloadTasks.some(task => ['completed', 'failed'].includes(task.status))" @click="clearFinishedDownloads">清除已结束</a-button></a-space>
+                <div><h2>传输管理</h2><p>上传和下载任务统一显示在这里，完成记录会保留到手动清除。</p></div>
+                <a-space>
+                  <a-tag v-if="activeUploadCount" color="processing">{{ activeUploadCount }} 个上传中</a-tag>
+                  <a-tag v-if="activeDownloadCount || queuedDownloadCount" color="purple">{{ activeDownloadCount + queuedDownloadCount }} 个下载中</a-tag>
+                  <a-button v-if="isTauri" @click="openTransferSettings"><template #icon><SettingOutlined /></template>并发设置</a-button>
+                  <a-button :disabled="!finishedUploadCount && !finishedDownloadCount" @click="clearFinishedTransfers">清除已结束</a-button>
+                </a-space>
               </div>
-              <a-card class="content-card download-manager-card" :bordered="false">
+
+              <a-card class="content-card upload-progress-card" :bordered="false">
+                <template #title><a-flex align="center" gap="small"><UploadOutlined /><span>上传任务</span></a-flex></template>
+                <template #extra>
+                  <a-space>
+                    <a-tag v-if="activeUploadCount" color="processing">{{ activeUploadCount }} 个进行中</a-tag>
+                    <a-tag v-if="finishedUploadCount" color="success">{{ finishedUploadCount }} 个已结束</a-tag>
+                    <a-button size="small" :disabled="!finishedUploadCount" @click="clearFinishedUploads">清除已结束</a-button>
+                  </a-space>
+                </template>
+                <a-empty v-if="!recentUploads.length" description="暂无上传任务；手动上传和备份上传都会显示在这里。" />
+                <div v-else class="upload-progress-list">
+                  <div v-for="upload in recentUploads" :key="upload.filePath" class="upload-progress-item">
+                    <div class="upload-progress-heading">
+                      <div><strong>{{ upload.fileName }}</strong><span :title="upload.filePath">{{ upload.filePath }}</span></div>
+                      <span>{{ upload.stage }}<template v-if="upload.state === 'uploading'"> · {{ formatUploadSpeed(upload.bytesPerSecond) }}</template></span>
+                    </div>
+                    <a-progress :percent="upload.percent" :status="uploadProgressStatus(upload.state)" size="small" />
+                  </div>
+                </div>
+              </a-card>
+
+              <a-card class="content-card download-manager-card transfer-download-card" :bordered="false">
+                <template #title><a-flex align="center" gap="small"><DownloadOutlined /><span>下载任务</span></a-flex></template>
+                <template #extra>
+                  <a-space>
+                    <a-tag v-if="activeDownloadCount" color="processing">{{ activeDownloadCount }} 个进行中</a-tag>
+                    <a-tag v-if="queuedDownloadCount">{{ queuedDownloadCount }} 个等待</a-tag>
+                    <a-button size="small" :disabled="!finishedDownloadCount" @click="clearFinishedDownloads">清除已结束</a-button>
+                  </a-space>
+                </template>
                 <a-empty v-if="!downloadTasks.length" description="还没有本机下载任务；请在云盘文件或接收分享中点击下载。" />
                 <div v-else class="download-task-list">
                   <div v-for="task in downloadTasks" :key="task.id" class="download-task-item">
@@ -1685,6 +1851,80 @@ onBeforeUnmount(() => {
           <a-button type="primary" block :loading="backupSubmitting" @click="addBackup"><template #icon><PlusOutlined /></template>创建备份任务</a-button>
         </a-form>
       </a-drawer>
+
+      <a-modal
+        v-if="isTauri"
+        v-model:open="gcidImport.open"
+        title="GCID JSON 秒传导入"
+        :width="680"
+        :footer="null"
+        :mask-closable="!gcidImport.loading"
+      >
+        <a-alert
+          type="info"
+          show-icon
+          message="导入光鸭 GCID 导出文件"
+          :description="`文件会导入到当前目录「${currentFolderName}」下的新文件夹；任务状态保存到本机，应用重启后仍可继续。`"
+          class="drawer-alert"
+        />
+
+        <a-form layout="vertical">
+          <a-form-item label="JSON 来源">
+            <a-flex gap="small">
+              <a-input :value="gcidImport.sourceName || gcidImport.sourcePath" readonly placeholder="请选择 JSON 文件，或在下方粘贴内容" />
+              <a-button :disabled="gcidImportRunning" @click="selectGcidImportFile"><template #icon><FileAddOutlined /></template>选择文件</a-button>
+            </a-flex>
+          </a-form-item>
+          <a-form-item v-if="!gcidImport.sourcePath" label="或粘贴 JSON 内容">
+            <a-textarea v-model:value="gcidImport.pastedJson" :rows="6" :disabled="gcidImportRunning" placeholder="粘贴完整的光鸭 GCID 导出 JSON" />
+            <div v-if="shouldConvertPasteToFile(gcidImport.pastedJson)" class="form-help">内容较大，提交时会先写入本机暂存文件，避免一次性跨进程传输。</div>
+          </a-form-item>
+          <a-row :gutter="12">
+            <a-col :span="16">
+              <a-form-item label="云端目标文件夹" required>
+                <a-input v-model:value="gcidImport.destinationName" :disabled="gcidImportRunning" placeholder="例如：影视资源导入" />
+              </a-form-item>
+            </a-col>
+            <a-col :span="8">
+              <a-form-item label="并发数">
+                <a-input-number v-model:value="gcidImport.concurrency" :min="1" :max="16" :precision="0" :disabled="gcidImportRunning" style="width:100%" />
+              </a-form-item>
+            </a-col>
+          </a-row>
+        </a-form>
+
+        <div v-if="gcidImport.status" class="gcid-import-status">
+          <a-flex justify="space-between" align="center" gap="small">
+            <div>
+              <strong>{{ gcidImport.status.destination_name }}</strong>
+              <span>{{ gcidImport.status.current_path || gcidImport.status.error || '等待处理' }}</span>
+            </div>
+            <a-tag :color="gcidImportRunning ? 'processing' : gcidImport.status.status === 'completed' ? 'success' : 'warning'">
+              {{ gcidImportRunning ? '导入中' : gcidImport.status.status === 'completed' ? '已完成' : '已暂停或存在异常' }}
+            </a-tag>
+          </a-flex>
+          <a-progress :percent="gcidImportProgress" :status="gcidImport.status.status === 'failed' ? 'exception' : gcidImport.status.status === 'completed' ? 'success' : 'active'" />
+          <div class="gcid-import-counts">
+            <span>总数 <strong>{{ gcidImport.status.total_files || 0 }}</strong></span>
+            <span>秒传 <strong>{{ gcidImport.status.counts?.imported || 0 }}</strong></span>
+            <span>已存在 <strong>{{ gcidImport.status.counts?.existing || 0 }}</strong></span>
+            <span>未命中 <strong>{{ gcidImport.status.counts?.missed || 0 }}</strong></span>
+            <span>冲突 <strong>{{ gcidImport.status.counts?.conflict || 0 }}</strong></span>
+            <span>失败 <strong>{{ gcidImport.status.counts?.failed || 0 }}</strong></span>
+          </div>
+        </div>
+
+        <a-flex justify="space-between" align="center" gap="small" class="modal-actions">
+          <a-button v-if="gcidImport.status && !gcidImportRunning" @click="resetGcidImportDraft">新建导入</a-button>
+          <span v-else></span>
+          <a-space>
+            <a-button @click="gcidImport.open = false">关闭</a-button>
+            <a-button type="primary" :loading="gcidImport.loading" :disabled="gcidImportRunning" @click="submitGcidImport">
+              {{ gcidImport.status && !['completed', 'completed_with_errors'].includes(gcidImport.status.status) ? '继续导入' : '开始导入' }}
+            </a-button>
+          </a-space>
+        </a-flex>
+      </a-modal>
 
       <a-modal
         v-if="isTauri"

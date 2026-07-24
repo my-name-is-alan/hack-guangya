@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>光鸭云盘 · 设计预览</title>
+  <link rel="stylesheet" href="./glass.css" />
+  <style>
+    body { overflow: auto; display: grid; place-items: center; }
+    .wrap { width: min(720px, 92vw); padding: 40px 0; }
+    .hero { text-align: center; margin-bottom: 28px; }
+    .hero .brand-mark { width: 56px; height: 56px; margin: 0 auto 14px; }
+    .hero .brand-mark svg { width: 32px; height: 32px; }
+    .hero h1 { margin: 0; font-size: 24px; font-weight: 700; }
+    .hero p { margin: 8px 0 0; color: var(--text-2); font-size: 13px; }
+    .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .nav-card {
+      display: flex; flex-direction: column; gap: 4px;
+      padding: 20px; border-radius: var(--r-card);
+      text-decoration: none; color: inherit;
+      transition: transform 0.16s var(--ease), box-shadow 0.16s var(--ease);
+    }
+    .nav-card:hover { transform: translateY(-2px); box-shadow: var(--highlight-top), var(--shadow-float); }
+    .nav-card .ic { display: grid; place-items: center; width: 40px; height: 40px; border-radius: 12px; color: var(--accent-strong); background: var(--accent-soft); margin-bottom: 8px; }
+    .nav-card strong { font-size: 15px; }
+    .nav-card span { font-size: 12px; color: var(--text-3); }
+    .nav-card.todo { opacity: 0.55; pointer-events: none; }
+    .badge { align-self: flex-start; margin-top: 6px; padding: 1px 8px; border-radius: 999px; font-size: 10px; background: var(--ok-soft); color: var(--ok); }
+    .badge.soon { background: rgba(146,156,176,0.16); color: var(--text-3); }
+  </style>
+</head>
+<body>
+  <!-- 图标符号库 (与 cloud.html 同一套 inline svg) -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <g id="i-cloud"><path d="M6.5 18a4 4 0 0 1-.5-7.97A5.5 5.5 0 0 1 17 9.5a3.5 3.5 0 0 1-.5 6.98" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></g>
+      <g id="i-folder"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4l1.5 2h5.5A1.5 1.5 0 0 1 17 8.5v8A1.5 1.5 0 0 1 15.5 18h-11A1.5 1.5 0 0 1 3 16.5z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></g>
+      <g id="i-up"><path d="M10 15V5m0 0l-4 4m4-4l4 4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></g>
+      <g id="i-down"><path d="M10 5v10m0 0l-4-4m4 4l4-4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></g>
+      <g id="i-share"><circle cx="15" cy="5" r="2" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="5" cy="10" r="2" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="15" cy="15" r="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M6.8 9l6.4-3M6.8 11l6.4 3" stroke="currentColor" stroke-width="1.5"/></g>
+      <g id="i-settings"><circle cx="10" cy="10" r="2.4" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 2.6v2.2M10 15.2v2.2M17.4 10h-2.2M4.8 10H2.6M15.2 4.8l-1.6 1.6M6.4 13.6l-1.6 1.6M15.2 15.2l-1.6-1.6M6.4 6.4 4.8 4.8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></g>
+      <g id="i-duck" fill-rule="evenodd" clip-rule="evenodd"><path d="M8 3.4A3.6 3.6 0 0 0 4.6 8C3.3 8.4 2.4 9.6 2.4 11c0 2.9 3 5.2 7.4 5.2h3.8c3.2 0 5.8-2 5.8-4.8 0-1.2-.5-2.2-1-2.8.9-.2 1.6-.9 1.9-1.8-1 .1-2 .1-2 .1A5 5 0 0 0 8 3.4Zm-1 3.2a1 1 0 1 1 0 2 1 1 0 0 1 0-2Z" fill="currentColor"/></g>
+    </defs>
+  </svg>
+
+  <div class="wrap">
+    <div class="hero">
+      <div class="brand-mark glass"><svg width="30" height="30" aria-hidden="true"><use href="#i-duck"/></svg></div>
+      <h1>光鸭云盘 · 设计预览</h1>
+      <p>对齐真实在跑的应用 · Ant Design 轻量后台 · 紧凑克制</p>
+    </div>
+    <div class="cards">
+      <a class="nav-card glass" href="./app.html">
+        <span class="ic"><svg width="22" height="22" aria-hidden="true"><use href="#i-cloud"/></svg></span>
+        <strong>云盘文件</strong>
+        <span>对齐真实应用 · 侧栏 + 顶栏 + 文件表格 · 右键菜单 · 4 套状态</span>
+        <span class="badge">当前方向</span>
+      </a>
+      <div class="nav-card glass todo"><span class="ic"><svg width="22" height="22" aria-hidden="true"><use href="#i-folder"/></svg></span><strong>备份任务</strong><span>任务列表 · 新建抽屉 · 最近活动</span><span class="badge soon">待定风格后补</span></div>
+      <div class="nav-card glass todo"><span class="ic"><svg width="22" height="22" aria-hidden="true"><use href="#i-up"/></svg></span><strong>传输管理</strong><span>上传 + 下载 · 并发设置</span><span class="badge soon">待定风格后补</span></div>
+      <div class="nav-card glass todo"><span class="ic"><svg width="22" height="22" aria-hidden="true"><use href="#i-down"/></svg></span><strong>离线下载</strong><span>创建任务 · 任务列表</span><span class="badge soon">待定风格后补</span></div>
+      <div class="nav-card glass todo"><span class="ic"><svg width="22" height="22" aria-hidden="true"><use href="#i-share"/></svg></span><strong>分享管理</strong><span>我的分享 · 接收 · 本地收藏</span><span class="badge soon">待定风格后补</span></div>
+      <div class="nav-card glass todo"><span class="ic"><svg width="22" height="22" aria-hidden="true"><use href="#i-settings"/></svg></span><strong>设置</strong><span>账号 · 传输 · Hdhive · 运行信息</span><span class="badge soon">待定风格后补</span></div>
+    </div>
+    <div style="margin-top:22px;text-align:center">
+      <a href="./cloud.html" style="color:var(--text-3);font-size:11px">查看早期「液态玻璃」探索稿（已弃用方向）→</a>
+    </div>
+  </div>
+</body>
+</html>
