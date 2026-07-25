@@ -13,6 +13,7 @@ import { readJsonResponse } from './httpResponse.js';
 import { parseGuangyaShareLink } from './shareLink.js';
 import { createConcurrencyQueue, normalizeTransferConcurrency } from './transferQueue.js';
 import { gcidImportPercent, shouldConvertPasteToFile } from './gcidImport.js';
+import { normalizeFolderName, validateFolderName } from './folderName.js';
 import {
   ArrowDownOutlined,
   ArrowUpOutlined,
@@ -28,6 +29,7 @@ import {
   EditOutlined,
   FileAddOutlined,
   FileOutlined,
+  FolderAddOutlined,
   FolderOpenOutlined,
   FolderOutlined,
   HomeOutlined,
@@ -81,6 +83,7 @@ const bridge = isTauri ? {
     if (command === 'get_state') return webRequest('/api/state');
     if (command === 'get_overview') return webRequest('/api/overview');
     if (command === 'list_files') return webRequest(`/api/files?page=${args.page || 0}&parentId=${encodeURIComponent(args.parent_id || '')}`);
+    if (command === 'create_folder') return webRequest('/api/files/create-folder', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'copy_files') return webRequest('/api/files/copy', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'move_files') return webRequest('/api/files/move', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'delete_files') return webRequest('/api/files/delete', { method: 'POST', body: JSON.stringify(args) });
@@ -219,6 +222,7 @@ const folderPicker = reactive({ open: false, title: '选择云端目录', loadin
 const clipboard = reactive({ mode: '', items: [] });
 const contextMenu = reactive({ visible: false, x: 0, y: 0, record: null });
 const deleteDialog = reactive({ open: false, items: [], loading: false });
+const createFolderDialog = reactive({ open: false, name: '', loading: false, touched: false });
 const renameOpen = ref(false);
 const renameTargets = ref([]);
 const renameRules = ref([]);
@@ -278,6 +282,10 @@ const totalUploadSpeed = computed(() => recentUploads.value.reduce((total, uploa
 const activeUploadCount = computed(() => recentUploads.value.filter((upload) => !['done', 'error'].includes(upload.state)).length);
 const finishedUploadCount = computed(() => recentUploads.value.filter((upload) => ['done', 'error'].includes(upload.state)).length);
 const selectedFiles = computed(() => files.value.filter((item) => selectedFileIds.value.includes(fileId(item))));
+const createFolderError = computed(() => validateFolderName(
+  createFolderDialog.name,
+  files.value.map((item) => pick(item, ['fileName', 'name'], '')),
+));
 const activeDownloadCount = computed(() => downloadTasks.value.filter((task) => ['preparing', 'downloading'].includes(task.status)).length);
 const queuedDownloadCount = computed(() => downloadTasks.value.filter((task) => task.status === 'queued').length);
 const finishedDownloadCount = computed(() => downloadTasks.value.filter((task) => ['completed', 'failed'].includes(task.status)).length);
@@ -545,6 +553,30 @@ async function goToPath(index) {
   currentParentId.value = target.id;
   currentFolderName.value = target.name;
   await loadFiles();
+}
+function openCreateFolder() {
+  if (!appState.logged_in) { message.warning('请先登录光鸭云盘'); return; }
+  Object.assign(createFolderDialog, { open: true, name: '', loading: false, touched: false });
+}
+async function submitCreateFolder() {
+  if (createFolderDialog.loading) return;
+  createFolderDialog.touched = true;
+  if (createFolderError.value) {
+    message.warning(createFolderError.value);
+    return;
+  }
+  const folderName = normalizeFolderName(createFolderDialog.name);
+  createFolderDialog.loading = true;
+  try {
+    await bridge.invoke('create_folder', { parent_id: currentParentId.value, folder_name: folderName });
+    createFolderDialog.open = false;
+    await loadFiles();
+    message.success(`文件夹“${folderName}”已创建`);
+  } catch (error) {
+    message.error(`新建文件夹失败：${errorText(error)}`);
+  } finally {
+    createFolderDialog.loading = false;
+  }
 }
 async function createShare() {
   if (!selectedFileIds.value.length || shareCreating.value) return;
@@ -1231,6 +1263,7 @@ function contextAction(action) {
   else if (action === 'paste') pasteClipboard();
   else if (action === 'uploadFile') triggerUpload('files');
   else if (action === 'uploadFolder') triggerUpload('folder');
+  else if (action === 'createFolder') openCreateFolder();
   else if (action === 'refresh') loadFiles();
 }
 
@@ -1403,7 +1436,7 @@ function isTypingTarget(target) {
   return target instanceof HTMLElement && (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable);
 }
 function handleShortcut(event) {
-  if (activeView.value !== 'cloud' || isTypingTarget(event.target) || renameOpen.value || folderPicker.open || backupOpen.value) return;
+  if (activeView.value !== 'cloud' || isTypingTarget(event.target) || renameOpen.value || createFolderDialog.open || folderPicker.open || backupOpen.value) return;
   if (event.key === 'F2' && selectedFiles.value.length) { event.preventDefault(); openRename(); }
   else if (event.key === 'Delete' && selectedFiles.value.length) { event.preventDefault(); requestDelete(); }
 }
@@ -1587,6 +1620,7 @@ onBeforeUnmount(() => {
 
                 <div class="file-toolbar">
                   <a-flex wrap="wrap" gap="small" align="center">
+                    <a-button :disabled="!appState.logged_in" @click="openCreateFolder"><template #icon><FolderAddOutlined /></template>新建文件夹</a-button>
                     <a-button @click="triggerUpload('folder')"><template #icon><FolderOpenOutlined /></template>上传文件夹</a-button>
                     <a-button :disabled="!selectedFileIds.length" @click="setFileClipboard('copy')"><template #icon><CopyOutlined /></template>复制</a-button>
                     <a-button :disabled="!selectedFileIds.length" @click="setFileClipboard('move')"><template #icon><ScissorOutlined /></template>剪切</a-button>
@@ -1983,6 +2017,17 @@ onBeforeUnmount(() => {
         <div class="delete-preview"><div v-for="item in deleteDialog.items.slice(0, 8)" :key="fileId(item)"><FileOutlined />{{ pick(item, ['fileName', 'name'], '未命名') }}</div><span v-if="deleteDialog.items.length > 8">另有 {{ deleteDialog.items.length - 8 }} 项</span></div>
       </a-modal>
 
+      <a-modal v-model:open="createFolderDialog.open" title="新建文件夹" ok-text="创建" cancel-text="取消" :confirm-loading="createFolderDialog.loading" :ok-button-props="{ disabled: Boolean(createFolderError) }" @ok="submitCreateFolder">
+        <a-form layout="vertical">
+          <a-form-item label="文件夹名称" required :validate-status="createFolderDialog.touched && createFolderError ? 'error' : ''" :help="createFolderDialog.touched ? createFolderError : ''">
+            <a-input v-model:value="createFolderDialog.name" autofocus :disabled="createFolderDialog.loading" placeholder="请输入文件夹名称" @update:value="createFolderDialog.touched = true" @press-enter="submitCreateFolder">
+              <template #prefix><FolderAddOutlined /></template>
+            </a-input>
+          </a-form-item>
+        </a-form>
+        <a-alert type="info" show-icon :message="`将在“${currentFolderPath}”中新建文件夹`" />
+      </a-modal>
+
       <Teleport to="body">
         <div v-if="contextMenu.visible" class="file-context-menu" :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }" @click.stop>
           <template v-if="contextMenu.record">
@@ -1998,6 +2043,8 @@ onBeforeUnmount(() => {
             <button class="danger" @click="contextAction('delete')"><DeleteOutlined />移入回收站 <kbd>Del</kbd></button>
           </template>
           <template v-else>
+            <button @click="contextAction('createFolder')"><FolderAddOutlined />新建文件夹</button>
+            <div class="context-separator"></div>
             <button @click="contextAction('uploadFile')"><FileAddOutlined />上传文件</button>
             <button @click="contextAction('uploadFolder')"><FolderOpenOutlined />上传文件夹</button>
             <button :disabled="!clipboard.items.length" @click="contextAction('paste')"><CheckOutlined />粘贴</button>

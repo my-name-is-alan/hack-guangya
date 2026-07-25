@@ -15,6 +15,7 @@ commands.allow = [
   "select_upload_files",
   "select_upload_folder",
   "queue_upload_paths",
+  "create_folder",
   "copy_files",
   "move_files",
   "delete_files",

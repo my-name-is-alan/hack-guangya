@@ -5235,6 +5235,20 @@ fn validate_file_ids(file_ids: &[String]) -> Result<(), String> {
     }
 }
 
+fn validate_folder_name(folder_name: &str) -> Result<String, String> {
+    let name = folder_name.trim();
+    if name.is_empty()
+        || matches!(name, "." | "..")
+        || name.chars().count() > 255
+        || name
+            .chars()
+            .any(|value| value.is_control() || "\\/:*?\"<>|".contains(value))
+    {
+        return Err("无效的文件夹名称".into());
+    }
+    Ok(name.to_string())
+}
+
 async fn fetch_received_share_files(
     token: &str,
     device_id: &str,
@@ -5932,6 +5946,29 @@ async fn copy_files(
     {
         wait_operation_task(&token, &device_id, task_id).await?;
     }
+    Ok(response.data.unwrap_or_else(|| json!({})))
+}
+
+#[tauri::command]
+async fn create_folder(
+    state: tauri::State<'_, SharedState>,
+    parent_id: String,
+    folder_name: String,
+) -> Result<Value, String> {
+    let folder_name = validate_folder_name(&folder_name)?;
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/userres/v1/file/create_dir",
+        json!({
+            "parentId": parent_id,
+            "dirName": folder_name,
+            "failIfNameExist": true
+        }),
+        &[],
+    )
+    .await?;
     Ok(response.data.unwrap_or_else(|| json!({})))
 }
 
@@ -7238,6 +7275,7 @@ fn run() {
             select_upload_files,
             select_upload_folder,
             queue_upload_paths,
+            create_folder,
             copy_files,
             move_files,
             delete_files,
@@ -7364,6 +7402,21 @@ mod tests {
             share_file_payload(&["file-1".to_string()], "   ")["title"],
             "云盘分享"
         );
+    }
+
+    #[test]
+    fn folder_names_are_trimmed_and_invalid_paths_are_rejected() {
+        assert_eq!(
+            validate_folder_name("  新建文件夹  ").unwrap(),
+            "新建文件夹"
+        );
+        for invalid in ["", "   ", ".", "..", "a/b", "a\\b", "bad\nname"] {
+            assert!(
+                validate_folder_name(invalid).is_err(),
+                "folder name should be rejected: {invalid:?}"
+            );
+        }
+        assert!(validate_folder_name(&"a".repeat(256)).is_err());
     }
 
     #[test]

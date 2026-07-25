@@ -458,6 +458,95 @@ test('Web 扫码登录保存刷新令牌并在重启后自动续期', async () =
   }
 });
 
+test('Web 新建文件夹校验名称并转发云盘目录创建请求', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-create-folder-test-'));
+  const watchRoot = path.join(root, 'watch');
+  const archiveRoot = path.join(root, 'archive');
+  const dataDir = path.join(root, 'data');
+  await Promise.all([fsp.mkdir(watchRoot), fsp.mkdir(archiveRoot)]);
+
+  const requests = [];
+  const apiServer = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const input = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
+    requests.push({ url: request.url, input });
+    response.setHeader('content-type', 'application/json');
+    if (request.url !== '/userres/v1/file/create_dir') {
+      response.statusCode = 404;
+      response.end(JSON.stringify({ code: 404, msg: 'not found' }));
+      return;
+    }
+    if (input.dirName === '已存在') {
+      response.end(JSON.stringify({ code: 159, msg: '文件夹已存在' }));
+      return;
+    }
+    response.end(JSON.stringify({ code: 0, data: { fileId: 'folder-new' } }));
+  });
+  apiServer.listen(0, '127.0.0.1');
+  await once(apiServer, 'listening');
+
+  const port = await freePort();
+  const child = spawn(process.execPath, [path.join(here, 'server.mjs')], {
+    cwd: path.resolve(here, '..'),
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DATA_DIR: dataDir,
+      GUANGYA_WATCH_ROOT: watchRoot,
+      GUANGYA_ARCHIVE_ROOT: archiveRoot,
+      GUANGYA_API_BASE: `http://127.0.0.1:${apiServer.address().port}`,
+      GUANGYA_TOKEN: 'test-token',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+
+  try {
+    await waitUntil(() => output.includes('Guangya Web listening'));
+    const createdResponse = await fetch(`http://127.0.0.1:${port}/api/files/create-folder`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ parent_id: 'folder-parent', folder_name: '  新建文件夹  ' }),
+    });
+    const created = await createdResponse.json();
+    assert.equal(createdResponse.status, 200, JSON.stringify(created));
+    assert.deepEqual(created, { fileId: 'folder-new' });
+    assert.deepEqual(requests, [{
+      url: '/userres/v1/file/create_dir',
+      input: { parentId: 'folder-parent', dirName: '新建文件夹', failIfNameExist: true },
+    }]);
+
+    const invalidResponse = await fetch(`http://127.0.0.1:${port}/api/files/create-folder`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ parent_id: 'folder-parent', folder_name: 'bad/name' }),
+    });
+    assert.equal(invalidResponse.status, 400);
+    assert.match((await invalidResponse.json()).error, /无效的文件夹名称/);
+    assert.equal(requests.length, 1, '无效名称不应请求云盘接口');
+
+    const duplicateResponse = await fetch(`http://127.0.0.1:${port}/api/files/create-folder`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ parent_id: '', folder_name: '已存在' }),
+    });
+    assert.equal(duplicateResponse.status, 400);
+    assert.deepEqual(await duplicateResponse.json(), { error: '文件夹已存在' });
+    assert.deepEqual(requests[1], {
+      url: '/userres/v1/file/create_dir',
+      input: { parentId: '', dirName: '已存在', failIfNameExist: true },
+    });
+  } finally {
+    child.kill();
+    await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 2_000))]);
+    await new Promise((resolve) => apiServer.close(resolve));
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('浏览器文件落盘后立即返回并由后台队列完成云端上传', async () => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-browser-upload-test-'));
   const watchRoot = path.join(root, 'watch');

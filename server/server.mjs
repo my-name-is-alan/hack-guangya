@@ -1332,6 +1332,15 @@ async function routeApi(request, response, url) { if (request.method === 'GET' &
 async function apiOverview() { const assets = await apiPost('/assets/v1/get_assets', {}); let profile = {}; try { profile = await accountGet('/v1/user/me'); } catch { try { profile = (await apiPost('/activity/v1/get_user_data', {})).data || {}; } catch {} } return { assets: assets.data || {}, profile: profile?.data || profile || {} }; }
 
 function validateFileIds(fileIds) { if (!Array.isArray(fileIds) || !fileIds.length) throw new Error('请至少选择一个文件或文件夹'); return fileIds.map(String); }
+function validateFolderName(folderName) {
+  const name = String(folderName || '').trim().normalize('NFC');
+  if (!name || name === '.' || name === '..' || [...name].length > 255 || /[\\/:*?"<>|\u0000-\u001f\u007f-\u009f]/.test(name)) throw new Error('无效的文件夹名称');
+  return name;
+}
+async function createRemoteFolder(parentId, folderName) {
+  const response = await apiPost('/userres/v1/file/create_dir', { parentId: String(parentId || ''), dirName: validateFolderName(folderName), failIfNameExist: true });
+  return response.data || {};
+}
 async function renameRemote(fileId, newName) { await apiPost('/userres/v1/file/rename', { fileId, newName }); }
 async function batchRename(renames) {
   const work = (Array.isArray(renames) ? renames : []).map((item) => ({ fileId: String(item.fileId || ''), currentName: String(item.currentName || ''), newName: String(item.newName || '') })).filter((item) => item.currentName !== item.newName);
@@ -1393,6 +1402,7 @@ async function routeApiV2(request, response, url) {
     const body = await readBody(request);
     return json(response, 200, await queueServerUploads(body.paths, body.parent_id));
   }
+  if (request.method === 'POST' && url.pathname === '/api/files/create-folder') { const body = await readBody(request); return json(response, 200, await createRemoteFolder(body.parent_id, body.folder_name)); }
   if (request.method === 'POST' && url.pathname === '/api/files/copy') { const body = await readBody(request); const result = await apiPost('/userres/v1/file/copy_file', { fileIds: validateFileIds(body.file_ids), parentId: String(body.parent_id || '') }); await waitOperation(result.data?.taskId); return json(response, 200, result.data || {}); }
   if (request.method === 'POST' && url.pathname === '/api/files/move') { const body = await readBody(request); const result = await apiPost('/userres/v1/file/move_file', { fileIds: validateFileIds(body.file_ids), parentId: String(body.parent_id || '') }); await waitOperation(result.data?.taskId); return json(response, 200, result.data || {}); }
   if (request.method === 'POST' && url.pathname === '/api/files/delete') { const body = await readBody(request); const result = await apiPost('/userres/v1/file/delete_file', { fileIds: validateFileIds(body.file_ids) }); await waitOperation(result.data?.taskId); return json(response, 200, result.data || {}); }
