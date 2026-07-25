@@ -39,6 +39,11 @@ const AUTH_URL: &str = "https://www.guangyapan.com/#/";
 const DEFAULT_UPLOAD_CONCURRENCY: usize = 2;
 const DEFAULT_DOWNLOAD_CONCURRENCY: usize = 2;
 const MAX_TRANSFER_CONCURRENCY: usize = 8;
+const DEFAULT_MULTIPART_PART_SIZE: &str = "auto";
+const MULTIPART_PART_SIZE_OPTIONS: &[&str] = &["auto", "4m", "8m", "16m"];
+const DEFAULT_CACHE_MAX_ENTRIES: usize = 10_000;
+const MIN_CACHE_MAX_ENTRIES: usize = 100;
+const MAX_CACHE_MAX_ENTRIES: usize = 100_000;
 const OSS_WRITE_RETRY_TIMES: usize = 5;
 const FILE_STABILITY_WAIT_MS: u64 = 1_200;
 const FILE_BUSY_RETRY_SECS: u64 = 3;
@@ -74,6 +79,18 @@ const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "ass", "ssa", "vtt", "sub", "idx",
 const AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "wav", "flac", "aac", "m4a", "ogg", "opus", "wma", "aiff",
 ];
+const DOCUMENT_EXTENSIONS: &[&str] = &[
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "csv", "rtf", "odt", "ods",
+    "odp", "epub",
+];
+const ARCHIVE_EXTENSIONS: &[&str] = &[
+    "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "tgz", "zipx", "iso",
+];
+const CLOUD_FILE_TYPE_IMAGE: u8 = 1;
+const CLOUD_FILE_TYPE_VIDEO: u8 = 2;
+const CLOUD_FILE_TYPE_AUDIO: u8 = 3;
+const CLOUD_FILE_TYPE_DOCUMENT: u8 = 4;
+const CLOUD_FILE_TYPE_ARCHIVE: u8 = 5;
 type SharedState = Arc<Mutex<RuntimeState>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +133,8 @@ struct AppConfig {
     upload_concurrency: usize,
     #[serde(default = "default_download_concurrency")]
     download_concurrency: usize,
+    #[serde(default = "default_multipart_part_size")]
+    multipart_part_size: String,
 }
 impl Default for AppConfig {
     fn default() -> Self {
@@ -124,6 +143,7 @@ impl Default for AppConfig {
             saved_shares: Vec::new(),
             upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
             download_concurrency: DEFAULT_DOWNLOAD_CONCURRENCY,
+            multipart_part_size: default_multipart_part_size(),
         }
     }
 }
@@ -135,6 +155,7 @@ struct Snapshot {
     active_uploads: usize,
     upload_concurrency: usize,
     download_concurrency: usize,
+    multipart_part_size: String,
     mappings: Vec<Mapping>,
     saved_shares: Vec<SavedShare>,
     hdhive: HdhivePublicConfig,
@@ -183,19 +204,56 @@ struct RuntimeState {
     active_uploads: usize,
     upload_concurrency: usize,
     download_concurrency: usize,
+    multipart_part_size: String,
+    cache_enabled: bool,
+    cache_max_entries: usize,
     device_id: String,
+    hdhive_enabled: bool,
     hdhive_base_url: String,
     hdhive_secret: String,
     hdhive_instance_id: String,
     auto_share_processing: HashSet<String>,
     gcid_import_running: HashSet<String>,
+    sms_verifications: HashMap<String, SmsVerificationSession>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct HdhivePublicConfig {
+    enabled: bool,
     configured: bool,
     base_url: String,
     instance_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct TransferSettings {
+    upload_concurrency: usize,
+    download_concurrency: usize,
+    multipart_part_size: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+struct CacheSettings {
+    enabled: bool,
+    max_entries: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct MetadataCacheStats {
+    bytes: u64,
+    entries: u64,
+    file_fingerprints_bytes: u64,
+    file_fingerprints_entries: u64,
+    remote_cache_bytes: u64,
+    remote_cache_entries: u64,
+    policy: CacheSettings,
+}
+
+#[derive(Debug, Clone)]
+struct SmsVerificationSession {
+    phone_number: String,
+    is_user: bool,
+    captcha_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -399,9 +457,11 @@ fn snapshot(state: &RuntimeState) -> Snapshot {
         active_uploads: state.active_uploads,
         upload_concurrency: state.upload_concurrency,
         download_concurrency: state.download_concurrency,
+        multipart_part_size: state.multipart_part_size.clone(),
         mappings: state.mappings.clone(),
         saved_shares: state.saved_shares.clone(),
         hdhive: HdhivePublicConfig {
+            enabled: state.hdhive_enabled,
             configured: !state.hdhive_base_url.is_empty() && !state.hdhive_secret.is_empty(),
             base_url: state.hdhive_base_url.clone(),
             instance_id: state.hdhive_instance_id.clone(),
@@ -418,12 +478,147 @@ fn default_upload_concurrency() -> usize {
 fn default_download_concurrency() -> usize {
     DEFAULT_DOWNLOAD_CONCURRENCY
 }
+fn default_multipart_part_size() -> String {
+    DEFAULT_MULTIPART_PART_SIZE.to_string()
+}
+fn default_cache_enabled() -> bool {
+    true
+}
+fn default_cache_max_entries() -> usize {
+    DEFAULT_CACHE_MAX_ENTRIES
+}
+fn parse_cache_enabled(value: Option<&str>) -> bool {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("false" | "0" | "off" | "disabled") => false,
+        Some("true" | "1" | "on" | "enabled") => true,
+        _ => default_cache_enabled(),
+    }
+}
+fn validate_cache_max_entries(value: usize) -> Result<usize, String> {
+    if (MIN_CACHE_MAX_ENTRIES..=MAX_CACHE_MAX_ENTRIES).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "缓存条目上限必须在 {MIN_CACHE_MAX_ENTRIES}–{MAX_CACHE_MAX_ENTRIES} 之间"
+        ))
+    }
+}
+fn parse_cache_max_entries(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .and_then(|value| validate_cache_max_entries(value).ok())
+        .unwrap_or_else(default_cache_max_entries)
+}
+fn cache_settings(state: &RuntimeState) -> CacheSettings {
+    CacheSettings {
+        enabled: state.cache_enabled,
+        max_entries: state.cache_max_entries,
+    }
+}
+fn default_hdhive_enabled() -> bool {
+    true
+}
+fn parse_hdhive_enabled(value: Option<&str>) -> bool {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("false" | "0" | "off" | "disabled") => false,
+        Some("true" | "1" | "on" | "enabled") => true,
+        _ => default_hdhive_enabled(),
+    }
+}
+fn hdhive_allowed_hosts() -> HashSet<String> {
+    std::env::var("HDHIVE_ALLOWED_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+fn normalize_hdhive_base_url_with_allowed_hosts(
+    value: &str,
+    allowed_hosts: &HashSet<String>,
+) -> Result<String, String> {
+    let input = value.trim();
+    if input.is_empty() {
+        return Ok(String::new());
+    }
+    let mut parsed = reqwest::Url::parse(input)
+        .map_err(|_| "Hdhive 地址必须是完整的 HTTP(S) URL".to_string())?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err("Hdhive 地址必须使用 HTTP 或 HTTPS".to_string());
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("Hdhive 地址不能包含账号、查询参数或片段".to_string());
+    }
+    let raw_hostname = parsed
+        .host_str()
+        .ok_or_else(|| "Hdhive 地址必须包含主机名".to_string())?;
+    let hostname = raw_hostname.to_ascii_lowercase();
+    let host = parsed
+        .port()
+        .map(|port| format!("{hostname}:{port}"))
+        .unwrap_or_else(|| hostname.clone());
+    if !allowed_hosts.is_empty()
+        && !allowed_hosts.contains(&host)
+        && !allowed_hosts.contains(&hostname)
+    {
+        return Err("Hdhive 地址不在 HDHIVE_ALLOWED_HOSTS 允许列表中".to_string());
+    }
+    let normalized_path = parsed.path().trim_end_matches('/').to_string();
+    parsed.set_path(&normalized_path);
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+fn normalize_hdhive_base_url(value: &str) -> Result<String, String> {
+    normalize_hdhive_base_url_with_allowed_hosts(value, &hdhive_allowed_hosts())
+}
+fn build_hdhive_target_url(
+    base_url: &str,
+    path_segments: &[&str],
+) -> Result<(reqwest::Url, String), String> {
+    if path_segments.is_empty()
+        || path_segments.iter().any(|segment| {
+            segment.is_empty()
+                || *segment == "."
+                || *segment == ".."
+                || !segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+    {
+        return Err("Hdhive 请求路径无效".to_string());
+    }
+    let mut target = reqwest::Url::parse(base_url)
+        .map_err(|_| "Hdhive 地址必须是完整的 HTTP(S) URL".to_string())?;
+    target
+        .path_segments_mut()
+        .map_err(|_| "Hdhive 地址不能作为 API 基地址".to_string())?
+        .pop_if_empty()
+        .extend(path_segments.iter().copied());
+    target.set_query(None);
+    target.set_fragment(None);
+    Ok((target, format!("/{}", path_segments.join("/"))))
+}
 fn normalize_transfer_concurrency(value: usize, fallback: usize) -> usize {
     if (1..=MAX_TRANSFER_CONCURRENCY).contains(&value) {
         value
     } else {
         fallback
     }
+}
+fn validate_multipart_part_size(value: &str) -> Result<String, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if MULTIPART_PART_SIZE_OPTIONS.contains(&normalized.as_str()) {
+        Ok(normalized)
+    } else {
+        Err("分片档位只支持 auto、4m、8m 或 16m".to_string())
+    }
+}
+fn normalize_multipart_part_size(value: &str) -> String {
+    validate_multipart_part_size(value).unwrap_or_else(|_| default_multipart_part_size())
 }
 fn default_true() -> bool {
     true
@@ -473,8 +668,22 @@ fn oss_part_size(size: u64) -> u64 {
         OSS_LARGE_FILE_PART_SIZE
     };
     let minimum_size = ceil_div_u64(size, OSS_MULTIPART_TARGET_PARTS);
-    let aligned_minimum_size = ceil_div_u64(minimum_size, OSS_MIB) * OSS_MIB;
+    let aligned_minimum_size = ceil_div_u64(minimum_size, OSS_MIB).saturating_mul(OSS_MIB);
     tier_size.max(aligned_minimum_size)
+}
+fn configured_oss_part_size(size: u64, multipart_part_size: &str) -> u64 {
+    if multipart_part_size == DEFAULT_MULTIPART_PART_SIZE {
+        return oss_part_size(size);
+    }
+    let configured_size = match multipart_part_size {
+        "4m" => 4 * OSS_MIB,
+        "8m" => 8 * OSS_MIB,
+        "16m" => 16 * OSS_MIB,
+        _ => return oss_part_size(size),
+    };
+    let minimum_size = ceil_div_u64(size, OSS_MULTIPART_TARGET_PARTS);
+    let aligned_minimum_size = ceil_div_u64(minimum_size, OSS_MIB).saturating_mul(OSS_MIB);
+    configured_size.max(aligned_minimum_size)
 }
 fn normalize_monitor_mode(value: &str) -> String {
     if value.eq_ignore_ascii_case("polling") {
@@ -554,6 +763,125 @@ fn file_extension(path: &Path) -> String {
         .to_lowercase();
     extension
 }
+fn normalize_search_file_type(value: Option<&str>) -> Result<Option<String>, String> {
+    let normalized = value.unwrap_or_default().trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized == "all" {
+        return Ok(None);
+    }
+    if ["image", "video", "audio", "document", "archive", "folder"].contains(&normalized.as_str()) {
+        Ok(Some(normalized))
+    } else {
+        Err("文件类型只支持 image、video、audio、document、archive 或 folder".to_string())
+    }
+}
+fn normalize_search_extension(value: Option<&str>) -> Option<String> {
+    let normalized = value
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    (!normalized.is_empty()).then_some(normalized)
+}
+fn cloud_item_is_folder(item: &Value) -> bool {
+    item.get("resType").and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str()?.parse::<i64>().ok())
+    }) == Some(2)
+        || item
+            .get("isFolder")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+fn cloud_item_extension(item: &Value) -> String {
+    let explicit = ["fileSuffix", "extension", "ext"]
+        .iter()
+        .find_map(|key| item.get(key).and_then(Value::as_str))
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    ["fileName", "name"]
+        .iter()
+        .find_map(|key| item.get(key).and_then(Value::as_str))
+        .and_then(|name| name.rsplit_once('.').map(|(_, extension)| extension))
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+fn cloud_item_matches_search_filters(
+    item: &Value,
+    file_type: Option<&str>,
+    extension: Option<&str>,
+) -> bool {
+    let is_folder = cloud_item_is_folder(item);
+    let item_extension = cloud_item_extension(item);
+    let type_matches = match file_type {
+        None => true,
+        Some("folder") => is_folder,
+        Some("image") => !is_folder && IMAGE_EXTENSIONS.contains(&item_extension.as_str()),
+        Some("video") => !is_folder && VIDEO_EXTENSIONS.contains(&item_extension.as_str()),
+        Some("audio") => !is_folder && AUDIO_EXTENSIONS.contains(&item_extension.as_str()),
+        Some("document") => !is_folder && DOCUMENT_EXTENSIONS.contains(&item_extension.as_str()),
+        Some("archive") => !is_folder && ARCHIVE_EXTENSIONS.contains(&item_extension.as_str()),
+        Some(_) => false,
+    };
+    type_matches && extension.is_none_or(|expected| !is_folder && item_extension == expected)
+}
+fn cloud_search_file_type(file_type: Option<&str>, extension: Option<&str>) -> Option<u8> {
+    match file_type {
+        Some("image") => Some(CLOUD_FILE_TYPE_IMAGE),
+        Some("video") => Some(CLOUD_FILE_TYPE_VIDEO),
+        Some("audio") => Some(CLOUD_FILE_TYPE_AUDIO),
+        Some("document") => Some(CLOUD_FILE_TYPE_DOCUMENT),
+        Some("archive") => Some(CLOUD_FILE_TYPE_ARCHIVE),
+        Some("folder") => None,
+        _ => extension.and_then(|extension| {
+            if IMAGE_EXTENSIONS.contains(&extension) {
+                Some(CLOUD_FILE_TYPE_IMAGE)
+            } else if VIDEO_EXTENSIONS.contains(&extension) {
+                Some(CLOUD_FILE_TYPE_VIDEO)
+            } else if AUDIO_EXTENSIONS.contains(&extension) {
+                Some(CLOUD_FILE_TYPE_AUDIO)
+            } else if DOCUMENT_EXTENSIONS.contains(&extension) {
+                Some(CLOUD_FILE_TYPE_DOCUMENT)
+            } else if ARCHIVE_EXTENSIONS.contains(&extension) {
+                Some(CLOUD_FILE_TYPE_ARCHIVE)
+            } else {
+                None
+            }
+        }),
+    }
+}
+fn cloud_search_request(
+    query: &str,
+    file_type: Option<&str>,
+    extension: Option<&str>,
+    page: u64,
+) -> (&'static str, Value) {
+    let query = query.trim();
+    if !query.is_empty() {
+        return (
+            "/userres/v1/file/search_files",
+            json!({ "name": query, "pageSize": 100, "page": page }),
+        );
+    }
+
+    let mut request = json!({
+        "parentId": "*",
+        "pageSize": 100,
+        "page": page,
+        "orderBy": 3,
+        "sortType": 1,
+        "resType": if file_type == Some("folder") { 2 } else { 1 }
+    });
+    if let Some(file_type) = cloud_search_file_type(file_type, extension) {
+        request["fileTypes"] = json!([file_type]);
+    }
+    ("/userres/v1/file/get_file_list", request)
+}
 fn should_sync(path: &Path, sync_types: &[String]) -> bool {
     let extension = file_extension(path);
     !extension.is_empty()
@@ -613,7 +941,8 @@ fn save_config(state: &RuntimeState) {
         "mappings": state.mappings,
         "saved_shares": state.saved_shares,
         "upload_concurrency": state.upload_concurrency,
-        "download_concurrency": state.download_concurrency
+        "download_concurrency": state.download_concurrency,
+        "multipart_part_size": state.multipart_part_size
     });
     let _ = fs::write(
         &state.config_path,
@@ -803,7 +1132,11 @@ fn load_cached_file_gcid(
     file_path: &Path,
     size: u64,
     modified_ms: u128,
+    settings: CacheSettings,
 ) -> Result<Option<String>, String> {
+    if !settings.enabled {
+        return Ok(None);
+    }
     let size = i64::try_from(size).map_err(|_| "文件过大，无法缓存秒传指纹".to_string())?;
     let connection = open_database(database)?;
     let gcid = connection
@@ -832,7 +1165,11 @@ fn save_cached_file_gcid(
     size: u64,
     modified_ms: u128,
     gcid: &str,
+    settings: CacheSettings,
 ) -> Result<(), String> {
+    if !settings.enabled {
+        return Ok(());
+    }
     let size = i64::try_from(size).map_err(|_| "文件过大，无法缓存秒传指纹".to_string())?;
     let connection = open_database(database)?;
     let file_path = file_path.to_string_lossy();
@@ -860,7 +1197,130 @@ fn save_cached_file_gcid(
             ],
         )
         .map_err(|error| format!("保存秒传指纹缓存失败：{error}"))?;
+    trim_file_fingerprint_cache(database, settings.max_entries)?;
     Ok(())
+}
+
+fn reset_remote_cache(remote_cache: &mut HashMap<String, String>) {
+    remote_cache.clear();
+    remote_cache.insert(String::new(), String::new());
+}
+
+fn trim_file_fingerprint_cache(database: &Path, max_entries: usize) -> Result<(), String> {
+    let max_entries = i64::try_from(max_entries).map_err(|_| "缓存条目上限无效".to_string())?;
+    open_database(database)?
+        .execute(
+            "DELETE FROM file_fingerprints
+             WHERE rowid IN (
+               SELECT rowid FROM file_fingerprints
+               ORDER BY computed_at DESC, rowid DESC
+               LIMIT -1 OFFSET ?1
+             )",
+            params![max_entries],
+        )
+        .map_err(|error| format!("裁剪秒传指纹缓存失败：{error}"))?;
+    Ok(())
+}
+
+fn trim_remote_cache(remote_cache: &mut HashMap<String, String>, max_entries: usize) {
+    let excess = remote_cache
+        .len()
+        .saturating_sub(usize::from(remote_cache.contains_key("")))
+        .saturating_sub(max_entries);
+    let keys = remote_cache
+        .keys()
+        .filter(|key| !key.is_empty())
+        .take(excess)
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in keys {
+        remote_cache.remove(&key);
+    }
+}
+
+fn file_fingerprint_cache_usage(database: &Path) -> Result<(u64, u64), String> {
+    let connection = open_database(database)?;
+    let mut statement = connection
+        .prepare("SELECT file_path, modified_ms, gcid FROM file_fingerprints")
+        .map_err(|error| format!("读取秒传指纹缓存统计失败：{error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("读取秒传指纹缓存统计失败：{error}"))?;
+    let mut entries = 0_u64;
+    let mut bytes = 0_u64;
+    for row in rows {
+        let (file_path, modified_ms, gcid) =
+            row.map_err(|error| format!("解析秒传指纹缓存统计失败：{error}"))?;
+        entries = entries.saturating_add(1);
+        bytes = bytes.saturating_add(
+            u64::try_from(file_path.len() + modified_ms.len() + gcid.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(16),
+        );
+    }
+    Ok((entries, bytes))
+}
+
+fn remote_cache_usage(remote_cache: &HashMap<String, String>) -> (u64, u64) {
+    remote_cache
+        .iter()
+        .filter(|(key, value)| !(key.is_empty() && value.is_empty()))
+        .fold((0_u64, 0_u64), |(entries, bytes), (key, value)| {
+            (
+                entries.saturating_add(1),
+                bytes.saturating_add(u64::try_from(key.len() + value.len()).unwrap_or(u64::MAX)),
+            )
+        })
+}
+
+fn metadata_cache_stats(
+    database: &Path,
+    remote_cache: &HashMap<String, String>,
+    policy: CacheSettings,
+) -> Result<MetadataCacheStats, String> {
+    let (file_fingerprints_entries, file_fingerprints_bytes) =
+        file_fingerprint_cache_usage(database)?;
+    let (remote_cache_entries, remote_cache_bytes) = remote_cache_usage(remote_cache);
+    Ok(MetadataCacheStats {
+        bytes: file_fingerprints_bytes.saturating_add(remote_cache_bytes),
+        entries: file_fingerprints_entries.saturating_add(remote_cache_entries),
+        file_fingerprints_bytes,
+        file_fingerprints_entries,
+        remote_cache_bytes,
+        remote_cache_entries,
+        policy,
+    })
+}
+
+fn clear_metadata_cache_storage(
+    database: &Path,
+    remote_cache: &mut HashMap<String, String>,
+    policy: CacheSettings,
+) -> Result<MetadataCacheStats, String> {
+    open_database(database)?
+        .execute("DELETE FROM file_fingerprints", [])
+        .map_err(|error| format!("清理秒传指纹缓存失败：{error}"))?;
+    reset_remote_cache(remote_cache);
+    metadata_cache_stats(database, remote_cache, policy)
+}
+
+fn apply_cache_policy(
+    database: &Path,
+    remote_cache: &mut HashMap<String, String>,
+    policy: CacheSettings,
+) -> Result<MetadataCacheStats, String> {
+    if !policy.enabled {
+        return clear_metadata_cache_storage(database, remote_cache, policy);
+    }
+    trim_file_fingerprint_cache(database, policy.max_entries)?;
+    trim_remote_cache(remote_cache, policy.max_entries);
+    metadata_cache_stats(database, remote_cache, policy)
 }
 
 fn load_auth_session(path: &Path) -> Result<AuthSession, String> {
@@ -1565,13 +2025,31 @@ fn parse_guangya_share_link(value: &str) -> Result<(String, String), String> {
 }
 
 async fn account_post(endpoint: &str, body: Value) -> Result<(u16, Value), String> {
-    let response = reqwest::Client::new()
+    account_post_with_captcha(endpoint, body, None).await
+}
+
+async fn account_post_with_captcha(
+    endpoint: &str,
+    body: Value,
+    captcha_token: Option<&str>,
+) -> Result<(u16, Value), String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(API_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(API_REQUEST_TIMEOUT_SECS))
+        .build()
+        .map_err(|error| format!("创建账号请求客户端失败：{error}"))?;
+    let mut request = client
         .post(format!("{ACCOUNT_BASE}{endpoint}"))
         .header(CONTENT_TYPE, "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+        .header("x-client-id", OAUTH_CLIENT_ID)
+        .header("x-sdk-version", "9.0.2")
+        .header("x-protocol-version", "301")
+        .header("accept-language", "zh-CN")
+        .json(&body);
+    if let Some(captcha_token) = captcha_token.filter(|value| !value.trim().is_empty()) {
+        request = request.header("x-captcha-token", captcha_token.trim());
+    }
+    let response = request.send().await.map_err(|e| e.to_string())?;
     let status = response.status().as_u16();
     let raw = response.text().await.map_err(|e| e.to_string())?;
     let payload = if raw.trim().is_empty() && (200..300).contains(&status) {
@@ -1582,6 +2060,127 @@ async fn account_post(endpoint: &str, body: Value) -> Result<(u16, Value), Strin
         })?
     };
     Ok((status, payload))
+}
+
+fn account_payload_value<'a>(payload: &'a Value, key: &str) -> Option<&'a Value> {
+    payload
+        .get(key)
+        .or_else(|| payload.get("data").and_then(|data| data.get(key)))
+}
+
+fn account_payload_string(payload: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        let value = account_payload_value(payload, key)?;
+        value
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| value.as_i64().map(|value| value.to_string()))
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+fn account_payload_bool(payload: &Value, key: &str) -> Option<bool> {
+    let value = account_payload_value(payload, key)?;
+    value.as_bool().or_else(|| {
+        value.as_i64().map(|value| value != 0).or_else(|| {
+            match value.as_str()?.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => None,
+            }
+        })
+    })
+}
+
+fn account_error_message(payload: &Value, fallback: &str) -> String {
+    account_payload_string(
+        payload,
+        &[
+            "error_description",
+            "description",
+            "message",
+            "msg",
+            "error",
+        ],
+    )
+    .unwrap_or_else(|| fallback.to_string())
+}
+
+fn payload_mentions_captcha(payload: &Value) -> bool {
+    let serialized = payload.to_string().to_ascii_lowercase();
+    serialized.contains("captcha")
+        || serialized.contains("人机验证")
+        || serialized.contains("安全验证")
+}
+
+fn flatten_account_payload(payload: &Value) -> serde_json::Map<String, Value> {
+    let mut object = payload.as_object().cloned().unwrap_or_default();
+    if let Some(data) = payload.get("data").and_then(Value::as_object) {
+        for (key, value) in data {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    object.remove("data");
+    object
+}
+
+fn captcha_challenge_response(payload: &Value, force: bool) -> Option<Value> {
+    let url = account_payload_string(payload, &["captcha_url", "captchaUrl", "url"]);
+    let captcha_token = account_payload_string(payload, &["captcha_token", "captchaToken"]);
+    let explicitly_required = account_payload_bool(payload, "captcha_required")
+        .or_else(|| account_payload_bool(payload, "captchaRequired"))
+        .unwrap_or(false);
+    if !force && url.is_none() && !explicitly_required {
+        return None;
+    }
+    let mut object = flatten_account_payload(payload);
+    object.insert("captcha_required".to_string(), json!(true));
+    object.insert("authenticated".to_string(), json!(false));
+    if let Some(url) = url {
+        object.insert("captcha_url".to_string(), json!(url));
+    }
+    if let Some(captcha_token) = captcha_token {
+        object.insert("captcha_token".to_string(), json!(captcha_token));
+    }
+    Some(Value::Object(object))
+}
+
+fn normalize_china_phone(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|character| !character.is_ascii_digit() && !"+ -()".contains(character))
+    {
+        return Err("请输入有效的中国大陆手机号".to_string());
+    }
+    let digits = trimmed
+        .chars()
+        .filter(|character| character.is_ascii_digit())
+        .collect::<String>();
+    let local = if digits.len() == 13 && digits.starts_with("86") {
+        &digits[2..]
+    } else if digits.len() == 11 {
+        digits.as_str()
+    } else {
+        return Err("请输入 11 位中国大陆手机号".to_string());
+    };
+    if !local.starts_with('1') {
+        return Err("请输入有效的中国大陆手机号".to_string());
+    }
+    Ok(format!("+86 {local}"))
+}
+
+fn masked_phone_name(phone_number: &str) -> String {
+    let local = phone_number
+        .trim()
+        .strip_prefix("+86 ")
+        .unwrap_or(phone_number);
+    if local.len() == 11 && local.bytes().all(|byte| byte.is_ascii_digit()) {
+        format!("用户{}****{}", &local[..3], &local[7..])
+    } else {
+        "光鸭用户".to_string()
+    }
 }
 
 async fn account_get(token: &str, endpoint: &str) -> Result<Value, String> {
@@ -1658,13 +2257,14 @@ async fn ensure_remote_path(
             format!("{prefix}/{part}")
         };
         let cache_key = format!("{}::{prefix}", base_parent_id);
-        if let Some(cached) = state
-            .lock()
-            .map_err(|e| e.to_string())?
-            .remote_cache
-            .get(&cache_key)
-            .cloned()
-        {
+        let cached = {
+            let guard = state.lock().map_err(|e| e.to_string())?;
+            guard
+                .cache_enabled
+                .then(|| guard.remote_cache.get(&cache_key).cloned())
+                .flatten()
+        };
+        if let Some(cached) = cached {
             parent = cached;
             continue;
         }
@@ -1686,11 +2286,14 @@ async fn ensure_remote_path(
             file_id = find_remote_folder(token, device_id, &parent, part).await?;
         }
         let file_id = file_id.ok_or_else(|| format!("无法创建或定位远程目录：{prefix}"))?;
-        state
-            .lock()
-            .map_err(|e| e.to_string())?
-            .remote_cache
-            .insert(cache_key, file_id.clone());
+        {
+            let mut guard = state.lock().map_err(|e| e.to_string())?;
+            if guard.cache_enabled {
+                guard.remote_cache.insert(cache_key, file_id.clone());
+                let max_entries = guard.cache_max_entries;
+                trim_remote_cache(&mut guard.remote_cache, max_entries);
+            }
+        }
         parent = file_id;
     }
     Ok(parent)
@@ -2725,25 +3328,36 @@ async fn hdhive_request(
     secret: &str,
     instance_id: &str,
     method: reqwest::Method,
-    path: &str,
+    path_segments: &[&str],
     body: Option<&Value>,
 ) -> Result<Value, String> {
     if base_url.is_empty() || secret.is_empty() {
         return Err("尚未配置 Hdhive 接入地址和密钥".to_string());
     }
+    let normalized_base_url = normalize_hdhive_base_url(base_url)?;
+    let (target_url, signature_path) =
+        build_hdhive_target_url(&normalized_base_url, path_segments)?;
     let body_text = body.map(Value::to_string).unwrap_or_default();
     let timestamp = unix_timestamp().to_string();
-    let response = reqwest::Client::new()
-        .request(
-            method.clone(),
-            format!("{}{path}", base_url.trim_end_matches('/')),
-        )
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(API_CONNECT_TIMEOUT_SECS))
+        .build()
+        .map_err(|error| format!("创建 Hdhive 客户端失败：{error}"))?;
+    let response = client
+        .request(method.clone(), target_url)
         .header(CONTENT_TYPE, "application/json")
         .header("X-GuangYa-Instance-Id", instance_id)
         .header("X-GuangYa-Timestamp", &timestamp)
         .header(
             "X-GuangYa-Signature",
-            hdhive_signature(secret, method.as_str(), path, &body_text, &timestamp),
+            hdhive_signature(
+                secret,
+                method.as_str(),
+                &signature_path,
+                &body_text,
+                &timestamp,
+            ),
         )
         .body(body_text)
         .timeout(Duration::from_secs(30))
@@ -2779,6 +3393,9 @@ async fn schedule_auto_share(
     };
     let (mapping, token, device_id, db_path) = {
         let guard = state.lock().map_err(|error| error.to_string())?;
+        if !guard.hdhive_enabled {
+            return Ok(());
+        }
         let Some(mapping) = guard
             .mappings
             .iter()
@@ -2877,21 +3494,27 @@ async fn poll_hdhive_receipt(
     for attempt in 0..60_u64 {
         sleep(Duration::from_secs((2 + attempt / 2).min(10))).await;
         let (base_url, secret, instance_id, db_path) = match state.lock() {
-            Ok(guard) => (
+            Ok(guard) if guard.hdhive_enabled => (
                 guard.hdhive_base_url.clone(),
                 guard.hdhive_secret.clone(),
                 guard.hdhive_instance_id.clone(),
                 guard.db_path.clone(),
             ),
+            Ok(_) => return,
             Err(_) => return,
         };
-        let endpoint = format!("/api/integrations/guangya-sync/events/{}", pending.event_id);
         match hdhive_request(
             &base_url,
             &secret,
             &instance_id,
             reqwest::Method::GET,
-            &endpoint,
+            &[
+                "api",
+                "integrations",
+                "guangya-sync",
+                "events",
+                pending.event_id.as_str(),
+            ],
             None,
         )
         .await
@@ -2983,9 +3606,10 @@ async fn process_auto_share(
     state: SharedState,
     pending: PendingAutoShare,
 ) -> Result<(), String> {
-    let (mapping, token, device_id, db_path, base_url, secret, instance_id, has_work) = {
+    let (enabled, mapping, token, device_id, db_path, base_url, secret, instance_id, has_work) = {
         let guard = state.lock().map_err(|error| error.to_string())?;
         (
+            guard.hdhive_enabled,
             guard
                 .mappings
                 .iter()
@@ -3000,6 +3624,9 @@ async fn process_auto_share(
             target_has_work(&guard, &pending.mapping_id, &pending.target_key),
         )
     };
+    if !enabled {
+        return Ok(());
+    }
     let Some(mapping) = mapping else {
         return delete_pending_auto_share(&db_path, &pending.mapping_id, &pending.target_key);
     };
@@ -3145,6 +3772,13 @@ async fn process_auto_share(
         "intent": intent,
         "change_hint": { "added": added, "changed": changed, "removed": [] }
     });
+    if !state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .hdhive_enabled
+    {
+        return Ok(());
+    }
     save_auto_share_event(
         &db_path,
         &pending.event_id,
@@ -3163,7 +3797,7 @@ async fn process_auto_share(
         &secret,
         &instance_id,
         reqwest::Method::POST,
-        "/api/integrations/guangya-sync/events",
+        &["api", "integrations", "guangya-sync", "events"],
         Some(&payload),
     )
     .await?;
@@ -3195,7 +3829,9 @@ async fn auto_share_loop(app: tauri::AppHandle, state: SharedState) {
         let (db_path, configured) = match state.lock() {
             Ok(guard) => (
                 guard.db_path.clone(),
-                !guard.hdhive_base_url.is_empty() && !guard.hdhive_secret.is_empty(),
+                guard.hdhive_enabled
+                    && !guard.hdhive_base_url.is_empty()
+                    && !guard.hdhive_secret.is_empty(),
             ),
             Err(_) => continue,
         };
@@ -3400,6 +4036,7 @@ async fn upload_oss(
     token_data: &UploadToken,
     path: &Path,
     app: &tauri::AppHandle,
+    multipart_part_size: &str,
 ) -> Result<(), String> {
     let credentials = token_data
         .creds
@@ -3459,7 +4096,7 @@ async fn upload_oss(
         .layer(retry_layer)
         .finish();
     let size = fs::metadata(path).map_err(|e| e.to_string())?.len();
-    let part_size = usize::try_from(oss_part_size(size))
+    let part_size = usize::try_from(configured_oss_part_size(size, multipart_part_size))
         .map_err(|_| "文件过大，当前平台无法设置 OSS 分片大小".to_string())?;
     let writer_future = operator
         .writer_with(object_path)
@@ -3723,7 +4360,7 @@ async fn upload_item(
     state: &SharedState,
     item: &UploadItem,
 ) -> Result<UploadOutcome, String> {
-    let (token, device_id, db_path) = {
+    let (token, device_id, multipart_part_size) = {
         let guard = state.lock().map_err(|e| e.to_string())?;
         (
             guard
@@ -3731,7 +4368,7 @@ async fn upload_item(
                 .clone()
                 .ok_or_else(|| "尚未登录光鸭云盘".to_string())?,
             guard.device_id.clone(),
-            guard.db_path.clone(),
+            guard.multipart_part_size.clone(),
         )
     };
     emit(
@@ -3783,14 +4420,22 @@ async fn upload_item(
             app,
             json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 0, "stage": "正在校验秒传" }),
         );
-        let cached_gcid =
-            match load_cached_file_gcid(&db_path, &item.file_path, item.size, item.modified_ms) {
-                Ok(value) => value,
-                Err(error) => {
-                    status(app, "warning", error);
-                    None
-                }
-            };
+        let cached_gcid = match {
+            let guard = state.lock().map_err(|error| error.to_string())?;
+            load_cached_file_gcid(
+                &guard.db_path,
+                &item.file_path,
+                item.size,
+                item.modified_ms,
+                cache_settings(&guard),
+            )
+        } {
+            Ok(value) => value,
+            Err(error) => {
+                status(app, "warning", error);
+                None
+            }
+        };
         let gcid_result = if let Some(gcid) = cached_gcid {
             emit(
                 app,
@@ -3806,13 +4451,18 @@ async fn upload_item(
         } else {
             let result = calculate_file_gcid(app, &item.file_path, item.size).await;
             if let Ok(gcid) = &result {
-                if let Err(error) = save_cached_file_gcid(
-                    &db_path,
-                    &item.file_path,
-                    item.size,
-                    item.modified_ms,
-                    gcid,
-                ) {
+                let saved = {
+                    let guard = state.lock().map_err(|error| error.to_string())?;
+                    save_cached_file_gcid(
+                        &guard.db_path,
+                        &item.file_path,
+                        item.size,
+                        item.modified_ms,
+                        gcid,
+                        cache_settings(&guard),
+                    )
+                };
+                if let Err(error) = saved {
                     status(app, "warning", error);
                 }
             }
@@ -3866,7 +4516,7 @@ async fn upload_item(
             app,
             json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 0, "stage": "正在连接 OSS" }),
         );
-        upload_oss(&data, &item.file_path, app).await?;
+        upload_oss(&data, &item.file_path, app, &multipart_part_size).await?;
     } else {
         emit(
             app,
@@ -4862,9 +5512,11 @@ fn get_state(state: tauri::State<'_, SharedState>) -> Snapshot {
             active_uploads: 0,
             upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
             download_concurrency: DEFAULT_DOWNLOAD_CONCURRENCY,
+            multipart_part_size: default_multipart_part_size(),
             mappings: vec![],
             saved_shares: vec![],
             hdhive: HdhivePublicConfig {
+                enabled: default_hdhive_enabled(),
                 configured: false,
                 base_url: String::new(),
                 instance_id: String::new(),
@@ -4923,6 +5575,52 @@ async fn list_files(
     Ok(response
         .data
         .unwrap_or_else(|| json!({ "list": [], "total": 0 })))
+}
+
+#[tauri::command]
+async fn search_files(
+    state: tauri::State<'_, SharedState>,
+    query: String,
+    file_type: Option<String>,
+    extension: Option<String>,
+    page: Option<u64>,
+) -> Result<Value, String> {
+    let file_type = normalize_search_file_type(file_type.as_deref())?;
+    let extension = normalize_search_extension(extension.as_deref());
+    let (token, device_id) = auth_context(&state)?;
+    let page = page.unwrap_or(0);
+    let (endpoint, request) =
+        cloud_search_request(&query, file_type.as_deref(), extension.as_deref(), page);
+    let response = api_post(&token, &device_id, endpoint, request, &[]).await?;
+    let data = response
+        .data
+        .unwrap_or_else(|| json!({ "list": [], "total": 0 }));
+    let source_total = data.get("total").and_then(Value::as_u64).unwrap_or(0);
+    let source_list = data
+        .get("list")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let remote_count = source_list.len() as u64;
+    let list = source_list
+        .into_iter()
+        .filter(|item| {
+            cloud_item_matches_search_filters(item, file_type.as_deref(), extension.as_deref())
+        })
+        .collect::<Vec<_>>();
+    let total = if file_type.is_some() || extension.is_some() {
+        list.len() as u64
+    } else {
+        source_total
+    };
+    Ok(json!({
+        "list": list,
+        "total": total,
+        "remote_total": source_total,
+        "remote_count": remote_count,
+        "page": page,
+        "page_size": 100
+    }))
 }
 
 fn collect_manual_uploads(path: &Path, remote_prefix: &str, files: &mut Vec<(PathBuf, String)>) {
@@ -6122,9 +6820,10 @@ async fn create_share(
         &share_url,
         if reused_existing { "update" } else { "new" },
     );
-    let (base_url, secret, instance_id, db_path) = {
+    let (hdhive_enabled, base_url, secret, instance_id, db_path) = {
         let guard = state.lock().map_err(|error| error.to_string())?;
         (
+            guard.hdhive_enabled,
             guard.hdhive_base_url.clone(),
             guard.hdhive_secret.clone(),
             guard.hdhive_instance_id.clone(),
@@ -6132,91 +6831,100 @@ async fn create_share(
         )
     };
     let mapping_id = "__manual__";
-    let _ = save_auto_share_event(
-        &db_path,
-        &event_id,
-        mapping_id,
-        &title,
-        Some(&share_url),
-        "sending",
-        None,
-        Some(if reused_existing {
-            "已复用光鸭分享，正在提交影巢更新"
-        } else {
-            "光鸭分享成功，正在提交影巢"
-        }),
-        None,
-        &payload,
-    );
-    let (hdhive_status, hdhive_message) = match hdhive_request(
-        &base_url,
-        &secret,
-        &instance_id,
-        reqwest::Method::POST,
-        "/api/integrations/guangya-sync/events",
-        Some(&payload),
-    )
-    .await
-    {
-        Ok(accepted) => {
-            let hdhive_status = accepted
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("accepted")
-                .to_string();
-            let hdhive_message = if reused_existing {
-                "影巢已接收，正在更新备注".to_string()
+    if hdhive_enabled {
+        let _ = save_auto_share_event(
+            &db_path,
+            &event_id,
+            mapping_id,
+            &title,
+            Some(&share_url),
+            "sending",
+            None,
+            Some(if reused_existing {
+                "已复用光鸭分享，正在提交影巢更新"
             } else {
-                "影巢已接收，正在解析并投稿".to_string()
-            };
-            let _ = save_auto_share_event(
-                &db_path,
-                &event_id,
-                mapping_id,
-                &title,
-                Some(&share_url),
-                &hdhive_status,
-                None,
-                Some(&hdhive_message),
-                None,
-                &payload,
-            );
-            let pending = PendingAutoShare {
-                mapping_id: mapping_id.to_string(),
-                target_key: title.clone(),
-                target_type,
-                title: title.clone(),
-                remote_target_id: file_ids[0].clone(),
-                added: HashSet::new(),
-                changed: HashSet::new(),
-                event_id: event_id.clone(),
-                retry_count: 0,
-            };
-            tauri::async_runtime::spawn(poll_hdhive_receipt(
-                app.clone(),
-                state.inner().clone(),
-                pending,
-                share_url.clone(),
-                payload.clone(),
-            ));
-            (hdhive_status, hdhive_message)
-        }
-        Err(error) => {
-            let hdhive_status = "delivery_failed".to_string();
-            let hdhive_message = format!("光鸭分享成功，但提交影巢失败：{error}");
-            let _ = save_auto_share_event(
-                &db_path,
-                &event_id,
-                mapping_id,
-                &title,
-                Some(&share_url),
-                &hdhive_status,
-                None,
-                Some(&hdhive_message),
-                None,
-                &payload,
-            );
-            (hdhive_status, hdhive_message)
+                "光鸭分享成功，正在提交影巢"
+            }),
+            None,
+            &payload,
+        );
+    }
+    let (hdhive_status, hdhive_message) = if !hdhive_enabled {
+        (
+            "disabled".to_string(),
+            "HDHive 已关闭，仅创建光鸭分享".to_string(),
+        )
+    } else {
+        match hdhive_request(
+            &base_url,
+            &secret,
+            &instance_id,
+            reqwest::Method::POST,
+            &["api", "integrations", "guangya-sync", "events"],
+            Some(&payload),
+        )
+        .await
+        {
+            Ok(accepted) => {
+                let hdhive_status = accepted
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("accepted")
+                    .to_string();
+                let hdhive_message = if reused_existing {
+                    "影巢已接收，正在更新备注".to_string()
+                } else {
+                    "影巢已接收，正在解析并投稿".to_string()
+                };
+                let _ = save_auto_share_event(
+                    &db_path,
+                    &event_id,
+                    mapping_id,
+                    &title,
+                    Some(&share_url),
+                    &hdhive_status,
+                    None,
+                    Some(&hdhive_message),
+                    None,
+                    &payload,
+                );
+                let pending = PendingAutoShare {
+                    mapping_id: mapping_id.to_string(),
+                    target_key: title.clone(),
+                    target_type,
+                    title: title.clone(),
+                    remote_target_id: file_ids[0].clone(),
+                    added: HashSet::new(),
+                    changed: HashSet::new(),
+                    event_id: event_id.clone(),
+                    retry_count: 0,
+                };
+                tauri::async_runtime::spawn(poll_hdhive_receipt(
+                    app.clone(),
+                    state.inner().clone(),
+                    pending,
+                    share_url.clone(),
+                    payload.clone(),
+                ));
+                (hdhive_status, hdhive_message)
+            }
+            Err(error) => {
+                let hdhive_status = "delivery_failed".to_string();
+                let hdhive_message = format!("光鸭分享成功，但提交影巢失败：{error}");
+                let _ = save_auto_share_event(
+                    &db_path,
+                    &event_id,
+                    mapping_id,
+                    &title,
+                    Some(&share_url),
+                    &hdhive_status,
+                    None,
+                    Some(&hdhive_message),
+                    None,
+                    &payload,
+                );
+                (hdhive_status, hdhive_message)
+            }
         }
     };
     emit_state(&app, state.inner());
@@ -6364,7 +7072,7 @@ async fn refresh_saved_session(app: tauri::AppHandle, state: SharedState) -> Res
         if next_refresh.is_some() {
             guard.refresh_token = next_refresh.clone();
         }
-        guard.remote_cache.clear();
+        reset_remote_cache(&mut guard.remote_cache);
         guard.db_path.clone()
     };
     save_auth_session(&db_path, Some(&access_token), next_refresh.as_deref())?;
@@ -6392,6 +7100,217 @@ async fn token_refresh_loop(app: tauri::AppHandle, state: SharedState) {
             );
         }
     }
+}
+
+#[tauri::command]
+async fn request_sms_code(
+    state: tauri::State<'_, SharedState>,
+    phone: String,
+    captcha_token: Option<String>,
+) -> Result<Value, String> {
+    let phone_number = normalize_china_phone(&phone)?;
+    let supplied_captcha_token = captcha_token.filter(|value| !value.trim().is_empty());
+    let resolved_captcha_token = if let Some(token) = supplied_captcha_token {
+        Some(token.trim().to_string())
+    } else {
+        let device_id = state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .device_id
+            .clone();
+        let (status_code, payload) = account_post_with_captcha(
+            "/v1/shield/captcha/init",
+            json!({
+                "client_id": OAUTH_CLIENT_ID,
+                "action": "POST:/v1/auth/verification",
+                "device_id": device_id,
+                "captcha_token": Value::Null,
+                "meta": { "phone_number": phone_number }
+            }),
+            None,
+        )
+        .await?;
+        if !(200..300).contains(&status_code) {
+            if let Some(challenge) =
+                captcha_challenge_response(&payload, payload_mentions_captcha(&payload))
+            {
+                return Ok(challenge);
+            }
+            return Err(account_error_message(&payload, "初始化短信安全验证失败"));
+        }
+        if account_payload_string(&payload, &["captcha_url", "captchaUrl", "url"]).is_some() {
+            return captcha_challenge_response(&payload, true)
+                .ok_or_else(|| "短信安全验证响应无效".to_string());
+        }
+        Some(
+            account_payload_string(&payload, &["captcha_token", "captchaToken"])
+                .ok_or_else(|| "短信安全验证没有返回 token 或验证页面".to_string())?,
+        )
+    };
+
+    let (status_code, payload) = account_post_with_captcha(
+        "/v1/auth/verification",
+        json!({
+            "phone_number": phone_number,
+            "target": "ANY",
+            "client_id": OAUTH_CLIENT_ID
+        }),
+        resolved_captcha_token.as_deref(),
+    )
+    .await?;
+    if !(200..300).contains(&status_code) {
+        if let Some(challenge) =
+            captcha_challenge_response(&payload, payload_mentions_captcha(&payload))
+        {
+            return Ok(challenge);
+        }
+        return Err(account_error_message(&payload, "发送短信验证码失败"));
+    }
+    if let Some(challenge) = captcha_challenge_response(&payload, false) {
+        return Ok(challenge);
+    }
+    let verification_id = account_payload_string(&payload, &["verification_id"])
+        .ok_or_else(|| "短信接口没有返回 verification_id".to_string())?;
+    let is_user = account_payload_bool(&payload, "is_user")
+        .ok_or_else(|| "短信接口没有返回 is_user".to_string())?;
+    {
+        let mut guard = state.lock().map_err(|error| error.to_string())?;
+        guard
+            .sms_verifications
+            .retain(|_, verification| verification.phone_number != phone_number);
+        guard.sms_verifications.insert(
+            verification_id.clone(),
+            SmsVerificationSession {
+                phone_number: phone_number.clone(),
+                is_user,
+                captcha_token: resolved_captcha_token,
+            },
+        );
+    }
+    let mut result = flatten_account_payload(&payload);
+    result.insert("request_id".to_string(), json!(verification_id));
+    result.insert("phone_number".to_string(), json!(phone_number));
+    result.insert("is_user".to_string(), json!(is_user));
+    result.insert("captcha_required".to_string(), json!(false));
+    Ok(Value::Object(result))
+}
+
+#[tauri::command]
+async fn login_with_sms(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+    phone: String,
+    code: String,
+    request_id: String,
+    captcha_token: Option<String>,
+) -> Result<Value, String> {
+    let phone_number = normalize_china_phone(&phone)?;
+    let verification_code = code.trim();
+    if !(4..=8).contains(&verification_code.len())
+        || !verification_code.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("请输入有效的短信验证码".to_string());
+    }
+    let verification_id = request_id.trim();
+    if verification_id.is_empty() {
+        return Err("请先获取短信验证码".to_string());
+    }
+    let verification = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .sms_verifications
+        .get(verification_id)
+        .cloned()
+        .ok_or_else(|| "短信验证码请求已失效，请重新获取".to_string())?;
+    if verification.phone_number != phone_number {
+        return Err("手机号与验证码请求不一致，请重新获取".to_string());
+    }
+    let resolved_captcha_token = captcha_token
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string())
+        .or(verification.captcha_token.clone());
+    let (verify_status, verify_payload) = account_post_with_captcha(
+        "/v1/auth/verification/verify",
+        json!({
+            "verification_id": verification_id,
+            "verification_code": verification_code,
+            "client_id": OAUTH_CLIENT_ID
+        }),
+        resolved_captcha_token.as_deref(),
+    )
+    .await?;
+    if !(200..300).contains(&verify_status) {
+        if let Some(challenge) =
+            captcha_challenge_response(&verify_payload, payload_mentions_captcha(&verify_payload))
+        {
+            return Ok(challenge);
+        }
+        return Err(account_error_message(&verify_payload, "短信验证码校验失败"));
+    }
+    if let Some(challenge) = captcha_challenge_response(&verify_payload, false) {
+        return Ok(challenge);
+    }
+    let verification_token = account_payload_string(&verify_payload, &["verification_token"])
+        .ok_or_else(|| "短信校验接口没有返回 verification_token".to_string())?;
+    let (endpoint, body) = if verification.is_user {
+        (
+            "/v1/auth/signin",
+            json!({
+                "username": phone_number,
+                "verification_code": verification_code,
+                "verification_token": verification_token,
+                "client_id": OAUTH_CLIENT_ID
+            }),
+        )
+    } else {
+        (
+            "/v1/auth/signup",
+            json!({
+                "phone_number": phone_number,
+                "verification_code": verification_code,
+                "verification_token": verification_token,
+                "client_id": OAUTH_CLIENT_ID,
+                "name": masked_phone_name(&phone_number)
+            }),
+        )
+    };
+    let (login_status, login_payload) =
+        account_post_with_captcha(endpoint, body, resolved_captcha_token.as_deref()).await?;
+    if !(200..300).contains(&login_status) {
+        if let Some(challenge) =
+            captcha_challenge_response(&login_payload, payload_mentions_captcha(&login_payload))
+        {
+            return Ok(challenge);
+        }
+        return Err(account_error_message(&login_payload, "手机号登录失败"));
+    }
+    if let Some(challenge) = captcha_challenge_response(&login_payload, false) {
+        return Ok(challenge);
+    }
+    let access_token = account_payload_string(&login_payload, &["access_token"])
+        .ok_or_else(|| "登录接口没有返回 access_token".to_string())?;
+    let refresh_token = account_payload_string(&login_payload, &["refresh_token"]);
+    let db_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    save_auth_session(&db_path, Some(&access_token), refresh_token.as_deref())?;
+    {
+        let mut guard = state.lock().map_err(|error| error.to_string())?;
+        guard.token = Some(access_token);
+        guard.refresh_token = refresh_token;
+        guard.sms_verifications.remove(verification_id);
+        reset_remote_cache(&mut guard.remote_cache);
+    }
+    status(
+        &app,
+        "success",
+        "手机号登录成功，可以开始使用云盘和备份任务",
+    );
+    emit_state(&app, state.inner());
+    drain_queue(app, state.inner().clone());
+    Ok(json!({ "authenticated": true, "is_user": verification.is_user }))
 }
 
 #[tauri::command]
@@ -6450,7 +7369,7 @@ async fn poll_device_login(
             if refresh_token.is_some() {
                 guard.refresh_token = refresh_token.clone();
             }
-            guard.remote_cache.clear();
+            reset_remote_cache(&mut guard.remote_cache);
             guard.db_path.clone()
         };
         if let Err(message) = save_auth_session(&db_path, Some(&token), refresh_token.as_deref()) {
@@ -6521,7 +7440,7 @@ async fn capture_token(
             return Ok(());
         }
         guard.token = Some(token.clone());
-        guard.remote_cache.clear();
+        reset_remote_cache(&mut guard.remote_cache);
         guard.db_path.clone()
     };
     if let Err(message) = save_auth_session(&db_path, Some(&token), None) {
@@ -6765,35 +7684,29 @@ fn update_hdhive_config(
     state: tauri::State<'_, SharedState>,
     base_url: String,
     secret: Option<String>,
+    enabled: Option<bool>,
 ) -> Result<HdhivePublicConfig, String> {
-    let normalized = base_url.trim().trim_end_matches('/').to_string();
-    if !normalized.is_empty() {
-        let parsed = reqwest::Url::parse(&normalized)
-            .map_err(|_| "Hdhive 地址必须是完整的 HTTP(S) URL".to_string())?;
-        if parsed.scheme() != "http" && parsed.scheme() != "https" {
-            return Err("Hdhive 地址必须是完整的 HTTP(S) URL".to_string());
-        }
-    }
-    let (db_path, result) = {
+    let normalized = normalize_hdhive_base_url(&base_url)?;
+    let (db_path, secret_value, result) = {
         let mut guard = state.lock().map_err(|error| error.to_string())?;
         guard.hdhive_base_url = normalized;
         if let Some(value) = secret.filter(|value| !value.trim().is_empty()) {
             guard.hdhive_secret = value.trim().to_string();
         }
+        if let Some(enabled) = enabled {
+            guard.hdhive_enabled = enabled;
+        }
         let result = HdhivePublicConfig {
+            enabled: guard.hdhive_enabled,
             configured: !guard.hdhive_base_url.is_empty() && !guard.hdhive_secret.is_empty(),
             base_url: guard.hdhive_base_url.clone(),
             instance_id: guard.hdhive_instance_id.clone(),
         };
-        (guard.db_path.clone(), result)
+        (guard.db_path.clone(), guard.hdhive_secret.clone(), result)
     };
     save_app_state(&db_path, "hdhive_base_url", &result.base_url)?;
-    let secret_value = state
-        .lock()
-        .map_err(|error| error.to_string())?
-        .hdhive_secret
-        .clone();
     save_app_state(&db_path, "hdhive_secret", &secret_value)?;
+    save_app_state(&db_path, "hdhive_enabled", &result.enabled.to_string())?;
     emit_state(&app, state.inner());
     Ok(result)
 }
@@ -6829,6 +7742,9 @@ async fn backfill_auto_shares(
 ) -> Result<usize, String> {
     let (mapping, db_path) = {
         let guard = state.lock().map_err(|error| error.to_string())?;
+        if !guard.hdhive_enabled {
+            return Err("HDHive 已关闭，请先在设置中开启".to_string());
+        }
         let mapping = guard
             .mappings
             .iter()
@@ -6909,6 +7825,9 @@ async fn retry_auto_share_event(
 ) -> Result<Value, String> {
     let (base_url, secret, instance_id, db_path) = {
         let guard = state.lock().map_err(|error| error.to_string())?;
+        if !guard.hdhive_enabled {
+            return Err("HDHive 已关闭，请先在设置中开启".to_string());
+        }
         (
             guard.hdhive_base_url.clone(),
             guard.hdhive_secret.clone(),
@@ -6952,21 +7871,27 @@ async fn retry_auto_share_event(
                 &secret,
                 &instance_id,
                 reqwest::Method::POST,
-                "/api/integrations/guangya-sync/events",
+                &["api", "integrations", "guangya-sync", "events"],
                 Some(&payload),
             )
             .await?,
             "Hdhive 已重新接收投稿事件",
         )
     } else {
-        let endpoint = format!("/api/integrations/guangya-sync/events/{event_id}/retry");
         (
             hdhive_request(
                 &base_url,
                 &secret,
                 &instance_id,
                 reqwest::Method::POST,
-                &endpoint,
+                &[
+                    "api",
+                    "integrations",
+                    "guangya-sync",
+                    "events",
+                    event_id.as_str(),
+                    "retry",
+                ],
                 Some(&retry_body),
             )
             .await?,
@@ -7029,11 +7954,21 @@ fn pause_queue(app: tauri::AppHandle, state: tauri::State<'_, SharedState>) {
     emit_state(&app, state.inner());
 }
 #[tauri::command]
+fn get_transfer_settings(state: tauri::State<'_, SharedState>) -> Result<TransferSettings, String> {
+    let guard = state.lock().map_err(|error| error.to_string())?;
+    Ok(TransferSettings {
+        upload_concurrency: guard.upload_concurrency,
+        download_concurrency: guard.download_concurrency,
+        multipart_part_size: guard.multipart_part_size.clone(),
+    })
+}
+#[tauri::command]
 fn update_transfer_settings(
     app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
     upload_concurrency: usize,
     download_concurrency: usize,
+    multipart_part_size: Option<String>,
 ) -> Result<Snapshot, String> {
     if !(1..=MAX_TRANSFER_CONCURRENCY).contains(&upload_concurrency)
         || !(1..=MAX_TRANSFER_CONCURRENCY).contains(&download_concurrency)
@@ -7042,16 +7977,65 @@ fn update_transfer_settings(
             "上传和下载并发数必须在 1–{MAX_TRANSFER_CONCURRENCY} 之间"
         ));
     }
+    let multipart_part_size = multipart_part_size
+        .map(|value| validate_multipart_part_size(&value))
+        .transpose()?;
     let next = {
         let mut guard = state.lock().map_err(|error| error.to_string())?;
         guard.upload_concurrency = upload_concurrency;
         guard.download_concurrency = download_concurrency;
+        if let Some(multipart_part_size) = multipart_part_size {
+            guard.multipart_part_size = multipart_part_size;
+        }
         save_config(&guard);
         snapshot(&guard)
     };
     emit_state(&app, state.inner());
     drain_queue(app, state.inner().clone());
     Ok(next)
+}
+#[tauri::command]
+fn get_cache_settings(state: tauri::State<'_, SharedState>) -> Result<CacheSettings, String> {
+    let guard = state.lock().map_err(|error| error.to_string())?;
+    Ok(cache_settings(&guard))
+}
+#[tauri::command]
+fn update_cache_settings(
+    state: tauri::State<'_, SharedState>,
+    enabled: Option<bool>,
+    max_entries: Option<usize>,
+) -> Result<CacheSettings, String> {
+    let mut guard = state.lock().map_err(|error| error.to_string())?;
+    let next = CacheSettings {
+        enabled: enabled.unwrap_or(guard.cache_enabled),
+        max_entries: max_entries
+            .map(validate_cache_max_entries)
+            .transpose()?
+            .unwrap_or(guard.cache_max_entries),
+    };
+    let db_path = guard.db_path.clone();
+    apply_cache_policy(&db_path, &mut guard.remote_cache, next)?;
+    save_app_state(&db_path, "cache_enabled", &next.enabled.to_string())?;
+    save_app_state(&db_path, "cache_max_entries", &next.max_entries.to_string())?;
+    guard.cache_enabled = next.enabled;
+    guard.cache_max_entries = next.max_entries;
+    Ok(next)
+}
+#[tauri::command]
+fn get_metadata_cache_stats(
+    state: tauri::State<'_, SharedState>,
+) -> Result<MetadataCacheStats, String> {
+    let guard = state.lock().map_err(|error| error.to_string())?;
+    metadata_cache_stats(&guard.db_path, &guard.remote_cache, cache_settings(&guard))
+}
+#[tauri::command]
+fn clear_metadata_cache(
+    state: tauri::State<'_, SharedState>,
+) -> Result<MetadataCacheStats, String> {
+    let mut guard = state.lock().map_err(|error| error.to_string())?;
+    let db_path = guard.db_path.clone();
+    let policy = cache_settings(&guard);
+    clear_metadata_cache_storage(&db_path, &mut guard.remote_cache, policy)
 }
 #[tauri::command]
 async fn resume_queue(
@@ -7096,13 +8080,28 @@ fn run() {
             let upload_history = load_upload_history(&db_path)?;
             let pending_cloud = pending_upload_stamps(&db_path)?;
             let device_id = load_or_create_device_id(&db_path)?;
-            let hdhive_base_url = std::env::var("HDHIVE_BASE_URL")
+            let cache_policy = CacheSettings {
+                enabled: parse_cache_enabled(load_app_state(&db_path, "cache_enabled")?.as_deref()),
+                max_entries: parse_cache_max_entries(
+                    load_app_state(&db_path, "cache_max_entries")?.as_deref(),
+                ),
+            };
+            save_app_state(&db_path, "cache_enabled", &cache_policy.enabled.to_string())?;
+            save_app_state(
+                &db_path,
+                "cache_max_entries",
+                &cache_policy.max_entries.to_string(),
+            )?;
+            let mut remote_cache = HashMap::from([(String::new(), String::new())]);
+            apply_cache_policy(&db_path, &mut remote_cache, cache_policy)?;
+            let hdhive_enabled =
+                parse_hdhive_enabled(load_app_state(&db_path, "hdhive_enabled")?.as_deref());
+            let raw_hdhive_base_url = std::env::var("HDHIVE_BASE_URL")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .or(load_app_state(&db_path, "hdhive_base_url")?)
-                .unwrap_or_default()
-                .trim_end_matches('/')
-                .to_string();
+                .unwrap_or_default();
+            let hdhive_base_url = normalize_hdhive_base_url(&raw_hdhive_base_url)?;
             let hdhive_secret = std::env::var("HDHIVE_GUANGYA_SYNC_SECRET")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -7123,6 +8122,7 @@ fn run() {
                 config.download_concurrency,
                 DEFAULT_DOWNLOAD_CONCURRENCY,
             );
+            let multipart_part_size = normalize_multipart_part_size(&config.multipart_part_size);
             let mappings = config
                 .mappings
                 .into_iter()
@@ -7146,19 +8146,24 @@ fn run() {
                 recovering_pending: HashSet::new(),
                 inflight: HashMap::new(),
                 inflight_items: HashMap::new(),
-                remote_cache: HashMap::from([(String::new(), String::new())]),
+                remote_cache,
                 watchers: HashMap::new(),
                 event_tx,
                 paused: false,
                 active_uploads: 0,
                 upload_concurrency,
                 download_concurrency,
+                multipart_part_size,
+                cache_enabled: cache_policy.enabled,
+                cache_max_entries: cache_policy.max_entries,
                 device_id,
+                hdhive_enabled,
                 hdhive_base_url,
                 hdhive_secret,
                 hdhive_instance_id,
                 auto_share_processing: HashSet::new(),
                 gcid_import_running: HashSet::new(),
+                sms_verifications: HashMap::new(),
             }));
             app.manage(state.clone());
             let app_handle = app.handle().clone();
@@ -7227,9 +8232,12 @@ fn run() {
         .invoke_handler(tauri::generate_handler![
             get_state,
             start_device_login,
+            request_sms_code,
+            login_with_sms,
             poll_device_login,
             get_overview,
             list_files,
+            search_files,
             select_gcid_import_file,
             stage_gcid_import_text,
             prepare_gcid_import,
@@ -7267,7 +8275,12 @@ fn run() {
             backfill_auto_shares,
             retry_auto_share_event,
             pause_queue,
+            get_transfer_settings,
             update_transfer_settings,
+            get_cache_settings,
+            update_cache_settings,
+            get_metadata_cache_stats,
+            clear_metadata_cache,
             resume_queue
         ])
         .run(tauri::generate_context!())
@@ -7610,6 +8623,28 @@ mod tests {
             oss_part_size(tier_boundary + 1),
             OSS_LARGE_FILE_PART_SIZE + OSS_MIB
         );
+
+        assert_eq!(configured_oss_part_size(100 * OSS_MIB, "auto"), OSS_MIB);
+        assert_eq!(configured_oss_part_size(100 * OSS_MIB, "4m"), 4 * OSS_MIB);
+        assert_eq!(configured_oss_part_size(100 * OSS_MIB, "8m"), 8 * OSS_MIB);
+        assert_eq!(configured_oss_part_size(100 * OSS_MIB, "16m"), 16 * OSS_MIB);
+        for tier in MULTIPART_PART_SIZE_OPTIONS {
+            let configured = configured_oss_part_size(u64::MAX / 2, tier);
+            assert!(ceil_div_u64(u64::MAX / 2, configured) <= OSS_MULTIPART_TARGET_PARTS);
+            assert!(ceil_div_u64(u64::MAX / 2, configured) <= 10_000);
+        }
+    }
+
+    #[test]
+    fn multipart_part_size_validation_accepts_only_supported_tiers() {
+        for tier in MULTIPART_PART_SIZE_OPTIONS {
+            assert_eq!(validate_multipart_part_size(tier).unwrap(), *tier);
+        }
+        assert_eq!(validate_multipart_part_size(" 8M ").unwrap(), "8m");
+        for invalid in ["", "1m", "2m", "32m", "custom"] {
+            assert!(validate_multipart_part_size(invalid).is_err());
+        }
+        assert_eq!(normalize_multipart_part_size("invalid"), "auto");
     }
 
     #[test]
@@ -7617,6 +8652,19 @@ mod tests {
         let config: AppConfig = serde_json::from_str("{}").expect("deserialize defaults");
         assert_eq!(config.upload_concurrency, DEFAULT_UPLOAD_CONCURRENCY);
         assert_eq!(config.download_concurrency, DEFAULT_DOWNLOAD_CONCURRENCY);
+        assert_eq!(config.multipart_part_size, DEFAULT_MULTIPART_PART_SIZE);
+        assert!(parse_cache_enabled(None));
+        assert!(!parse_cache_enabled(Some("false")));
+        assert_eq!(parse_cache_max_entries(None), DEFAULT_CACHE_MAX_ENTRIES);
+        assert_eq!(
+            parse_cache_max_entries(Some("99")),
+            DEFAULT_CACHE_MAX_ENTRIES
+        );
+        assert_eq!(parse_cache_max_entries(Some("100")), 100);
+        assert_eq!(parse_cache_max_entries(Some("100000")), 100_000);
+        assert!(parse_hdhive_enabled(None));
+        assert!(parse_hdhive_enabled(Some("true")));
+        assert!(!parse_hdhive_enabled(Some("false")));
         assert_eq!(
             normalize_transfer_concurrency(0, DEFAULT_UPLOAD_CONCURRENCY),
             DEFAULT_UPLOAD_CONCURRENCY
@@ -7628,6 +8676,101 @@ mod tests {
     }
 
     #[test]
+    fn hdhive_base_url_rejects_unsafe_parts_and_normalizes_paths() {
+        let unrestricted = HashSet::new();
+        assert_eq!(
+            normalize_hdhive_base_url_with_allowed_hosts(
+                "  https://Example.COM/integration///  ",
+                &unrestricted,
+            )
+            .unwrap(),
+            "https://example.com/integration"
+        );
+        assert_eq!(
+            normalize_hdhive_base_url_with_allowed_hosts("", &unrestricted).unwrap(),
+            ""
+        );
+        for unsafe_url in [
+            "ftp://example.com",
+            "https://user:secret@example.com",
+            "https://example.com?next=https://evil.example",
+            "https://example.com/#fragment",
+        ] {
+            assert!(
+                normalize_hdhive_base_url_with_allowed_hosts(unsafe_url, &unrestricted).is_err(),
+                "unsafe URL should be rejected: {unsafe_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn hdhive_base_url_honors_the_optional_host_allowlist() {
+        let host_only = HashSet::from(["api.example.com".to_string()]);
+        assert!(normalize_hdhive_base_url_with_allowed_hosts(
+            "https://api.example.com:8443/root",
+            &host_only,
+        )
+        .is_ok());
+        assert!(normalize_hdhive_base_url_with_allowed_hosts(
+            "https://other.example.com/root",
+            &host_only,
+        )
+        .is_err());
+
+        let host_and_port = HashSet::from(["api.example.com:8443".to_string()]);
+        assert!(normalize_hdhive_base_url_with_allowed_hosts(
+            "https://api.example.com:8443/root",
+            &host_and_port,
+        )
+        .is_ok());
+        assert!(normalize_hdhive_base_url_with_allowed_hosts(
+            "https://api.example.com:9443/root",
+            &host_and_port,
+        )
+        .is_err());
+
+        let ipv6_host_and_port = HashSet::from(["[::1]:8080".to_string()]);
+        assert!(normalize_hdhive_base_url_with_allowed_hosts(
+            "http://[::1]:8080/root",
+            &ipv6_host_and_port,
+        )
+        .is_ok());
+        let ipv6_host = HashSet::from(["[::1]".to_string()]);
+        assert!(
+            normalize_hdhive_base_url_with_allowed_hosts("http://[::1]:8080/root", &ipv6_host,)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn hdhive_target_url_appends_only_a_structured_path() {
+        let (target, signature_path) = build_hdhive_target_url(
+            "https://api.example.com/integration",
+            &["api", "guangya-sync", "events"],
+        )
+        .unwrap();
+        assert_eq!(
+            target.as_str(),
+            "https://api.example.com/integration/api/guangya-sync/events"
+        );
+        assert_eq!(signature_path, "/api/guangya-sync/events");
+        for unsafe_segment in [
+            "event/id",
+            r"event\id",
+            ".",
+            "..",
+            "event?redirect=evil",
+            "event#fragment",
+        ] {
+            assert!(build_hdhive_target_url(
+                "https://api.example.com",
+                &["api", "events", unsafe_segment],
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn file_gcid_cache_is_reused_only_for_an_unchanged_file_stamp() {
         let root = std::env::temp_dir().join(format!("guangya-gcid-cache-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("create gcid cache test root");
@@ -7636,26 +8779,304 @@ mod tests {
         init_database(&database).expect("initialize gcid cache database");
         fs::write(&file, b"fixture").expect("write gcid fixture");
         let gcid = "0123456789ABCDEF0123456789ABCDEF01234567";
+        let policy = CacheSettings {
+            enabled: true,
+            max_entries: DEFAULT_CACHE_MAX_ENTRIES,
+        };
 
         assert_eq!(
-            load_cached_file_gcid(&database, &file, 7, 100).expect("load empty cache"),
+            load_cached_file_gcid(&database, &file, 7, 100, policy).expect("load empty cache"),
             None
         );
-        save_cached_file_gcid(&database, &file, 7, 100, gcid).expect("save gcid cache");
+        save_cached_file_gcid(&database, &file, 7, 100, gcid, policy).expect("save gcid cache");
         assert_eq!(
-            load_cached_file_gcid(&database, &file, 7, 100).expect("load cached gcid"),
+            load_cached_file_gcid(&database, &file, 7, 100, policy).expect("load cached gcid"),
             Some(gcid.to_string())
         );
         assert_eq!(
-            load_cached_file_gcid(&database, &file, 7, 101).expect("reject changed mtime"),
+            load_cached_file_gcid(&database, &file, 7, 101, policy).expect("reject changed mtime"),
             None
         );
         assert_eq!(
-            load_cached_file_gcid(&database, &file, 8, 100).expect("reject changed size"),
+            load_cached_file_gcid(&database, &file, 8, 100, policy).expect("reject changed size"),
             None
         );
 
         fs::remove_dir_all(root).expect("remove gcid cache test root");
+    }
+
+    #[test]
+    fn metadata_cache_policy_persists_disables_and_bounds_each_cache() {
+        let root =
+            std::env::temp_dir().join(format!("guangya-cache-policy-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create cache policy test root");
+        let database = root.join("state.sqlite3");
+        init_database(&database).expect("initialize cache policy database");
+        let enabled = CacheSettings {
+            enabled: true,
+            max_entries: MIN_CACHE_MAX_ENTRIES,
+        };
+
+        for index in 0..105_u64 {
+            save_cached_file_gcid(
+                &database,
+                &root.join(format!("cached-{index}.bin")),
+                index + 1,
+                u128::from(index),
+                "0123456789ABCDEF0123456789ABCDEF01234567",
+                enabled,
+            )
+            .expect("save bounded fingerprint");
+        }
+        assert_eq!(
+            open_database(&database)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM file_fingerprints", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            MIN_CACHE_MAX_ENTRIES
+        );
+
+        let mut remote_cache = HashMap::from([(String::new(), String::new())]);
+        for index in 0..105 {
+            remote_cache.insert(format!("root::{index}"), format!("folder-{index}"));
+        }
+        let bounded = apply_cache_policy(&database, &mut remote_cache, enabled)
+            .expect("apply enabled cache policy");
+        assert_eq!(bounded.file_fingerprints_entries, 100);
+        assert_eq!(bounded.remote_cache_entries, 100);
+        assert_eq!(bounded.policy, enabled);
+        assert_eq!(remote_cache.get(""), Some(&String::new()));
+
+        let disabled = CacheSettings {
+            enabled: false,
+            max_entries: MIN_CACHE_MAX_ENTRIES,
+        };
+        let disabled_path = root.join("disabled.bin");
+        save_cached_file_gcid(
+            &database,
+            &disabled_path,
+            1,
+            1,
+            "89ABCDEF0123456789ABCDEF0123456789ABCDEF",
+            disabled,
+        )
+        .expect("disabled cache write is a no-op");
+        assert!(
+            load_cached_file_gcid(&database, &disabled_path, 1, 1, disabled)
+                .expect("disabled cache read is a no-op")
+                .is_none()
+        );
+        let cleared = apply_cache_policy(&database, &mut remote_cache, disabled)
+            .expect("disable and clear cache");
+        assert_eq!(cleared.entries, 0);
+        assert_eq!(cleared.policy, disabled);
+        assert_eq!(
+            remote_cache,
+            HashMap::from([(String::new(), String::new())])
+        );
+
+        save_app_state(&database, "cache_enabled", &disabled.enabled.to_string())
+            .expect("persist cache switch");
+        save_app_state(
+            &database,
+            "cache_max_entries",
+            &disabled.max_entries.to_string(),
+        )
+        .expect("persist cache limit");
+        assert!(!parse_cache_enabled(
+            load_app_state(&database, "cache_enabled")
+                .unwrap()
+                .as_deref()
+        ));
+        assert_eq!(
+            parse_cache_max_entries(
+                load_app_state(&database, "cache_max_entries")
+                    .unwrap()
+                    .as_deref()
+            ),
+            MIN_CACHE_MAX_ENTRIES
+        );
+        assert!(validate_cache_max_entries(MIN_CACHE_MAX_ENTRIES - 1).is_err());
+        assert!(validate_cache_max_entries(MAX_CACHE_MAX_ENTRIES + 1).is_err());
+
+        fs::remove_dir_all(root).expect("remove cache policy test root");
+    }
+
+    #[test]
+    fn metadata_cache_clear_preserves_upload_records_files_and_root_mapping() {
+        let root =
+            std::env::temp_dir().join(format!("guangya-cache-clear-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create metadata cache test root");
+        let database = root.join("state.sqlite3");
+        let file = root.join("movie.mkv");
+        init_database(&database).expect("initialize metadata cache database");
+        fs::write(&file, b"fixture").expect("write cache fixture");
+        let policy = CacheSettings {
+            enabled: true,
+            max_entries: DEFAULT_CACHE_MAX_ENTRIES,
+        };
+        save_cached_file_gcid(
+            &database,
+            &file,
+            7,
+            100,
+            "0123456789ABCDEF0123456789ABCDEF01234567",
+            policy,
+        )
+        .expect("save fingerprint cache");
+        let upload = UploadItem {
+            mapping_id: "mapping-cache-test".to_string(),
+            file_path: file.clone(),
+            remote_parent_id: String::new(),
+            remote_dir: String::new(),
+            relative_path: "movie.mkv".to_string(),
+            change_kind: "added".to_string(),
+            size: 7,
+            modified_ms: 100,
+        };
+        save_upload_record(
+            &database,
+            &upload,
+            &UploadOutcome {
+                task_id: "task-cache-test".to_string(),
+                remote_file_id: Some("file-cache-test".to_string()),
+            },
+            UPLOAD_STATE_CLOUD_CONFIRMED,
+        )
+        .expect("save upload record");
+        let mut remote_cache = HashMap::from([
+            (String::new(), String::new()),
+            ("root::Movies".to_string(), "folder-1".to_string()),
+        ]);
+        let before =
+            metadata_cache_stats(&database, &remote_cache, policy).expect("read cache stats");
+        assert_eq!(before.file_fingerprints_entries, 1);
+        assert_eq!(before.remote_cache_entries, 1);
+        assert_eq!(before.entries, 2);
+        assert!(before.bytes > 0);
+
+        let after = clear_metadata_cache_storage(&database, &mut remote_cache, policy)
+            .expect("clear metadata cache");
+        assert_eq!(after.entries, 0);
+        assert_eq!(after.bytes, 0);
+        assert_eq!(
+            remote_cache,
+            HashMap::from([(String::new(), String::new())])
+        );
+        assert!(file.exists());
+        assert!(load_cached_file_gcid(&database, &file, 7, 100, policy)
+            .expect("read cleared fingerprint")
+            .is_none());
+        assert!(load_upload_history(&database)
+            .expect("load preserved upload history")
+            .contains_key(&item_key(&upload.mapping_id, &upload.file_path)));
+
+        fs::remove_dir_all(root).expect("remove metadata cache test root");
+    }
+
+    #[test]
+    fn search_filters_use_cloud_item_suffixes_on_the_current_page() {
+        let folder = json!({ "fileName": "相册", "resType": 2 });
+        let image = json!({ "fileName": "封面.JPG", "fileSuffix": ".JPG", "resType": 1 });
+        let video = json!({ "fileName": "电影.MKV", "resType": "1" });
+        let document = json!({ "fileName": "说明.pdf", "resType": 1 });
+        let archive = json!({ "fileName": "备份.7z", "resType": 1 });
+
+        assert!(cloud_item_matches_search_filters(
+            &folder,
+            Some("folder"),
+            None
+        ));
+        assert!(!cloud_item_matches_search_filters(
+            &folder,
+            Some("image"),
+            None
+        ));
+        assert!(cloud_item_matches_search_filters(
+            &image,
+            Some("image"),
+            Some("jpg")
+        ));
+        assert!(cloud_item_matches_search_filters(
+            &video,
+            Some("video"),
+            Some("mkv")
+        ));
+        assert!(cloud_item_matches_search_filters(
+            &document,
+            Some("document"),
+            None
+        ));
+        assert!(cloud_item_matches_search_filters(
+            &archive,
+            Some("archive"),
+            Some("7z")
+        ));
+        assert!(!cloud_item_matches_search_filters(
+            &archive,
+            Some("document"),
+            None
+        ));
+        assert_eq!(normalize_search_file_type(Some("ALL")).unwrap(), None);
+        assert!(normalize_search_file_type(Some("executable")).is_err());
+        assert_eq!(
+            normalize_search_extension(Some(" .MP4 ")).as_deref(),
+            Some("mp4")
+        );
+
+        let (search_endpoint, search_request) =
+            cloud_search_request(" holiday ", Some("video"), None, 2);
+        assert_eq!(search_endpoint, "/userres/v1/file/search_files");
+        assert_eq!(
+            search_request,
+            json!({ "name": "holiday", "pageSize": 100, "page": 2 })
+        );
+
+        let (video_endpoint, video_request) = cloud_search_request("", Some("video"), None, 3);
+        assert_eq!(video_endpoint, "/userres/v1/file/get_file_list");
+        assert_eq!(
+            video_request,
+            json!({
+                "parentId": "*",
+                "pageSize": 100,
+                "page": 3,
+                "orderBy": 3,
+                "sortType": 1,
+                "resType": 1,
+                "fileTypes": [CLOUD_FILE_TYPE_VIDEO]
+            })
+        );
+
+        let (_, extension_request) = cloud_search_request("", None, Some("pdf"), 0);
+        assert_eq!(
+            extension_request.get("fileTypes"),
+            Some(&json!([CLOUD_FILE_TYPE_DOCUMENT]))
+        );
+        let (_, folder_request) = cloud_search_request("", Some("folder"), None, 0);
+        assert_eq!(folder_request.get("resType"), Some(&json!(2)));
+        assert!(folder_request.get("fileTypes").is_none());
+        let (_, unknown_extension_request) = cloud_search_request("", None, Some("blend"), 0);
+        assert!(unknown_extension_request.get("fileTypes").is_none());
+    }
+
+    #[test]
+    fn sms_phone_normalization_and_masked_signup_name_are_stable() {
+        assert_eq!(
+            normalize_china_phone("13800138000").unwrap(),
+            "+86 13800138000"
+        );
+        assert_eq!(
+            normalize_china_phone("+86 13800138000").unwrap(),
+            "+86 13800138000"
+        );
+        assert_eq!(
+            normalize_china_phone("86-138-0013-8000").unwrap(),
+            "+86 13800138000"
+        );
+        assert!(normalize_china_phone("23800138000").is_err());
+        assert!(normalize_china_phone("1380013800").is_err());
+        assert_eq!(masked_phone_name("+86 13800138000"), "用户138****8000");
     }
 
     #[test]

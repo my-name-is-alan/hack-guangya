@@ -4,9 +4,12 @@ description = "允许主窗口管理登录、监控目录和上传队列"
 commands.allow = [
   "get_state",
   "start_device_login",
+  "request_sms_code",
+  "login_with_sms",
   "poll_device_login",
   "get_overview",
   "list_files",
+  "search_files",
   "select_gcid_import_file",
   "stage_gcid_import_text",
   "prepare_gcid_import",
@@ -43,7 +46,12 @@ commands.allow = [
   "backfill_auto_shares",
   "retry_auto_share_event",
   "pause_queue",
+  "get_transfer_settings",
   "update_transfer_settings",
+  "get_cache_settings",
+  "update_cache_settings",
+  "get_metadata_cache_stats",
+  "clear_metadata_cache",
   "resume_queue"
 ]
 

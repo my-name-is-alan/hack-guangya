@@ -2,6 +2,7 @@
 import { computed, h, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
 import { message } from 'antdv-next';
 import appLogo from '../src-tauri/icons/128x128.png';
+import useIllustrationTheme from './illustrationTheme';
 import { buildRenamePreview } from './renameRules.js';
 import {
   formatUploadSpeed,
@@ -123,30 +124,7 @@ const bridge = isTauri ? {
   login: () => webRequest('/api/auth/device/start', { method: 'POST', body: '{}' }),
 };
 
-const theme = {
-  token: {
-    colorPrimary: '#1677ff',
-    colorInfo: '#1677ff',
-    colorSuccess: '#16a672',
-    colorWarning: '#f59e0b',
-    colorError: '#e5484d',
-    borderRadius: 6,
-    borderRadiusLG: 8,
-    controlHeight: 28,
-    controlHeightSM: 22,
-    controlHeightLG: 34,
-    fontSize: 13,
-    colorBgLayout: '#f5f7fb',
-    colorText: '#172033',
-    colorTextSecondary: '#667085',
-    fontFamily: "Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif",
-  },
-  components: {
-    Layout: { bodyBg: '#f5f7fb', siderBg: '#ffffff', headerBg: '#f5f7fb' },
-    Menu: { itemBorderRadius: 6, itemHeight: 36, itemMarginInline: 8 },
-    Table: { headerBg: '#f8fafc', headerColor: '#667085', rowHoverBg: '#f5f9ff' },
-  },
-};
+const configProps = useIllustrationTheme();
 
 const navigation = [
   { key: 'cloud', label: '云盘文件', icon: () => h(CloudOutlined) },
@@ -1516,10 +1494,10 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <a-config-provider :theme="theme">
+  <a-config-provider v-bind="configProps">
     <a-app>
       <a-layout class="app-shell">
-        <a-layout-sider :width="240" class="sidebar" theme="light">
+        <a-layout-sider :width="220" class="sidebar" theme="light">
           <div class="brand">
             <div class="brand-mark"><img :src="appLogo" alt="光鸭文件夹同步" /></div>
             <div><strong>光鸭云盘</strong><span>GUANGYA SYNC</span></div>
