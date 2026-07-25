@@ -9,6 +9,7 @@ import { pipeline } from 'node:stream/promises';
 import chokidar from 'chokidar';
 import OSS from 'ali-oss';
 import { autoShareTargetFor, shareFilePayload, signHdhiveRequest } from './auto-share.mjs';
+import { uploadPartSize } from './upload-parts.mjs';
 import { parseGuangyaShareLink } from '../ui/shareLink.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -913,7 +914,6 @@ async function waitTask(taskId, eventPath) {
   throw error;
 }
 async function waitOperation(taskId) { if (!taskId) return; for (let index = 0; index < 90; index += 1) { const response = await apiPost('/userres/v1/get_task_status', { taskId }); const statusCode = Number(response.data?.status); const detail = response.data?.detail || {}; if ([2, 3].includes(statusCode) && detail.code && Number(detail.code) !== 0) throw new Error(detail.msg || '文件操作失败'); if (statusCode === 2) return; if (statusCode === 3) throw new Error(detail.msg || '文件操作失败'); await new Promise((resolve) => setTimeout(resolve, 1000)); } throw new Error('文件操作长时间未完成'); }
-function uploadPartSize(size) { if (size <= 100 * 1024 * 1024) return 1024 * 1024; if (size <= 1024 * 1024 * 1024) return 2 * 1024 * 1024; if (size <= 10 * 1024 * 1024 * 1024) return 4 * 1024 * 1024; return 8 * 1024 * 1024; }
 function gcidChunkSize(size) { if (size <= 0x08000000) return 256 * 1024; if (size <= 0x10000000) return 512 * 1024; if (size <= 0x20000000) return 1024 * 1024; return 2 * 1024 * 1024; }
 async function calculateFileHash(filePath, algorithm) {
   const hash = crypto.createHash(algorithm);
