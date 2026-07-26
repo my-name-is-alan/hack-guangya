@@ -58,3 +58,16 @@ test('SharesView copies the URL together with direct or URL-derived extraction c
   assert.match(copySource, /copyText\(code\s*\?\s*`\$\{url\} 提取码：\$\{code\}`\s*:\s*url,\s*message\)/);
   assert.match(source, /@click=['"]copyCloudShare\(record\)['"]/);
 });
+
+test('SharesView provides searchable pagination and deletes by the backend ids contract', async () => {
+  const source = await sharesViewSource;
+  const deleteSource = sourceBetween(source, 'async function deleteShare(record)', 'function handleCloudShareTableChange');
+
+  assert.match(source, /const filteredCloudShares = computed/);
+  assert.match(source, /v-model:value="cloudShareQuery"/);
+  assert.match(source, /:pagination="cloudSharePagination"/);
+  assert.match(source, /showSizeChanger:\s*true/);
+  assert.match(deleteSource, /record\.id \?\? record\.shareId \?\? record\.share_id/);
+  assert.match(deleteSource, /bridge\.invoke\(['"]delete_shares['"],\s*\{\s*ids:\s*\[id\]\s*\}\)/);
+  assert.doesNotMatch(deleteSource, /share_ids/);
+});

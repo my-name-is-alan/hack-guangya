@@ -48,6 +48,12 @@ test('CloudView creates shares with the backend contract and opens an explicit r
   assert.match(createShareSource, /file_ids:\s*targets\.map\(fileId\)\.filter\(Boolean\)/);
   assert.match(createShareSource, /\btitle\s*,/);
   assert.match(createShareSource, /target_type:\s*targetType/);
+  assert.match(createShareSource, /share_type:\s*shareType/);
+  assert.match(createShareSource, /code:\s*shareType === 2 \? code : ['"]['"]/);
+  assert.match(createShareSource, /auto_fill_code:\s*false/);
+  assert.match(source, /value="none">不设置/);
+  assert.match(source, /value="random">随机/);
+  assert.match(source, /value="fixed">固定/);
   assert.doesNotMatch(createShareSource, /\b(?:period|password)\s*:/);
   assert.doesNotMatch(createShareSource, /navigator\.clipboard\.writeText/);
 });

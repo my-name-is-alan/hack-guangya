@@ -13,6 +13,8 @@ export interface UploadTask {
   stage: string
   percent: number
   bytesPerSecond: number
+  uploadedBytes: number
+  totalBytes: number
   startedAt: number
   updatedAt: number
 }

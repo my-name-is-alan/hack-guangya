@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   autoShareTargetFor,
   DEFAULT_SHARE_TEMPLATE,
+  normalizeShareAccess,
   shareFilePayload,
   signHdhiveRequest,
 } from './auto-share.mjs';
@@ -45,4 +46,20 @@ test('光鸭分享请求与网页版普通分享参数一致', () => {
 
 test('光鸭分享请求不会提交空标题', () => {
   assert.equal(shareFilePayload(['file-1'], '   ').title, '云盘分享');
+});
+
+test('光鸭分享访问码支持不设置、随机和固定四位码', () => {
+  assert.deepEqual(normalizeShareAccess({ share_type: 0 }), {
+    shareType: 0, code: '', autoFillCode: false,
+  });
+  assert.deepEqual(normalizeShareAccess({ share_type: 1 }), {
+    shareType: 1, code: '', autoFillCode: false,
+  });
+  assert.deepEqual(normalizeShareAccess({ share_type: 2, code: 'a1B2' }), {
+    shareType: 2, code: 'a1B2', autoFillCode: false,
+  });
+  assert.throws(
+    () => normalizeShareAccess({ share_type: 2, code: 'xyz' }),
+    /4 位.*数字/,
+  );
 });

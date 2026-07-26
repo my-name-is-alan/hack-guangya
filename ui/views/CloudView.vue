@@ -158,6 +158,12 @@ const shareResult = reactive({
   hdhiveStatus: '',
   hdhiveMessage: '',
 });
+const shareAccess = reactive({
+  open: false,
+  records: [],
+  mode: 'none',
+  code: '',
+});
 const shareResultReceipt = computed(() => (appState.auto_share_receipts || [])
   .find((receipt) => receipt.event_id === shareResult.hdhiveEventId) || null);
 const shareResultView = computed(() => ({
@@ -714,11 +720,26 @@ async function confirmServerUpload() {
 async function createCloudShare(records) {
   const targets = (Array.isArray(records) ? records : []).filter(Boolean);
   if (!targets.length || shareResult.creating) return;
+  shareAccess.records = targets;
+  shareAccess.mode = 'none';
+  shareAccess.code = '';
+  shareAccess.open = true;
+}
+
+async function confirmCloudShare() {
+  const targets = shareAccess.records;
+  if (!targets.length || shareResult.creating) return;
+  const code = shareAccess.code.trim();
+  if (shareAccess.mode === 'fixed' && !/^[A-Za-z0-9]{4}$/.test(code)) {
+    message.warning('固定访问码必须是 4 位英文或数字');
+    return;
+  }
   const names = targets
     .map((item) => String(pick(item, ['fileName', 'name'], '')).trim())
     .filter(Boolean);
   const title = names.length > 1 ? `${names[0]} 等 ${names.length} 项` : names[0] || '云盘分享';
   const targetType = targets.length === 1 && isFolder(targets[0]) ? 'folder' : 'file';
+  const shareType = ({ none: 0, random: 1, fixed: 2 })[shareAccess.mode] ?? 0;
   shareResult.creating = true;
   const closeProgress = message.loading('正在创建分享，请稍候…', 0);
   try {
@@ -726,6 +747,9 @@ async function createCloudShare(records) {
       file_ids: targets.map(fileId).filter(Boolean),
       title,
       target_type: targetType,
+      share_type: shareType,
+      code: shareType === 2 ? code : '',
+      auto_fill_code: false,
     }));
     const url = pick(data, ['shareUrl', 'share_url', 'url'], '');
     if (!url) throw new Error('光鸭没有返回分享链接');
@@ -743,6 +767,7 @@ async function createCloudShare(records) {
       hdhiveStatus: String(pick(data, ['hdhive_status'], 'disabled') || 'disabled'),
       hdhiveMessage: String(pick(data, ['hdhive_message'], '光鸭分享已创建') || ''),
     });
+    shareAccess.open = false;
     if (['accepted', 'processing', 'completed'].includes(shareResult.hdhiveStatus)) {
       message.success(shareResult.reused ? '已复用已有分享，Hdhive 将更新现有内容' : '分享已创建，Hdhive 正在处理');
     } else if (shareResult.hdhiveStatus === 'disabled') {
@@ -1154,6 +1179,10 @@ async function uploadWebFiles(entries) {
           lastModified: String(entry.file.lastModified || 0),
         });
         const eventPath = `[浏览器]/${entry.relativePath || entry.file.name}`;
+        transfers.handleSyncEvent({
+          type: 'file', state: 'uploading', file_path: eventPath,
+          uploaded_bytes: 0, total_bytes: entry.file.size, stage: '正在传到服务器',
+        });
         const payload = await new Promise((resolve, reject) => {
           const request = new XMLHttpRequest();
           const startedAt = performance.now();
@@ -1165,19 +1194,30 @@ async function uploadWebFiles(entries) {
             transfers.handleSyncEvent({
               type: 'progress', file_path: eventPath,
               percent: total ? Math.round(event.loaded / total * 100) : 0,
+              uploaded_bytes: event.loaded,
+              total_bytes: total,
               bytes_per_second: event.loaded / elapsed,
               stage: '正在传到服务器',
             });
           };
-          request.onerror = () => reject(new Error(`上传接口网络错误：${entry.file.name}`));
+          request.onerror = () => {
+            const error = new Error(`上传接口网络错误：${entry.file.name}`);
+            transfers.handleSyncEvent({ type: 'file', state: 'error', file_path: eventPath, total_bytes: entry.file.size, error: error.message });
+            reject(error);
+          };
           request.onload = async () => {
             try {
               const response = new Response(request.responseText || '', {
                 status: request.status || 500,
                 headers: { 'content-type': request.getResponseHeader('content-type') || 'text/plain' },
               });
-              resolve(await readJsonResponse(response, `上传接口失败：${entry.file.name}`));
-            } catch (error) { reject(error); }
+              const result = await readJsonResponse(response, `上传接口失败：${entry.file.name}`);
+              if (result.skipped) transfers.handleSyncEvent({ type: 'file', state: 'done', file_path: eventPath, uploaded_bytes: entry.file.size, total_bytes: entry.file.size, stage: '文件未变化，已跳过' });
+              resolve(result);
+            } catch (error) {
+              transfers.handleSyncEvent({ type: 'file', state: 'error', file_path: eventPath, total_bytes: entry.file.size, error: error.message });
+              reject(error);
+            }
           };
           request.send(entry.file);
         });
@@ -1229,7 +1269,7 @@ function handleWindowClick(event) {
 
 useFileKeyboardShortcuts({
   getState: () => ({
-    blocked: fileContextMenu.open || shareResult.open || shareResult.creating || renameModal.open || folderPicker.open || gcidImport.open || gcidImport.detailsOpen || serverFilePicker.open || operationBusy.value,
+    blocked: fileContextMenu.open || shareAccess.open || shareResult.open || shareResult.creating || renameModal.open || folderPicker.open || gcidImport.open || gcidImport.detailsOpen || serverFilePicker.open || operationBusy.value,
     fileCount: files.value.length,
     selectedCount: selectedKeys.value.length,
     clipboardCount: fileClipboard.items.length,
@@ -1372,6 +1412,28 @@ onBeforeUnmount(() => {
         <span class="file-context-anchor" :style="{ left: `${fileContextMenu.x}px`, top: `${fileContextMenu.y}px` }" />
       </a-dropdown>
     </teleport>
+
+    <a-modal
+      v-model:open="shareAccess.open"
+      title="创建分享"
+      ok-text="创建分享"
+      cancel-text="取消"
+      :confirm-loading="shareResult.creating"
+      @ok="confirmCloudShare"
+    >
+      <a-form layout="vertical">
+        <a-form-item label="访问码">
+          <a-radio-group v-model:value="shareAccess.mode">
+            <a-radio-button value="none">不设置</a-radio-button>
+            <a-radio-button value="random">随机</a-radio-button>
+            <a-radio-button value="fixed">固定</a-radio-button>
+          </a-radio-group>
+        </a-form-item>
+        <a-form-item v-if="shareAccess.mode === 'fixed'" label="固定访问码" extra="仅支持 4 位英文字母或数字">
+          <a-input v-model:value="shareAccess.code" :maxlength="4" placeholder="4 位英文或数字" @press-enter="confirmCloudShare" />
+        </a-form-item>
+      </a-form>
+    </a-modal>
 
     <ShareResultDialog v-model:open="shareResult.open" :result="shareResultView" :saving="shareResult.saving" @save="saveCreatedShare" />
 

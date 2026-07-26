@@ -1,5 +1,5 @@
 <script setup>
-import { onMounted, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { message, Modal } from 'antdv-next';
 import {
   CloudOutlined,
@@ -7,6 +7,7 @@ import {
   DeleteOutlined,
   LinkOutlined,
   ReloadOutlined,
+  SearchOutlined,
 } from '@antdv-next/icons';
 import { bridge } from '../bridge.js';
 import FavoriteLinkDialog from '../components/shares/FavoriteLinkDialog.vue';
@@ -19,6 +20,30 @@ import { cloudShareStatus, copyText, errorText, formatSize, formatTime, isFolder
 const shareTab = ref('cloud');
 const cloudShares = ref([]);
 const cloudSharesLoading = ref(false);
+const cloudShareQuery = ref('');
+const cloudSharePage = ref(1);
+const cloudSharePageSize = ref(20);
+const filteredCloudShares = computed(() => {
+  const query = cloudShareQuery.value.trim().toLowerCase();
+  if (!query) return cloudShares.value;
+  return cloudShares.value.filter((record) => [
+    shareDisplayName(record),
+    record.shareUrl,
+    record.share_url,
+    record.code,
+    record.id,
+    record.shareId,
+  ].some((value) => String(value ?? '').toLowerCase().includes(query)));
+});
+const cloudSharePagination = computed(() => ({
+  current: cloudSharePage.value,
+  pageSize: cloudSharePageSize.value,
+  total: filteredCloudShares.value.length,
+  hideOnSinglePage: false,
+  showSizeChanger: true,
+  pageSizeOptions: ['20', '50', '100'],
+  showTotal: (total) => `共 ${total} 条分享`,
+}));
 
 const shareColumns = [
   { title: '名称', key: 'name', ellipsis: true },
@@ -38,6 +63,7 @@ async function loadCloudShares() {
   try {
     const data = unwrapData(await bridge.invoke('list_shares'));
     cloudShares.value = data.list || data.shares || [];
+    cloudSharePage.value = 1;
   } catch (error) {
     message.error(errorText(error));
   } finally {
@@ -67,6 +93,11 @@ async function copyCloudShare(record) {
   await copyText(code ? `${url} 提取码：${code}` : url, message);
 }
 async function deleteShare(record) {
+  const id = record.id ?? record.shareId ?? record.share_id;
+  if (id === undefined || id === null || id === '') {
+    message.error('当前分享缺少可取消的记录 ID，请刷新后重试');
+    return;
+  }
   Modal.confirm({
     title: '取消分享',
     content: `确定取消「${shareDisplayName(record)}」吗？`,
@@ -75,7 +106,7 @@ async function deleteShare(record) {
     cancelText: '关闭',
     async onOk() {
       try {
-        await bridge.invoke('delete_shares', { share_ids: [record.shareId || record.id] });
+        await bridge.invoke('delete_shares', { ids: [id] });
         await loadCloudShares();
         message.success('已取消分享');
       } catch (error) {
@@ -83,6 +114,10 @@ async function deleteShare(record) {
       }
     },
   });
+}
+function handleCloudShareTableChange(pagination) {
+  cloudSharePage.value = Number(pagination?.current || 1);
+  cloudSharePageSize.value = Number(pagination?.pageSize || 20);
 }
 async function removeShareLink(record) {
   try {
@@ -103,13 +138,16 @@ onMounted(loadCloudShares);
     <a-tabs v-model:active-key="shareTab" class="page-tabs">
       <template #rightExtra>
         <a-space>
+          <a-input v-if="shareTab === 'cloud'" v-model:value="cloudShareQuery" allow-clear placeholder="搜索分享" style="width: 220px" @change="cloudSharePage = 1">
+            <template #prefix><SearchOutlined /></template>
+          </a-input>
           <ReceiveShareDialog v-if="shareTab === 'cloud'" />
           <FavoriteLinkDialog v-else />
           <a-button :loading="cloudSharesLoading" @click="refreshActiveTab"><template #icon><ReloadOutlined /></template>刷新</a-button>
         </a-space>
       </template>
       <a-tab-pane key="cloud" tab="分享">
-        <a-table :columns="shareColumns" :data-source="cloudShares" :loading="cloudSharesLoading" :row-key="(item) => item.shareId || item.id" :pagination="false" size="small">
+        <a-table :columns="shareColumns" :data-source="filteredCloudShares" :loading="cloudSharesLoading" :row-key="(item) => item.id || item.shareId" :pagination="cloudSharePagination" size="small" @change="handleCloudShareTableChange">
           <template #emptyText><a-empty :description="appState.logged_in ? '暂无分享' : '登录后查看分享'" /></template>
           <template #bodyCell="{ column, record }">
             <template v-if="column.key === 'name'">

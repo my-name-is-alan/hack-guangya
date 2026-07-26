@@ -1,7 +1,14 @@
 const terminalStates = new Set(['done', 'error']);
 
 export function nextUploadProgress(previous, payload, updatedAt = Date.now()) {
-  const current = previous || { percent: 0, state: 'queued', stage: '排队等待', bytesPerSecond: 0 };
+  const current = previous || {
+    percent: 0,
+    state: 'queued',
+    stage: '排队等待',
+    bytesPerSecond: 0,
+    uploadedBytes: 0,
+    totalBytes: 0,
+  };
 
   // A delayed progress event from the backend must never turn a completed or
   // failed item back into an active upload. A new explicit file event can
@@ -20,6 +27,20 @@ export function nextUploadProgress(previous, payload, updatedAt = Date.now()) {
     ? Math.max(0, Number(payload.bytes_per_second))
     : Number(current.bytesPerSecond || 0);
   if (nextState !== 'uploading') bytesPerSecond = 0;
+  const totalBytes = Number.isFinite(Number(payload?.total_bytes))
+    ? Math.max(0, Number(payload.total_bytes))
+    : Math.max(0, Number(current.totalBytes || 0));
+  let uploadedBytes = Number.isFinite(Number(payload?.uploaded_bytes))
+    ? Math.max(0, Number(payload.uploaded_bytes))
+    : Math.max(0, Number(current.uploadedBytes || 0));
+  if (totalBytes > 0 && payload?.uploaded_bytes == null && payload?.percent != null) {
+    uploadedBytes = Math.round((percent / 100) * totalBytes);
+  }
+  if (['queued', 'waiting-login', 'waiting-file', 'preparing'].includes(nextState)) {
+    uploadedBytes = payload?.uploaded_bytes == null ? 0 : uploadedBytes;
+  }
+  if (['processing', 'done'].includes(nextState) && totalBytes > 0) uploadedBytes = totalBytes;
+  if (totalBytes > 0) uploadedBytes = Math.min(uploadedBytes, totalBytes);
 
   const defaultStage = {
     queued: '排队等待',
@@ -35,6 +56,8 @@ export function nextUploadProgress(previous, payload, updatedAt = Date.now()) {
   return {
     percent,
     bytesPerSecond,
+    uploadedBytes,
+    totalBytes,
     state: nextState,
     stage: payload?.stage || (nextState === 'error' ? payload?.error : '') || defaultStage,
     updatedAt,

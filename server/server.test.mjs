@@ -277,11 +277,12 @@ test('Docker Web 会话保存到 SQLite 并在重启后恢复', async () => {
     const configResponse = await fetch(`http://127.0.0.1:${firstPort}/api/hdhive/config`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ base_url: 'https://hdhive.example.test', secret: 'local-only-secret' }),
+      body: JSON.stringify({ enabled: false, base_url: 'https://hdhive.example.test', secret: 'local-only-secret' }),
     });
     const configRaw = await configResponse.text();
     assert.equal(configResponse.status, 200, configRaw);
     const configured = JSON.parse(configRaw);
+    assert.equal(configured.enabled, false);
     assert.equal(configured.configured, true);
     assert.equal('secret' in configured, false);
     const instanceId = configured.instance_id;
@@ -292,6 +293,7 @@ test('Docker Web 会话保存到 SQLite 并在重启后恢复', async () => {
     child = await startServer(secondPort);
     const restored = await fetch(`http://127.0.0.1:${secondPort}/api/state`).then((value) => value.json());
     assert.equal(restored.logged_in, true);
+    assert.equal(restored.hdhive.enabled, false);
     assert.equal(restored.hdhive.configured, true);
     assert.equal(restored.hdhive.base_url, 'https://hdhive.example.test');
     assert.equal(restored.hdhive.instance_id, instanceId);
@@ -551,6 +553,7 @@ test('同一电视剧多季复用顶层文件夹分享并按静默窗口聚合�
   await Promise.all([fsp.mkdir(watchRoot, { recursive: true }), fsp.mkdir(archiveRoot, { recursive: true })]);
 
   const folders = new Map();
+  let confirmSecondEpisode = false;
   let shareCount = 0;
   const sharePayloads = [];
   const shareRecords = [];
@@ -571,6 +574,10 @@ test('同一电视剧多季复用顶层文件夹分享并按静默窗口聚合�
       return;
     }
     if (request.url === '/userres/v1/file/get_info_by_task_id') {
+      if (input.taskId === 'task-s02.mkv' && !confirmSecondEpisode) {
+        response.end(JSON.stringify({ code: 145, data: {} }));
+        return;
+      }
       response.end(JSON.stringify({ code: 0, data: { fileId: `remote-${input.taskId}` } }));
       return;
     }
@@ -647,7 +654,8 @@ test('同一电视剧多季复用顶层文件夹分享并按静默窗口聚合�
     env: {
       ...process.env,
       PORT: String(port), DATA_DIR: dataDir, GUANGYA_WATCH_ROOT: watchRoot, GUANGYA_ARCHIVE_ROOT: archiveRoot,
-      GUANGYA_API_BASE: `http://127.0.0.1:${apiServer.address().port}`, GUANGYA_TOKEN: 'test-token', GUANGYA_AUTO_SHARE_QUIET_MS: '1000',
+      GUANGYA_API_BASE: `http://127.0.0.1:${apiServer.address().port}`, GUANGYA_TOKEN: 'test-token', GUANGYA_AUTO_SHARE_QUIET_MS: '1500',
+      GUANGYA_CLOUD_CONFIRM_TIMEOUT_MS: '1000', GUANGYA_CLOUD_CONFIRM_POLL_MS: '50',
       HDHIVE_BASE_URL: `http://127.0.0.1:${hdhiveServer.address().port}`, HDHIVE_GUANGYA_SYNC_SECRET: secret, HDHIVE_GUANGYA_SYNC_INSTANCE_ID: 'test-instance',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -668,6 +676,14 @@ test('同一电视剧多季复用顶层文件夹分享并按静默窗口聚合�
       fsp.writeFile(path.join(watchRoot, 'tvname', 'season 1', 's01.mkv'), 'episode-1'),
       fsp.writeFile(path.join(watchRoot, 'tvname', 'season 1', 's02.mkv'), 'episode-2'),
     ]);
+    await waitUntil(async () => {
+      const current = await fetch(`http://127.0.0.1:${port}/api/state`).then((value) => value.json());
+      return current.pending === 1;
+    }, 10_000);
+    await new Promise((resolve) => setTimeout(resolve, 1_800));
+    assert.equal(hdhiveEvents.length, 0, '目录中仍有文件等待云端入库时不能提前分享');
+    assert.equal(shareCount, 0);
+    confirmSecondEpisode = true;
     await waitUntil(() => hdhiveEvents.length === 1, 15_000).catch((error) => { throw new Error(`${error.message}\n${output}`); });
     assert.equal(shareCount, 1);
     assert.equal(sharePayloads[0].trafficLimit, '0');
@@ -693,7 +709,7 @@ test('同一电视剧多季复用顶层文件夹分享并按静默窗口聚合�
     const manualResponse = await fetch(`http://127.0.0.1:${port}/api/share`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ file_ids: ['manual-folder-1'], title: '手动投稿电视剧', target_type: 'folder' }),
+      body: JSON.stringify({ file_ids: ['manual-folder-1'], title: '手动投稿电视剧', target_type: 'folder', share_type: 2, code: 'a1B2' }),
     });
     const manualRaw = await manualResponse.text();
     assert.equal(manualResponse.status, 200, manualRaw);
@@ -708,6 +724,9 @@ test('同一电视剧多季复用顶层文件夹分享并按静默窗口聚合�
     assert.equal(hdhiveEvents[2].remote_target_id, 'manual-folder-1');
     assert.equal(hdhiveEvents[2].share_id, '1927007413038006365_manualCode');
     assert.equal(hdhiveEvents[2].intent, 'new');
+    assert.equal(sharePayloads[1].shareType, 2);
+    assert.equal(sharePayloads[1].code, 'a1B2');
+    assert.equal(sharePayloads[1].autoFillCode, false);
 
     const duplicateResponse = await fetch(`http://127.0.0.1:${port}/api/share`, {
       method: 'POST',
@@ -716,20 +735,20 @@ test('同一电视剧多季复用顶层文件夹分享并按静默窗口聚合�
     });
     const duplicateResult = await duplicateResponse.json();
     assert.equal(duplicateResponse.status, 200);
-    assert.equal(duplicateResult.reused_existing, true);
+    assert.equal(duplicateResult.reused_existing, false);
     assert.equal(duplicateResult.share_url, 'https://www.guangyapan.com/s/1927007413038006365_manualCode');
     await waitUntil(() => hdhiveEvents.length === 4, 10_000);
-    assert.equal(shareCount, 2);
-    assert.equal(hdhiveEvents[3].intent, 'update');
+    assert.equal(shareCount, 3);
+    assert.equal(hdhiveEvents[3].intent, 'new');
 
     const sharesResult = await fetch(`http://127.0.0.1:${port}/api/shares`).then((response) => response.json());
-    assert.equal(sharesResult.total, 2);
+    assert.equal(sharesResult.total, 3);
     const deleteShareResponse = await fetch(`http://127.0.0.1:${port}/api/shares/delete`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ids: [2] }),
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ share_ids: [2] }),
     });
     assert.equal(deleteShareResponse.status, 200);
     const remainingShares = await fetch(`http://127.0.0.1:${port}/api/shares`).then((response) => response.json());
-    assert.equal(remainingShares.total, 1);
+    assert.equal(remainingShares.total, 2);
   } finally {
     child.kill();
     await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 2_000))]);

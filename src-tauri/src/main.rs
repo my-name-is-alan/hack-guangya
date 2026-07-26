@@ -1,23 +1,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use futures_util::{stream, StreamExt};
 use hmac::{Hmac, Mac};
 use md5::Md5;
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use opendal::{
-    layers::{RetryEvent, RetryLayer},
-    services::Oss,
-    Operator,
-};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, DATE, ETAG};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::{self, OpenOptions},
-    io,
+    io::{self, SeekFrom},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -26,9 +23,9 @@ use std::{
 };
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
-    time::{sleep, timeout, Duration, Instant},
+    time::{sleep, Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -161,7 +158,7 @@ struct Snapshot {
     hdhive: HdhivePublicConfig,
     auto_share_receipts: Vec<AutoShareReceipt>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct UploadItem {
     mapping_id: String,
     file_path: PathBuf,
@@ -299,7 +296,7 @@ struct ApiResponse {
     msg: String,
     data: Option<Value>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct UploadCredentials {
     #[serde(rename = "accessKeyID")]
     access_key_id: String,
@@ -308,7 +305,7 @@ struct UploadCredentials {
     #[serde(rename = "sessionToken")]
     session_token: String,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UploadToken {
     task_id: String,
@@ -316,6 +313,26 @@ struct UploadToken {
     bucket_name: Option<String>,
     end_point: Option<String>,
     creds: Option<UploadCredentials>,
+    #[serde(default)]
+    provider: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OssUploadCheckpoint {
+    task_id: String,
+    object_path: String,
+    bucket_name: String,
+    end_point: String,
+    provider: Option<Value>,
+    upload_id: String,
+    part_size: u64,
+    completed_parts: BTreeMap<u32, String>,
+}
+
+#[derive(Debug, Clone)]
+struct PersistedUploadCheckpoint {
+    checkpoint: OssUploadCheckpoint,
+    uploaded_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -995,6 +1012,17 @@ fn init_database(path: &Path) -> Result<(), String> {
                uploaded_at INTEGER NOT NULL,
                PRIMARY KEY (mapping_id, file_path)
              );
+             CREATE TABLE IF NOT EXISTS upload_checkpoints (
+               mapping_id TEXT NOT NULL,
+               file_path TEXT NOT NULL,
+               size INTEGER NOT NULL,
+               modified_ms TEXT NOT NULL,
+               item_json TEXT NOT NULL,
+               checkpoint_json TEXT NOT NULL,
+               uploaded_bytes INTEGER NOT NULL DEFAULT 0,
+               updated_at INTEGER NOT NULL,
+               PRIMARY KEY (mapping_id, file_path)
+             );
              CREATE TABLE IF NOT EXISTS app_state (
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL,
@@ -1501,6 +1529,148 @@ fn pending_upload_stamps(path: &Path) -> Result<HashMap<String, Stamp>, String> 
         .collect())
 }
 
+fn clear_upload_checkpoint(path: &Path, item: &UploadItem) -> Result<(), String> {
+    let connection = open_database(path)?;
+    connection
+        .execute(
+            "DELETE FROM upload_checkpoints WHERE mapping_id = ?1 AND file_path = ?2",
+            params![item.mapping_id, item.file_path.to_string_lossy()],
+        )
+        .map_err(|error| format!("清除上传断点失败：{error}"))?;
+    Ok(())
+}
+
+fn load_upload_checkpoint(
+    path: &Path,
+    item: &UploadItem,
+) -> Result<Option<PersistedUploadCheckpoint>, String> {
+    let connection = open_database(path)?;
+    let row = connection
+        .query_row(
+            "SELECT size, modified_ms, checkpoint_json, uploaded_bytes
+             FROM upload_checkpoints
+             WHERE mapping_id = ?1 AND file_path = ?2",
+            params![item.mapping_id, item.file_path.to_string_lossy()],
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u64>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取上传断点失败：{error}"))?;
+    let Some((size, modified_ms, checkpoint_json, uploaded_bytes)) = row else {
+        return Ok(None);
+    };
+    if size != item.size || modified_ms != item.modified_ms.to_string() {
+        clear_upload_checkpoint(path, item)?;
+        return Ok(None);
+    }
+    let checkpoint = match serde_json::from_str::<OssUploadCheckpoint>(&checkpoint_json) {
+        Ok(value) => value,
+        Err(_) => {
+            clear_upload_checkpoint(path, item)?;
+            return Ok(None);
+        }
+    };
+    Ok(Some(PersistedUploadCheckpoint {
+        checkpoint,
+        uploaded_bytes: uploaded_bytes.min(item.size),
+    }))
+}
+
+fn save_upload_checkpoint(
+    path: &Path,
+    item: &UploadItem,
+    checkpoint: &OssUploadCheckpoint,
+    uploaded_bytes: u64,
+) -> Result<(), String> {
+    let connection = open_database(path)?;
+    let item_json =
+        serde_json::to_string(item).map_err(|error| format!("序列化上传任务失败：{error}"))?;
+    let checkpoint_json = serde_json::to_string(checkpoint)
+        .map_err(|error| format!("序列化上传断点失败：{error}"))?;
+    connection
+        .execute(
+            "INSERT INTO upload_checkpoints
+               (mapping_id, file_path, size, modified_ms, item_json, checkpoint_json,
+                uploaded_bytes, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(mapping_id, file_path) DO UPDATE SET
+               size = excluded.size,
+               modified_ms = excluded.modified_ms,
+               item_json = excluded.item_json,
+               checkpoint_json = excluded.checkpoint_json,
+               uploaded_bytes = excluded.uploaded_bytes,
+               updated_at = excluded.updated_at",
+            params![
+                item.mapping_id,
+                item.file_path.to_string_lossy(),
+                item.size,
+                item.modified_ms.to_string(),
+                item_json,
+                checkpoint_json,
+                uploaded_bytes.min(item.size),
+                unix_timestamp()
+            ],
+        )
+        .map_err(|error| format!("保存上传断点失败：{error}"))?;
+    Ok(())
+}
+
+fn load_resumable_uploads(path: &Path) -> Result<VecDeque<UploadItem>, String> {
+    let connection = open_database(path)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT mapping_id, file_path, size, modified_ms, item_json
+             FROM upload_checkpoints ORDER BY updated_at",
+        )
+        .map_err(|error| format!("读取待续传任务失败：{error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|error| format!("查询待续传任务失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析待续传任务失败：{error}"))?;
+    drop(statement);
+    let mut restored = VecDeque::new();
+    for (mapping_id, file_path, size, modified_ms_value, item_json) in rows {
+        let parsed = serde_json::from_str::<UploadItem>(&item_json).ok();
+        let valid = parsed.as_ref().is_some_and(|item| {
+            item.mapping_id == mapping_id
+                && item.file_path == PathBuf::from(&file_path)
+                && item.size == size
+                && item.modified_ms.to_string() == modified_ms_value
+                && fs::metadata(&item.file_path).ok().is_some_and(|metadata| {
+                    metadata.is_file()
+                        && metadata.len() == size
+                        && modified_ms(&metadata) == item.modified_ms
+                })
+        });
+        if valid {
+            restored.push_back(parsed.expect("checked resumable upload item"));
+        } else {
+            connection
+                .execute(
+                    "DELETE FROM upload_checkpoints WHERE mapping_id = ?1 AND file_path = ?2",
+                    params![mapping_id, file_path],
+                )
+                .map_err(|error| format!("清理失效上传断点失败：{error}"))?;
+        }
+    }
+    Ok(restored)
+}
+
 fn save_upload_record(
     path: &Path,
     item: &UploadItem,
@@ -1807,6 +1977,17 @@ fn target_has_work(state: &RuntimeState, mapping_id: &str, target_key: &str) -> 
             item.mapping_id == mapping_id
                 && auto_share_target(item).is_some_and(|target| target.key == target_key)
         })
+}
+
+fn target_has_pending_cloud(
+    database: &Path,
+    mapping_id: &str,
+    target_key: &str,
+) -> Result<bool, String> {
+    Ok(load_pending_uploads(database)?.iter().any(|pending| {
+        pending.item.mapping_id == mapping_id
+            && auto_share_target(&pending.item).is_some_and(|target| target.key == target_key)
+    }))
 }
 
 fn save_auto_share_event(
@@ -3266,7 +3447,39 @@ fn share_id_for_hdhive(data: &Value, share_url: &str) -> String {
 const DEFAULT_SHARE_TEMPLATE: &str =
     "光鸭云盘用户给你分享了{{filename}}，点击链接或复制整段内容，打开「光鸭APP」即可获取。\n链接：{{link}}";
 
-fn share_file_payload(file_ids: &[String], title: &str) -> Value {
+fn normalize_share_access(
+    share_type: Option<u8>,
+    code: Option<&str>,
+    auto_fill_code: Option<bool>,
+) -> Result<(u8, String, bool), String> {
+    let share_type = share_type.unwrap_or(0);
+    if !matches!(share_type, 0..=2) {
+        return Err("访问码类型无效".into());
+    }
+    let code = code.unwrap_or_default().trim();
+    if share_type == 2
+        && (code.chars().count() != 4 || !code.chars().all(|value| value.is_ascii_alphanumeric()))
+    {
+        return Err("固定访问码必须是 4 位英文或数字".into());
+    }
+    Ok((
+        share_type,
+        if share_type == 2 {
+            code.to_string()
+        } else {
+            String::new()
+        },
+        share_type != 0 && auto_fill_code.unwrap_or(false),
+    ))
+}
+
+fn share_file_payload(
+    file_ids: &[String],
+    title: &str,
+    share_type: u8,
+    code: &str,
+    auto_fill_code: bool,
+) -> Value {
     let title = title.trim();
     let title = if title.is_empty() {
         "云盘分享"
@@ -3277,9 +3490,9 @@ fn share_file_payload(file_ids: &[String], title: &str) -> Value {
         "fileIds": file_ids,
         "title": title,
         "validateDuration": 0,
-        "shareType": 0,
-        "code": "",
-        "autoFillCode": false,
+        "shareType": share_type,
+        "code": code,
+        "autoFillCode": auto_fill_code,
         // 光鸭网页版的普通分享会同时提交下载限制和分享文案模板。
         "trafficLimit": "0",
         "maxRestoreCount": 0,
@@ -3633,7 +3846,7 @@ async fn process_auto_share(
     if !mapping.auto_share {
         return delete_pending_auto_share(&db_path, &pending.mapping_id, &pending.target_key);
     }
-    if has_work {
+    if has_work || target_has_pending_cloud(&db_path, &pending.mapping_id, &pending.target_key)? {
         return reschedule_auto_share(&db_path, &pending, AUTO_SHARE_QUIET_SECS);
     }
     let failure_exists = open_database(&db_path)?
@@ -3705,6 +3918,9 @@ async fn process_auto_share(
                 share_file_payload(
                     std::slice::from_ref(&pending.remote_target_id),
                     &pending.title,
+                    0,
+                    "",
+                    false,
                 ),
                 &[],
             )
@@ -4032,155 +4248,391 @@ async fn wait_operation_task(token: &str, device_id: &str, task_id: &str) -> Res
     Err("文件操作长时间没有完成，请稍后刷新网盘".into())
 }
 
-async fn upload_oss(
-    token_data: &UploadToken,
-    path: &Path,
+fn oss_checkpoint_uploaded_bytes(checkpoint: &OssUploadCheckpoint, size: u64) -> u64 {
+    checkpoint
+        .completed_parts
+        .keys()
+        .filter_map(|part_number| {
+            let offset = u64::from(part_number.saturating_sub(1)) * checkpoint.part_size;
+            (offset < size).then_some(checkpoint.part_size.min(size - offset))
+        })
+        .sum::<u64>()
+        .min(size)
+}
+
+fn oss_request_url(
+    checkpoint: &OssUploadCheckpoint,
+    query: Option<&str>,
+) -> Result<reqwest::Url, String> {
+    let endpoint = normalize_oss_endpoint_url(&checkpoint.end_point, &checkpoint.bucket_name);
+    let mut url =
+        reqwest::Url::parse(&endpoint).map_err(|error| format!("OSS 端点无效：{error}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "OSS 端点缺少主机名".to_string())?
+        .to_string();
+    url.set_host(Some(&format!("{}.{}", checkpoint.bucket_name, host)))
+        .map_err(|_| "OSS 存储桶地址无效".to_string())?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| "OSS 对象地址无法设置路径".to_string())?;
+        segments.clear();
+        for segment in checkpoint.object_path.split('/') {
+            if !segment.is_empty() {
+                segments.push(segment);
+            }
+        }
+    }
+    url.set_query(query);
+    Ok(url)
+}
+
+fn oss_string_to_sign(
+    method: &str,
+    date: &str,
+    security_token: &str,
+    checkpoint: &OssUploadCheckpoint,
+    query: Option<&str>,
+) -> String {
+    let mut resource = format!(
+        "/{}/{}",
+        checkpoint.bucket_name,
+        checkpoint.object_path.trim_start_matches('/')
+    );
+    if let Some(query) = query.filter(|value| !value.is_empty()) {
+        resource.push('?');
+        resource.push_str(query);
+    }
+    format!("{method}\n\n\n{date}\nx-oss-security-token:{security_token}\n{resource}")
+}
+
+async fn oss_signed_request(
+    client: &reqwest::Client,
+    credentials: &UploadCredentials,
+    checkpoint: &OssUploadCheckpoint,
+    method: reqwest::Method,
+    query: Option<&str>,
+    body: Option<Vec<u8>>,
     app: &tauri::AppHandle,
-    multipart_part_size: &str,
-) -> Result<(), String> {
-    let credentials = token_data
-        .creds
-        .as_ref()
-        .ok_or_else(|| "光鸭没有返回 OSS 临时凭证".to_string())?;
-    let raw_endpoint = token_data
-        .end_point
-        .as_deref()
-        .ok_or_else(|| "光鸭没有返回 OSS 端点".to_string())?;
-    let bucket_name = token_data
-        .bucket_name
-        .as_deref()
-        .ok_or_else(|| "光鸭没有返回 OSS 存储桶".to_string())?;
-    let endpoint = normalize_oss_endpoint_url(raw_endpoint, bucket_name);
-    if endpoint.is_empty() {
-        return Err("光鸭返回的 OSS 端点无效".into());
-    }
-    let object_path = token_data
-        .object_path
-        .as_deref()
-        .ok_or_else(|| "光鸭没有返回 OSS 对象路径".to_string())?
-        .trim_start_matches('/');
-    if object_path.is_empty() {
-        return Err("光鸭返回的 OSS 对象路径无效".into());
-    }
-
-    let builder = Oss::default()
-        .bucket(bucket_name)
-        .endpoint(&endpoint)
-        .access_key_id(&credentials.access_key_id)
-        .access_key_secret(&credentials.secret_access_key)
-        .security_token(&credentials.session_token);
-    let retry_app = app.clone();
-    let retry_file_path = path.to_path_buf();
-    let retry_layer = RetryLayer::new()
-        .with_min_delay(Duration::from_secs(1))
-        .with_max_delay(Duration::from_secs(15))
-        .with_max_times(OSS_WRITE_RETRY_TIMES)
-        .with_jitter()
-        .with_notify(move |event: RetryEvent<'_>| {
-            emit(
-                &retry_app,
-                json!({
-                    "type": "progress",
-                    "file_path": retry_file_path.to_string_lossy(),
-                    "bytes_per_second": 0,
-                    "stage": format!(
-                        "OSS 临时错误，{:.1} 秒后进行第 {} 次重试",
-                        event.retry_after.as_secs_f64(),
-                        event.attempt
-                    )
-                }),
-            );
-        });
-    let operator = Operator::new(builder)
-        .map_err(|error| format!("初始化 OSS 客户端失败：{error}"))?
-        .layer(retry_layer)
-        .finish();
-    let size = fs::metadata(path).map_err(|e| e.to_string())?.len();
-    let part_size = usize::try_from(configured_oss_part_size(size, multipart_part_size))
-        .map_err(|_| "文件过大，当前平台无法设置 OSS 分片大小".to_string())?;
-    let writer_future = operator
-        .writer_with(object_path)
-        .chunk(part_size)
-        .concurrent(3);
-    let mut writer = timeout(Duration::from_secs(OSS_REQUEST_TIMEOUT_SECS), writer_future)
-        .await
-        .map_err(|_| "连接 OSS 超时".to_string())?
-        .map_err(|error| format!("连接 OSS 失败：{error}"))?;
-
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut uploaded = 0u64;
-    let upload_started_at = std::time::Instant::now();
-    loop {
-        let mut buffer = vec![0u8; part_size];
-        let read = file.read(&mut buffer).await.map_err(|e| e.to_string())?;
-        if read == 0 {
-            break;
+    path: &Path,
+    uploaded_bytes: u64,
+    total_bytes: u64,
+) -> Result<reqwest::Response, String> {
+    let url = oss_request_url(checkpoint, query)?;
+    for attempt in 0..=OSS_WRITE_RETRY_TIMES {
+        let date = httpdate::fmt_http_date(std::time::SystemTime::now());
+        let string_to_sign = oss_string_to_sign(
+            method.as_str(),
+            &date,
+            &credentials.session_token,
+            checkpoint,
+            query,
+        );
+        let mut mac = Hmac::<Sha1>::new_from_slice(credentials.secret_access_key.as_bytes())
+            .map_err(|error| format!("初始化 OSS 签名失败：{error}"))?;
+        mac.update(string_to_sign.as_bytes());
+        let signature = BASE64_STANDARD.encode(mac.finalize().into_bytes());
+        let authorization = format!("OSS {}:{signature}", credentials.access_key_id);
+        let mut request = client
+            .request(method.clone(), url.clone())
+            .header(DATE, &date)
+            .header("x-oss-security-token", &credentials.session_token)
+            .header(AUTHORIZATION, authorization);
+        if let Some(content) = body.clone() {
+            request = request.body(content);
         }
-        buffer.truncate(read);
-        match timeout(
-            Duration::from_secs(OSS_REQUEST_TIMEOUT_SECS),
-            writer.write(buffer),
-        )
-        .await
-        {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                let _ = timeout(Duration::from_secs(15), writer.abort()).await;
-                return Err(format!("OSS 上传失败：{error}"));
+        match request.send().await {
+            Ok(response) if response.status().is_success() => return Ok(response),
+            Ok(response) => {
+                let status_code = response.status();
+                let response_body = response.text().await.unwrap_or_default();
+                let retryable = status_code.is_server_error()
+                    || status_code.as_u16() == 408
+                    || status_code.as_u16() == 429;
+                if !retryable || attempt == OSS_WRITE_RETRY_TIMES {
+                    return Err(format!(
+                        "OSS 请求失败（{}）：{}",
+                        status_code,
+                        response_body.trim()
+                    ));
+                }
             }
-            Err(_) => {
-                let _ = timeout(Duration::from_secs(15), writer.abort()).await;
-                return Err(format!(
-                    "OSS 上传超过 {OSS_REQUEST_TIMEOUT_SECS} 秒，已停止当前任务"
-                ));
+            Err(error) if attempt == OSS_WRITE_RETRY_TIMES => {
+                return Err(format!("OSS 请求失败：{error}"));
             }
+            Err(_) => {}
         }
-        uploaded += read as u64;
+        let retry_after = Duration::from_secs((attempt as u64 + 1).min(10));
         emit(
             app,
             json!({
                 "type": "progress",
                 "file_path": path.to_string_lossy(),
-                "percent": if size == 0 { 100 } else { uploaded.saturating_mul(100) / size },
-                "bytes_per_second": uploaded as f64 / upload_started_at.elapsed().as_secs_f64().max(0.001),
-                "stage": "正在上传"
+                "uploaded_bytes": uploaded_bytes,
+                "total_bytes": total_bytes,
+                "bytes_per_second": 0,
+                "stage": format!(
+                    "OSS 临时错误，{} 秒后进行第 {} 次重试",
+                    retry_after.as_secs(),
+                    attempt + 1
+                )
             }),
         );
+        sleep(retry_after).await;
+    }
+    Err("OSS 请求失败".into())
+}
+
+fn xml_tag_value(body: &str, tag: &str) -> Option<String> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = body.find(&start_tag)? + start_tag.len();
+    let end = body[start..].find(&end_tag)? + start;
+    Some(body[start..end].trim().to_string())
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+async fn upload_oss(
+    token_data: &UploadToken,
+    item: &UploadItem,
+    app: &tauri::AppHandle,
+    multipart_part_size: &str,
+    db_path: &Path,
+    persisted: Option<PersistedUploadCheckpoint>,
+) -> Result<(), String> {
+    let credentials = token_data
+        .creds
+        .as_ref()
+        .ok_or_else(|| "光鸭没有返回 OSS 临时凭证".to_string())?;
+    let size = fs::metadata(&item.file_path)
+        .map_err(|error| error.to_string())?
+        .len();
+    let resumed = persisted.is_some();
+    let mut checkpoint = if let Some(saved) = persisted {
+        saved.checkpoint
+    } else {
+        let object_path = token_data
+            .object_path
+            .as_deref()
+            .ok_or_else(|| "光鸭没有返回 OSS 对象路径".to_string())?
+            .trim_start_matches('/')
+            .to_string();
+        if object_path.is_empty() {
+            return Err("光鸭返回的 OSS 对象路径无效".into());
+        }
+        OssUploadCheckpoint {
+            task_id: token_data.task_id.clone(),
+            object_path,
+            bucket_name: token_data
+                .bucket_name
+                .clone()
+                .ok_or_else(|| "光鸭没有返回 OSS 存储桶".to_string())?,
+            end_point: token_data
+                .end_point
+                .clone()
+                .ok_or_else(|| "光鸭没有返回 OSS 端点".to_string())?,
+            provider: token_data.provider.clone(),
+            upload_id: String::new(),
+            part_size: configured_oss_part_size(size, multipart_part_size),
+            completed_parts: BTreeMap::new(),
+        }
+    };
+    if checkpoint.part_size == 0 {
+        return Err("OSS 分片大小无效".into());
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(API_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(OSS_REQUEST_TIMEOUT_SECS))
+        .build()
+        .map_err(|error| format!("初始化 OSS 客户端失败：{error}"))?;
+
+    if size == 0 {
+        oss_signed_request(
+            &client,
+            credentials,
+            &checkpoint,
+            reqwest::Method::PUT,
+            None,
+            Some(Vec::new()),
+            app,
+            &item.file_path,
+            0,
+            0,
+        )
+        .await?;
+        clear_upload_checkpoint(db_path, item)?;
+        return Ok(());
     }
 
+    if checkpoint.upload_id.is_empty() {
+        let response = oss_signed_request(
+            &client,
+            credentials,
+            &checkpoint,
+            reqwest::Method::POST,
+            Some("uploads"),
+            None,
+            app,
+            &item.file_path,
+            0,
+            size,
+        )
+        .await?;
+        let response_body = response
+            .text()
+            .await
+            .map_err(|error| format!("读取 OSS 分片任务失败：{error}"))?;
+        checkpoint.upload_id = xml_tag_value(&response_body, "UploadId")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "OSS 没有返回分片任务 ID".to_string())?;
+        save_upload_checkpoint(db_path, item, &checkpoint, 0)?;
+    }
+
+    let total_parts = ceil_div_u64(size, checkpoint.part_size);
+    if total_parts > 10_000 || total_parts > u64::from(u32::MAX) {
+        return Err("文件分片数量超过 OSS 限制".into());
+    }
+    let upload_started_at = std::time::Instant::now();
+    let uploaded_at_start = oss_checkpoint_uploaded_bytes(&checkpoint, size);
     emit(
         app,
         json!({
             "type": "progress",
-            "file_path": path.to_string_lossy(),
-            "percent": if size == 0 { 0 } else { 100 },
+            "file_path": item.file_path.to_string_lossy(),
+            "percent": uploaded_at_start.saturating_mul(100) / size,
+            "uploaded_bytes": uploaded_at_start,
+            "total_bytes": size,
+            "bytes_per_second": 0,
+            "stage": if resumed { "正在从断点继续上传" } else { "正在上传" }
+        }),
+    );
+    let request_checkpoint = checkpoint.clone();
+    let pending_parts = (1..=total_parts as u32)
+        .filter(|part| !checkpoint.completed_parts.contains_key(part))
+        .collect::<Vec<_>>();
+    let mut part_uploads = stream::iter(pending_parts)
+        .map(|part| {
+            let client = &client;
+            let request_checkpoint = &request_checkpoint;
+            let file_path = &item.file_path;
+            async move {
+                let offset = u64::from(part - 1) * request_checkpoint.part_size;
+                let length = request_checkpoint.part_size.min(size - offset);
+                let mut file = tokio::fs::File::open(file_path)
+                    .await
+                    .map_err(|error| format!("打开上传文件失败：{error}"))?;
+                file.seek(SeekFrom::Start(offset))
+                    .await
+                    .map_err(|error| format!("定位上传分片失败：{error}"))?;
+                let mut buffer = vec![
+                    0_u8;
+                    usize::try_from(length).map_err(|_| {
+                        "当前平台无法分配 OSS 分片缓冲区".to_string()
+                    })?
+                ];
+                file.read_exact(&mut buffer)
+                    .await
+                    .map_err(|error| format!("读取上传分片失败：{error}"))?;
+                let query = format!(
+                    "partNumber={part}&uploadId={}",
+                    request_checkpoint.upload_id
+                );
+                let response = oss_signed_request(
+                    client,
+                    credentials,
+                    request_checkpoint,
+                    reqwest::Method::PUT,
+                    Some(&query),
+                    Some(buffer),
+                    app,
+                    file_path,
+                    uploaded_at_start,
+                    size,
+                )
+                .await?;
+                let etag = response
+                    .headers()
+                    .get(ETAG)
+                    .and_then(|value| value.to_str().ok())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| "OSS 分片响应缺少 ETag".to_string())?
+                    .to_string();
+                Ok::<_, String>((part, etag))
+            }
+        })
+        .buffer_unordered(3);
+    while let Some(result) = part_uploads.next().await {
+        let (part, etag) = result?;
+        checkpoint.completed_parts.insert(part, etag);
+        let uploaded = oss_checkpoint_uploaded_bytes(&checkpoint, size);
+        save_upload_checkpoint(db_path, item, &checkpoint, uploaded)?;
+        emit(
+            app,
+            json!({
+                "type": "progress",
+                "file_path": item.file_path.to_string_lossy(),
+                "percent": uploaded.saturating_mul(100) / size,
+                "uploaded_bytes": uploaded,
+                "total_bytes": size,
+                "bytes_per_second": uploaded.saturating_sub(uploaded_at_start) as f64
+                    / upload_started_at.elapsed().as_secs_f64().max(0.001),
+                "stage": if resumed { "正在断点续传" } else { "正在上传" }
+            }),
+        );
+    }
+
+    let parts_xml = checkpoint
+        .completed_parts
+        .iter()
+        .map(|(part, etag)| {
+            format!(
+                "<Part><PartNumber>{part}</PartNumber><ETag>{}</ETag></Part>",
+                xml_escape(etag)
+            )
+        })
+        .collect::<String>();
+    let complete_body =
+        format!("<CompleteMultipartUpload>{parts_xml}</CompleteMultipartUpload>").into_bytes();
+    let complete_query = format!("uploadId={}", checkpoint.upload_id);
+    emit(
+        app,
+        json!({
+            "type": "progress",
+            "file_path": item.file_path.to_string_lossy(),
+            "percent": 100,
+            "uploaded_bytes": size,
+            "total_bytes": size,
             "bytes_per_second": 0,
             "stage": "正在提交 OSS"
         }),
     );
-    match timeout(
-        Duration::from_secs(OSS_REQUEST_TIMEOUT_SECS),
-        writer.close(),
+    oss_signed_request(
+        &client,
+        credentials,
+        &checkpoint,
+        reqwest::Method::POST,
+        Some(&complete_query),
+        Some(complete_body),
+        app,
+        &item.file_path,
+        size,
+        size,
     )
-    .await
-    {
-        Ok(Ok(_)) => {
-            emit(
-                app,
-                json!({ "type": "progress", "file_path": path.to_string_lossy(), "percent": 100, "bytes_per_second": 0, "stage": "OSS 上传完成" }),
-            );
-        }
-        Ok(Err(error)) => {
-            let _ = timeout(Duration::from_secs(15), writer.abort()).await;
-            return Err(format!("提交 OSS 上传失败：{error}"));
-        }
-        Err(_) => {
-            let _ = timeout(Duration::from_secs(15), writer.abort()).await;
-            return Err("提交 OSS 上传超时".into());
-        }
-    }
+    .await?;
+    clear_upload_checkpoint(db_path, item)?;
+    emit(
+        app,
+        json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 100, "uploaded_bytes": size, "total_bytes": size, "bytes_per_second": 0, "stage": "OSS 上传完成" }),
+    );
     Ok(())
 }
 
@@ -4355,12 +4807,68 @@ async fn requeue_busy_upload(app: tauri::AppHandle, state: SharedState, mut item
     }
 }
 
+async fn requeue_resumable_upload(app: tauri::AppHandle, state: SharedState, item: UploadItem) {
+    sleep(Duration::from_secs(PENDING_UPLOAD_RETRY_SECS)).await;
+    let db_path = match state.lock() {
+        Ok(guard) => guard.db_path.clone(),
+        Err(_) => return,
+    };
+    let checkpoint = match load_upload_checkpoint(&db_path, &item) {
+        Ok(Some(value)) => value,
+        _ => return,
+    };
+    let key = item_key(&item.mapping_id, &item.file_path);
+    let queued = if let Ok(mut guard) = state.lock() {
+        let mapping_active = item.mapping_id == "__manual__"
+            || guard
+                .mappings
+                .iter()
+                .any(|mapping| mapping.id == item.mapping_id && mapping.enabled);
+        if !mapping_active
+            || upload_already_scheduled(
+                &guard.history,
+                &guard.pending_cloud,
+                &guard.inflight,
+                &guard.queue,
+                &guard.waiting_files,
+                &item,
+            )
+        {
+            false
+        } else {
+            guard
+                .queue
+                .retain(|queued| item_key(&queued.mapping_id, &queued.file_path) != key);
+            guard.queue.push_back(item.clone());
+            true
+        }
+    } else {
+        false
+    };
+    if queued {
+        emit(
+            &app,
+            json!({
+                "type": "file",
+                "state": "queued",
+                "file_path": item.file_path.to_string_lossy(),
+                "mapping_id": item.mapping_id,
+                "uploaded_bytes": checkpoint.uploaded_bytes,
+                "total_bytes": item.size,
+                "stage": "上传中断，已保留断点并自动重试"
+            }),
+        );
+        emit_state(&app, &state);
+        drain_queue(app, state);
+    }
+}
+
 async fn upload_item(
     app: &tauri::AppHandle,
     state: &SharedState,
     item: &UploadItem,
 ) -> Result<UploadOutcome, String> {
-    let (token, device_id, multipart_part_size) = {
+    let (token, device_id, multipart_part_size, db_path) = {
         let guard = state.lock().map_err(|e| e.to_string())?;
         (
             guard
@@ -4369,11 +4877,12 @@ async fn upload_item(
                 .ok_or_else(|| "尚未登录光鸭云盘".to_string())?,
             guard.device_id.clone(),
             guard.multipart_part_size.clone(),
+            guard.db_path.clone(),
         )
     };
     emit(
         app,
-        json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 0, "stage": "正在准备云端目录" }),
+        json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 0, "uploaded_bytes": 0, "total_bytes": item.size, "stage": "正在准备云端目录" }),
     );
     let parent_id = ensure_remote_path(
         state,
@@ -4390,35 +4899,118 @@ async fn upload_item(
         .ok_or_else(|| "无法读取文件名".to_string())?;
     emit(
         app,
-        json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 0, "stage": "正在申请上传凭证" }),
+        json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 0, "uploaded_bytes": 0, "total_bytes": item.size, "stage": "正在申请上传凭证" }),
     );
-    let mut res = json!({ "fileSize": item.size });
-    if item.size < 1024 * 1024 {
+    let mut persisted = load_upload_checkpoint(&db_path, item)?;
+    let mut resumed_data = None;
+    if let Some(saved) = persisted.as_ref() {
         emit(
             app,
-            json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 0, "stage": "正在计算秒传 MD5" }),
+            json!({
+                "type": "progress",
+                "file_path": item.file_path.to_string_lossy(),
+                "percent": if item.size == 0 { 0 } else { saved.uploaded_bytes.saturating_mul(100) / item.size },
+                "uploaded_bytes": saved.uploaded_bytes,
+                "total_bytes": item.size,
+                "stage": "正在恢复上传断点"
+            }),
         );
-        res["md5"] = json!(calculate_file_md5(&item.file_path).await?);
+        let resume_result = api_post(
+            &token,
+            &device_id,
+            "/userres/v1/get_res_center_resume_token",
+            json!({
+                "capacity": 2,
+                "res": { "fileSize": item.size },
+                "taskId": saved.checkpoint.task_id,
+                "object": {
+                    "objectPath": saved.checkpoint.object_path,
+                    "provider": saved.checkpoint.provider
+                }
+            }),
+            &[156],
+        )
+        .await;
+        match resume_result {
+            Ok(result) => {
+                let mut token_data: UploadToken = serde_json::from_value(
+                    result
+                        .data
+                        .ok_or_else(|| "光鸭没有返回续传凭证".to_string())?,
+                )
+                .map_err(|error| format!("续传凭证格式异常：{error}"))?;
+                if token_data
+                    .object_path
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    token_data.object_path = Some(saved.checkpoint.object_path.clone());
+                }
+                if token_data
+                    .bucket_name
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    token_data.bucket_name = Some(saved.checkpoint.bucket_name.clone());
+                }
+                if token_data
+                    .end_point
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    token_data.end_point = Some(saved.checkpoint.end_point.clone());
+                }
+                if token_data.provider.is_none() {
+                    token_data.provider = saved.checkpoint.provider.clone();
+                }
+                resumed_data = Some(token_data);
+            }
+            Err(error) => {
+                status(
+                    app,
+                    "warning",
+                    format!("恢复上传断点失败，将重新创建上传任务：{error}"),
+                );
+                clear_upload_checkpoint(&db_path, item)?;
+                persisted = None;
+            }
+        }
     }
-    let result = api_post(
-        &token,
-        &device_id,
-        "/userres/v1/get_res_center_token",
-        json!({ "capacity": 2, "name": name, "res": res, "parentId": parent_id }),
-        &[156],
-    )
-    .await?;
-    let mut data: UploadToken = serde_json::from_value(
-        result
-            .data
-            .ok_or_else(|| "光鸭没有返回上传凭证".to_string())?,
-    )
-    .map_err(|e| format!("上传凭证格式异常：{e}"))?;
-    let mut instant_upload = result.code == 156;
-    if !instant_upload && item.size >= 1024 * 1024 {
+    let (mut data, mut instant_upload) = if let Some(data) = resumed_data {
+        (data, false)
+    } else {
+        let mut res = json!({ "fileSize": item.size });
+        if item.size < 1024 * 1024 {
+            emit(
+                app,
+                json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 0, "uploaded_bytes": 0, "total_bytes": item.size, "stage": "正在计算秒传 MD5" }),
+            );
+            res["md5"] = json!(calculate_file_md5(&item.file_path).await?);
+        }
+        let result = api_post(
+            &token,
+            &device_id,
+            "/userres/v1/get_res_center_token",
+            json!({ "capacity": 2, "name": name, "res": res, "parentId": parent_id }),
+            &[156],
+        )
+        .await?;
+        let instant_upload = result.code == 156;
+        let data: UploadToken = serde_json::from_value(
+            result
+                .data
+                .ok_or_else(|| "光鸭没有返回上传凭证".to_string())?,
+        )
+        .map_err(|e| format!("上传凭证格式异常：{e}"))?;
+        (data, instant_upload)
+    };
+    if !instant_upload && persisted.is_none() && item.size >= 1024 * 1024 {
         emit(
             app,
-            json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 0, "stage": "正在校验秒传" }),
+            json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 0, "uploaded_bytes": 0, "total_bytes": item.size, "stage": "正在校验秒传" }),
         );
         let cached_gcid = match {
             let guard = state.lock().map_err(|error| error.to_string())?;
@@ -4443,6 +5035,8 @@ async fn upload_item(
                     "type": "progress",
                     "file_path": item.file_path.to_string_lossy(),
                     "percent": 0,
+                    "uploaded_bytes": 0,
+                    "total_bytes": item.size,
                     "bytes_per_second": 0,
                     "stage": "已复用本地秒传指纹"
                 }),
@@ -4508,19 +5102,25 @@ async fn upload_item(
         }
     }
     if !instant_upload {
+        let uploaded_bytes = persisted
+            .as_ref()
+            .map(|checkpoint| checkpoint.uploaded_bytes)
+            .unwrap_or(0);
+        let resumed = persisted.is_some();
         emit(
             app,
-            json!({ "type": "file", "state": "uploading", "file_path": item.file_path.to_string_lossy(), "mapping_id": item.mapping_id }),
+            json!({ "type": "file", "state": "uploading", "file_path": item.file_path.to_string_lossy(), "mapping_id": item.mapping_id, "uploaded_bytes": uploaded_bytes, "total_bytes": item.size }),
         );
         emit(
             app,
-            json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 0, "stage": "正在连接 OSS" }),
+            json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": if item.size == 0 { 0 } else { uploaded_bytes.saturating_mul(100) / item.size }, "uploaded_bytes": uploaded_bytes, "total_bytes": item.size, "stage": if resumed { "正在从断点继续上传" } else { "正在连接 OSS" } }),
         );
-        upload_oss(&data, &item.file_path, app, &multipart_part_size).await?;
+        upload_oss(&data, item, app, &multipart_part_size, &db_path, persisted).await?;
     } else {
+        clear_upload_checkpoint(&db_path, item)?;
         emit(
             app,
-            json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 100, "stage": "已命中秒传" }),
+            json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 100, "uploaded_bytes": item.size, "total_bytes": item.size, "stage": "已命中秒传" }),
         );
     }
     let pending_outcome = UploadOutcome {
@@ -4531,11 +5131,11 @@ async fn upload_item(
         .map_err(|message| format!("文件已上传，但写入本地上传记录失败：{message}"))?;
     emit(
         app,
-        json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 100, "stage": "已上传，正在等待云端入库" }),
+        json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 100, "uploaded_bytes": item.size, "total_bytes": item.size, "stage": "已上传，正在等待云端入库" }),
     );
     emit(
         app,
-        json!({ "type": "file", "state": "processing", "file_path": item.file_path.to_string_lossy(), "mapping_id": item.mapping_id, "stage": "已上传，正在等待云端入库" }),
+        json!({ "type": "file", "state": "processing", "file_path": item.file_path.to_string_lossy(), "mapping_id": item.mapping_id, "uploaded_bytes": item.size, "total_bytes": item.size, "stage": "已上传，正在等待云端入库" }),
     );
     let task_data = wait_upload_task(app, &token, &device_id, &data.task_id, &item.file_path)
         .await
@@ -4828,7 +5428,7 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
         };
         emit(
             &app,
-            json!({ "type": "file", "state": "preparing", "file_path": item.file_path.to_string_lossy(), "mapping_id": item.mapping_id }),
+            json!({ "type": "file", "state": "preparing", "file_path": item.file_path.to_string_lossy(), "mapping_id": item.mapping_id, "uploaded_bytes": 0, "total_bytes": item.size }),
         );
         let app2 = app.clone();
         let state2 = state.clone();
@@ -4880,6 +5480,8 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                         "state": "waiting-file",
                         "file_path": item.file_path.to_string_lossy(),
                         "mapping_id": item.mapping_id,
+                        "uploaded_bytes": 0,
+                        "total_bytes": item.size,
                         "stage": "另外的程序正在使用该文件，释放后将自动上传"
                     }),
                 );
@@ -4911,7 +5513,7 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                 }
                 emit(
                     &app2,
-                    json!({ "type": "file", "state": "done", "file_path": item.file_path.to_string_lossy(), "mapping_id": item.mapping_id }),
+                    json!({ "type": "file", "state": "done", "file_path": item.file_path.to_string_lossy(), "mapping_id": item.mapping_id, "uploaded_bytes": item.size, "total_bytes": item.size }),
                 );
             } else {
                 let message = error_message.unwrap_or_else(|| "上传失败".into());
@@ -4923,6 +5525,8 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                             "state": "processing",
                             "file_path": item.file_path.to_string_lossy(),
                             "mapping_id": item.mapping_id,
+                            "uploaded_bytes": item.size,
+                            "total_bytes": item.size,
                             "stage": "OSS 已完成，后台将继续确认云端入库"
                         }),
                     );
@@ -4931,12 +5535,16 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                     drain_queue(app2, state2);
                     return;
                 }
-                let auto_share_enabled = state2.lock().ok().is_some_and(|guard| {
-                    guard
-                        .mappings
-                        .iter()
-                        .any(|mapping| mapping.id == item.mapping_id && mapping.auto_share)
-                });
+                let resumable = db_path
+                    .as_deref()
+                    .and_then(|path| load_upload_checkpoint(path, &item).ok().flatten());
+                let auto_share_enabled = resumable.is_none()
+                    && state2.lock().ok().is_some_and(|guard| {
+                        guard
+                            .mappings
+                            .iter()
+                            .any(|mapping| mapping.id == item.mapping_id && mapping.auto_share)
+                    });
                 if auto_share_enabled {
                     if let Some(path) = db_path.as_deref() {
                         if let Err(error) = record_auto_share_failure(path, &item, &message) {
@@ -4944,10 +5552,21 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                         }
                     }
                 }
+                let uploaded_bytes = resumable
+                    .as_ref()
+                    .map(|checkpoint| checkpoint.uploaded_bytes)
+                    .unwrap_or(0);
                 emit(
                     &app2,
-                    json!({ "type": "file", "state": "error", "file_path": item.file_path.to_string_lossy(), "error": message.clone() }),
+                    json!({ "type": "file", "state": "error", "file_path": item.file_path.to_string_lossy(), "uploaded_bytes": uploaded_bytes, "total_bytes": item.size, "error": message.clone() }),
                 );
+                if resumable.is_some() {
+                    tauri::async_runtime::spawn(requeue_resumable_upload(
+                        app2.clone(),
+                        state2.clone(),
+                        item.clone(),
+                    ));
+                }
             }
             emit_state(&app2, &state2);
             drain_queue(app2, state2);
@@ -6768,6 +7387,9 @@ async fn create_share(
     file_ids: Vec<String>,
     title: String,
     target_type: Option<String>,
+    share_type: Option<u8>,
+    code: Option<String>,
+    auto_fill_code: Option<bool>,
 ) -> Result<Value, String> {
     if file_ids.is_empty() {
         return Err("请至少选择一个文件或文件夹".into());
@@ -6779,22 +7401,21 @@ async fn create_share(
         title.to_string()
     };
     let (token, device_id) = auth_context(&state)?;
-    let existing = find_existing_share_for_files(&token, &device_id, &file_ids).await?;
-    let reused_existing = existing.is_some();
-    let mut data = if let Some(existing) = existing {
-        existing
-    } else {
-        api_post(
-            &token,
-            &device_id,
-            "/userres/v1/share_file",
-            share_file_payload(&file_ids, &title),
-            &[],
-        )
-        .await?
-        .data
-        .ok_or_else(|| "光鸭没有返回分享信息".to_string())?
-    };
+    let (share_type, code, auto_fill_code) =
+        normalize_share_access(share_type, code.as_deref(), auto_fill_code)?;
+    // 手动分享始终创建当前快照。复用旧的文件夹分享会保留创建时的
+    // 空目录状态，导致云盘已有文件而分享页仍为空。
+    let reused_existing = false;
+    let mut data = api_post(
+        &token,
+        &device_id,
+        "/userres/v1/share_file",
+        share_file_payload(&file_ids, &title, share_type, &code, auto_fill_code),
+        &[],
+    )
+    .await?
+    .data
+    .ok_or_else(|| "光鸭没有返回分享信息".to_string())?;
     let share_url = ["shareUrl", "shareURL", "share_url", "url"]
         .iter()
         .find_map(|key| data.get(key).and_then(Value::as_str))
@@ -8132,6 +8753,13 @@ fn run() {
                     mapping
                 })
                 .collect::<Vec<_>>();
+            let mut resumable_uploads = load_resumable_uploads(&db_path)?;
+            resumable_uploads.retain(|item| {
+                item.mapping_id == "__manual__"
+                    || mappings
+                        .iter()
+                        .any(|mapping| mapping.id == item.mapping_id && mapping.enabled)
+            });
             let state = Arc::new(Mutex::new(RuntimeState {
                 token: auth_session.access_token,
                 refresh_token: auth_session.refresh_token,
@@ -8139,7 +8767,7 @@ fn run() {
                 db_path,
                 mappings: mappings.clone(),
                 saved_shares: config.saved_shares,
-                queue: VecDeque::new(),
+                queue: resumable_uploads,
                 waiting_files: HashMap::new(),
                 history: upload_history,
                 pending_cloud,
@@ -8226,6 +8854,7 @@ fn run() {
             ));
             tauri::async_runtime::spawn(auto_share_loop(app_handle.clone(), state.clone()));
             tauri::async_runtime::spawn(token_refresh_loop(app_handle.clone(), state.clone()));
+            drain_queue(app_handle.clone(), state.clone());
             emit_state(&app_handle, &state);
             Ok(())
         })
@@ -8341,6 +8970,40 @@ mod tests {
     }
 
     #[test]
+    fn auto_share_waits_for_pending_cloud_files_in_the_same_target() {
+        let root =
+            std::env::temp_dir().join(format!("guangya-auto-share-pending-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let database = root.join("state.sqlite3");
+        init_database(&database).unwrap();
+        let item = UploadItem {
+            mapping_id: "mapping-1".to_string(),
+            file_path: root.join("children").join("episode-02.mkv"),
+            remote_parent_id: String::new(),
+            remote_dir: "children".to_string(),
+            relative_path: "children/episode-02.mkv".to_string(),
+            change_kind: "added".to_string(),
+            size: 1024,
+            modified_ms: 123,
+        };
+        save_upload_record(
+            &database,
+            &item,
+            &UploadOutcome {
+                task_id: "task-pending".to_string(),
+                remote_file_id: None,
+            },
+            UPLOAD_STATE_OSS_COMPLETE,
+        )
+        .unwrap();
+
+        assert!(target_has_pending_cloud(&database, "mapping-1", "children").unwrap());
+        assert!(!target_has_pending_cloud(&database, "mapping-1", "another-folder").unwrap());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn hdhive_hmac_matches_node_and_backend() {
         assert_eq!(
             hdhive_signature(
@@ -8356,7 +9019,7 @@ mod tests {
 
     #[test]
     fn share_file_payload_matches_official_web_contract() {
-        let payload = share_file_payload(&["file-1".to_string()], "测试分享");
+        let payload = share_file_payload(&["file-1".to_string()], "测试分享", 0, "", false);
 
         assert_eq!(
             payload,
@@ -8374,9 +9037,14 @@ mod tests {
             })
         );
         assert_eq!(
-            share_file_payload(&["file-1".to_string()], "   ")["title"],
+            share_file_payload(&["file-1".to_string()], "   ", 0, "", false)["title"],
             "云盘分享"
         );
+        assert_eq!(
+            share_file_payload(&["file-1".to_string()], "私密分享", 2, "a1B2", false)["code"],
+            "a1B2"
+        );
+        assert!(normalize_share_access(Some(2), Some("bad"), None).is_err());
     }
 
     #[test]
@@ -8597,6 +9265,103 @@ mod tests {
             normalize_oss_endpoint_url("http://oss-cn-hangzhou.aliyuncs.com", "bucket"),
             "http://oss-cn-hangzhou.aliyuncs.com"
         );
+    }
+
+    #[test]
+    fn upload_token_preserves_numeric_provider_values() {
+        let token: UploadToken = serde_json::from_value(json!({
+            "taskId": "task-1",
+            "objectPath": "objects/video.mkv",
+            "bucketName": "bucket",
+            "endPoint": "https://oss-cn-shanghai.aliyuncs.com",
+            "provider": 1,
+            "creds": {
+                "accessKeyID": "access-key",
+                "secretAccessKey": "secret-key",
+                "sessionToken": "security-token"
+            }
+        }))
+        .expect("numeric provider should deserialize");
+
+        assert_eq!(token.provider, Some(json!(1)));
+    }
+
+    #[test]
+    fn oss_signature_uses_security_token_and_multipart_subresource() {
+        let checkpoint = OssUploadCheckpoint {
+            task_id: "task-1".into(),
+            object_path: "folder/video.mkv".into(),
+            bucket_name: "bucket".into(),
+            end_point: "https://oss-cn-shanghai.aliyuncs.com".into(),
+            provider: Some("oss".into()),
+            upload_id: "upload-1".into(),
+            part_size: OSS_MIB,
+            completed_parts: BTreeMap::new(),
+        };
+        assert_eq!(
+            oss_string_to_sign(
+                "PUT",
+                "Sun, 26 Jul 2026 12:00:00 GMT",
+                "security-token",
+                &checkpoint,
+                Some("partNumber=2&uploadId=upload-1")
+            ),
+            "PUT\n\n\nSun, 26 Jul 2026 12:00:00 GMT\nx-oss-security-token:security-token\n/bucket/folder/video.mkv?partNumber=2&uploadId=upload-1"
+        );
+    }
+
+    #[test]
+    fn upload_checkpoint_persists_parts_and_is_restored_after_restart() {
+        let root =
+            std::env::temp_dir().join(format!("guangya-upload-checkpoint-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create upload checkpoint fixture");
+        let database = root.join("state.sqlite3");
+        let file_path = root.join("video.mkv");
+        fs::write(&file_path, b"video-content").expect("write upload checkpoint fixture");
+        let metadata = fs::metadata(&file_path).expect("read upload checkpoint fixture metadata");
+        let item = UploadItem {
+            mapping_id: "__manual__".into(),
+            file_path: file_path.clone(),
+            remote_parent_id: "parent-1".into(),
+            remote_dir: String::new(),
+            relative_path: String::new(),
+            change_kind: "added".into(),
+            size: metadata.len(),
+            modified_ms: modified_ms(&metadata),
+        };
+        init_database(&database).expect("initialize upload checkpoint database");
+        let checkpoint = OssUploadCheckpoint {
+            task_id: "task-1".into(),
+            object_path: "objects/video.mkv".into(),
+            bucket_name: "bucket".into(),
+            end_point: "https://oss-cn-shanghai.aliyuncs.com".into(),
+            provider: Some("oss".into()),
+            upload_id: "upload-1".into(),
+            part_size: 5,
+            completed_parts: BTreeMap::from([(1, "\"etag-1\"".into())]),
+        };
+        save_upload_checkpoint(&database, &item, &checkpoint, 5).expect("save upload checkpoint");
+
+        let loaded = load_upload_checkpoint(&database, &item)
+            .expect("load upload checkpoint")
+            .expect("upload checkpoint should exist");
+        assert_eq!(loaded.uploaded_bytes, 5);
+        assert_eq!(
+            loaded.checkpoint.completed_parts.get(&1).unwrap(),
+            "\"etag-1\""
+        );
+        assert_eq!(
+            load_resumable_uploads(&database)
+                .expect("restore upload checkpoints")
+                .len(),
+            1
+        );
+
+        fs::write(&file_path, b"changed-video-content").expect("change upload fixture");
+        assert!(load_resumable_uploads(&database)
+            .expect("clean stale upload checkpoints")
+            .is_empty());
+        fs::remove_dir_all(root).expect("remove upload checkpoint fixture");
     }
 
     #[test]

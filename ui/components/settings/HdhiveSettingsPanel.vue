@@ -7,7 +7,26 @@ import { useSessionStore } from '../../stores/session'
 
 const session = useSessionStore()
 const saving = shallowRef(false)
+const enabledSaving = shallowRef(false)
 const form = reactive({ enabled: true, base_url: '', secret: '' })
+
+async function saveEnabled(enabled: boolean) {
+  enabledSaving.value = true
+  try {
+    const data = unwrapData(await bridge.invoke('update_hdhive_config', {
+      enabled,
+      base_url: session.state.hdhive?.base_url || '',
+    }))
+    Object.assign(session.state.hdhive, data)
+    form.enabled = data.enabled !== false
+    message.success(form.enabled ? 'HDHive 已开启' : 'HDHive 已关闭')
+  } catch (reason) {
+    form.enabled = session.state.hdhive?.enabled !== false
+    message.error(errorText(reason))
+  } finally {
+    enabledSaving.value = false
+  }
+}
 
 async function saveSettings() {
   saving.value = true
@@ -43,7 +62,12 @@ onMounted(() => {
         <strong>HDHive 集成</strong>
         <span>关闭后停止自动投稿与回执轮询，已有备份任务配置会保留。</span>
       </div>
-      <a-switch v-model:checked="form.enabled" aria-label="启用或关闭 HDHive 集成" />
+      <a-switch
+        v-model:checked="form.enabled"
+        :loading="enabledSaving"
+        aria-label="启用或关闭 HDHive 集成"
+        @change="saveEnabled"
+      />
     </div>
     <a-form class="settings-form" layout="vertical">
       <a-form-item label="服务地址">
@@ -52,7 +76,7 @@ onMounted(() => {
       <a-form-item label="接入密钥">
         <a-input-password v-model:value="form.secret" placeholder="留空表示不修改" :disabled="!form.enabled" />
       </a-form-item>
-      <a-button type="primary" :loading="saving" @click="saveSettings">保存 HDHive 设置</a-button>
+      <a-button type="primary" :loading="saving" :disabled="enabledSaving" @click="saveSettings">保存 HDHive 设置</a-button>
     </a-form>
   </section>
 </template>
