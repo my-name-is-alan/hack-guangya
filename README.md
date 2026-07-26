@@ -45,8 +45,11 @@ docker pull 94xhzy/guangya-sync:0.1.15
 cp .env.example .env
 openssl rand -hex 24
 # 把输出填到 .env 的 GUANGYA_ADMIN_PASSWORD= 后面
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
+
+完整的环境变量、目录挂载、HDHive、升级、回滚、备份与反向代理配置见 [DOCKER.md](./DOCKER.md)。
 
 Docker 会明确监听 `0.0.0.0:8080`，未设置管理密码或密码留空时 Compose 会拒绝启动。打开 `http://localhost:8080`，使用上述管理账号登录。需要从其他机器访问时，请同时限制防火墙来源；跨不可信网络应在前面配置 HTTPS 反向代理，避免通过明文 HTTP 传输管理凭据。
 
