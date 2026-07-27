@@ -2,9 +2,11 @@
 import { computed, reactive, ref } from 'vue';
 import { message, Modal } from 'antdv-next';
 import {
+  ArrowLeftOutlined,
   CloudSyncOutlined,
   DeleteOutlined,
   EditOutlined,
+  FolderOutlined,
   FolderOpenOutlined,
   PlusOutlined,
   ReloadOutlined,
@@ -16,7 +18,9 @@ import {
   defaultSyncExtensions,
   errorText,
   extensionPresets,
+  fileId,
   formatTime,
+  isFolder,
   mappingExtensions,
   normalizeExtensions,
   presetExtensions,
@@ -28,12 +32,36 @@ import {
   sourcePolicyColor,
   sourcePolicyLabel,
   syncTypeSummary,
+  unwrapData,
 } from '../formatters.js';
 
 const backupDrawerOpen = ref(false);
 const backupTab = ref('tasks');
 const backupSubmitting = ref(false);
-const backupForm = reactive({ local: '', remote: '', archive: '', policy: 'keep', monitor_mode: 'native', auto_share: false, sync_types: [...defaultSyncExtensions] });
+const backupForm = reactive({
+  local: '',
+  remote: '',
+  remoteParentId: '',
+  remoteLabel: '',
+  remoteChosen: false,
+  archive: '',
+  policy: 'keep',
+  monitor_mode: isTauri ? 'native' : 'polling',
+  auto_share: false,
+  sync_types: [...defaultSyncExtensions],
+});
+const cloudFolderPicker = reactive({
+  open: false,
+  loading: false,
+  items: [],
+  path: [{ id: '', name: '全部文件' }],
+  page: 0,
+  total: 0,
+});
+const cloudFolderColumns = [
+  { title: '文件夹', key: 'name', ellipsis: true },
+  { title: '操作', key: 'actions', width: 84 },
+];
 const syncTypesEditor = reactive({ open: false, saving: false, mapping: null, selected: [] });
 const autoShareHistory = reactive({ open: false, mapping: null });
 
@@ -67,9 +95,12 @@ function activityTimestamp(value) {
 function openBackupDrawer() {
   backupForm.local = '';
   backupForm.remote = '';
+  backupForm.remoteParentId = '';
+  backupForm.remoteLabel = '';
+  backupForm.remoteChosen = false;
   backupForm.archive = '';
   backupForm.policy = 'keep';
-  backupForm.monitor_mode = 'native';
+  backupForm.monitor_mode = isTauri ? 'native' : 'polling';
   backupForm.auto_share = false;
   backupForm.sync_types = [...defaultSyncExtensions];
   backupDrawerOpen.value = true;
@@ -78,8 +109,54 @@ async function pickBackupFolder(kind) {
   const selected = await bridge.selectFolder();
   if (selected) backupForm[kind] = selected;
 }
+async function loadCloudFolders(page = 0) {
+  cloudFolderPicker.loading = true;
+  try {
+    const parentId = cloudFolderPicker.path.at(-1)?.id || '';
+    const data = unwrapData(await bridge.invoke('list_files', { parent_id: parentId, page }));
+    cloudFolderPicker.items = (data.list || []).filter(isFolder);
+    cloudFolderPicker.page = page;
+    cloudFolderPicker.total = Math.max(Number(data.total || 0), cloudFolderPicker.items.length);
+  } catch (error) {
+    message.error(errorText(error));
+  } finally {
+    cloudFolderPicker.loading = false;
+  }
+}
+async function openCloudFolderPicker() {
+  cloudFolderPicker.path = [{ id: '', name: '全部文件' }];
+  cloudFolderPicker.open = true;
+  await loadCloudFolders(0);
+}
+async function enterCloudFolder(record) {
+  cloudFolderPicker.path.push({ id: String(fileId(record)), name: String(record.fileName || record.name || '未命名文件夹') });
+  await loadCloudFolders(0);
+}
+async function leaveCloudFolder() {
+  if (cloudFolderPicker.path.length <= 1) return;
+  cloudFolderPicker.path.pop();
+  await loadCloudFolders(0);
+}
+async function jumpToCloudFolder(index) {
+  if (index < 0 || index >= cloudFolderPicker.path.length - 1) return;
+  cloudFolderPicker.path = cloudFolderPicker.path.slice(0, index + 1);
+  await loadCloudFolders(0);
+}
+function chooseCloudFolder() {
+  const current = cloudFolderPicker.path.at(-1);
+  const names = cloudFolderPicker.path.slice(1).map((item) => item.name);
+  backupForm.remoteParentId = current?.id || '';
+  backupForm.remote = names.length ? `/${names.join('/')}` : '';
+  backupForm.remoteLabel = names.length ? `全部文件 / ${names.join(' / ')}` : '全部文件';
+  backupForm.remoteChosen = true;
+  cloudFolderPicker.open = false;
+}
+function handleCloudFolderTableChange(pagination) {
+  const page = Math.max(0, Number(pagination?.current || 1) - 1);
+  if (page !== cloudFolderPicker.page) void loadCloudFolders(page);
+}
 async function addBackup() {
-  if (!backupForm.local || !backupForm.remote) {
+  if (!backupForm.local || !backupForm.remoteChosen) {
     message.warning('请选择本地文件夹和云端目录');
     return;
   }
@@ -92,7 +169,7 @@ async function addBackup() {
     await bridge.invoke('add_mapping', {
       local_path: backupForm.local,
       remote_path: backupForm.remote,
-      remote_parent_id: '',
+      remote_parent_id: backupForm.remoteParentId,
       source_policy: backupForm.policy,
       archive_path: backupForm.policy === 'archive' ? backupForm.archive : undefined,
       scan_existing: true,
@@ -237,7 +314,7 @@ async function retryAutoShareEvent(event) {
               <a-tag v-if="item.auto_share" color="purple">自动分享</a-tag>
             </div>
             <div class="task-meta">
-              <span>云端：{{ item.remote_path }}</span>
+              <span>云端：{{ item.remote_path || '全部文件' }}</span>
               <span>格式：{{ syncTypeSummary(item) }}</span>
               <a-tag :color="sourcePolicyColor(item.source_policy)">{{ sourcePolicyLabel(item.source_policy) }}</a-tag>
             </div>
@@ -286,7 +363,9 @@ async function retryAutoShareEvent(event) {
           <small v-if="!isTauri" class="form-hint">Web 端路径以服务器或容器内的挂载目录为准</small>
         </a-form-item>
         <a-form-item label="云端目录" required>
-          <a-input v-model:value="backupForm.remote" placeholder="例如 /备份/照片" />
+          <a-input :value="backupForm.remoteLabel" readonly placeholder="选择光鸭云盘目录" @click="openCloudFolderPicker">
+            <template #suffix><FolderOpenOutlined /></template>
+          </a-input>
         </a-form-item>
         <a-form-item label="监控方式">
           <a-radio-group v-model:value="backupForm.monitor_mode">
@@ -319,6 +398,39 @@ async function retryAutoShareEvent(event) {
         <a-button type="primary" block :loading="backupSubmitting" @click="addBackup"><template #icon><PlusOutlined /></template>创建备份任务</a-button>
       </a-form>
     </a-drawer>
+
+    <a-modal v-model:open="cloudFolderPicker.open" title="选择云端目录" width="620px" ok-text="选择当前目录" cancel-text="取消" @ok="chooseCloudFolder">
+      <a-flex class="cloud-folder-toolbar" align="center" gap="small">
+        <a-button type="text" :disabled="cloudFolderPicker.path.length <= 1" aria-label="返回上级目录" @click="leaveCloudFolder">
+          <template #icon><ArrowLeftOutlined /></template>
+        </a-button>
+        <a-breadcrumb>
+          <a-breadcrumb-item v-for="(segment, index) in cloudFolderPicker.path" :key="segment.id || 'root'">
+            <a v-if="index < cloudFolderPicker.path.length - 1" href="#" @click.prevent="jumpToCloudFolder(index)">{{ segment.name }}</a>
+            <span v-else>{{ segment.name }}</span>
+          </a-breadcrumb-item>
+        </a-breadcrumb>
+      </a-flex>
+      <a-table
+        :columns="cloudFolderColumns"
+        :data-source="cloudFolderPicker.items"
+        :loading="cloudFolderPicker.loading"
+        :row-key="(item) => fileId(item)"
+        :pagination="{ current: cloudFolderPicker.page + 1, pageSize: 100, total: cloudFolderPicker.total, showSizeChanger: false }"
+        size="small"
+        @change="handleCloudFolderTableChange"
+      >
+        <template #emptyText><a-empty description="当前目录下没有文件夹" /></template>
+        <template #bodyCell="{ column, record }">
+          <template v-if="column.key === 'name'">
+            <a-space><FolderOutlined /><span>{{ record.fileName || record.name }}</span></a-space>
+          </template>
+          <template v-else-if="column.key === 'actions'">
+            <a-button type="link" size="small" @click="enterCloudFolder(record)">进入</a-button>
+          </template>
+        </template>
+      </a-table>
+    </a-modal>
 
     <a-modal v-model:open="syncTypesEditor.open" title="同步格式" :confirm-loading="syncTypesEditor.saving" ok-text="保存" cancel-text="取消" width="520px" @ok="saveSyncTypes">
       <div class="preset-row">

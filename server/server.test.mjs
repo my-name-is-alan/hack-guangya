@@ -31,6 +31,76 @@ async function waitUntil(check, timeout = 8_000) {
   throw new Error('等待备份任务状态超时');
 }
 
+test('Docker 自动续期确认失效后清空会话并回到未登录状态', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-expired-session-test-'));
+  const dataDir = path.join(root, 'data');
+  const watchRoot = path.join(root, 'watch');
+  const archiveRoot = path.join(root, 'archive');
+  await Promise.all([
+    fsp.mkdir(dataDir, { recursive: true }),
+    fsp.mkdir(watchRoot, { recursive: true }),
+    fsp.mkdir(archiveRoot, { recursive: true }),
+  ]);
+
+  const database = new DatabaseSync(path.join(dataDir, 'state.sqlite3'));
+  database.exec(`
+    CREATE TABLE auth_session (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      access_token TEXT,
+      refresh_token TEXT,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+  database.prepare('INSERT INTO auth_session (id, access_token, refresh_token, updated_at) VALUES (1, ?, ?, ?)').run('expired-access', 'expired-refresh', 1);
+  database.close();
+
+  const accountServer = http.createServer(async (request, response) => {
+    for await (const _ of request) {}
+    response.writeHead(400, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: 'invalid_grant', error_description: 'refresh token expired' }));
+  });
+  accountServer.listen(0, '127.0.0.1');
+  await once(accountServer, 'listening');
+
+  const port = await freePort();
+  const child = spawn(process.execPath, [path.join(here, 'server.mjs')], {
+    cwd: path.resolve(here, '..'),
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DATA_DIR: dataDir,
+      GUANGYA_WATCH_ROOT: watchRoot,
+      GUANGYA_ARCHIVE_ROOT: archiveRoot,
+      GUANGYA_ACCOUNT_BASE: `http://127.0.0.1:${accountServer.address().port}`,
+      GUANGYA_TOKEN: '',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+
+  try {
+    await waitUntil(() => output.includes('Guangya Web listening'));
+    await waitUntil(async () => {
+      const current = await fetch(`http://127.0.0.1:${port}/api/state`).then((response) => response.json());
+      return current.logged_in === false;
+    });
+    const persistedDatabase = new DatabaseSync(path.join(dataDir, 'state.sqlite3'), { readOnly: true });
+    const persisted = persistedDatabase
+      .prepare('SELECT access_token, refresh_token FROM auth_session WHERE id = 1')
+      .get();
+    persistedDatabase.close();
+    assert.equal(persisted.access_token, null);
+    assert.equal(persisted.refresh_token, null);
+  } finally {
+    child.kill();
+    await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 2_000))]);
+    await new Promise((resolve) => accountServer.close(resolve));
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('备份任务扫描已有文件并只监控所选类型', async () => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-sync-test-'));
   const watchRoot = path.join(root, 'watch');

@@ -53,6 +53,7 @@ const ossRetryMax = envInteger('GUANGYA_OSS_RETRY_MAX', 3, 0, 10);
 const ossParallel = envInteger('GUANGYA_OSS_PARALLEL', 3, 1, 8);
 const defaultUploadConcurrency = envInteger('GUANGYA_UPLOAD_CONCURRENCY', 2, 1, 8);
 const defaultDownloadConcurrency = envInteger('GUANGYA_DOWNLOAD_CONCURRENCY', 2, 1, 8);
+const defaultMonitorMode = String(process.env.GUANGYA_DEFAULT_MONITOR_MODE || 'native').toLowerCase() === 'polling' ? 'polling' : 'native';
 const defaultCacheMaxEntries = 10_000;
 const minCacheMaxEntries = 100;
 const maxCacheMaxEntries = 100_000;
@@ -241,6 +242,7 @@ database.prepare("INSERT INTO app_state (key, value, updated_at) VALUES ('device
 const clients = new Set();
 const watchers = new Map();
 const queue = new Map();
+const flashPreflightCache = new Map();
 const history = new Map(database.prepare("SELECT mapping_id, file_path, size, modified_ms FROM uploaded_files WHERE status = 'cloud_confirmed'").all().map((row) => [`${row.mapping_id}::${path.resolve(row.file_path)}`, `${row.size}:${row.modified_ms}`]));
 const pendingUploads = new Map(database.prepare("SELECT mapping_id, file_path, size, modified_ms, task_id, item_json, remote_parent_id, remote_dir, relative_path FROM uploaded_files WHERE status = 'oss_complete'").all().map((row) => [`${row.mapping_id}::${path.resolve(row.file_path)}`, row]));
 const inflight = new Map();
@@ -259,6 +261,9 @@ let refreshPromise = null;
 const smsChallenges = new Map();
 let paused = false;
 let active = 0;
+let activeFlashPreflights = 0;
+const flashPreflightConcurrency = 1;
+const flashPreflightTokenMaxAgeMs = 10 * 60 * 1000;
 const fileStabilityMs = Math.max(200, Number(process.env.GUANGYA_FILE_STABILITY_MS || 1200));
 const fileBusyRetryMs = Math.max(500, Number(process.env.GUANGYA_FILE_BUSY_RETRY_MS || 3000));
 const storedInstance = database.prepare("SELECT value FROM app_state WHERE key = 'hdhive_instance_id'").get();
@@ -295,13 +300,37 @@ function normalizeSyncTypes(value) {
   }
   return result.length ? result : [...DEFAULT_SYNC_TYPES];
 }
-function normalizeMonitorMode(value) { return String(value || '').toLowerCase() === 'polling' ? 'polling' : 'native'; }
+function normalizeMonitorMode(value) {
+  const normalized = String(value || '').toLowerCase();
+  if (!normalized) return defaultMonitorMode;
+  return normalized === 'polling' ? 'polling' : 'native';
+}
 function syncType(file) {
   const extension = path.extname(file).slice(1).toLowerCase();
   return extension;
 }
 function shouldSync(file, syncTypes) { const extension = syncType(file); return Boolean(extension) && normalizeSyncTypes(syncTypes).includes(extension); }
 function queueKey(mappingId, file) { return `${mappingId}::${path.resolve(file)}`; }
+function uploadStamp(item) { return `${item.size}:${item.mtime}`; }
+function flashPreflightCached(key, item) {
+  return flashPreflightCache.get(key)?.stamp === uploadStamp(item);
+}
+function takeFlashPreflightToken(key, item) {
+  const cached = flashPreflightCache.get(key);
+  flashPreflightCache.delete(key);
+  if (!cached || cached.stamp !== uploadStamp(item) || Date.now() - cached.createdAt > flashPreflightTokenMaxAgeMs) return null;
+  return cached.data || null;
+}
+function mappingAcceptsUpload(item) {
+  return item.mapping_id.startsWith('__')
+    || mappings.some((mapping) => mapping.id === item.mapping_id && mapping.enabled);
+}
+function prependQueuedItem(key, item) {
+  const queued = [...queue.entries()];
+  queue.clear();
+  queue.set(key, item);
+  for (const [queuedKey, queuedItem] of queued) queue.set(queuedKey, queuedItem);
+}
 function autoShareReceipts() { return database.prepare('SELECT event_id, mapping_id, target_key, share_url, status, action, message, resource_url, notification_status, updated_at FROM auto_share_events ORDER BY updated_at DESC LIMIT 50').all(); }
 function transferSettings() {
   return {
@@ -470,6 +499,12 @@ async function saveConfig() { await fsp.mkdir(dataDir, { recursive: true }); awa
 function saveAuthSession(accessToken, nextRefreshToken = null) { database.prepare('INSERT INTO auth_session (id, access_token, refresh_token, updated_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET access_token = excluded.access_token, refresh_token = COALESCE(excluded.refresh_token, auth_session.refresh_token), updated_at = excluded.updated_at').run(accessToken || null, nextRefreshToken || null, Math.floor(Date.now() / 1000)); }
 function replaceAuthSession(accessToken, nextRefreshToken = null) { database.prepare('INSERT INTO auth_session (id, access_token, refresh_token, updated_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET access_token = excluded.access_token, refresh_token = excluded.refresh_token, updated_at = excluded.updated_at').run(accessToken || null, nextRefreshToken || null, Math.floor(Date.now() / 1000)); }
 function saveAuthToken(value) { saveAuthSession(value, null); }
+function invalidateAuthSession() {
+  token = null;
+  refreshToken = null;
+  replaceAuthSession(null, null);
+  publishState();
+}
 function uploadHistoryPath(item) { return item.history_path || item.file_path; }
 function uploadEventPath(item) { return item.event_path || item.file_path; }
 function uploadCheckpointIdentity(item) {
@@ -792,9 +827,7 @@ async function apiPost(endpoint, body, allowed = [], allowRefresh = true) {
       await refreshSavedSession();
       return apiPost(endpoint, body, allowed, false);
     }
-    token = null;
-    saveAuthToken(null);
-    publishState();
+    invalidateAuthSession();
     throw new Error('登录态已失效，且自动续期失败，请重新扫码登录');
   }
   if (!response.ok || (code !== 0 && !allowed.includes(code))) {
@@ -1232,7 +1265,21 @@ async function retryAutoShareEvent(eventId, overrides) {
   void pollHdhiveReceipt(eventId, row.mapping_id, row.target_key, row.share_url, payload);
   return result;
 }
-async function accountGet(endpoint, allowRefresh = true) { if (!token) throw new Error('尚未设置光鸭会话令牌'); const response = await fetch(`${accountBase}${endpoint}`, { headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, signal: AbortSignal.timeout(120000) }); const payload = await parseResponse(response, endpoint); if (response.status === 401 && allowRefresh && refreshToken) { await refreshSavedSession(); return accountGet(endpoint, false); } if (!response.ok) throw new Error(payload.msg || `账号接口失败 ${response.status}`); return payload; }
+async function accountGet(endpoint, allowRefresh = true) {
+  if (!token) throw new Error('尚未设置光鸭会话令牌');
+  const response = await fetch(`${accountBase}${endpoint}`, { headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, signal: AbortSignal.timeout(120000) });
+  const payload = await parseResponse(response, endpoint);
+  if (response.status === 401) {
+    if (allowRefresh && refreshToken) {
+      await refreshSavedSession();
+      return accountGet(endpoint, false);
+    }
+    invalidateAuthSession();
+    throw new Error('登录态已失效，且自动续期失败，请重新扫码登录');
+  }
+  if (!response.ok) throw new Error(payload.msg || `账号接口失败 ${response.status}`);
+  return payload;
+}
 async function accountPost(endpoint, body, extraHeaders = {}) { const response = await fetch(`${accountBase}${endpoint}`, { method: 'POST', headers: { 'content-type': 'application/json', ...extraHeaders }, body: JSON.stringify(body || {}), signal: AbortSignal.timeout(120000) }); return { status: response.status, payload: await parseResponse(response, endpoint) }; }
 function authValue(payload, key) { return payload?.[key] ?? payload?.data?.[key] ?? null; }
 function accountError(payload, fallback) { return payload?.error_description || payload?.description || payload?.msg || payload?.message || payload?.error || fallback; }
@@ -1413,7 +1460,14 @@ async function refreshSavedSession() {
   if (!refreshToken) return false;
   if (!refreshPromise) refreshPromise = (async () => {
     const { status: statusCode, payload } = await accountPost('/v1/auth/token', { grant_type: 'refresh_token', refresh_token: refreshToken, client_id: oauthClientId });
-    if (statusCode >= 400) throw new Error(payload.error_description || payload.msg || '刷新登录状态失败');
+    if (statusCode >= 400) {
+      const message = payload.error_description || payload.msg || '刷新登录状态失败';
+      if ([400, 401, 403].includes(statusCode)) {
+        invalidateAuthSession();
+        throw new Error(`登录态已失效，请重新扫码登录：${message}`);
+      }
+      throw new Error(message);
+    }
     const accessToken = authValue(payload, 'access_token');
     const nextRefreshToken = authValue(payload, 'refresh_token');
     if (!accessToken) throw new Error('刷新登录状态时没有返回 access_token');
@@ -1586,6 +1640,51 @@ function scheduleBusyUploadRetry(key, item) {
     }
   }, fileBusyRetryMs);
 }
+async function preflightFlashUpload(item) {
+  const source = await validateWatchedSource(item);
+  item.file_path = source.absolute;
+  const stat = source.stat;
+  item.size = stat.size;
+  if (!item.history_path) item.mtime = stat.mtimeMs;
+  const eventPath = uploadEventPath(item);
+  if (loadUploadCheckpoint(item)) return { kind: 'skipped' };
+
+  publish({ type: 'progress', file_path: eventPath, percent: 0, uploaded_bytes: 0, total_bytes: stat.size, bytes_per_second: 0, stage: '正在后台校验秒传' });
+  const parentId = await ensureRemote(item.remote_parent_id || '', item.remote_dir);
+  const res = { fileSize: stat.size };
+  if (stat.size < 1024 * 1024) {
+    publish({ type: 'progress', file_path: eventPath, percent: 0, uploaded_bytes: 0, total_bytes: stat.size, bytes_per_second: 0, stage: '正在后台计算秒传 MD5' });
+    res.md5 = await calculateFileHash(item.file_path, 'md5');
+  }
+  const response = await apiPost('/userres/v1/get_res_center_token', {
+    capacity: 2,
+    name: path.basename(item.file_path),
+    res,
+    parentId,
+  }, [156]);
+  const data = response.data;
+  if (!data?.taskId) throw new Error('光鸭没有返回上传任务 ID');
+  let taskId = data.taskId;
+  let instantUpload = response.code === 156;
+  if (!instantUpload && stat.size >= 1024 * 1024) {
+    try {
+      const gcid = await calculateFileGcid(item.file_path, stat.size, stat.mtimeMs, eventPath);
+      const flash = await apiPost('/userres/v1/check_can_flash_upload', { taskId, gcid });
+      instantUpload = flash.data?.canFlashUpload === true;
+      if (instantUpload && flash.data?.taskId) taskId = String(flash.data.taskId);
+    } catch (error) {
+      status('warning', `后台秒传校验失败，稍后继续普通上传：${error.message}`);
+    }
+  }
+  if (!instantUpload) return { kind: 'miss', data };
+
+  clearUploadCheckpoint(item);
+  publish({ type: 'progress', file_path: eventPath, percent: 100, uploaded_bytes: stat.size, total_bytes: stat.size, bytes_per_second: 0, stage: '已命中秒传' });
+  if (item.mapping_id) savePendingUploadRecord(item, { taskId, remoteFileId: null });
+  publish({ type: 'file', state: 'processing', file_path: eventPath, uploaded_bytes: stat.size, total_bytes: stat.size, stage: '已秒传，正在等待云端入库' });
+  schedulePendingUploadRecovery(0);
+  return { kind: 'accepted' };
+}
 async function upload(item) {
   const source = await validateWatchedSource(item);
   item.file_path = source.absolute;
@@ -1599,6 +1698,7 @@ async function upload(item) {
   let checkpoint = loadUploadCheckpoint(item);
   let response;
   let data;
+  let flashPrechecked = false;
   if (checkpoint) {
     publish({
       type: 'progress',
@@ -1619,6 +1719,13 @@ async function upload(item) {
       checkpoint = null;
     }
   }
+  if (!data && !checkpoint) {
+    data = takeFlashPreflightToken(queueKey(item.mapping_id, uploadHistoryPath(item)), item);
+    if (data) {
+      flashPrechecked = true;
+      publish({ type: 'progress', file_path: eventPath, percent: 0, uploaded_bytes: 0, total_bytes: stat.size, bytes_per_second: 0, stage: '秒传未命中，正在进入上传通道' });
+    }
+  }
   if (!data) {
     const res = { fileSize: stat.size };
     if (stat.size < 1024 * 1024) {
@@ -1630,8 +1737,8 @@ async function upload(item) {
   }
   if (!data?.taskId) throw new Error('光鸭没有返回上传任务 ID');
   let taskId = data.taskId;
-  let instantUpload = response.code === 156;
-  if (!instantUpload && !checkpoint && stat.size >= 1024 * 1024) {
+  let instantUpload = response?.code === 156;
+  if (!instantUpload && !checkpoint && !flashPrechecked && stat.size >= 1024 * 1024) {
     try {
       const gcid = await calculateFileGcid(item.file_path, stat.size, stat.mtimeMs, eventPath);
       const flash = await apiPost('/userres/v1/check_can_flash_upload', { taskId, gcid });
@@ -1922,6 +2029,69 @@ async function cleanupUnreferencedManualUploads() {
     if (!retained.has(candidate)) await fsp.rm(candidate, { recursive: true, force: true });
   }
 }
+function pumpFlashPreflight() {
+  if (paused || !token || active === 0 || activeFlashPreflights >= flashPreflightConcurrency) return;
+  const candidate = [...queue.entries()].find(([key, item]) => !flashPreflightCached(key, item));
+  if (!candidate) return;
+  const [key, item] = candidate;
+  queue.delete(key);
+  inflight.set(key, uploadStamp(item));
+  inflightItems.set(key, item);
+  activeFlashPreflights += 1;
+  publish({ type: 'file', state: 'preparing', file_path: uploadEventPath(item), uploaded_bytes: 0, total_bytes: item.size, stage: '正在后台校验秒传' });
+  let preserveSource = true;
+  prepareUploadItem(item).then((ready) => {
+    Object.assign(item, ready);
+    return preflightFlashUpload(item);
+  }).then(async (result) => {
+    if (result.kind === 'miss') {
+      if (!mappingAcceptsUpload(item)) {
+        flashPreflightCache.delete(key);
+        return;
+      }
+      flashPreflightCache.set(key, { stamp: uploadStamp(item), data: result.data, createdAt: Date.now() });
+      prependQueuedItem(key, item);
+      publish({ type: 'file', state: 'queued', file_path: uploadEventPath(item), uploaded_bytes: 0, total_bytes: item.size, stage: '秒传未命中，等待上传通道' });
+      return;
+    }
+    if (result.kind === 'skipped') {
+      if (!mappingAcceptsUpload(item)) {
+        flashPreflightCache.delete(key);
+        return;
+      }
+      flashPreflightCache.set(key, { stamp: uploadStamp(item), data: null, createdAt: Date.now() });
+      prependQueuedItem(key, item);
+      publish({ type: 'file', state: 'queued', file_path: uploadEventPath(item), uploaded_bytes: 0, total_bytes: item.size, stage: '已有上传断点，等待上传通道' });
+      return;
+    }
+    flashPreflightCache.delete(key);
+    if (result.kind === 'accepted') return;
+  }).catch((error) => {
+    if (isFileBusyError(error)) {
+      scheduleBusyUploadRetry(key, item);
+      return;
+    }
+    if (error.requeueUpload) {
+      scheduleCloudUploadRetry(key, item, error.message);
+      return;
+    }
+    if (!mappingAcceptsUpload(item)) {
+      flashPreflightCache.delete(key);
+      return;
+    }
+    flashPreflightCache.set(key, { stamp: uploadStamp(item), data: null, createdAt: Date.now() });
+    prependQueuedItem(key, item);
+    status('warning', `后台秒传预检失败，已回到上传队列：${error.message}`);
+    publish({ type: 'file', state: 'queued', file_path: uploadEventPath(item), uploaded_bytes: 0, total_bytes: item.size, stage: '秒传预检失败，等待普通上传' });
+  }).finally(async () => {
+    if (!preserveSource && item.cleanup_path && isWithinRoot(manualUploadRoot, item.cleanup_path)) await fsp.rm(item.cleanup_path, { recursive: true, force: true });
+    inflight.delete(key);
+    inflightItems.delete(key);
+    activeFlashPreflights = Math.max(0, activeFlashPreflights - 1);
+    publishState();
+    pump();
+  });
+}
 function pump() {
   if (paused || !token) { publishState(); return; }
   while (active < uploadConcurrency && queue.size) {
@@ -1965,6 +2135,7 @@ function pump() {
       pump();
     });
   }
+  pumpFlashPreflight();
   publishState();
 }
 async function enqueue(mapping, file) {
@@ -2224,7 +2395,7 @@ async function routeApiV2(request, response, url) {
   if (request.method === 'POST' && url.pathname === '/api/share-links') { const body = await readBody(request); const value = { id: crypto.randomUUID(), label: String(body.label || '未命名分享').trim() || '未命名分享', url: String(body.url || '').trim(), created_at: Math.floor(Date.now() / 1000) }; if (!/^https?:\/\//i.test(value.url)) throw new Error('分享链接必须以 http:// 或 https:// 开头'); savedShares.unshift(value); await saveConfig(); publishState(); return json(response, 200, value); }
   if (request.method === 'DELETE' && url.pathname.startsWith('/api/share-links/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); savedShares = savedShares.filter((item) => item.id !== id); await saveConfig(); publishState(); return json(response, 200, {}); }
   if (request.method === 'POST' && url.pathname === '/api/mappings') { const body = await readBody(request); const localPath = allowedPath(body.local_path); const sourcePolicy = ['keep', 'archive', 'delete'].includes(body.source_policy) ? body.source_policy : 'keep'; const archivePath = sourcePolicy === 'archive' ? allowedArchivePath(body.archive_path || archiveRoot) : null; if (archivePath && (archivePath === localPath || archivePath.startsWith(`${localPath}${path.sep}`))) throw new Error('归档目录不能位于被监控目录内部'); if (body.auto_share && (!hdhiveBaseUrl || !hdhiveSecret)) throw new Error('开启自动分享前请先配置 Hdhive 地址和密钥'); const mapping = { id: crypto.randomUUID(), local_path: localPath, remote_path: normalizeRemote(body.remote_path), remote_parent_id: String(body.remote_parent_id || ''), enabled: true, source_policy: sourcePolicy, archive_path: archivePath, scan_existing: body.scan_existing !== false, sync_types: normalizeSyncTypes(body.sync_types), monitor_mode: normalizeMonitorMode(body.monitor_mode), auto_share: body.auto_share === true, watch_error: null }; const stat = await fsp.stat(mapping.local_path); if (!stat.isDirectory()) throw new Error('监控路径不是目录'); mappings.push(mapping); await fsp.mkdir(archiveRoot, { recursive: true }); await saveConfig(); try { await startWatcher(mapping); } catch (error) { mappings = mappings.filter((item) => item.id !== mapping.id); await saveConfig(); throw new Error(`创建目录监控失败：${error.message}`); } publishState(); return json(response, 200, mapping); }
-  if (request.method === 'DELETE' && url.pathname.startsWith('/api/mappings/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); await watchers.get(id)?.close(); watchers.delete(id); mappings = mappings.filter((item) => item.id !== id); for (const [key, item] of queue) if (item.mapping_id === id) queue.delete(key); for (const [key, item] of waitingFiles) if (item.mapping_id === id) waitingFiles.delete(key); for (const key of history.keys()) if (key.startsWith(`${id}::`)) history.delete(key); for (const key of inflight.keys()) if (key.startsWith(`${id}::`)) inflight.delete(key); deleteMappingTransientUploads(id); await saveConfig(); publishState(); return json(response, 200, {}); }
+  if (request.method === 'DELETE' && url.pathname.startsWith('/api/mappings/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); await watchers.get(id)?.close(); watchers.delete(id); mappings = mappings.filter((item) => item.id !== id); for (const [key, item] of queue) if (item.mapping_id === id) queue.delete(key); for (const [key, item] of waitingFiles) if (item.mapping_id === id) waitingFiles.delete(key); for (const key of flashPreflightCache.keys()) if (key.startsWith(`${id}::`)) flashPreflightCache.delete(key); for (const key of history.keys()) if (key.startsWith(`${id}::`)) history.delete(key); for (const key of inflight.keys()) if (key.startsWith(`${id}::`)) inflight.delete(key); deleteMappingTransientUploads(id); await saveConfig(); publishState(); return json(response, 200, {}); }
   if (request.method === 'POST' && /^\/api\/mappings\/[^/]+\/auto-share-backfill$/.test(url.pathname)) { const id = decodeURIComponent(url.pathname.split('/')[3]); return json(response, 202, await backfillAutoShares(id)); }
   if (request.method === 'PATCH' && url.pathname.startsWith('/api/mappings/')) {
     const id = decodeURIComponent(url.pathname.split('/').pop());
@@ -2316,8 +2487,9 @@ server.listen(port, listenHost, async () => {
     const selfTestHeaders = adminPassword ? { authorization: `Basic ${Buffer.from(`${adminUsername}:${adminPassword}`).toString('base64')}` } : {};
     const response = await fetch(`http://127.0.0.1:${port}/api/state`, { headers: selfTestHeaders });
     console.log(`SELF_TEST ${response.status} ${await response.text()}`);
-    server.close();
+    await new Promise((resolve) => server.close(resolve));
     for (const watcher of watchers.values()) await watcher.close();
+    process.exit(0);
   }
 });
 

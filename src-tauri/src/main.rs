@@ -36,6 +36,8 @@ const AUTH_URL: &str = "https://www.guangyapan.com/#/";
 const DEFAULT_UPLOAD_CONCURRENCY: usize = 2;
 const DEFAULT_DOWNLOAD_CONCURRENCY: usize = 2;
 const MAX_TRANSFER_CONCURRENCY: usize = 8;
+const FLASH_PREFLIGHT_CONCURRENCY: usize = 1;
+const FLASH_PREFLIGHT_TOKEN_MAX_AGE_SECS: u64 = 10 * 60;
 const DEFAULT_MULTIPART_PART_SIZE: &str = "auto";
 const MULTIPART_PART_SIZE_OPTIONS: &[&str] = &["auto", "4m", "8m", "16m"];
 const DEFAULT_CACHE_MAX_ENTRIES: usize = 10_000;
@@ -188,6 +190,7 @@ struct RuntimeState {
     mappings: Vec<Mapping>,
     saved_shares: Vec<SavedShare>,
     queue: VecDeque<UploadItem>,
+    flash_preflight_cache: HashMap<String, FlashPreflightCache>,
     waiting_files: HashMap<String, UploadItem>,
     history: HashMap<String, Stamp>,
     pending_cloud: HashMap<String, Stamp>,
@@ -199,6 +202,7 @@ struct RuntimeState {
     event_tx: UnboundedSender<FsEvent>,
     paused: bool,
     active_uploads: usize,
+    active_flash_preflights: usize,
     upload_concurrency: usize,
     download_concurrency: usize,
     multipart_part_size: String,
@@ -345,6 +349,23 @@ struct AuthSession {
 struct UploadOutcome {
     task_id: String,
     remote_file_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct FlashPreflightCache {
+    stamp: Stamp,
+    upload_token: Option<UploadToken>,
+    created_at: Instant,
+}
+
+enum FlashPreflightOutcome {
+    Accepted {
+        task_id: String,
+        token: String,
+        device_id: String,
+    },
+    Miss(UploadToken),
+    Skipped,
 }
 
 #[derive(Debug, Deserialize)]
@@ -714,6 +735,30 @@ fn item_key(mapping_id: &str, path: &Path) -> String {
 }
 fn stamp_matches(item: &UploadItem, stamp: &Stamp) -> bool {
     stamp.size == item.size && stamp.modified_ms == item.modified_ms
+}
+fn flash_preflight_cached(state: &RuntimeState, item: &UploadItem) -> bool {
+    state
+        .flash_preflight_cache
+        .get(&item_key(&item.mapping_id, &item.file_path))
+        .is_some_and(|cached| stamp_matches(item, &cached.stamp))
+}
+fn take_flash_preflight_token(
+    state: &SharedState,
+    item: &UploadItem,
+) -> Result<Option<UploadToken>, String> {
+    let key = item_key(&item.mapping_id, &item.file_path);
+    let cached = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .flash_preflight_cache
+        .remove(&key);
+    Ok(cached.and_then(|cached| {
+        (stamp_matches(item, &cached.stamp)
+            && cached.created_at.elapsed()
+                <= Duration::from_secs(FLASH_PREFLIGHT_TOKEN_MAX_AGE_SECS))
+        .then_some(cached.upload_token)
+        .flatten()
+    }))
 }
 fn upload_already_scheduled(
     history: &HashMap<String, Stamp>,
@@ -1403,6 +1448,32 @@ fn clear_persisted_access_token(path: &Path) -> Result<(), String> {
         )
         .map_err(|e| format!("清理过期登录状态失败：{e}"))?;
     Ok(())
+}
+
+fn clear_persisted_auth_session(path: &Path) -> Result<(), String> {
+    let connection = open_database(path)?;
+    connection
+        .execute(
+            "UPDATE auth_session
+             SET access_token = NULL, refresh_token = NULL, updated_at = ?1
+             WHERE id = 1",
+            params![unix_timestamp()],
+        )
+        .map_err(|e| format!("清理过期登录状态失败：{e}"))?;
+    Ok(())
+}
+
+fn invalidate_auth_session(app: &tauri::AppHandle, state: &SharedState) -> Result<(), String> {
+    let db_path = {
+        let mut guard = state.lock().map_err(|e| e.to_string())?;
+        guard.token = None;
+        guard.refresh_token = None;
+        reset_remote_cache(&mut guard.remote_cache);
+        guard.db_path.clone()
+    };
+    let result = clear_persisted_auth_session(&db_path);
+    emit_state(app, state);
+    result
 }
 
 fn load_upload_history(path: &Path) -> Result<HashMap<String, Stamp>, String> {
@@ -4863,6 +4934,216 @@ async fn requeue_resumable_upload(app: tauri::AppHandle, state: SharedState, ite
     }
 }
 
+async fn preflight_flash_upload(
+    app: &tauri::AppHandle,
+    state: &SharedState,
+    item: &UploadItem,
+) -> Result<FlashPreflightOutcome, String> {
+    let (token, device_id, db_path) = {
+        let guard = state.lock().map_err(|error| error.to_string())?;
+        (
+            guard
+                .token
+                .clone()
+                .ok_or_else(|| "尚未登录光鸭云盘".to_string())?,
+            guard.device_id.clone(),
+            guard.db_path.clone(),
+        )
+    };
+    if load_upload_checkpoint(&db_path, item)?.is_some() {
+        return Ok(FlashPreflightOutcome::Skipped);
+    }
+
+    emit(
+        app,
+        json!({
+            "type": "progress",
+            "file_path": item.file_path.to_string_lossy(),
+            "percent": 0,
+            "uploaded_bytes": 0,
+            "total_bytes": item.size,
+            "bytes_per_second": 0,
+            "stage": "正在后台校验秒传"
+        }),
+    );
+    let parent_id = ensure_remote_path(
+        state,
+        &token,
+        &device_id,
+        &item.remote_parent_id,
+        &item.remote_dir,
+    )
+    .await?;
+    let name = item
+        .file_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "无法读取文件名".to_string())?;
+    let mut res = json!({ "fileSize": item.size });
+    if item.size < OSS_MIB {
+        emit(
+            app,
+            json!({
+                "type": "progress",
+                "file_path": item.file_path.to_string_lossy(),
+                "percent": 0,
+                "uploaded_bytes": 0,
+                "total_bytes": item.size,
+                "bytes_per_second": 0,
+                "stage": "正在后台计算秒传 MD5"
+            }),
+        );
+        res["md5"] = json!(calculate_file_md5(&item.file_path).await?);
+    }
+    let result = api_post(
+        &token,
+        &device_id,
+        "/userres/v1/get_res_center_token",
+        json!({ "capacity": 2, "name": name, "res": res, "parentId": parent_id }),
+        &[156],
+    )
+    .await?;
+    let mut instant_upload = result.code == 156;
+    let mut data: UploadToken = serde_json::from_value(
+        result
+            .data
+            .ok_or_else(|| "光鸭没有返回上传凭证".to_string())?,
+    )
+    .map_err(|error| format!("上传凭证格式异常：{error}"))?;
+
+    if !instant_upload && item.size >= OSS_MIB {
+        let cached_gcid = match {
+            let guard = state.lock().map_err(|error| error.to_string())?;
+            load_cached_file_gcid(
+                &guard.db_path,
+                &item.file_path,
+                item.size,
+                item.modified_ms,
+                cache_settings(&guard),
+            )
+        } {
+            Ok(value) => value,
+            Err(error) => {
+                status(app, "warning", error);
+                None
+            }
+        };
+        let gcid_result = if let Some(gcid) = cached_gcid {
+            emit(
+                app,
+                json!({
+                    "type": "progress",
+                    "file_path": item.file_path.to_string_lossy(),
+                    "percent": 0,
+                    "uploaded_bytes": 0,
+                    "total_bytes": item.size,
+                    "bytes_per_second": 0,
+                    "stage": "后台已复用本地秒传指纹"
+                }),
+            );
+            Ok(gcid)
+        } else {
+            let result = calculate_file_gcid(app, &item.file_path, item.size).await;
+            if let Ok(gcid) = &result {
+                let saved = {
+                    let guard = state.lock().map_err(|error| error.to_string())?;
+                    save_cached_file_gcid(
+                        &guard.db_path,
+                        &item.file_path,
+                        item.size,
+                        item.modified_ms,
+                        gcid,
+                        cache_settings(&guard),
+                    )
+                };
+                if let Err(error) = saved {
+                    status(app, "warning", error);
+                }
+            }
+            result
+        };
+        match gcid_result {
+            Ok(gcid) => match api_post(
+                &token,
+                &device_id,
+                "/userres/v1/check_can_flash_upload",
+                json!({ "taskId": data.task_id, "gcid": gcid }),
+                &[],
+            )
+            .await
+            {
+                Ok(check) => {
+                    let check_data = check.data.unwrap_or_default();
+                    instant_upload = check_data
+                        .get("canFlashUpload")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if instant_upload {
+                        if let Some(task_id) = check_data
+                            .get("taskId")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                        {
+                            data.task_id = task_id.to_string();
+                        }
+                    }
+                }
+                Err(error) => status(
+                    app,
+                    "warning",
+                    format!("后台秒传校验失败，稍后继续普通上传：{error}"),
+                ),
+            },
+            Err(error) => status(
+                app,
+                "warning",
+                format!("后台秒传指纹计算失败，稍后继续普通上传：{error}"),
+            ),
+        }
+    }
+
+    if !instant_upload {
+        return Ok(FlashPreflightOutcome::Miss(data));
+    }
+
+    clear_upload_checkpoint(&db_path, item)?;
+    emit(
+        app,
+        json!({
+            "type": "progress",
+            "file_path": item.file_path.to_string_lossy(),
+            "percent": 100,
+            "uploaded_bytes": item.size,
+            "total_bytes": item.size,
+            "bytes_per_second": 0,
+            "stage": "已命中秒传"
+        }),
+    );
+    let pending_outcome = UploadOutcome {
+        task_id: data.task_id.clone(),
+        remote_file_id: None,
+    };
+    remember_pending_upload(state, item, &pending_outcome)
+        .map_err(|message| format!("文件已秒传，但写入本地上传记录失败：{message}"))?;
+    emit(
+        app,
+        json!({
+            "type": "file",
+            "state": "processing",
+            "file_path": item.file_path.to_string_lossy(),
+            "mapping_id": item.mapping_id,
+            "uploaded_bytes": item.size,
+            "total_bytes": item.size,
+            "stage": "已秒传，正在等待云端入库"
+        }),
+    );
+    Ok(FlashPreflightOutcome::Accepted {
+        task_id: data.task_id,
+        token,
+        device_id,
+    })
+}
+
 async fn upload_item(
     app: &tauri::AppHandle,
     state: &SharedState,
@@ -4979,7 +5260,26 @@ async fn upload_item(
             }
         }
     }
+    let preflight_token = if resumed_data.is_none() && persisted.is_none() {
+        take_flash_preflight_token(state, item)?
+    } else {
+        None
+    };
     let (mut data, mut instant_upload) = if let Some(data) = resumed_data {
+        (data, false)
+    } else if let Some(data) = preflight_token {
+        emit(
+            app,
+            json!({
+                "type": "progress",
+                "file_path": item.file_path.to_string_lossy(),
+                "percent": 0,
+                "uploaded_bytes": 0,
+                "total_bytes": item.size,
+                "bytes_per_second": 0,
+                "stage": "秒传未命中，正在进入上传通道"
+            }),
+        );
         (data, false)
     } else {
         let mut res = json!({ "fileSize": item.size });
@@ -5392,6 +5692,337 @@ fn resubmit_source_if_changed(state: &SharedState, item: &UploadItem) {
     }
 }
 
+async fn finalize_successful_upload(
+    app: &tauri::AppHandle,
+    state: &SharedState,
+    item: &UploadItem,
+    outcome: &UploadOutcome,
+) {
+    let db_path = state.lock().ok().map(|guard| guard.db_path.clone());
+    if let Some(path) = db_path.as_deref() {
+        if let Err(message) = clear_auto_share_failure(path, item) {
+            status(app, "error", message);
+        }
+    }
+    if let Err(message) = schedule_auto_share(state, item, outcome).await {
+        status(
+            app,
+            "error",
+            format!("文件已上传，但自动分享排队失败：{message}"),
+        );
+    }
+    match apply_source_policy(state, item) {
+        Ok(Some(message)) => status(app, "success", message),
+        Ok(None) => {}
+        Err(message) => {
+            status(app, "error", message);
+            resubmit_source_if_changed(state, item);
+        }
+    }
+    emit(
+        app,
+        json!({
+            "type": "file",
+            "state": "done",
+            "file_path": item.file_path.to_string_lossy(),
+            "mapping_id": item.mapping_id,
+            "uploaded_bytes": item.size,
+            "total_bytes": item.size
+        }),
+    );
+}
+
+fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
+    loop {
+        let item = {
+            let mut guard = match state.lock() {
+                Ok(value) => value,
+                Err(_) => return,
+            };
+            if guard.paused
+                || guard.token.is_none()
+                || guard.active_uploads == 0
+                || guard.active_flash_preflights >= FLASH_PREFLIGHT_CONCURRENCY
+            {
+                None
+            } else {
+                let position = guard
+                    .queue
+                    .iter()
+                    .position(|candidate| !flash_preflight_cached(&guard, candidate));
+                position.and_then(|position| {
+                    let item = guard.queue.remove(position)?;
+                    let key = item_key(&item.mapping_id, &item.file_path);
+                    guard.active_flash_preflights += 1;
+                    guard.inflight.insert(
+                        key.clone(),
+                        Stamp {
+                            size: item.size,
+                            modified_ms: item.modified_ms,
+                        },
+                    );
+                    guard.inflight_items.insert(key, item.clone());
+                    Some(item)
+                })
+            }
+        };
+        let Some(item) = item else {
+            emit_state(&app, &state);
+            return;
+        };
+        emit(
+            &app,
+            json!({
+                "type": "file",
+                "state": "preparing",
+                "file_path": item.file_path.to_string_lossy(),
+                "mapping_id": item.mapping_id,
+                "uploaded_bytes": 0,
+                "total_bytes": item.size,
+                "stage": "正在后台校验秒传"
+            }),
+        );
+        let app2 = app.clone();
+        let state2 = state.clone();
+        tauri::async_runtime::spawn(async move {
+            let upload_key = item_key(&item.mapping_id, &item.file_path);
+            let mut item = item;
+            let result = match prepare_upload_item(&item).await {
+                Ok(Some(ready)) => {
+                    item = ready;
+                    preflight_flash_upload(&app2, &state2, &item)
+                        .await
+                        .map(Some)
+                }
+                Ok(None) => Ok(None),
+                Err(message) => Err(message),
+            };
+            let waiting_for_file = result.as_ref().ok().is_some_and(Option::is_none);
+            let auth_expired = result
+                .as_ref()
+                .err()
+                .is_some_and(|message| message.contains("登录态已失效"));
+            let cloud_pending = state2
+                .lock()
+                .ok()
+                .is_some_and(|guard| guard.pending_cloud.contains_key(&upload_key));
+            let mut db_path = None;
+            let mut requeued = false;
+            if let Ok(mut guard) = state2.lock() {
+                guard.active_flash_preflights = guard.active_flash_preflights.saturating_sub(1);
+                guard.inflight.remove(&upload_key);
+                guard.inflight_items.remove(&upload_key);
+                db_path = Some(guard.db_path.clone());
+                if auth_expired {
+                    guard.token = None;
+                }
+                let mapping_active = item.mapping_id == "__manual__"
+                    || guard
+                        .mappings
+                        .iter()
+                        .any(|mapping| mapping.id == item.mapping_id && mapping.enabled);
+                match &result {
+                    Ok(Some(FlashPreflightOutcome::Miss(_))) if mapping_active => {
+                        let token = match result.as_ref().ok().and_then(Option::as_ref) {
+                            Some(FlashPreflightOutcome::Miss(token)) => Some(token.clone()),
+                            _ => None,
+                        };
+                        guard.flash_preflight_cache.insert(
+                            upload_key.clone(),
+                            FlashPreflightCache {
+                                stamp: Stamp {
+                                    size: item.size,
+                                    modified_ms: item.modified_ms,
+                                },
+                                upload_token: token,
+                                created_at: Instant::now(),
+                            },
+                        );
+                        guard.queue.push_front(item.clone());
+                        requeued = true;
+                    }
+                    Ok(Some(FlashPreflightOutcome::Skipped)) | Err(_)
+                        if !cloud_pending && mapping_active =>
+                    {
+                        guard.flash_preflight_cache.insert(
+                            upload_key.clone(),
+                            FlashPreflightCache {
+                                stamp: Stamp {
+                                    size: item.size,
+                                    modified_ms: item.modified_ms,
+                                },
+                                upload_token: None,
+                                created_at: Instant::now(),
+                            },
+                        );
+                        guard.queue.push_front(item.clone());
+                        requeued = true;
+                    }
+                    _ => {
+                        guard.flash_preflight_cache.remove(&upload_key);
+                    }
+                }
+                if waiting_for_file {
+                    guard.waiting_files.insert(upload_key.clone(), item.clone());
+                }
+            }
+            if auth_expired {
+                if let Some(path) = db_path.as_deref() {
+                    if let Err(message) = clear_persisted_access_token(path) {
+                        status(&app2, "error", message);
+                    }
+                }
+            }
+            match result {
+                Ok(Some(FlashPreflightOutcome::Accepted {
+                    task_id,
+                    token,
+                    device_id,
+                })) => {
+                    let confirm_app = app2.clone();
+                    let confirm_state = state2.clone();
+                    let confirm_item = item.clone();
+                    tauri::async_runtime::spawn(async move {
+                        match wait_upload_task(
+                            &confirm_app,
+                            &token,
+                            &device_id,
+                            &task_id,
+                            &confirm_item.file_path,
+                        )
+                        .await
+                        {
+                            Ok(task_data) => {
+                                let outcome = UploadOutcome {
+                                    task_id,
+                                    remote_file_id: task_data
+                                        .get("fileId")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned),
+                                };
+                                match remember_confirmed_upload(
+                                    &confirm_state,
+                                    &confirm_item,
+                                    &outcome,
+                                ) {
+                                    Ok(()) => {
+                                        finalize_successful_upload(
+                                            &confirm_app,
+                                            &confirm_state,
+                                            &confirm_item,
+                                            &outcome,
+                                        )
+                                        .await;
+                                    }
+                                    Err(message) => status(&confirm_app, "warning", message),
+                                }
+                            }
+                            Err(error) => status(
+                                &confirm_app,
+                                "warning",
+                                format!(
+                                    "秒传已完成，云端入库将在后台继续确认：{}",
+                                    error.message()
+                                ),
+                            ),
+                        }
+                        emit_state(&confirm_app, &confirm_state);
+                    });
+                }
+                Ok(Some(FlashPreflightOutcome::Miss(_))) => {
+                    if requeued {
+                        emit(
+                            &app2,
+                            json!({
+                                "type": "file",
+                                "state": "queued",
+                                "file_path": item.file_path.to_string_lossy(),
+                                "mapping_id": item.mapping_id,
+                                "uploaded_bytes": 0,
+                                "total_bytes": item.size,
+                                "stage": "秒传未命中，等待上传通道"
+                            }),
+                        );
+                    }
+                }
+                Ok(Some(FlashPreflightOutcome::Skipped)) => {
+                    if requeued {
+                        emit(
+                            &app2,
+                            json!({
+                                "type": "file",
+                                "state": "queued",
+                                "file_path": item.file_path.to_string_lossy(),
+                                "mapping_id": item.mapping_id,
+                                "uploaded_bytes": 0,
+                                "total_bytes": item.size,
+                                "stage": "已有上传断点，等待上传通道"
+                            }),
+                        );
+                    }
+                }
+                Ok(None) => {
+                    emit(
+                        &app2,
+                        json!({
+                            "type": "file",
+                            "state": "waiting-file",
+                            "file_path": item.file_path.to_string_lossy(),
+                            "mapping_id": item.mapping_id,
+                            "uploaded_bytes": 0,
+                            "total_bytes": item.size,
+                            "stage": "另外的程序正在使用该文件，释放后将自动上传"
+                        }),
+                    );
+                    tauri::async_runtime::spawn(requeue_busy_upload(
+                        app2.clone(),
+                        state2.clone(),
+                        item.clone(),
+                    ));
+                }
+                Err(message) if cloud_pending => {
+                    emit(
+                        &app2,
+                        json!({
+                            "type": "file",
+                            "state": "processing",
+                            "file_path": item.file_path.to_string_lossy(),
+                            "mapping_id": item.mapping_id,
+                            "uploaded_bytes": item.size,
+                            "total_bytes": item.size,
+                            "stage": "秒传已完成，后台将继续确认云端入库"
+                        }),
+                    );
+                    status(&app2, "warning", message);
+                }
+                Err(message) => {
+                    if requeued {
+                        status(
+                            &app2,
+                            "warning",
+                            format!("后台秒传预检失败，已回到上传队列：{message}"),
+                        );
+                        emit(
+                            &app2,
+                            json!({
+                                "type": "file",
+                                "state": if auth_expired { "waiting-login" } else { "queued" },
+                                "file_path": item.file_path.to_string_lossy(),
+                                "mapping_id": item.mapping_id,
+                                "uploaded_bytes": 0,
+                                "total_bytes": item.size,
+                                "stage": if auth_expired { "登录态已失效，重新登录后继续" } else { "秒传预检失败，等待普通上传" }
+                            }),
+                        );
+                    }
+                }
+            }
+            emit_state(&app2, &state2);
+            drain_queue(app2, state2);
+        });
+    }
+}
+
 fn drain_queue(app: tauri::AppHandle, state: SharedState) {
     loop {
         let item = {
@@ -5424,6 +6055,7 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
         };
         let Some(item) = item else {
             emit_state(&app, &state);
+            drain_flash_preflight(app, state);
             return;
         };
         emit(
@@ -5491,30 +6123,7 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                     item.clone(),
                 ));
             } else if let Some(outcome) = outcome {
-                if let Some(path) = db_path.as_deref() {
-                    if let Err(message) = clear_auto_share_failure(path, &item) {
-                        status(&app2, "error", message);
-                    }
-                }
-                if let Err(message) = schedule_auto_share(&state2, &item, &outcome).await {
-                    status(
-                        &app2,
-                        "error",
-                        format!("文件已上传，但自动分享排队失败：{message}"),
-                    );
-                }
-                match apply_source_policy(&state2, &item) {
-                    Ok(Some(message)) => status(&app2, "success", message),
-                    Ok(None) => {}
-                    Err(message) => {
-                        status(&app2, "error", message);
-                        resubmit_source_if_changed(&state2, &item);
-                    }
-                }
-                emit(
-                    &app2,
-                    json!({ "type": "file", "state": "done", "file_path": item.file_path.to_string_lossy(), "mapping_id": item.mapping_id, "uploaded_bytes": item.size, "total_bytes": item.size }),
-                );
+                finalize_successful_upload(&app2, &state2, &item, &outcome).await;
             } else {
                 let message = error_message.unwrap_or_else(|| "上传失败".into());
                 if cloud_pending {
@@ -7659,12 +8268,17 @@ async fn refresh_saved_session(app: tauri::AppHandle, state: SharedState) -> Res
     )
     .await?;
     if status_code >= 400 {
-        return Err(payload
+        let message = payload
             .get("error_description")
             .or_else(|| payload.get("msg"))
             .and_then(Value::as_str)
             .unwrap_or("刷新登录状态失败")
-            .to_string());
+            .to_string();
+        if matches!(status_code, 400 | 401 | 403) {
+            invalidate_auth_session(&app, &state)?;
+            return Err(format!("登录态已失效，请重新扫码登录：{message}"));
+        }
+        return Err(message);
     }
     let access_token = payload
         .get("access_token")
@@ -7932,6 +8546,14 @@ async fn login_with_sms(
     emit_state(&app, state.inner());
     drain_queue(app, state.inner().clone());
     Ok(json!({ "authenticated": true, "is_user": verification.is_user }))
+}
+
+#[tauri::command]
+fn clear_expired_session(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> Result<(), String> {
+    invalidate_auth_session(&app, state.inner())
 }
 
 #[tauri::command]
@@ -8768,6 +9390,7 @@ fn run() {
                 mappings: mappings.clone(),
                 saved_shares: config.saved_shares,
                 queue: resumable_uploads,
+                flash_preflight_cache: HashMap::new(),
                 waiting_files: HashMap::new(),
                 history: upload_history,
                 pending_cloud,
@@ -8779,6 +9402,7 @@ fn run() {
                 event_tx,
                 paused: false,
                 active_uploads: 0,
+                active_flash_preflights: 0,
                 upload_concurrency,
                 download_concurrency,
                 multipart_part_size,
@@ -8860,6 +9484,7 @@ fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
+            clear_expired_session,
             start_device_login,
             request_sms_code,
             login_with_sms,
@@ -9940,6 +10565,10 @@ mod tests {
         let auth = load_auth_session(&database).expect("auth should load");
         assert_eq!(auth.access_token.as_deref(), Some("access-token"));
         assert_eq!(auth.refresh_token.as_deref(), Some("refresh-token"));
+        clear_persisted_auth_session(&database).expect("expired auth should clear");
+        let cleared_auth = load_auth_session(&database).expect("cleared auth should load");
+        assert!(cleared_auth.access_token.is_none());
+        assert!(cleared_auth.refresh_token.is_none());
         let device_id = load_or_create_device_id(&database).expect("device id should persist");
         assert_eq!(
             load_or_create_device_id(&database).expect("device id should reload"),

@@ -3,24 +3,58 @@ import { readJsonResponse } from './httpResponse.js';
 const tauriInvoke = window.__TAURI__?.core?.invoke;
 const tauriListen = window.__TAURI__?.event?.listen;
 export const isTauri = Boolean(tauriInvoke && tauriListen);
+const authExpiredListeners = new Set();
 
 const camelizeArgs = (args = {}) => Object.fromEntries(
   Object.entries(args).map(([key, value]) => [key.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase()), value]),
 );
 
+const errorMessage = (error) => String(error?.message || error || '');
+const isAuthExpiredError = (error) => errorMessage(error).includes('登录态已失效');
+const notifyAuthExpired = (error) => {
+  if (!isAuthExpiredError(error)) return;
+  for (const listener of authExpiredListeners) listener(errorMessage(error));
+};
+const subscribeAuthExpired = (callback) => {
+  authExpiredListeners.add(callback);
+  return () => authExpiredListeners.delete(callback);
+};
+
 async function webRequest(url, options = {}) {
-  const response = await fetch(url, {
-    credentials: 'same-origin',
-    ...options,
-    headers: { 'content-type': 'application/json', ...(options.headers || {}) },
-  });
-  return readJsonResponse(response, `请求 ${url} 失败`);
+  try {
+    const response = await fetch(url, {
+      credentials: 'same-origin',
+      ...options,
+      headers: { 'content-type': 'application/json', ...(options.headers || {}) },
+    });
+    return await readJsonResponse(response, `请求 ${url} 失败`);
+  } catch (error) {
+    notifyAuthExpired(error);
+    throw error;
+  }
 }
 export { webRequest };
 
+async function invokeTauri(command, args = {}) {
+  try {
+    return await tauriInvoke(command, camelizeArgs(args));
+  } catch (error) {
+    if (isAuthExpiredError(error)) {
+      try {
+        await tauriInvoke('clear_expired_session');
+      } catch {
+        // 原始登录失效错误更有用；清理失败由下一次启动继续校验。
+      }
+      notifyAuthExpired(error);
+    }
+    throw error;
+  }
+}
+
 export const bridge = isTauri ? {
-  invoke: (command, args = {}) => tauriInvoke(command, camelizeArgs(args)),
+  invoke: invokeTauri,
   subscribe: (callback) => tauriListen('sync-event', ({ payload }) => callback(payload)),
+  subscribeAuthExpired,
   subscribeDrag: async (callback) => {
     const unlisteners = await Promise.all([
       tauriListen('tauri://drag-enter', ({ payload }) => callback('enter', payload)),
@@ -82,13 +116,14 @@ export const bridge = isTauri ? {
     if (command === 'request_sms_code') return webRequest('/api/auth/sms/send', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'login_with_sms') return webRequest('/api/auth/sms/login', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'poll_device_login') return webRequest('/api/auth/device/poll', { method: 'POST', body: JSON.stringify(args) });
-    return null;
+    throw new Error(`Docker Web 端暂不支持命令：${command}`);
   },
   subscribe: async (callback) => {
     const source = new EventSource('/api/events');
     source.onmessage = (event) => callback(JSON.parse(event.data));
     return () => source.close();
   },
+  subscribeAuthExpired,
   subscribeDrag: async () => () => {},
   selectFolder: async () => null,
   selectUploadFiles: async () => [],

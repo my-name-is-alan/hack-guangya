@@ -41,6 +41,7 @@ export const useSessionStore = defineStore('session', () => {
   const forceAuth = shallowRef(false)
 
   let unsubscribe: (() => void) | null = null
+  let unsubscribeAuthExpired: (() => void) | null = null
 
   const userName = computed(() => pick(overview.profile, [
     'nickname', 'nickName', 'name', 'userName', 'displayName',
@@ -85,6 +86,18 @@ export const useSessionStore = defineStore('session', () => {
     if (!state.logged_in) {
       Object.assign(overview, { profile: {}, assets: {} })
       useFilesStore().reset()
+    }
+  }
+
+  function handleAuthExpired(reason = '登录态已失效，请重新扫码登录') {
+    const wasLoggedIn = state.logged_in
+    applyState({ logged_in: false })
+    forceAuth.value = false
+    if (wasLoggedIn) appendLog('warning', reason)
+    if (isTauri) {
+      void bridge.invoke('clear_expired_session').catch((error) => {
+        appendLog('error', `清理过期登录态失败：${String(error)}`)
+      })
     }
   }
 
@@ -139,7 +152,11 @@ export const useSessionStore = defineStore('session', () => {
       const transfers = useTransfersStore()
       unsubscribe = await bridge.subscribe((payload: any) => {
         if (payload?.type === 'state') applyState(payload.state)
-        if (payload?.type === 'status') appendLog(payload.level || 'info', String(payload.message || ''))
+        if (payload?.type === 'status') {
+          const text = String(payload.message || '')
+          appendLog(payload.level || 'info', text)
+          if (text.includes('登录态已失效')) handleAuthExpired(text)
+        }
         transfers.handleSyncEvent(payload)
       })
     }
@@ -159,6 +176,7 @@ export const useSessionStore = defineStore('session', () => {
     initializing.value = true
     bootLoading.value = true
     try {
+      if (!unsubscribeAuthExpired) unsubscribeAuthExpired = bridge.subscribeAuthExpired(handleAuthExpired)
       const allowed = await checkAccess()
       if (allowed) await connect()
     }
@@ -171,6 +189,8 @@ export const useSessionStore = defineStore('session', () => {
   function dispose() {
     unsubscribe?.()
     unsubscribe = null
+    unsubscribeAuthExpired?.()
+    unsubscribeAuthExpired = null
   }
 
   return {
