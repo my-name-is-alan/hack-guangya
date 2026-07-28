@@ -342,10 +342,10 @@ const receivedShareColumns = [
 ];
 const cloudShareColumns = [
   { title: '分享名称', key: 'title', dataIndex: 'title' },
-  { title: '类型', key: 'type', width: 100 },
-  { title: '状态', key: 'status', width: 110 },
-  { title: '创建时间', key: 'time', width: 180 },
-  { title: '操作', key: 'actions', width: 230 },
+  { title: '类型', key: 'type', width: 72 },
+  { title: '状态', key: 'status', width: 72 },
+  { title: '创建时间', key: 'time', width: 112 },
+  { title: '操作', key: 'actions', width: 206 },
 ];
 const sourcePolicyOptions = [
   { value: 'keep', label: '保留源文件（推荐）' },
@@ -1602,18 +1602,19 @@ onBeforeUnmount(() => {
               <a-card class="content-card file-card file-drop-surface" :class="{ 'is-dragging': dragActive }" :bordered="false" @dragenter.prevent="dragActive = true" @dragover.prevent="dragActive = true" @dragleave.prevent="dragActive = false" @drop.prevent="handleWebDrop" @contextmenu="(event) => { if (event.target.closest('tbody')) return; showContextMenu(event) }">
                 <div v-if="dragActive" class="drop-overlay"><div><UploadOutlined /><strong>拖到这里上传</strong><span>文件和文件夹将上传到 {{ currentFolderPath }}</span></div></div>
                 <template #title>
-                  <a-flex align="center" gap="small"><div class="section-icon"><FolderOpenOutlined /></div><div><strong>我的文件</strong><span class="section-subtitle">{{ currentFolderPath }}</span></div></a-flex>
+                  <a-flex align="center" gap="small"><div class="section-icon"><FolderOpenOutlined /></div><div class="section-heading"><strong>我的文件</strong><span class="section-subtitle">{{ currentFolderPath }}</span></div></a-flex>
                 </template>
                 <template #extra>
                   <a-space>
                     <a-button @click="openReceivedShare"><template #icon><InboxOutlined /></template>接收分享</a-button>
                     <a-button @click="openShareForm"><template #icon><LinkOutlined /></template>收藏链接</a-button>
                     <a-button v-if="isTauri" :disabled="!appState.logged_in" @click="openGcidImport"><template #icon><FileAddOutlined /></template>JSON 秒传</a-button>
+                    <a-button :disabled="!appState.logged_in" @click="triggerUpload('folder')"><template #icon><FolderOpenOutlined /></template>上传文件夹</a-button>
                     <a-button type="primary" @click="triggerUpload('files')" :disabled="!appState.logged_in"><template #icon><UploadOutlined /></template>上传文件</a-button>
                   </a-space>
                 </template>
 
-                <div class="file-breadcrumb">
+                <div v-if="currentPath.length" class="file-breadcrumb">
                   <button :class="{ active: !currentPath.length }" @click="goRoot"><HomeOutlined />根目录</button>
                   <template v-for="(part, index) in currentPath" :key="part.id"><span>/</span><button :class="{ active: index === currentPath.length - 1 }" @click="goToPath(index)">{{ part.name }}</button></template>
                 </div>
@@ -1621,7 +1622,6 @@ onBeforeUnmount(() => {
                 <div class="file-toolbar">
                   <a-flex wrap="wrap" gap="small" align="center">
                     <a-button :disabled="!appState.logged_in" @click="openCreateFolder"><template #icon><FolderAddOutlined /></template>新建文件夹</a-button>
-                    <a-button @click="triggerUpload('folder')"><template #icon><FolderOpenOutlined /></template>上传文件夹</a-button>
                     <a-button :disabled="!selectedFileIds.length" @click="setFileClipboard('copy')"><template #icon><CopyOutlined /></template>复制</a-button>
                     <a-button :disabled="!selectedFileIds.length" @click="setFileClipboard('move')"><template #icon><ScissorOutlined /></template>剪切</a-button>
                     <a-button :disabled="!selectedFileIds.length" :loading="operationBusy" @click="chooseTransferTarget('move')"><template #icon><SwapOutlined /></template>移动到</a-button>
@@ -1842,14 +1842,14 @@ onBeforeUnmount(() => {
             <template v-else>
               <div class="section-toolbar"><div><h2>我的分享</h2><p>直接查询光鸭账号中的已有分享；相同文件或文件夹会自动复用，不会重复创建。</p></div><a-space><a-button @click="openReceivedShare"><template #icon><InboxOutlined /></template>接收分享</a-button><a-button :loading="cloudSharesLoading" @click="loadCloudShares"><template #icon><ReloadOutlined /></template>刷新</a-button></a-space></div>
               <a-card class="content-card" :bordered="false">
-                <a-table :columns="cloudShareColumns" :data-source="cloudShares" :loading="cloudSharesLoading" :row-key="(item) => item.id || item.shareId" :pagination="{ pageSize: 20, hideOnSinglePage: true }" size="small">
+                <a-table class="cloud-share-table" table-layout="fixed" :columns="cloudShareColumns" :data-source="cloudShares" :loading="cloudSharesLoading" :row-key="(item) => item.id || item.shareId" :pagination="{ pageSize: 20, hideOnSinglePage: true }" size="small">
                   <template #emptyText><a-empty description="当前账号还没有分享记录" /></template>
                   <template #bodyCell="{ column, record }">
-                    <template v-if="column.key === 'title'"><a-flex align="center" gap="small"><a-avatar class="list-avatar"><ShareAltOutlined /></a-avatar><div><strong>{{ record.title || '未命名分享' }}</strong><div class="table-secondary">{{ record.shareUrl }}</div></div></a-flex></template>
+                    <template v-if="column.key === 'title'"><a-flex class="cloud-share-title" align="center" gap="small"><a-avatar class="list-avatar"><ShareAltOutlined /></a-avatar><div><strong>{{ record.title || '未命名分享' }}</strong><div class="table-secondary">{{ record.shareUrl }}</div></div></a-flex></template>
                     <template v-else-if="column.key === 'type'"><a-tag :color="Number(record.resType) === 2 ? 'blue' : undefined">{{ Number(record.resType) === 2 ? '文件夹' : '文件' }}</a-tag></template>
                     <template v-else-if="column.key === 'status'"><a-tag :color="cloudShareStatus(record)[1]">{{ cloudShareStatus(record)[0] }}</a-tag></template>
                     <template v-else-if="column.key === 'time'">{{ formatTime(record.createTime) }}</template>
-                    <template v-else-if="column.key === 'actions'"><a-space><a-button size="small" @click="copyText(record.shareUrl)"><CopyOutlined />复制</a-button><a-button size="small" type="link" :href="record.shareUrl" target="_blank">打开</a-button><a-popconfirm v-if="Number(record.shareStatus) === 1" title="确定取消这个分享？链接将立即失效。" @confirm="deleteCloudShare(record)"><a-button size="small" danger type="text">取消分享</a-button></a-popconfirm></a-space></template>
+                    <template v-else-if="column.key === 'actions'"><a-space class="cloud-share-actions" :size="4"><a-button size="small" @click="copyText(record.shareUrl)"><CopyOutlined />复制</a-button><a-button size="small" type="link" :href="record.shareUrl" target="_blank">打开</a-button><a-popconfirm v-if="Number(record.shareStatus) === 1" title="确定取消这个分享？链接将立即失效。" @confirm="deleteCloudShare(record)"><a-button size="small" danger type="text">取消分享</a-button></a-popconfirm></a-space></template>
                   </template>
                 </a-table>
               </a-card>
@@ -1891,6 +1891,8 @@ onBeforeUnmount(() => {
         v-model:open="gcidImport.open"
         title="GCID JSON 秒传导入"
         :width="680"
+        centered
+        wrap-class-name="gcid-import-modal"
         :footer="null"
         :mask-closable="!gcidImport.loading"
       >
