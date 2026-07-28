@@ -13,7 +13,7 @@ import { bridge } from '../bridge.js';
 import FavoriteLinkDialog from '../components/shares/FavoriteLinkDialog.vue';
 import ReceiveShareDialog from '../components/shares/ReceiveShareDialog.vue';
 import { parseGuangyaShareLink } from '../shareLink.js';
-import { shareDisplayName } from '../shareRecord.js';
+import { cloudShareRowKey, shareDisplayName } from '../shareRecord.js';
 import { appState, refreshState } from '../store.js';
 import { cloudShareStatus, copyText, errorText, formatSize, formatTime, isFolder, pick, unwrapData } from '../formatters.js';
 
@@ -33,6 +33,8 @@ const filteredCloudShares = computed(() => {
     record.code,
     record.id,
     record.shareId,
+    record.share_id,
+    record.shareID,
   ].some((value) => String(value ?? '').toLowerCase().includes(query)));
 });
 const cloudSharePagination = computed(() => ({
@@ -110,7 +112,7 @@ function openCloudShare(record) {
   window.open(url, '_blank', 'noopener,noreferrer');
 }
 async function deleteShare(record) {
-  const id = record.id ?? record.shareId ?? record.share_id;
+  const id = record.id ?? record.shareId ?? record.share_id ?? record.shareID;
   if (id === undefined || id === null || id === '') {
     message.error('当前分享缺少可取消的记录 ID，请刷新后重试');
     return;
@@ -164,7 +166,7 @@ onMounted(loadCloudShares);
         </a-space>
       </template>
       <a-tab-pane key="cloud" tab="分享">
-        <a-table class="cloud-share-table" table-layout="fixed" :columns="shareColumns" :data-source="filteredCloudShares" :loading="cloudSharesLoading" :row-key="(item) => item.id || item.shareId" :pagination="cloudSharePagination" size="small" @change="handleCloudShareTableChange">
+        <a-table class="cloud-share-table" table-layout="fixed" :columns="shareColumns" :data-source="filteredCloudShares" :loading="cloudSharesLoading" :row-key="cloudShareRowKey" :pagination="cloudSharePagination" size="small" @change="handleCloudShareTableChange">
           <template #emptyText><a-empty :description="appState.logged_in ? '暂无分享' : '登录后查看分享'" /></template>
           <template #bodyCell="{ column, record }">
             <template v-if="column.key === 'name'">

@@ -31,6 +31,28 @@ test('挂载菜单提供 rclone FUSE 原生挂载、权限、并行和缓存控�
   assert.match(mountPanel, /stop_native_mount/)
 })
 
+test('原生挂载每次启动都要求 WebDAV 密码且图标操作可访问', () => {
+  assert.doesNotMatch(mountPanel, /v-if="!isTauri" label="当前 WebDAV 挂载密码"/)
+  assert.match(mountPanel, /if \(nativePassword\.value\.length < 12\)/)
+  assert.match(mountPanel, /password:\s*nativePassword\.value/)
+  assert.match(mountPanel, /仅用于本次启动原生挂载，不会写入配置/)
+  assert.match(mountPanel, /:readonly="isTauri"/)
+  assert.match(mountPanel, /自定义程序必须通过文件选择器批准，只在本次应用运行期间有效/)
+  for (const label of ['选择挂载目录', '选择 rclone 可执行文件', '复制 WebDAV 地址', '复制 WebDAV 用户名']) {
+    assert.match(mountPanel, new RegExp(`aria-label="${label}"`))
+  }
+  assert.match(mountPanel, /\.input-icon-button \{[^}]*width:\s*40px;[^}]*height:\s*40px;/)
+  assert.match(mountPanel, /\.input-icon-button:focus-visible \{/)
+})
+
+test('设置导航和挂载表单在窄窗口切换为纵向内容且不制造横向滚动', () => {
+  assert.match(settingsView, /window\.matchMedia\('\(max-width: 960px\)'\)/)
+  assert.match(settingsView, /:tab-position="tabPosition"/)
+  assert.match(settingsView, /overflow-x:\s*hidden/)
+  assert.match(mountPanel, /\.two-columns, \.three-columns \{ grid-template-columns: 1fr/)
+  assert.match(mountPanel, /overflow-x:\s*hidden/)
+})
+
 test('桌面与 Docker Web bridge 都能读取挂载信息', () => {
   assert.match(bridge, /get_mount_info/)
   assert.match(bridge, /webRequest\('\/api\/mount'\)/)

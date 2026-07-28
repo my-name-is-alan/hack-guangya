@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { shareDisplayName } from './shareRecord.js';
+import { cloudShareRowKey, shareDisplayName } from './shareRecord.js';
 
 const sharesViewSource = readFile(new URL('./views/SharesView.vue', import.meta.url), 'utf8');
 
@@ -41,9 +41,20 @@ test('shareDisplayName reads nested share details and uses a concrete id only wh
 test('SharesView uses the shared display-name resolver in the list', async () => {
   const source = await sharesViewSource;
 
-  assert.match(source, /import \{ shareDisplayName \} from ['"]\.\.\/shareRecord\.js['"]/);
+  assert.match(source, /import \{[^}]*\bshareDisplayName\b[^}]*\} from ['"]\.\.\/shareRecord\.js['"]/);
   assert.match(source, /\{\{\s*shareDisplayName\(record\)\s*\}\}/);
   assert.match(source, /确定取消「\$\{shareDisplayName\(record\)\}」吗？/);
+});
+
+test('cloudShareRowKey supports all backend id naming variants without treating zero as absent', async () => {
+  assert.equal(cloudShareRowKey({ id: 0, shareId: 'fallback' }), 0);
+  assert.equal(cloudShareRowKey({ shareId: 'camel-id' }), 'camel-id');
+  assert.equal(cloudShareRowKey({ share_id: 'snake-id' }), 'snake-id');
+  assert.equal(cloudShareRowKey({ shareID: 'capital-id' }), 'capital-id');
+
+  const source = await sharesViewSource;
+  assert.match(source, /import \{[^}]*\bcloudShareRowKey\b[^}]*\} from ['"]\.\.\/shareRecord\.js['"]/);
+  assert.match(source, /:row-key=['"]cloudShareRowKey['"]/);
 });
 
 test('SharesView copies the URL together with direct or URL-derived extraction codes', async () => {
@@ -89,7 +100,7 @@ test('SharesView provides searchable pagination and deletes by the backend ids c
   assert.match(source, /v-model:value="cloudShareQuery"/);
   assert.match(source, /:pagination="cloudSharePagination"/);
   assert.match(source, /showSizeChanger:\s*true/);
-  assert.match(deleteSource, /record\.id \?\? record\.shareId \?\? record\.share_id/);
+  assert.match(deleteSource, /record\.id \?\? record\.shareId \?\? record\.share_id \?\? record\.shareID/);
   assert.match(deleteSource, /bridge\.invoke\(['"]delete_shares['"],\s*\{\s*ids:\s*\[id\]\s*\}\)/);
   assert.doesNotMatch(deleteSource, /share_ids/);
 });

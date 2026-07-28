@@ -34,6 +34,11 @@ const downloadCounts = computed(() => ({
   finished: downloads.value.filter(item => ['completed', 'failed'].includes(item.status)).length,
 }))
 
+function downloadDetail(item: (typeof downloads.value)[number]) {
+  if (item.status === 'failed' && item.error) return `失败原因：${item.error}`
+  return item.filePath || item.destination
+}
+
 async function toggleQueue() {
   await bridge.invoke(session.state.paused ? 'resume_queue' : 'pause_queue')
   await session.refreshState()
@@ -64,7 +69,12 @@ watch(tab, value => void router.replace({ query: { ...route.query, tab: value } 
           <div v-for="item in orderedUploads" :key="item.filePath" class="transfer-row">
             <span class="transfer-icon upload"><CloudUploadOutlined /></span>
             <div class="transfer-main">
-              <div class="transfer-name"><strong :title="item.filePath">{{ item.fileName }}</strong><span>{{ item.stage }}</span></div>
+              <div class="transfer-name">
+                <strong :title="item.filePath">{{ item.fileName }}</strong>
+                <a-tooltip :title="item.stage" :trigger="['hover', 'focus']" placement="topLeft">
+                  <span class="transfer-detail" tabindex="0" :aria-label="`任务详情：${item.stage}`">{{ item.stage }}</span>
+                </a-tooltip>
+              </div>
               <a-progress :percent="item.percent" :status="uploadProgressStatus(item.state)" :show-info="false" size="small" />
             </div>
             <span class="transfer-speed">
@@ -84,7 +94,12 @@ watch(tab, value => void router.replace({ query: { ...route.query, tab: value } 
           <div v-for="item in downloads" :key="item.id" class="transfer-row">
             <span class="transfer-icon download"><CloudDownloadOutlined /></span>
             <div class="transfer-main">
-              <div class="transfer-name"><strong :title="item.fileName">{{ item.fileName }}</strong><span>{{ item.filePath || item.destination }}</span></div>
+              <div class="transfer-name">
+                <strong :title="item.fileName">{{ item.fileName }}</strong>
+                <a-tooltip :title="downloadDetail(item)" :trigger="['hover', 'focus']" placement="topLeft">
+                  <span class="transfer-detail" tabindex="0" :aria-label="`任务详情：${downloadDetail(item)}`">{{ downloadDetail(item) }}</span>
+                </a-tooltip>
+              </div>
               <a-progress :percent="Math.round(item.progress || 0)" :status="item.status === 'failed' ? 'exception' : item.status === 'completed' ? 'success' : 'normal'" :show-info="false" size="small" />
             </div>
             <span class="transfer-speed">{{ item.bytesPerSecond ? formatUploadSpeed(item.bytesPerSecond) : item.totalBytes ? `${formatSize(item.downloadedBytes)} / ${formatSize(item.totalBytes)}` : '' }}</span>
@@ -107,8 +122,11 @@ watch(tab, value => void router.replace({ query: { ...route.query, tab: value } 
 .transfer-icon.download { color: #1769aa; background: #edf5ff; }
 .transfer-main { min-width: 0; }
 .transfer-name { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
-.transfer-name strong, .transfer-name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.transfer-name span, .transfer-speed { color: var(--text-3, #98a2b3); font-size: 11px; }
+.transfer-name strong, .transfer-detail { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.transfer-name strong { flex: 1 1 42%; }
+.transfer-detail { flex: 1 1 58%; color: var(--text-3, #98a2b3); cursor: help; font-size: 11px; outline: none; }
+.transfer-detail:focus-visible { border-radius: 3px; box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary, #262626) 24%, transparent); }
+.transfer-speed { color: var(--text-3, #98a2b3); font-size: 11px; }
 .transfer-speed { min-width: 0; overflow: hidden; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
 .transfer-status { justify-self: end; white-space: nowrap; }
 @media (max-width: 720px) {

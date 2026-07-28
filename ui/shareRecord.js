@@ -47,3 +47,8 @@ export function shareDisplayName(record) {
   const shareId = firstText(record, ['shareId', 'shareID', 'share_id', 'id']);
   return shareId ? `分享 ${shareId}` : '未命名分享';
 }
+
+/** Keep Ant Design table keys stable across backend naming variants. */
+export function cloudShareRowKey(record) {
+  return record?.id ?? record?.shareId ?? record?.share_id ?? record?.shareID;
+}

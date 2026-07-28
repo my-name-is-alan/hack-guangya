@@ -169,7 +169,7 @@ async function saveNativeOptions(notify = true) {
 }
 
 async function startNativeMount() {
-  if (!isTauri && nativePassword.value.length < 12) {
+  if (nativePassword.value.length < 12) {
     message.error('请输入当前 WebDAV 挂载密码')
     return
   }
@@ -251,7 +251,14 @@ onMounted(loadInfo)
         <a-form-item label="盘符或挂载目录">
           <a-input v-model:value="native.target" :disabled="native.running" placeholder="X: 或 /mnt/guangya">
             <template v-if="isTauri" #suffix>
-              <FolderOpenOutlined class="copy-icon" @click="!native.running && selectNativeTarget()" />
+              <button
+                type="button"
+                class="input-icon-button"
+                :disabled="native.running"
+                aria-label="选择挂载目录"
+                title="选择挂载目录"
+                @click="selectNativeTarget"
+              ><FolderOpenOutlined /></button>
             </template>
           </a-input>
         </a-form-item>
@@ -286,22 +293,30 @@ onMounted(loadInfo)
             <a-input-number v-model:value="native.cache_size_gb" :min="1" :max="1024" :disabled="native.running" />
           </a-form-item>
           <a-form-item label="rclone 可执行文件">
-            <a-input v-model:value="native.rclone_path" :disabled="native.running" placeholder="留空时优先使用软件内置版本">
+            <a-input v-model:value="native.rclone_path" :disabled="native.running" :readonly="isTauri" placeholder="留空时优先使用软件内置版本">
               <template v-if="isTauri" #suffix>
-                <FolderOpenOutlined class="copy-icon" @click="!native.running && selectRcloneBinary()" />
+                <button
+                  type="button"
+                  class="input-icon-button"
+                  :disabled="native.running"
+                  aria-label="选择 rclone 可执行文件"
+                  title="选择 rclone 可执行文件"
+                  @click="selectRcloneBinary"
+                ><FolderOpenOutlined /></button>
               </template>
             </a-input>
+            <div v-if="isTauri" class="field-help">自定义程序必须通过文件选择器批准，只在本次应用运行期间有效；重启后会恢复为内置版本。</div>
           </a-form-item>
         </div>
 
-        <a-form-item v-if="!isTauri" label="当前 WebDAV 挂载密码">
+        <a-form-item label="当前 WebDAV 挂载密码">
           <a-input-password
             v-model:value="nativePassword"
             autocomplete="current-password"
             placeholder="只用于本次启动，不会保存"
             :disabled="native.running"
           />
-          <div class="field-help">服务端只保存密码哈希，因此启动原生挂载时需要再次输入；该值不会写入配置。</div>
+          <div class="field-help">仅用于本次启动原生挂载，不会写入配置；重新启动应用后需要再次输入。</div>
         </a-form-item>
 
         <a-alert
@@ -368,13 +383,17 @@ onMounted(loadInfo)
       <a-form class="mount-form" layout="vertical">
         <a-form-item label="WebDAV 地址">
           <a-input :value="info.endpoint" readonly>
-            <template #suffix><CopyOutlined class="copy-icon" @click="copyText(info.endpoint)" /></template>
+            <template #suffix>
+              <button type="button" class="input-icon-button" aria-label="复制 WebDAV 地址" title="复制 WebDAV 地址" @click="copyText(info.endpoint)"><CopyOutlined /></button>
+            </template>
           </a-input>
         </a-form-item>
         <div class="two-columns">
           <a-form-item label="用户名">
             <a-input v-model:value="credentials.username" autocomplete="username" :maxlength="64">
-              <template #suffix><CopyOutlined class="copy-icon" @click="copyText(credentials.username)" /></template>
+              <template #suffix>
+                <button type="button" class="input-icon-button" aria-label="复制 WebDAV 用户名" title="复制 WebDAV 用户名" @click="copyText(credentials.username)"><CopyOutlined /></button>
+              </template>
             </a-input>
           </a-form-item>
           <a-form-item label="新密码">
@@ -432,14 +451,14 @@ onMounted(loadInfo)
 </template>
 
 <style scoped>
-.setting-section { max-width: 860px; padding: 8px 18px 36px 24px; }
+.setting-section { width: 100%; max-width: 860px; min-width: 0; overflow-x: hidden; padding: 8px 18px 36px 24px; }
 .section-lead { margin-bottom: 18px; }
 .section-lead strong, .section-lead span { display: block; }
 .section-lead strong { font-size: 18px; }
 .section-lead span { margin-top: 5px; color: var(--text-3, #98a2b3); font-size: 12px; }
-.mount-mode { margin-bottom: 18px; }
+.mount-mode { max-width: 100%; margin-bottom: 18px; }
 .mount-alert { max-width: 720px; margin-bottom: 18px; }
-.mount-form { max-width: 720px; }
+.mount-form { width: 100%; max-width: 720px; min-width: 0; }
 .native-form { padding: 18px; border: 1px solid var(--line, #e7e8eb); border-radius: 12px; background: var(--surface, #fff); }
 .form-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
 .form-heading strong, .form-heading span { display: block; }
@@ -447,7 +466,10 @@ onMounted(loadInfo)
 .two-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .three-columns { display: grid; grid-template-columns: 1.35fr .8fr .8fr; gap: 16px; }
 .three-columns :deep(.ant-input-number), .two-columns :deep(.ant-input-number) { width: 100%; }
-.copy-icon { color: var(--text-3, #98a2b3); cursor: pointer; }
+.input-icon-button { display: inline-grid; width: 40px; height: 40px; place-items: center; padding: 0; border: 0; border-radius: 7px; color: var(--text-3, #98a2b3); background: transparent; cursor: pointer; }
+.input-icon-button:hover:not(:disabled) { color: var(--text-1, #20242c); background: var(--surface-muted, #f3f4f6); }
+.input-icon-button:focus-visible { outline: 2px solid color-mix(in srgb, var(--primary, #262626) 45%, transparent); outline-offset: 1px; color: var(--text-1, #20242c); background: var(--surface-muted, #f3f4f6); }
+.input-icon-button:disabled { opacity: .45; cursor: not-allowed; }
 .field-help { margin-top: 6px; color: var(--text-3, #98a2b3); font-size: 12px; line-height: 1.55; }
 .field-help code { padding: 1px 4px; border-radius: 4px; background: var(--surface-muted, #f3f4f6); }
 .inline-alert { margin: 0 0 18px; }
@@ -462,7 +484,14 @@ onMounted(loadInfo)
 .guide-note { margin: 9px 0 0; }
 .support-alert { max-width: 720px; margin-top: 22px; }
 @media (max-width: 760px) {
+  .setting-section { padding: 6px 2px 28px; }
   .two-columns, .three-columns { grid-template-columns: 1fr; gap: 0; }
   .native-form { padding: 14px; }
+  .form-heading, .guide-title { align-items: flex-start; flex-direction: column; gap: 6px; }
+  .mount-mode { display: flex; width: 100%; }
+  .mount-mode :deep(.ant-segmented-group) { width: 100%; }
+  .mount-mode :deep(.ant-segmented-item) { min-width: 0; flex: 1; }
+  .command-box { min-width: 0; flex-direction: column; }
+  .command-box pre { width: 100%; overflow-x: hidden; }
 }
 </style>

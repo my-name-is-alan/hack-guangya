@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { shallowRef } from 'vue'
+import { computed, onBeforeUnmount, onMounted, shallowRef } from 'vue'
 import {
   CloudServerOutlined,
   DatabaseOutlined,
@@ -19,11 +19,26 @@ import PreferenceSettingsPanel from '../components/settings/PreferenceSettingsPa
 import TransferSettingsPanel from '../components/settings/TransferSettingsPanel.vue'
 
 const activeTab = shallowRef('account')
+const narrowSettings = shallowRef(false)
+let settingsMedia: MediaQueryList | null = null
+const tabPosition = computed<'top' | 'left'>(() => narrowSettings.value ? 'top' : 'left')
+
+function updateSettingsLayout(event?: MediaQueryListEvent) {
+  narrowSettings.value = event?.matches ?? settingsMedia?.matches ?? false
+}
+
+onMounted(() => {
+  settingsMedia = window.matchMedia('(max-width: 960px)')
+  updateSettingsLayout()
+  settingsMedia.addEventListener('change', updateSettingsLayout)
+})
+
+onBeforeUnmount(() => settingsMedia?.removeEventListener('change', updateSettingsLayout))
 </script>
 
 <template>
   <div class="settings-view">
-    <a-tabs v-model:active-key="activeTab" tab-position="left" class="settings-tabs">
+    <a-tabs v-model:active-key="activeTab" :tab-position="tabPosition" class="settings-tabs">
       <a-tab-pane key="account">
         <template #tab><span class="setting-tab"><UserOutlined />账号</span></template>
         <AccountSettingsPanel />
@@ -63,7 +78,14 @@ const activeTab = shallowRef('account')
 </template>
 
 <style scoped>
-.settings-view { min-height: calc(100vh - 96px); }
+.settings-view { min-width: 0; min-height: calc(100vh - 96px); overflow-x: hidden; }
+.settings-tabs { min-width: 0; }
 .settings-tabs :deep(.ant-tabs-nav) { width: 154px; }
 .setting-tab { display: inline-flex; align-items: center; gap: 9px; }
+@media (max-width: 960px) {
+  .settings-tabs :deep(.ant-tabs-nav) { width: 100%; max-width: 100%; }
+  .settings-tabs :deep(.ant-tabs-content-holder),
+  .settings-tabs :deep(.ant-tabs-content),
+  .settings-tabs :deep(.ant-tabs-tabpane) { min-width: 0; }
+}
 </style>
