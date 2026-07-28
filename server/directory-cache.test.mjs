@@ -74,3 +74,12 @@ test('登录身份变化会清空目录缓存并阻止跨账号复用', async ()
   assert.equal(cache.stats().entries, 0);
   assert.equal((await cache.get('root', async () => [{ fileId: 'private-b' }]))[0].fileId, 'private-b');
 });
+
+test('强制刷新失败时不会让写操作降级使用过期目录', async () => {
+  const cache = createDirectoryCache();
+  await cache.get('root', async () => [{ fileId: 'stale-target', fileName: '旧目标' }]);
+  await assert.rejects(
+    () => cache.get('root', async () => { throw new Error('云端目录刷新失败'); }, { force: true }),
+    /刷新失败/,
+  );
+});

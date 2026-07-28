@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import net from 'node:net';
 
 const ACCESS_COOKIE = 'guangya_access';
 const SESSION_TTL_SECONDS = 12 * 60 * 60;
@@ -66,19 +67,86 @@ function parseCookies(header) {
   return values;
 }
 
-function requestIsSecure(request) {
-  const forwarded = String(request.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
-  return forwarded === 'https' || Boolean(request.socket.encrypted);
+function splitForwardedElements(value) {
+  const elements = [];
+  let current = '';
+  let quoted = false;
+  let escaped = false;
+  for (const character of String(value || '')) {
+    if (escaped) {
+      current += character;
+      escaped = false;
+    } else if (character === '\\' && quoted) {
+      current += character;
+      escaped = true;
+    } else if (character === '"') {
+      current += character;
+      quoted = !quoted;
+    } else if (character === ',' && !quoted) {
+      elements.push(current);
+      current = '';
+    } else {
+      current += character;
+    }
+  }
+  if (current) elements.push(current);
+  return elements;
 }
 
-function sessionCookie(request, value, maxAge = SESSION_TTL_SECONDS) {
+function forwardedParameter(request, name) {
+  for (const element of splitForwardedElements(request.headers.forwarded)) {
+    for (const part of element.split(';')) {
+      const separator = part.indexOf('=');
+      if (separator < 1 || part.slice(0, separator).trim().toLowerCase() !== name) continue;
+      const raw = part.slice(separator + 1).trim();
+      if (raw.startsWith('"') && raw.endsWith('"')) return raw.slice(1, -1).replace(/\\(.)/g, '$1');
+      return raw;
+    }
+  }
+  return '';
+}
+
+function normalizeForwardedIp(value) {
+  let candidate = String(value || '').trim();
+  if (!candidate || candidate.toLowerCase() === 'unknown' || candidate.startsWith('_')) return '';
+  if (candidate.startsWith('[')) {
+    const closing = candidate.indexOf(']');
+    if (closing < 0) return '';
+    candidate = candidate.slice(1, closing);
+  } else if (net.isIP(candidate) === 0) {
+    const ipv4WithPort = candidate.match(/^([^:]+):\d+$/);
+    if (ipv4WithPort) candidate = ipv4WithPort[1];
+  }
+  return net.isIP(candidate) ? candidate : '';
+}
+
+function forwardedClientIp(request) {
+  const standardized = normalizeForwardedIp(forwardedParameter(request, 'for'));
+  if (standardized) return standardized;
+  for (const entry of String(request.headers['x-forwarded-for'] || '').split(',')) {
+    const parsed = normalizeForwardedIp(entry);
+    if (parsed) return parsed;
+  }
+  return '';
+}
+
+export function requestProtocol(request, trustedProxy = false) {
+  if (trustedProxy) {
+    const forwarded = String(forwardedParameter(request, 'proto')
+      || String(request.headers['x-forwarded-proto'] || '').split(',')[0]).trim().toLowerCase();
+    if (forwarded === 'https' || forwarded === 'http') return forwarded;
+  }
+  return request.socket.encrypted ? 'https' : 'http';
+}
+
+function sessionCookie(request, value, maxAge = SESSION_TTL_SECONDS, trustedProxy = false) {
   return [
     `${ACCESS_COOKIE}=${value}`,
     'Path=/',
     'HttpOnly',
     'SameSite=Strict',
     `Max-Age=${maxAge}`,
-    requestIsSecure(request) ? 'Secure' : '',
+    requestProtocol(request, trustedProxy) === 'https' ? 'Secure' : '',
   ].filter(Boolean).join('; ');
 }
 
@@ -153,33 +221,49 @@ export function createAccessControl({
   username = 'admin',
   tableName = 'access_control',
   realm = 'Guangya Sync',
+  trustedProxy = false,
+  persistUsername = false,
   rateLimit = {},
   now = () => Date.now(),
 }) {
   if (!/^[a-z][a-z0-9_]*$/.test(tableName)) throw new Error('访问控制表名无效');
-  let currentUsername = String(username || '').trim();
-  if (!currentUsername || currentUsername.includes(':') || /[\u0000-\u001f\u007f]/.test(currentUsername)) {
-    throw new Error('访问用户名无效');
-  }
+  const normalizeUsername = (value) => {
+    const normalized = String(value || '').trim();
+    if (!normalized || normalized.includes(':') || /[\u0000-\u001f\u007f]/.test(normalized)) {
+      throw new Error('访问用户名无效');
+    }
+    return normalized;
+  };
+  let currentUsername = normalizeUsername(username);
   database.exec(`
     CREATE TABLE IF NOT EXISTS ${tableName} (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       code_salt TEXT NOT NULL,
       code_hash TEXT NOT NULL,
+      username TEXT,
       updated_at INTEGER NOT NULL
     );
   `);
+  if (!database.prepare(`PRAGMA table_info(${tableName})`).all().some((column) => column.name === 'username')) {
+    database.exec(`ALTER TABLE ${tableName} ADD COLUMN username TEXT`);
+  }
 
-  const selectRecord = database.prepare(`SELECT code_salt, code_hash, updated_at FROM ${tableName} WHERE id = 1`);
+  const selectRecord = database.prepare(`SELECT code_salt, code_hash, username, updated_at FROM ${tableName} WHERE id = 1`);
   const saveRecord = database.prepare(`
-    INSERT INTO ${tableName} (id, code_salt, code_hash, updated_at)
-    VALUES (1, ?, ?, ?)
+    INSERT INTO ${tableName} (id, code_salt, code_hash, username, updated_at)
+    VALUES (1, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       code_salt = excluded.code_salt,
       code_hash = excluded.code_hash,
+      username = CASE WHEN ? THEN excluded.username ELSE ${tableName}.username END,
       updated_at = excluded.updated_at
   `);
   let record = selectRecord.get() || null;
+  if (persistUsername && record?.username) currentUsername = normalizeUsername(record.username);
+  if (persistUsername && record && !record.username) {
+    database.prepare(`UPDATE ${tableName} SET username = ? WHERE id = 1`).run(currentUsername);
+    record = { ...record, username: currentUsername };
+  }
   const sessions = new Map();
   const rateConfig = {
     windowMs: positiveInteger(rateLimit.windowMs, DEFAULT_RATE_LIMIT.windowMs),
@@ -192,12 +276,13 @@ export function createAccessControl({
   let globalPending = 0;
   let activeKdf = 0;
 
-  function persistCode(code) {
+  function persistCode(code, nextUsername = currentUsername) {
     const normalized = normalizeNewCode(code);
     const salt = crypto.randomBytes(16).toString('hex');
     const codeHash = hashCodeSync(normalized, salt);
-    saveRecord.run(salt, codeHash, Math.floor(now() / 1000));
-    record = { code_salt: salt, code_hash: codeHash };
+    const storedUsername = persistUsername ? normalizeUsername(nextUsername) : null;
+    saveRecord.run(salt, codeHash, storedUsername, Math.floor(now() / 1000), persistUsername ? 1 : 0);
+    record = { code_salt: salt, code_hash: codeHash, username: storedUsername };
   }
 
   const normalizedInitialCode = String(initialCode ?? '');
@@ -235,6 +320,10 @@ export function createAccessControl({
   }
 
   function clientIp(request) {
+    if (trustedProxy) {
+      const forwarded = forwardedClientIp(request);
+      if (forwarded) return forwarded;
+    }
     return String(request.socket?.remoteAddress || 'unknown');
   }
 
@@ -379,25 +468,22 @@ export function createAccessControl({
     return {
       ...authorizedResult('access_code'),
       payload: { required: true, authenticated: true, mode: 'access_code', username: currentUsername },
-      cookie: sessionCookie(request, token),
+      cookie: sessionCookie(request, token, SESSION_TTL_SECONDS, trustedProxy),
     };
   }
 
   function updateCode(request, code) {
     persistCode(code);
     sessions.clear();
-    return sessionCookie(request, '', 0);
+    return sessionCookie(request, '', 0, trustedProxy);
   }
 
   function updateCredentials(request, nextUsername, code) {
-    const normalizedUsername = String(nextUsername || '').trim();
-    if (!normalizedUsername || normalizedUsername.includes(':') || /[\u0000-\u001f\u007f]/.test(normalizedUsername)) {
-      throw new Error('访问用户名无效');
-    }
-    persistCode(code);
+    const normalizedUsername = normalizeUsername(nextUsername);
+    persistCode(code, normalizedUsername);
     currentUsername = normalizedUsername;
     sessions.clear();
-    return sessionCookie(request, '', 0);
+    return sessionCookie(request, '', 0, trustedProxy);
   }
 
   function reject(response, result = unauthorizedResult()) {
@@ -428,5 +514,16 @@ export function createAccessControl({
     response.end(body);
   }
 
-  return { authenticate, reject, required, serveGate, status, unlock, updateCode, updateCredentials, verifyCode };
+  return {
+    authenticate,
+    reject,
+    required,
+    serveGate,
+    status,
+    unlock,
+    updateCode,
+    updateCredentials,
+    username: () => currentUsername,
+    verifyCode,
+  };
 }

@@ -85,6 +85,55 @@ test('访问控制让 unlock 与 Basic 共用每 IP 和全局失败限额', asyn
   }
 });
 
+test('转发地址和协议仅在显式信任反向代理时生效', async () => {
+  const untrustedDatabase = new DatabaseSync(':memory:');
+  const trustedDatabase = new DatabaseSync(':memory:');
+  const plainHttpDatabase = new DatabaseSync(':memory:');
+  try {
+    const untrusted = createAccessControl({
+      database: untrustedDatabase,
+      initialCode: 'correct access code',
+      rateLimit: { windowMs: 60_000, perIpFailures: 1, globalFailures: 20, maxConcurrentKdf: 2 },
+    });
+    const directPeer = '10.0.0.5';
+    assert.equal((await untrusted.unlock(accessRequest(directPeer, {
+      'x-forwarded-for': '192.0.2.10',
+    }), 'wrong code')).status, 401);
+    assert.equal((await untrusted.unlock(accessRequest(directPeer, {
+      'x-forwarded-for': '192.0.2.11',
+    }), 'correct access code')).status, 429, '未信任代理时伪造转发地址不能绕过每 IP 限流');
+
+    const trusted = createAccessControl({
+      database: trustedDatabase,
+      initialCode: 'correct access code',
+      trustedProxy: true,
+      rateLimit: { windowMs: 60_000, perIpFailures: 1, globalFailures: 20, maxConcurrentKdf: 2 },
+    });
+    assert.equal((await trusted.unlock(accessRequest(directPeer, {
+      forwarded: 'for="[2001:db8::10]:4711";proto=https',
+    }), 'wrong code')).status, 401);
+    const otherClient = await trusted.unlock(accessRequest(directPeer, {
+      'x-forwarded-for': '192.0.2.11',
+      'x-forwarded-proto': 'https',
+    }), 'correct access code');
+    assert.equal(otherClient.status, 200, '信任代理时不同客户端应使用各自的转发地址限流');
+    assert.match(otherClient.cookie, /; Secure(?:;|$)/);
+
+    const plainHttp = createAccessControl({
+      database: plainHttpDatabase,
+      initialCode: 'correct access code',
+    });
+    const spoofedProtocol = await plainHttp.unlock(accessRequest('192.0.2.20', {
+      'x-forwarded-proto': 'https',
+    }), 'correct access code');
+    assert.doesNotMatch(spoofedProtocol.cookie, /; Secure(?:;|$)/);
+  } finally {
+    untrustedDatabase.close();
+    trustedDatabase.close();
+    plainHttpDatabase.close();
+  }
+});
+
 test('访问控制保留正确 unlock、Cookie 会话与旧 Basic 登录', async () => {
   const database = new DatabaseSync(':memory:');
   try {
@@ -136,6 +185,7 @@ test('独立访问控制表支持修改用户名且不会复用管理员凭据',
       username: 'mount-user',
       tableName: 'webdav_access_control',
       realm: 'Guangya WebDAV',
+      persistUsername: true,
     });
 
     assert.equal((await webdav.authenticate(accessRequest('192.0.2.30', {
@@ -154,6 +204,26 @@ test('独立访问控制表支持修改用户名且不会复用管理员凭据',
       authorization: basic('storage-user', 'replacement webdav password'),
     }))).status, 200);
     assert.equal(await admin.verifyCode('administrator password'), true);
+
+    assert.throws(
+      () => webdav.updateCredentials(accessRequest('192.0.2.36'), 'changed-user', 'short'),
+      /长度必须为 8 到 256/,
+    );
+    assert.equal(webdav.status(accessRequest('192.0.2.37')).username, 'storage-user', '密码写入失败不应单独改变用户名');
+    const stored = database.prepare('SELECT username, code_hash FROM webdav_access_control WHERE id = 1').get();
+    assert.equal(stored.username, 'storage-user');
+    assert.notEqual(stored.code_hash, 'replacement webdav password');
+    const restartedWebDav = createAccessControl({
+      database,
+      username: 'legacy-default',
+      tableName: 'webdav_access_control',
+      realm: 'Guangya WebDAV',
+      persistUsername: true,
+    });
+    assert.equal(restartedWebDav.username(), 'storage-user');
+    assert.equal((await restartedWebDav.authenticate(accessRequest('192.0.2.38', {
+      authorization: basic('storage-user', 'replacement webdav password'),
+    }))).status, 200);
 
     const rejected = responseRecorder();
     webdav.reject(rejected);
@@ -208,12 +278,30 @@ test('WebDAV 使用独立本机端口和独立持久化账号密码', async () =
           transfers: 6,
           read_streams: 3,
           cache_size_gb: 24,
-          rclone_path: 'missing-rclone-for-api-test',
+          rclone_path: '',
         },
       }),
     });
     assert.equal(nativeOptions.status, 200, await nativeOptions.clone().text());
-    assert.equal((await nativeOptions.json()).access_mode, 'read_only');
+    const savedNativeOptions = await nativeOptions.json();
+    assert.equal(savedNativeOptions.access_mode, 'read_only');
+    const rejectedExecutable = await fetch(`${mainBase}/api/mount/native/options`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        options: {
+          target: process.platform === 'win32' ? 'Y:' : '/mnt/test-guangya',
+          access_mode: 'read_only',
+          vfs_cache_mode: 'writes',
+          transfers: 6,
+          read_streams: 3,
+          cache_size_gb: 24,
+          rclone_path: '/tmp/untrusted-rclone',
+        },
+      }),
+    });
+    assert.equal(rejectedExecutable.status, 400);
+    assert.match((await rejectedExecutable.json()).error, /GUANGYA_RCLONE_PATH/);
     const wrongNativePassword = await fetch(`${mainBase}/api/mount/native/start`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -221,6 +309,15 @@ test('WebDAV 使用独立本机端口和独立持久化账号密码', async () =
     });
     assert.equal(wrongNativePassword.status, 400);
     assert.match((await wrongNativePassword.json()).error, /密码错误/);
+
+    const legacyDatabase = new DatabaseSync(path.join(instance.dataDir, 'state.sqlite3'));
+    legacyDatabase.prepare("UPDATE app_state SET value = ? WHERE key = 'native_mount_options'")
+      .run(JSON.stringify({
+        ...savedNativeOptions,
+        rclone_path: '/tmp/legacy-untrusted-rclone',
+        password: 'legacy plaintext password',
+      }));
+    legacyDatabase.close();
 
     await stopTestServer(instance);
     instance = await startTestServer(root);
@@ -235,6 +332,12 @@ test('WebDAV 使用独立本机端口和独立持久化账号密码', async () =
     const restartedNative = await fetch(`http://127.0.0.1:${instance.port}/api/mount/native`).then((response) => response.json());
     assert.equal(restartedNative.access_mode, 'read_only');
     assert.equal(restartedNative.transfers, 6);
+    assert.equal(restartedNative.rclone_path, '');
+    const sanitizedDatabase = new DatabaseSync(path.join(instance.dataDir, 'state.sqlite3'));
+    const sanitizedOptions = JSON.parse(sanitizedDatabase.prepare("SELECT value FROM app_state WHERE key = 'native_mount_options'").get().value);
+    sanitizedDatabase.close();
+    assert.equal(Object.hasOwn(sanitizedOptions, 'password'), false);
+    assert.equal(sanitizedOptions.rclone_path, '');
   } finally {
     await stopTestServer(instance);
     await fsp.rm(root, { recursive: true, force: true });

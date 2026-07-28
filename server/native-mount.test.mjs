@@ -6,9 +6,14 @@ import test from 'node:test';
 import {
   createNativeMountManager,
   nativeMountArguments,
+  NATIVE_MOUNT_STOP_TIMEOUT_MS,
   normalizeNativeMountOptions,
   prepareNativeMountTarget,
 } from './native-mount.mjs';
+
+test('原生挂载停止预算为 FUSE 卸载和 VFS 写回预留时间', () => {
+  assert.equal(NATIVE_MOUNT_STOP_TIMEOUT_MS, 30_000);
+});
 
 test('原生挂载参数限制权限、并行数与缓存上限', () => {
   const options = normalizeNativeMountOptions({
@@ -18,8 +23,10 @@ test('原生挂载参数限制权限、并行数与缓存上限', () => {
     transfers: 6,
     read_streams: 3,
     cache_size_gb: 32,
+    password: 'must-not-be-persisted',
   }, 'linux');
   assert.equal(options.transfers, 6);
+  assert.equal(Object.hasOwn(options, 'password'), false);
   assert.throws(() => normalizeNativeMountOptions({ ...options, access_mode: 'owner' }, 'linux'), /只读或读写/);
   assert.throws(() => normalizeNativeMountOptions({ ...options, transfers: 17 }, 'linux'), /1 到 16/);
   assert.throws(() => normalizeNativeMountOptions({ ...options, read_streams: 0 }, 'linux'), /1 到 16/);
@@ -85,4 +92,39 @@ test('Windows 目录挂载只移除空挂载叶子且拒绝非空目录', async 
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+test('Unix 挂载拒绝符号链接和非空目录并收紧目录权限', { skip: process.platform === 'win32' }, async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'guangya-native-target-'));
+  try {
+    const target = path.join(root, 'mount');
+    await fs.mkdir(target, { mode: 0o755 });
+    await fs.writeFile(path.join(target, 'keep.txt'), 'keep');
+    assert.throws(() => prepareNativeMountTarget(target, process.platform), /必须为空/);
+    await fs.rm(path.join(target, 'keep.txt'));
+    prepareNativeMountTarget(target, process.platform);
+    assert.equal((await fs.stat(target)).mode & 0o777, 0o700);
+
+    const linked = path.join(root, 'linked');
+    await fs.symlink(target, linked, 'dir');
+    assert.throws(() => prepareNativeMountTarget(linked, process.platform), /符号链接/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('原生挂载默认忽略旧配置中的任意可执行路径并拒绝重新设置', () => {
+  const manager = createNativeMountManager({
+    dataDir: process.cwd(),
+    initialOptions: { target: process.platform === 'win32' ? 'X:' : '/mnt/cloud', rclone_path: '/tmp/untrusted-rclone' },
+    enabled: false,
+    platform: process.platform,
+    defaultRclonePath: '',
+    allowCustomRclonePath: false,
+  });
+  assert.equal(manager.options().rclone_path, '');
+  assert.throws(
+    () => manager.setOptions({ ...manager.options(), rclone_path: '/tmp/another-untrusted-rclone' }),
+    /GUANGYA_RCLONE_PATH/,
+  );
 });

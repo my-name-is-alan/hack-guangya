@@ -24,6 +24,163 @@ struct WebDavContext {
     app: tauri::AppHandle,
     state: SharedState,
     directory_cache: Arc<DirectoryCache>,
+    locks: Arc<DavLockManager>,
+    mutation_gate: Arc<tokio::sync::Mutex<()>>,
+    auth_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Clone)]
+struct DavLock {
+    path: Vec<String>,
+    token: String,
+    depth_infinity: bool,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct DavLockManager {
+    locks: Mutex<Vec<DavLock>>,
+}
+
+impl DavLockManager {
+    fn purge_expired(locks: &mut Vec<DavLock>) {
+        let now = Instant::now();
+        locks.retain(|lock| lock.expires_at > now);
+    }
+
+    fn lock_applies(lock: &DavLock, path: &[String]) -> bool {
+        lock.path == path
+            || (lock.depth_infinity && path.len() > lock.path.len() && path.starts_with(&lock.path))
+    }
+
+    fn request_tokens(headers: &HeaderMap) -> HashSet<String> {
+        ["if", "lock-token"]
+            .into_iter()
+            .filter_map(|name| headers.get(name).and_then(|value| value.to_str().ok()))
+            .flat_map(|value| {
+                value
+                    .split('<')
+                    .skip(1)
+                    .filter_map(|part| part.split('>').next())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn ensure_write_allowed(
+        &self,
+        headers: &HeaderMap,
+        paths: &[(&[String], bool)],
+    ) -> DavResult<()> {
+        let supplied = Self::request_tokens(headers);
+        let mut locks = self
+            .locks
+            .lock()
+            .map_err(|error| DavError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        Self::purge_expired(&mut locks);
+        let blocked = paths.iter().any(|(path, include_descendants)| {
+            locks.iter().any(|lock| {
+                (Self::lock_applies(lock, path)
+                    || (*include_descendants
+                        && lock.path.len() > path.len()
+                        && lock.path.starts_with(path)))
+                    && !supplied.contains(lock.token.as_str())
+            })
+        });
+        if blocked {
+            Err(DavError::new(
+                StatusCode::LOCKED,
+                "资源已锁定，请提供有效的 WebDAV 锁令牌",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn acquire(
+        &self,
+        path: &[String],
+        headers: &HeaderMap,
+        depth_infinity: bool,
+        timeout_secs: u64,
+    ) -> DavResult<(String, bool)> {
+        let supplied = Self::request_tokens(headers);
+        let mut locks = self
+            .locks
+            .lock()
+            .map_err(|error| DavError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        Self::purge_expired(&mut locks);
+        if let Some(existing) = locks
+            .iter_mut()
+            .find(|lock| lock.path == path && supplied.contains(lock.token.as_str()))
+        {
+            existing.expires_at = Instant::now() + Duration::from_secs(timeout_secs);
+            return Ok((existing.token.clone(), existing.depth_infinity));
+        }
+        let conflicts = locks.iter().any(|lock| {
+            Self::lock_applies(lock, path)
+                || (depth_infinity && lock.path.len() > path.len() && lock.path.starts_with(path))
+        });
+        if conflicts {
+            return Err(DavError::new(
+                StatusCode::LOCKED,
+                "资源已经持有不兼容的 WebDAV 锁",
+            ));
+        }
+        let token = format!("opaquelocktoken:{}", Uuid::new_v4());
+        locks.push(DavLock {
+            path: path.to_vec(),
+            token: token.clone(),
+            depth_infinity,
+            expires_at: Instant::now() + Duration::from_secs(timeout_secs),
+        });
+        Ok((token, depth_infinity))
+    }
+
+    fn unlock(&self, path: &[String], headers: &HeaderMap) -> DavResult<()> {
+        let supplied = Self::request_tokens(headers);
+        let mut locks = self
+            .locks
+            .lock()
+            .map_err(|error| DavError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        Self::purge_expired(&mut locks);
+        let Some(index) = locks
+            .iter()
+            .position(|lock| lock.path == path && supplied.contains(lock.token.as_str()))
+        else {
+            return Err(DavError::new(
+                StatusCode::CONFLICT,
+                "没有找到与路径和 Lock-Token 匹配的活动锁",
+            ));
+        };
+        locks.swap_remove(index);
+        Ok(())
+    }
+
+    fn discovery_xml(&self, path: &[String]) -> String {
+        let Ok(mut locks) = self.locks.lock() else {
+            return "<D:lockdiscovery/>".to_string();
+        };
+        Self::purge_expired(&mut locks);
+        let active = locks
+            .iter()
+            .filter(|lock| Self::lock_applies(lock, path))
+            .map(|lock| {
+                let remaining = lock
+                    .expires_at
+                    .saturating_duration_since(Instant::now())
+                    .as_secs()
+                    .max(1);
+                format!(
+                    "<D:activelock><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope><D:depth>{}</D:depth><D:timeout>Second-{remaining}</D:timeout><D:locktoken><D:href>{}</D:href></D:locktoken></D:activelock>",
+                    if lock.depth_infinity { "infinity" } else { "0" },
+                    xml_escape(&lock.token)
+                )
+            })
+            .collect::<String>();
+        format!("<D:lockdiscovery>{active}</D:lockdiscovery>")
+    }
 }
 
 #[derive(Debug)]
@@ -496,7 +653,35 @@ async fn resolve_entry(context: &WebDavContext, segments: &[String]) -> DavResul
     Ok(entry.unwrap_or_else(RemoteEntry::root))
 }
 
-async fn resolve_parent(
+async fn resolve_entry_for_write(
+    context: &WebDavContext,
+    segments: &[String],
+) -> DavResult<RemoteEntry> {
+    if segments.is_empty() {
+        return Ok(RemoteEntry::root());
+    }
+    let mut parent_id = String::new();
+    let mut entry = None;
+    for (index, segment) in segments.iter().enumerate() {
+        context.directory_cache.invalidate(&parent_id);
+        let current = find_child(context, &parent_id, segment)
+            .await?
+            .ok_or_else(|| {
+                DavError::new(StatusCode::NOT_FOUND, format!("云端项目不存在：{segment}"))
+            })?;
+        if index + 1 < segments.len() && !current.is_directory {
+            return Err(DavError::new(
+                StatusCode::CONFLICT,
+                format!("路径中包含文件：{segment}"),
+            ));
+        }
+        parent_id = current.id.clone();
+        entry = Some(current);
+    }
+    Ok(entry.unwrap_or_else(RemoteEntry::root))
+}
+
+async fn resolve_parent_for_write(
     context: &WebDavContext,
     segments: &[String],
 ) -> DavResult<(String, String, Option<RemoteEntry>)> {
@@ -510,12 +695,13 @@ async fn resolve_parent(
     let parent_id = if segments.len() == 1 {
         String::new()
     } else {
-        let parent = resolve_entry(context, &segments[..segments.len() - 1]).await?;
+        let parent = resolve_entry_for_write(context, &segments[..segments.len() - 1]).await?;
         if !parent.is_directory {
             return Err(DavError::new(StatusCode::CONFLICT, "目标父路径不是目录"));
         }
         parent.id
     };
+    context.directory_cache.invalidate(&parent_id);
     let existing = find_child(context, &parent_id, &name).await?;
     Ok((parent_id, name, existing))
 }
@@ -562,7 +748,7 @@ fn destination_path(headers: &HeaderMap) -> DavResult<Vec<String>> {
     decode_path(&path)
 }
 
-fn authenticated(headers: &HeaderMap, state: &SharedState) -> bool {
+async fn authenticated(headers: &HeaderMap, context: &WebDavContext) -> bool {
     let authorization = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -579,10 +765,52 @@ fn authenticated(headers: &HeaderMap, state: &SharedState) -> bool {
     let Some((username, password)) = decoded.split_once(':') else {
         return false;
     };
-    state
-        .lock()
-        .ok()
-        .is_some_and(|guard| username == guard.webdav_username && password == guard.webdav_password)
+    let candidate = webdav_password_verifier(password);
+    let cached_verifier = {
+        let Ok(guard) = context.state.lock() else {
+            return false;
+        };
+        if username != guard.webdav_username || guard.webdav_password_hash.is_empty() {
+            return false;
+        }
+        guard.webdav_password_verifier
+    };
+    if let Some(expected) = cached_verifier {
+        return constant_time_eq(&candidate, &expected);
+    }
+
+    // Only the first valid request after launch needs the expensive persisted-hash
+    // verification. Serialize that work and keep it off the async runtime threads.
+    let _auth_guard = context.auth_gate.lock().await;
+    let encoded_hash = {
+        let Ok(guard) = context.state.lock() else {
+            return false;
+        };
+        if username != guard.webdav_username || guard.webdav_password_hash.is_empty() {
+            return false;
+        }
+        if let Some(expected) = guard.webdav_password_verifier {
+            return constant_time_eq(&candidate, &expected);
+        }
+        guard.webdav_password_hash.clone()
+    };
+    let password = password.to_string();
+    let hash_for_check = encoded_hash.clone();
+    let verified =
+        tokio::task::spawn_blocking(move || verify_webdav_password(&password, &hash_for_check))
+            .await
+            .unwrap_or(false);
+    if !verified {
+        return false;
+    }
+    let Ok(mut guard) = context.state.lock() else {
+        return false;
+    };
+    if username != guard.webdav_username || guard.webdav_password_hash != encoded_hash {
+        return false;
+    }
+    guard.webdav_password_verifier = Some(candidate);
+    true
 }
 
 fn plain_response(status: StatusCode, body: impl Into<String>) -> Response<Body> {
@@ -662,7 +890,7 @@ fn http_date(timestamp_ms: u64) -> String {
     httpdate::fmt_http_date(UNIX_EPOCH + std::time::Duration::from_millis(timestamp_ms))
 }
 
-fn property_response(segments: &[String], entry: &RemoteEntry) -> String {
+fn property_response(segments: &[String], entry: &RemoteEntry, lock_discovery: &str) -> String {
     let resource_type = if entry.is_directory {
         "<D:collection/>"
     } else {
@@ -685,6 +913,7 @@ fn property_response(segments: &[String], entry: &RemoteEntry) -> String {
 <D:creationdate>{}</D:creationdate>
 <D:getetag>{}</D:getetag>
 <D:supportedlock><D:lockentry><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockentry></D:supportedlock>
+{}
 </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>
 </D:response>"#,
         xml_escape(&encoded_href(segments, entry.is_directory)),
@@ -694,7 +923,8 @@ fn property_response(segments: &[String], entry: &RemoteEntry) -> String {
         content_type(entry),
         http_date(entry.modified_ms),
         xml_escape(&http_date(entry.modified_ms)),
-        xml_escape(&entry.etag())
+        xml_escape(&entry.etag()),
+        lock_discovery
     )
 }
 
@@ -845,7 +1075,11 @@ async fn copy_entry(
     name: &str,
 ) -> DavResult<()> {
     let before = list_children(context, parent_id).await?;
-    if entry.name != name && before.iter().any(|item| item.name == entry.name) {
+    if entry.name != name
+        && before
+            .iter()
+            .any(|item| item.name == entry.name && item.id != entry.id)
+    {
         return Err(DavError::new(
             StatusCode::CONFLICT,
             format!("目标目录中已有 {}，无法安全完成改名复制", entry.name),
@@ -927,6 +1161,18 @@ async fn put_file(
                 format!("创建 WebDAV 临时目录失败：{error}"),
             )
         })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&temporary_root, fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|error| {
+                DavError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("限制 WebDAV 临时目录权限失败：{error}"),
+                )
+            })?;
+    }
     let result = async {
         let mut output = tokio::fs::File::create(&temporary_file)
             .await
@@ -936,6 +1182,18 @@ async fn put_file(
                     format!("创建 WebDAV 临时文件失败：{error}"),
                 )
             })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&temporary_file, fs::Permissions::from_mode(0o600))
+                .await
+                .map_err(|error| {
+                    DavError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("限制 WebDAV 临时文件权限失败：{error}"),
+                    )
+                })?;
+        }
         let mut stream = request.into_body().into_data_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| {
@@ -995,11 +1253,53 @@ async fn put_file(
                 "文件已上传，但云端暂未确认入库",
             )
         })?;
-        if let Some(existing) = existing {
-            delete_entry(context, existing).await?;
-        }
+        let uploaded_entry = RemoteEntry {
+            id: remote_id.clone(),
+            parent_id: parent_id.to_string(),
+            name: temporary_name.clone(),
+            is_directory: false,
+            size: metadata.len(),
+            modified_ms: modified_ms as u64,
+        };
+        let backup = if let Some(existing) = existing {
+            let backup_name = format!(".__gy_replaced_{}", Uuid::new_v4().simple());
+            if let Err(error) = rename_entry(context, &existing.id, &backup_name).await {
+                let _ = delete_entry(context, &uploaded_entry).await;
+                return Err(error);
+            }
+            context.directory_cache.invalidate(parent_id);
+            let mut backup = existing.clone();
+            backup.name = backup_name;
+            Some(backup)
+        } else {
+            None
+        };
         if temporary_name != name {
-            rename_entry(context, &remote_id, name).await?;
+            if let Err(mut error) = rename_entry(context, &remote_id, name).await {
+                if let Some(backup) = backup.as_ref() {
+                    if let Err(rollback) = rename_entry(context, &backup.id, name).await {
+                        error.message = format!(
+                            "{}；原文件仍保留为 {}，但恢复原名失败：{}",
+                            error.message, backup.name, rollback.message
+                        );
+                    }
+                }
+                let _ = delete_entry(context, &uploaded_entry).await;
+                context.directory_cache.invalidate(parent_id);
+                return Err(error);
+            }
+        }
+        if let Some(backup) = backup {
+            if let Err(error) = delete_entry(context, &backup).await {
+                status(
+                    &context.app,
+                    "warning",
+                    format!(
+                        "文件已安全覆盖，但清理旧版本 {} 失败：{}",
+                        backup.name, error.message
+                    ),
+                );
+            }
         }
         context.directory_cache.invalidate(parent_id);
         Ok(RemoteEntry {
@@ -1101,16 +1401,17 @@ async fn read_file(
         .map_err(|error| DavError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
-fn lock_response() -> Response<Body> {
-    let token = format!("opaquelocktoken:{}", Uuid::new_v4());
+fn lock_response(token: &str, timeout_secs: u64, depth_infinity: bool) -> Response<Body> {
     let body = format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock>
 <D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope>
-<D:depth>infinity</D:depth><D:timeout>Second-3600</D:timeout>
+<D:depth>{}</D:depth><D:timeout>Second-{}</D:timeout>
 <D:locktoken><D:href>{}</D:href></D:locktoken>
 </D:activelock></D:lockdiscovery></D:prop>"#,
-        xml_escape(&token)
+        if depth_infinity { "infinity" } else { "0" },
+        timeout_secs,
+        xml_escape(token)
     );
     Response::builder()
         .status(StatusCode::OK)
@@ -1120,11 +1421,34 @@ fn lock_response() -> Response<Body> {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
+fn requested_lock_timeout(headers: &HeaderMap) -> u64 {
+    headers
+        .get("timeout")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value.split(',').find_map(|candidate| {
+                candidate
+                    .trim()
+                    .strip_prefix("Second-")
+                    .and_then(|seconds| seconds.parse::<u64>().ok())
+            })
+        })
+        .unwrap_or(3_600)
+        .clamp(60, 3_600)
+}
+
+fn requires_mutation_gate(method: &Method) -> bool {
+    matches!(
+        method.as_str(),
+        "PUT" | "MKCOL" | "DELETE" | "MOVE" | "COPY" | "LOCK" | "UNLOCK"
+    )
+}
+
 async fn handle_request(
     State(context): State<WebDavContext>,
     request: Request<Body>,
 ) -> Response<Body> {
-    if !authenticated(request.headers(), &context.state) {
+    if !authenticated(request.headers(), &context).await {
         return Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header(
@@ -1147,6 +1471,11 @@ async fn handle_authenticated(
 ) -> DavResult<Response<Body>> {
     let method = request.method().clone();
     let segments = decode_path(request.uri().path())?;
+    let _mutation_guard = if requires_mutation_gate(&method) {
+        Some(context.mutation_gate.lock().await)
+    } else {
+        None
+    };
     if method == Method::OPTIONS {
         return Ok(Response::builder()
             .status(StatusCode::NO_CONTENT)
@@ -1169,12 +1498,20 @@ async fn handle_authenticated(
             return Err(DavError::new(StatusCode::FORBIDDEN, "仅支持 Depth: 0 或 1"));
         }
         let entry = resolve_entry(context, &segments).await?;
-        let mut responses = vec![property_response(&segments, &entry)];
+        let mut responses = vec![property_response(
+            &segments,
+            &entry,
+            &context.locks.discovery_xml(&segments),
+        )];
         if depth == "1" && entry.is_directory {
             for child in list_children(context, &entry.id).await? {
                 let mut child_segments = segments.clone();
                 child_segments.push(child.name.clone());
-                responses.push(property_response(&child_segments, &child));
+                responses.push(property_response(
+                    &child_segments,
+                    &child,
+                    &context.locks.discovery_xml(&child_segments),
+                ));
             }
         }
         let body = format!(
@@ -1192,7 +1529,7 @@ async fn handle_authenticated(
         let entry = resolve_entry(context, &segments).await?;
         let body = format!(
             r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">{}</D:multistatus>"#,
-            property_response(&segments, &entry)
+            property_response(&segments, &entry, &context.locks.discovery_xml(&segments),)
         );
         return Response::builder()
             .status(StatusCode::MULTI_STATUS)
@@ -1224,7 +1561,10 @@ async fn handle_authenticated(
         return read_file(context, &headers, &entry, method == Method::HEAD).await;
     }
     if method == Method::PUT {
-        let (parent_id, name, existing) = resolve_parent(context, &segments).await?;
+        context
+            .locks
+            .ensure_write_allowed(request.headers(), &[(segments.as_slice(), false)])?;
+        let (parent_id, name, existing) = resolve_parent_for_write(context, &segments).await?;
         if existing.as_ref().is_some_and(|entry| entry.is_directory) {
             return Err(DavError::new(
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -1244,7 +1584,10 @@ async fn handle_authenticated(
             .unwrap_or_else(|_| Response::new(Body::empty())));
     }
     if method.as_str() == "MKCOL" {
-        let (parent_id, name, existing) = resolve_parent(context, &segments).await?;
+        context
+            .locks
+            .ensure_write_allowed(request.headers(), &[(segments.as_slice(), false)])?;
+        let (parent_id, name, existing) = resolve_parent_for_write(context, &segments).await?;
         if existing.is_some() {
             return Err(DavError::new(
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -1255,7 +1598,10 @@ async fn handle_authenticated(
         return Ok(empty_response(StatusCode::CREATED));
     }
     if method == Method::DELETE {
-        let entry = resolve_entry(context, &segments).await?;
+        context
+            .locks
+            .ensure_write_allowed(request.headers(), &[(segments.as_slice(), true)])?;
+        let entry = resolve_entry_for_write(context, &segments).await?;
         if entry.id.is_empty() {
             return Err(DavError::new(
                 StatusCode::FORBIDDEN,
@@ -1266,7 +1612,7 @@ async fn handle_authenticated(
         return Ok(empty_response(StatusCode::NO_CONTENT));
     }
     if matches!(method.as_str(), "MOVE" | "COPY") {
-        let entry = resolve_entry(context, &segments).await?;
+        let entry = resolve_entry_for_write(context, &segments).await?;
         if entry.id.is_empty() {
             return Err(DavError::new(
                 StatusCode::FORBIDDEN,
@@ -1274,7 +1620,21 @@ async fn handle_authenticated(
             ));
         }
         let destination = destination_path(request.headers())?;
-        let (parent_id, name, existing) = resolve_parent(context, &destination).await?;
+        if destination == segments {
+            return if method.as_str() == "MOVE" {
+                Ok(empty_response(StatusCode::NO_CONTENT))
+            } else {
+                Err(DavError::new(StatusCode::FORBIDDEN, "不能将资源复制到自身"))
+            };
+        }
+        let mut affected_paths = vec![(destination.as_slice(), true)];
+        if method.as_str() == "MOVE" {
+            affected_paths.push((segments.as_slice(), true));
+        }
+        context
+            .locks
+            .ensure_write_allowed(request.headers(), &affected_paths)?;
+        let (parent_id, name, existing) = resolve_parent_for_write(context, &destination).await?;
         let overwrite = request
             .headers()
             .get("overwrite")
@@ -1282,8 +1642,12 @@ async fn handle_authenticated(
             .unwrap_or("T")
             .to_uppercase()
             != "F";
-        if method.as_str() == "MOVE" && existing.as_ref().is_some_and(|item| item.id == entry.id) {
-            return Ok(empty_response(StatusCode::NO_CONTENT));
+        if existing.as_ref().is_some_and(|item| item.id == entry.id) {
+            return if method.as_str() == "MOVE" {
+                Ok(empty_response(StatusCode::NO_CONTENT))
+            } else {
+                Err(DavError::new(StatusCode::FORBIDDEN, "不能将资源复制到自身"))
+            };
         }
         if existing.is_some() && !overwrite {
             return Err(DavError::new(
@@ -1292,13 +1656,44 @@ async fn handle_authenticated(
             ));
         }
         let replaced = existing.is_some();
-        if let Some(existing) = existing {
-            delete_entry(context, &existing).await?;
-        }
-        if method.as_str() == "MOVE" {
-            move_entry(context, &entry, &parent_id, &name).await?;
+        let backup = if let Some(mut existing) = existing {
+            let original_name = existing.name.clone();
+            let backup_name = format!(".__gy_replaced_{}", Uuid::new_v4().simple());
+            rename_entry(context, &existing.id, &backup_name).await?;
+            existing.name = backup_name;
+            context.directory_cache.invalidate(&parent_id);
+            Some((existing, original_name))
         } else {
-            copy_entry(context, &entry, &parent_id, &name).await?;
+            None
+        };
+        let operation = if method.as_str() == "MOVE" {
+            move_entry(context, &entry, &parent_id, &name).await
+        } else {
+            copy_entry(context, &entry, &parent_id, &name).await
+        };
+        if let Err(mut error) = operation {
+            if let Some((backup, original_name)) = backup.as_ref() {
+                if let Err(rollback) = rename_entry(context, &backup.id, original_name).await {
+                    error.message = format!(
+                        "{}；原目标仍保留为 {}，但恢复原名失败：{}",
+                        error.message, backup.name, rollback.message
+                    );
+                }
+                context.directory_cache.invalidate(&parent_id);
+            }
+            return Err(error);
+        }
+        if let Some((backup, _)) = backup {
+            if let Err(error) = delete_entry(context, &backup).await {
+                status(
+                    &context.app,
+                    "warning",
+                    format!(
+                        "目标已安全替换，但清理旧版本 {} 失败：{}",
+                        backup.name, error.message
+                    ),
+                );
+            }
         }
         return Ok(empty_response(if replaced {
             StatusCode::NO_CONTENT
@@ -1307,9 +1702,21 @@ async fn handle_authenticated(
         }));
     }
     if method.as_str() == "LOCK" {
-        return Ok(lock_response());
+        let depth_infinity = request
+            .headers()
+            .get("depth")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("infinity")
+            != "0";
+        let timeout_secs = requested_lock_timeout(request.headers());
+        let (token, actual_depth_infinity) =
+            context
+                .locks
+                .acquire(&segments, request.headers(), depth_infinity, timeout_secs)?;
+        return Ok(lock_response(&token, timeout_secs, actual_depth_infinity));
     }
     if method.as_str() == "UNLOCK" {
+        context.locks.unlock(&segments, request.headers())?;
         return Ok(empty_response(StatusCode::NO_CONTENT));
     }
     Err(DavError::new(
@@ -1350,6 +1757,9 @@ pub async fn serve(app: tauri::AppHandle, state: SharedState, port: u16) {
             app: app.clone(),
             state: state.clone(),
             directory_cache: Arc::new(DirectoryCache::default()),
+            locks: Arc::new(DavLockManager::default()),
+            mutation_gate: Arc::new(tokio::sync::Mutex::new(())),
+            auth_gate: Arc::new(tokio::sync::Mutex::new(())),
         });
     if let Err(error) = axum::serve(listener, router).await {
         if let Ok(mut guard) = state.lock() {
@@ -1393,8 +1803,15 @@ mod tests {
             size: 12,
             modified_ms: 1_700_000_000_000,
         };
-        assert!(property_response(&["资料".to_string()], &directory).contains("<D:collection/>"));
-        let file_xml = property_response(&["资料".to_string(), "readme.txt".to_string()], &file);
+        assert!(
+            property_response(&["资料".to_string()], &directory, "<D:lockdiscovery/>")
+                .contains("<D:collection/>")
+        );
+        let file_xml = property_response(
+            &["资料".to_string(), "readme.txt".to_string()],
+            &file,
+            "<D:lockdiscovery/>",
+        );
         assert!(file_xml.contains("<D:getcontentlength>12</D:getcontentlength>"));
         assert!(file_xml.contains("text/plain"));
         assert!(file_xml.contains("/%E8%B5%84%E6%96%99/readme%2Etxt"));
@@ -1451,5 +1868,60 @@ mod tests {
         assert!(cache.put_if_current("", cache.generation(""), Vec::new()));
         cache.ensure_scope(b"account-b");
         assert!(cache.snapshot("").is_none());
+    }
+
+    #[test]
+    fn webdav_locks_require_the_matching_token_and_unlock_explicitly() {
+        use axum::http::HeaderValue;
+
+        let manager = DavLockManager::default();
+        let root = vec!["资料".to_string()];
+        let child = vec!["资料".to_string(), "readme.txt".to_string()];
+        let headers = HeaderMap::new();
+        let (token, _) = manager
+            .acquire(&root, &headers, true, 3_600)
+            .expect("lock should be acquired");
+        assert!(manager.discovery_xml(&child).contains(&token));
+        assert!(manager
+            .ensure_write_allowed(&headers, &[(child.as_slice(), false)])
+            .is_err());
+
+        let mut token_headers = HeaderMap::new();
+        token_headers.insert(
+            "if",
+            HeaderValue::from_str(&format!("(<{token}>)")).unwrap(),
+        );
+        assert!(manager
+            .ensure_write_allowed(&token_headers, &[(child.as_slice(), false)])
+            .is_ok());
+        assert!(manager.unlock(&root, &token_headers).is_ok());
+        assert!(manager
+            .ensure_write_allowed(&headers, &[(child.as_slice(), false)])
+            .is_ok());
+        assert!(manager.unlock(&root, &token_headers).is_err());
+    }
+
+    #[test]
+    fn webdav_recursive_mutations_respect_descendant_locks_and_lock_changes_are_serialized() {
+        let manager = DavLockManager::default();
+        let root = vec!["资料".to_string()];
+        let child = vec!["资料".to_string(), "readme.txt".to_string()];
+        let headers = HeaderMap::new();
+        manager
+            .acquire(&child, &headers, false, 3_600)
+            .expect("child lock should be acquired");
+
+        assert!(manager
+            .ensure_write_allowed(&headers, &[(root.as_slice(), false)])
+            .is_ok());
+        assert!(manager
+            .ensure_write_allowed(&headers, &[(root.as_slice(), true)])
+            .is_err());
+        for method in [b"LOCK".as_slice(), b"UNLOCK".as_slice()]
+            .into_iter()
+            .map(|value| Method::from_bytes(value).unwrap())
+        {
+            assert!(requires_mutation_gate(&method));
+        }
     }
 }

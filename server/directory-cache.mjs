@@ -110,7 +110,9 @@ export function createDirectoryCache({
     try {
       return await load(key, loader);
     } catch (error) {
-      if (cached) return cached.value;
+      // Read-only browsing may degrade to stale data, but callers performing a
+      // mutation use force=true and must never act on a stale directory view.
+      if (cached && !force) return cached.value;
       throw error;
     }
   }

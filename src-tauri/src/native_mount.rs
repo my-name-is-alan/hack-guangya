@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -11,6 +11,7 @@ use std::{
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const MAX_PARALLELISM: usize = 16;
 const MAX_CACHE_SIZE_GB: usize = 1024;
@@ -76,17 +77,24 @@ pub struct NativeMountManager {
     resource_dir: PathBuf,
     started_at: Option<u64>,
     error: Option<String>,
+    approved_rclone: Option<(PathBuf, [u8; 32])>,
 }
 
 impl NativeMountManager {
     pub fn new(options: NativeMountOptions, data_dir: PathBuf, resource_dir: PathBuf) -> Self {
+        let mut options = normalize_options(options).unwrap_or_default();
+        // A persisted arbitrary executable path must not become an ambient native-code
+        // capability for the webview. Custom paths are approved again through a native
+        // file picker for each process lifetime.
+        options.rclone_path.clear();
         Self {
-            options: normalize_options(options).unwrap_or_default(),
+            options,
             child: None,
             data_dir,
             resource_dir,
             started_at: None,
             error: None,
+            approved_rclone: None,
         }
     }
 
@@ -98,14 +106,41 @@ impl NativeMountManager {
         if self.child.is_some() && self.options != options {
             return Err("请先卸载当前原生挂载，再修改挂载参数".to_string());
         }
-        self.options = normalize_options(options)?;
+        let options = normalize_options(options)?;
+        self.validate_rclone_selection(&options.rclone_path)?;
+        self.options = options;
+        Ok(())
+    }
+
+    pub fn approve_rclone_path(&mut self, path: &Path) -> Result<(), String> {
+        let canonical =
+            fs::canonicalize(path).map_err(|error| format!("无法读取所选 rclone：{error}"))?;
+        if !canonical.is_file() {
+            return Err("所选 rclone 路径不是普通文件".to_string());
+        }
+        let expected_name = if cfg!(windows) {
+            "rclone.exe"
+        } else {
+            "rclone"
+        };
+        if !canonical
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(expected_name))
+        {
+            return Err(format!("请选择名为 {expected_name} 的可执行文件"));
+        }
+        self.approved_rclone = Some((canonical.clone(), file_sha256(&canonical)?));
         Ok(())
     }
 
     pub fn info(&mut self) -> NativeMountInfo {
         self.refresh_process();
         let executable = self.resolve_rclone_path();
-        let version = probe_rclone(&executable).unwrap_or_default();
+        let version = self
+            .validate_resolved_executable(&executable)
+            .and_then(|()| probe_rclone(&executable))
+            .unwrap_or_default();
         let rclone_available = !version.is_empty();
         let (fuse_available, prerequisite) = fuse_prerequisite();
         NativeMountInfo {
@@ -142,6 +177,7 @@ impl NativeMountManager {
         }
         self.options = normalize_options(self.options.clone())?;
         let executable = self.resolve_rclone_path();
+        self.validate_resolved_executable(&executable)?;
         let version = probe_rclone(&executable).map_err(|error| {
             format!("未找到可用的 rclone：{error}。可在挂载设置中选择 rclone 可执行文件")
         })?;
@@ -149,12 +185,12 @@ impl NativeMountManager {
         if !fuse_available {
             return Err(prerequisite);
         }
-        fs::create_dir_all(self.data_dir.join("native-mount-cache"))
+        create_private_directory(&self.data_dir.join("native-mount-cache"))
             .map_err(|error| format!("创建原生挂载缓存目录失败：{error}"))?;
-        fs::create_dir_all(self.data_dir.join("logs"))
+        create_private_directory(&self.data_dir.join("logs"))
             .map_err(|error| format!("创建原生挂载日志目录失败：{error}"))?;
         let log_path = self.log_path();
-        fs::write(&log_path, b"").map_err(|error| format!("创建原生挂载日志失败：{error}"))?;
+        create_private_file(&log_path).map_err(|error| format!("创建原生挂载日志失败：{error}"))?;
         let obscured_password = obscure_password(&executable, password)?;
         prepare_target(&self.options.target)?;
 
@@ -205,7 +241,9 @@ impl NativeMountManager {
         }
         attempt_unmount(&self.options.target);
         if let Some(child) = self.child.as_mut() {
-            for _ in 0..20 {
+            // rclone may still be committing a closed file after the mount disappears.
+            // Give it a real graceful-shutdown window before the last-resort kill.
+            for _ in 0..300 {
                 match child.try_wait() {
                     Ok(Some(_)) => break,
                     Ok(None) => thread::sleep(Duration::from_millis(100)),
@@ -213,8 +251,11 @@ impl NativeMountManager {
                 }
             }
             if child.try_wait().ok().flatten().is_none() {
-                let _ = child.kill();
-                let _ = child.wait();
+                let message =
+                    "rclone 仍在回写缓存；为避免丢失未上传数据，程序没有强制结束进程，请稍后再次卸载"
+                        .to_string();
+                self.error = Some(message.clone());
+                return Err(message);
             }
         }
         self.child = None;
@@ -256,6 +297,32 @@ impl NativeMountManager {
             }
         }
         PathBuf::from(file_name)
+    }
+
+    fn validate_rclone_selection(&self, selected: &str) -> Result<(), String> {
+        if selected.trim().is_empty() {
+            return Ok(());
+        }
+        let canonical = fs::canonicalize(selected.trim())
+            .map_err(|error| format!("无法读取所选 rclone：{error}"))?;
+        let Some((approved, expected_digest)) = self.approved_rclone.as_ref() else {
+            return Err("请先通过文件选择按钮选择并批准 rclone 可执行文件".to_string());
+        };
+        if canonical != *approved || !constant_time_eq(&file_sha256(&canonical)?, expected_digest) {
+            return Err("所选 rclone 已变化，请重新选择后再保存".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_resolved_executable(&self, executable: &Path) -> Result<(), String> {
+        if self.options.rclone_path.trim().is_empty() {
+            return Ok(());
+        }
+        self.validate_rclone_selection(
+            executable
+                .to_str()
+                .ok_or_else(|| "rclone 路径不是有效文本".to_string())?,
+        )
     }
 
     fn refresh_process(&mut self) {
@@ -346,7 +413,7 @@ fn build_mount_arguments(
         "--vfs-cache-poll-interval".to_string(),
         "1m".to_string(),
         "--vfs-write-back".to_string(),
-        "5s".to_string(),
+        "2s".to_string(),
         "--dir-cache-time".to_string(),
         "5m".to_string(),
         "--poll-interval".to_string(),
@@ -477,8 +544,85 @@ fn prepare_target(target: &str) -> Result<(), String> {
         if !path.is_absolute() {
             return Err("挂载目录必须使用绝对路径；Windows 也可填写 X: 形式的盘符".to_string());
         }
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err("挂载目标必须是普通空目录，不能使用符号链接".to_string());
+                }
+                if fs::read_dir(path)
+                    .map_err(|error| format!("读取挂载目录失败：{error}"))?
+                    .next()
+                    .transpose()
+                    .map_err(|error| format!("读取挂载目录失败：{error}"))?
+                    .is_some()
+                {
+                    return Err(
+                        "挂载目录必须为空；为避免遮蔽现有文件，程序不会使用非空目录".to_string()
+                    );
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("检查挂载目录失败：{error}")),
+        }
         fs::create_dir_all(path).map_err(|error| format!("创建挂载目录失败：{error}"))
     }
+}
+
+fn file_sha256(path: &Path) -> Result<[u8; 32], String> {
+    use sha2::{Digest, Sha256};
+    let mut file = fs::File::open(path).map_err(|error| format!("读取 rclone 失败：{error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("读取 rclone 失败：{error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (left ^ right)
+            })
+            == 0
+}
+
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn create_private_file(path: &Path) -> std::io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 fn restore_windows_directory_target(_target: &str) {
@@ -584,10 +728,10 @@ fn read_log_tail(path: &Path) -> String {
     tail.join(" | ")
 }
 
-fn hide_command_window(command: &mut Command) {
+fn hide_command_window(_command: &mut Command) {
     #[cfg(windows)]
     {
-        command.creation_flags(CREATE_NO_WINDOW);
+        _command.creation_flags(CREATE_NO_WINDOW);
     }
 }
 
@@ -696,6 +840,36 @@ mod tests {
         assert!(arguments
             .windows(2)
             .any(|pair| pair == ["--vfs-read-chunk-size", "4M"]));
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["--vfs-write-back", "2s"]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_mount_target_rejects_symlinks_and_non_empty_directories() {
+        use std::os::unix::fs::symlink;
+
+        let root = env::temp_dir().join(format!(
+            "guangya-native-mount-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let target = root.join("mount");
+        fs::create_dir_all(&target).unwrap();
+        assert!(prepare_target(target.to_str().unwrap()).is_ok());
+
+        fs::write(target.join("keep.txt"), b"keep").unwrap();
+        assert!(prepare_target(target.to_str().unwrap()).is_err());
+        fs::remove_file(target.join("keep.txt")).unwrap();
+
+        let link = root.join("link");
+        symlink(&target, &link).unwrap();
+        assert!(prepare_target(link.to_str().unwrap()).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]

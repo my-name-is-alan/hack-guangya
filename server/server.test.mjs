@@ -447,6 +447,7 @@ test('Web 扫码登录保存刷新令牌并在重启后自动续期', async () =
         refreshCount += 1;
         response.end(JSON.stringify({ access_token: `refreshed-access-token-${refreshCount}`, refresh_token: `refresh-token-${refreshCount + 1}` }));
       }
+      else if (body.device_code === 'device-without-refresh') response.end(JSON.stringify({ access_token: 'replacement-device-access-token' }));
       else response.end(JSON.stringify({ access_token: 'device-access-token', refresh_token: 'refresh-token-1' }));
       return;
     }
@@ -520,6 +521,19 @@ test('Web 扫码登录保存刷新令牌并在重启后自动续期', async () =
     const filesResponse = await fetch(`http://127.0.0.1:${secondPort}/api/files`);
     assert.equal(filesResponse.status, 200, await filesResponse.text());
     assert.equal(refreshCount, 2);
+
+    const replacementLogin = await fetch(`http://127.0.0.1:${secondPort}/api/auth/device/poll`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ device_code: 'device-without-refresh' }),
+    });
+    assert.equal(replacementLogin.status, 200, await replacementLogin.clone().text());
+    assert.deepEqual(await replacementLogin.json(), { authenticated: true });
+    const persistedDatabase = new DatabaseSync(path.join(dataDir, 'state.sqlite3'), { readOnly: true });
+    const replacementSession = persistedDatabase.prepare('SELECT access_token, refresh_token FROM auth_session WHERE id = 1').get();
+    persistedDatabase.close();
+    assert.equal(replacementSession.access_token, 'replacement-device-access-token');
+    assert.equal(replacementSession.refresh_token, null, '切换登录且未返回 refresh token 时必须清除旧值');
   } finally {
     if (child) await stopServer(child);
     await Promise.all([

@@ -9,9 +9,13 @@ import { pipeline } from 'node:stream/promises';
 import chokidar from 'chokidar';
 import OSS from 'ali-oss';
 import { autoShareTargetFor, shareFilePayload, signHdhiveRequest } from './auto-share.mjs';
-import { createAccessControl } from './access-control.mjs';
+import { createAccessControl, requestProtocol } from './access-control.mjs';
 import { createDirectoryCache } from './directory-cache.mjs';
-import { createNativeMountManager, normalizeNativeMountOptions } from './native-mount.mjs';
+import {
+  createNativeMountManager,
+  NATIVE_MOUNT_STOP_TIMEOUT_MS,
+  normalizeNativeMountOptions,
+} from './native-mount.mjs';
 import { uploadPartSize } from './upload-parts.mjs';
 import { createWebDavHandler, normalizeWebDavEntry, WebDavError } from './webdav.mjs';
 import { parseGuangyaShareLink } from '../ui/shareLink.js';
@@ -25,6 +29,18 @@ const requestedListenHost = String(process.env.LISTEN_HOST || process.env.HOST |
 const loopbackHosts = new Set(['127.0.0.1', '::1', 'localhost']);
 if (!adminPassword && !loopbackHosts.has(requestedListenHost.toLowerCase())) throw new Error('未配置 GUANGYA_ADMIN_PASSWORD 时只允许监听回环地址');
 const listenHost = requestedListenHost;
+function envBoolean(name, fallback = false) {
+  const value = String(process.env[name] ?? '').trim().toLowerCase();
+  if (!value) return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(value);
+}
+// Only enable this when direct client access is blocked and the reverse proxy
+// overwrites Forwarded/X-Forwarded-* headers. They are attacker-controlled otherwise.
+const trustedProxy = envBoolean('GUANGYA_TRUST_PROXY');
+if (process.platform !== 'win32') {
+  const currentUmask = process.umask();
+  process.umask(currentUmask | 0o077);
+}
 const defaultWebDavPort = process.env.NODE_TEST_CONTEXT ? 0 : 19090;
 const webdavPort = Number(process.env.GUANGYA_WEBDAV_PORT ?? defaultWebDavPort);
 if (!Number.isInteger(webdavPort) || webdavPort < 0 || webdavPort > 65535) throw new Error('GUANGYA_WEBDAV_PORT 必须是 0 到 65535 的整数');
@@ -59,6 +75,13 @@ const fileRoots = (process.env.GUANGYA_FILE_ROOTS || watchRoot).split(',').map((
 const configFile = path.join(dataDir, 'config.json');
 const databaseFile = path.join(dataDir, 'state.sqlite3');
 const manualUploadRoot = path.join(dataDir, 'manual-uploads');
+function chmodPrivateSync(target, mode) {
+  if (process.platform !== 'win32' && fs.existsSync(target)) fs.chmodSync(target, mode);
+}
+chmodPrivateSync(dataDir, 0o700);
+chmodPrivateSync(configFile, 0o600);
+if (!fs.existsSync(databaseFile)) fs.closeSync(fs.openSync(databaseFile, 'a', 0o600));
+chmodPrivateSync(databaseFile, 0o600);
 const apiBase = process.env.GUANGYA_API_BASE || 'https://api.guangyapan.com';
 const accountBase = process.env.GUANGYA_ACCOUNT_BASE || 'https://account.guangyapan.com';
 const oauthClientId = 'aMe-8VSlkrbQXpUR';
@@ -77,7 +100,10 @@ const cloudConfirmPollMs = envInteger('GUANGYA_CLOUD_CONFIRM_POLL_MS', 1_000, 10
 const autoShareQuietMs = envInteger('GUANGYA_AUTO_SHARE_QUIET_MS', 30_000, 1_000, 600_000);
 const tokenRefreshIntervalMs = envInteger('GUANGYA_TOKEN_REFRESH_MS', 20 * 60_000, 60_000, 60 * 60_000);
 const maxJsonBodyBytes = envInteger('GUANGYA_MAX_JSON_BODY_BYTES', 64 * 1024, 4 * 1024, 1024 * 1024);
-const requestTimeoutMs = envInteger('GUANGYA_REQUEST_TIMEOUT_MS', 30_000, 5_000, 120_000);
+// This is an inactivity limit while receiving a body, not a total upload duration.
+// Slow uploads may run for hours as long as bytes continue to arrive.
+const requestBodyIdleTimeoutMs = envInteger('GUANGYA_REQUEST_TIMEOUT_MS', 30_000, 100, 24 * 60 * 60_000);
+const headersTimeoutMs = envInteger('GUANGYA_HEADERS_TIMEOUT_MS', 15_000, 1_000, 120_000);
 const hdhiveAllowedHosts = new Set(String(process.env.HDHIVE_ALLOWED_HOSTS || '')
   .split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
 function normalizeHdhiveBaseUrl(value) {
@@ -199,6 +225,9 @@ database.exec(`
     PRIMARY KEY (mapping_id, target_key, relative_path)
   );
 `);
+for (const privateDatabaseFile of [databaseFile, `${databaseFile}-wal`, `${databaseFile}-shm`]) {
+  chmodPrivateSync(privateDatabaseFile, 0o600);
+}
 if (!database.prepare("PRAGMA table_info(auth_session)").all().some((column) => column.name === 'refresh_token')) database.exec('ALTER TABLE auth_session ADD COLUMN refresh_token TEXT');
 if (!database.prepare("PRAGMA table_info(auto_share_events)").all().some((column) => column.name === 'notification_status')) database.exec('ALTER TABLE auto_share_events ADD COLUMN notification_status TEXT');
 if (!database.prepare("PRAGMA table_info(uploaded_files)").all().some((column) => column.name === 'status')) {
@@ -219,6 +248,7 @@ const accessControl = createAccessControl({
   database,
   initialCode: adminPassword,
   username: adminUsername,
+  trustedProxy,
 });
 function appStateValue(key) {
   return database.prepare('SELECT value FROM app_state WHERE key = ?').get(key)?.value;
@@ -239,7 +269,7 @@ function normalizeWebDavPassword(value) {
   if (normalized.length < 12 || normalized.length > 256) throw new Error('WebDAV 密码必须为 12 到 256 个字符');
   return normalized;
 }
-let webdavUsername = normalizeWebDavUsername(
+const initialWebDavUsername = normalizeWebDavUsername(
   appStateValue('webdav_username') || process.env.GUANGYA_WEBDAV_USERNAME || 'guangya',
 );
 const initialWebDavPassword = String(process.env.GUANGYA_WEBDAV_PASSWORD || '');
@@ -247,11 +277,13 @@ if (initialWebDavPassword) normalizeWebDavPassword(initialWebDavPassword);
 const webdavAccessControl = createAccessControl({
   database,
   initialCode: initialWebDavPassword,
-  username: webdavUsername,
+  username: initialWebDavUsername,
   tableName: 'webdav_access_control',
   realm: 'Guangya WebDAV',
+  persistUsername: true,
+  trustedProxy,
 });
-saveAppStateValue('webdav_username', webdavUsername);
+let webdavUsername = webdavAccessControl.username();
 let storedNativeMountOptions = {};
 try {
   storedNativeMountOptions = JSON.parse(appStateValue('native_mount_options') || '{}');
@@ -265,6 +297,9 @@ const nativeMountManager = createNativeMountManager({
   initialOptions: storedNativeMountOptions,
   enabled: nativeMountEnabled,
 });
+// Rewrite legacy options through the allowlist so older rows cannot retain a
+// password or an arbitrary executable path from a previous version.
+saveAppStateValue('native_mount_options', JSON.stringify(nativeMountManager.options()));
 function storedConcurrency(key, fallback) {
   const value = Number(appStateValue(key));
   return Number.isInteger(value) && value >= 1 && value <= 8 ? value : fallback;
@@ -308,8 +343,10 @@ const pendingAutoShares = new Map();
 let mappings = [];
 let savedShares = [];
 const storedAuth = database.prepare('SELECT access_token, refresh_token FROM auth_session WHERE id = 1').get();
-let token = process.env.GUANGYA_TOKEN || storedAuth?.access_token || null;
-let refreshToken = storedAuth?.refresh_token || null;
+const configuredToken = String(process.env.GUANGYA_TOKEN || '').trim() || null;
+let token = configuredToken || storedAuth?.access_token || null;
+let refreshToken = configuredToken ? null : (storedAuth?.refresh_token || null);
+if (configuredToken) replaceAuthSession(configuredToken, null);
 let refreshPromise = null;
 const smsChallenges = new Map();
 let paused = false;
@@ -516,8 +553,7 @@ function hasSameOrigin(request) {
   if (!origin) return true;
   try {
     const originUrl = new URL(origin);
-    const forwardedProtocol = String(request.headers['x-forwarded-proto'] || '').split(',')[0].trim();
-    const protocol = forwardedProtocol || (request.socket.encrypted ? 'https' : 'http');
+    const protocol = requestProtocol(request, trustedProxy);
     return originUrl.origin === new URL(`${protocol}://${request.headers.host}`).origin;
   } catch { return false; }
 }
@@ -532,6 +568,16 @@ function httpError(statusCode, message, headers = {}) {
   error.headers = headers;
   return error;
 }
+function armRequestBodyIdleTimeout(request, message) {
+  const socket = request.socket;
+  const onTimeout = () => request.destroy(new Error(message));
+  socket.setTimeout(requestBodyIdleTimeoutMs);
+  socket.once('timeout', onTimeout);
+  return () => {
+    socket.removeListener('timeout', onTimeout);
+    socket.setTimeout(0);
+  };
+}
 async function readBody(request, { maxBytes = maxJsonBodyBytes } = {}) {
   const contentLength = String(request.headers['content-length'] || '').trim();
   if (/^\d+$/.test(contentLength) && Number(contentLength) > maxBytes) {
@@ -539,19 +585,27 @@ async function readBody(request, { maxBytes = maxJsonBodyBytes } = {}) {
   }
   const chunks = [];
   let size = 0;
-  for await (const chunk of request) {
-    size += chunk.length;
-    if (size > maxBytes) throw httpError(413, `请求体不能超过 ${maxBytes} 字节`, { connection: 'close' });
-    chunks.push(chunk);
+  const clearIdleTimeout = armRequestBodyIdleTimeout(request, '请求体接收超时');
+  try {
+    for await (const chunk of request) {
+      size += chunk.length;
+      if (size > maxBytes) throw httpError(413, `请求体不能超过 ${maxBytes} 字节`, { connection: 'close' });
+      chunks.push(chunk);
+    }
+  } finally {
+    clearIdleTimeout();
   }
   if (!chunks.length) return {};
   try { return JSON.parse(Buffer.concat(chunks, size).toString('utf8')); }
   catch { throw httpError(400, '请求体必须是有效的 JSON'); }
 }
-async function saveConfig() { await fsp.mkdir(dataDir, { recursive: true }); await fsp.writeFile(configFile, JSON.stringify({ mappings, saved_shares: savedShares }, null, 2)); }
-function saveAuthSession(accessToken, nextRefreshToken = null) { database.prepare('INSERT INTO auth_session (id, access_token, refresh_token, updated_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET access_token = excluded.access_token, refresh_token = COALESCE(excluded.refresh_token, auth_session.refresh_token), updated_at = excluded.updated_at').run(accessToken || null, nextRefreshToken || null, Math.floor(Date.now() / 1000)); }
+async function saveConfig() {
+  await fsp.mkdir(dataDir, { recursive: true, mode: 0o700 });
+  await fsp.writeFile(configFile, JSON.stringify({ mappings, saved_shares: savedShares }, null, 2), { mode: 0o600 });
+  if (process.platform !== 'win32') await fsp.chmod(configFile, 0o600);
+}
+function saveRefreshedAuthSession(accessToken, nextRefreshToken = null) { database.prepare('INSERT INTO auth_session (id, access_token, refresh_token, updated_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET access_token = excluded.access_token, refresh_token = COALESCE(excluded.refresh_token, auth_session.refresh_token), updated_at = excluded.updated_at').run(accessToken || null, nextRefreshToken || null, Math.floor(Date.now() / 1000)); }
 function replaceAuthSession(accessToken, nextRefreshToken = null) { database.prepare('INSERT INTO auth_session (id, access_token, refresh_token, updated_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET access_token = excluded.access_token, refresh_token = excluded.refresh_token, updated_at = excluded.updated_at').run(accessToken || null, nextRefreshToken || null, Math.floor(Date.now() / 1000)); }
-function saveAuthToken(value) { saveAuthSession(value, null); }
 function invalidateAuthSession() {
   token = null;
   refreshToken = null;
@@ -1494,10 +1548,10 @@ async function pollDeviceLogin(deviceCode) {
   const nextRefreshToken = authValue(payload, 'refresh_token');
   if (accessToken) {
     token = String(accessToken);
-    if (nextRefreshToken) refreshToken = String(nextRefreshToken);
+    refreshToken = nextRefreshToken ? String(nextRefreshToken) : null;
     remoteCache.clear();
     remoteCache.set('', '');
-    saveAuthSession(token, refreshToken);
+    replaceAuthSession(token, refreshToken);
     status('success', '扫码登录成功，可以开始使用云盘和备份任务');
     publishState();
     pump();
@@ -1527,7 +1581,7 @@ async function refreshSavedSession() {
     if (!accessToken) throw new Error('刷新登录状态时没有返回 access_token');
     token = String(accessToken);
     if (nextRefreshToken) refreshToken = String(nextRefreshToken);
-    saveAuthSession(token, refreshToken);
+    saveRefreshedAuthSession(token, refreshToken);
     publishState();
     pump();
     schedulePendingUploadRecovery(0);
@@ -1975,6 +2029,10 @@ function rebuildPendingItem(row) {
   return { mapping_id: mapping.id, file_path: row.file_path, relative_path: relative, change_kind: 'added', remote_parent_id: mapping.remote_parent_id || '', remote_dir: [mapping.remote_parent_id ? '' : mapping.remote_path, relativeDir].filter(Boolean).join('/'), size: Number(row.size), mtime: Number(row.modified_ms) };
 }
 async function finalizeConfirmedUpload(key, item, taskData, recovered = false) {
+  // A WebDAV overwrite is committed only after the new cloud object is fully
+  // visible. Keep the pending record until the rename/replace transaction has
+  // succeeded so a restart can safely retry instead of orphaning the upload.
+  if (item.webdav_commit) await commitWebDavUpload(item, taskData.remoteFileId);
   if (!confirmPendingUploadRecord(key, taskData.taskId, taskData.remoteFileId)) return false;
   clearAutoShareFailure(item);
   try { await scheduleAutoShare(item, taskData); }
@@ -2274,7 +2332,7 @@ async function startWatcher(mapping) {
   }
 }
 async function restartWatchers() { for (const watcher of watchers.values()) await watcher.close(); watchers.clear(); for (const mapping of mappings) { if (!mapping.enabled) continue; try { await startWatcher(mapping); } catch (error) { mapping.enabled = false; mapping.watch_error = error.message; console.error(`备份任务监控启动失败：${mapping.local_path}：${error.message}`); } } await saveConfig(); }
-async function routeApi(request, response, url) { if (request.method === 'GET' && url.pathname === '/api/state') return json(response, 200, state()); if (request.method === 'GET' && url.pathname === '/api/events') { response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' }); response.write(`data: ${JSON.stringify({ type: 'state', state: state() })}\n\n`); clients.add(response); request.on('close', () => clients.delete(response)); return; } if (request.method === 'POST' && url.pathname === '/api/auth') { const body = await readBody(request); token = String(body.token || '').trim().replace(/^Bearer\s+/i, '') || null; saveAuthToken(token); publishState(); pump(); return json(response, 200, state()); } if (request.method === 'POST' && url.pathname === '/api/mappings') { const body = await readBody(request); const mapping = { id: crypto.randomUUID(), local_path: allowedPath(body.local_path), remote_path: normalizeRemote(body.remote_path), enabled: true }; const stat = await fsp.stat(mapping.local_path); if (!stat.isDirectory()) throw new Error('监控路径不是目录'); mappings.push(mapping); await saveConfig(); await startWatcher(mapping); publishState(); return json(response, 200, mapping); } if (request.method === 'DELETE' && url.pathname.startsWith('/api/mappings/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); await watchers.get(id)?.close(); watchers.delete(id); mappings = mappings.filter((item) => item.id !== id); deleteMappingTransientUploads(id); await saveConfig(); publishState(); return json(response, 200, {}); } if (request.method === 'PATCH' && url.pathname.startsWith('/api/mappings/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); const body = await readBody(request); const mapping = mappings.find((item) => item.id === id); if (!mapping) return json(response, 404, { error: '监控目录不存在' }); mapping.enabled = Boolean(body.enabled); await saveConfig(); await startWatcher(mapping); publishState(); return json(response, 200, mapping); } if (request.method === 'POST' && url.pathname === '/api/queue/pause') { paused = true; publishState(); return json(response, 200, state()); } if (request.method === 'POST' && url.pathname === '/api/queue/resume') { paused = false; pump(); return json(response, 200, state()); } json(response, 404, { error: 'not found' }); }
+async function routeApi(request, response, url) { if (request.method === 'GET' && url.pathname === '/api/state') return json(response, 200, state()); if (request.method === 'GET' && url.pathname === '/api/events') { response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' }); response.write(`data: ${JSON.stringify({ type: 'state', state: state() })}\n\n`); clients.add(response); request.on('close', () => clients.delete(response)); return; } if (request.method === 'POST' && url.pathname === '/api/auth') { const body = await readBody(request); token = String(body.token || '').trim().replace(/^Bearer\s+/i, '') || null; refreshToken = null; replaceAuthSession(token, null); publishState(); pump(); return json(response, 200, state()); } if (request.method === 'POST' && url.pathname === '/api/mappings') { const body = await readBody(request); const mapping = { id: crypto.randomUUID(), local_path: allowedPath(body.local_path), remote_path: normalizeRemote(body.remote_path), enabled: true }; const stat = await fsp.stat(mapping.local_path); if (!stat.isDirectory()) throw new Error('监控路径不是目录'); mappings.push(mapping); await saveConfig(); await startWatcher(mapping); publishState(); return json(response, 200, mapping); } if (request.method === 'DELETE' && url.pathname.startsWith('/api/mappings/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); await watchers.get(id)?.close(); watchers.delete(id); mappings = mappings.filter((item) => item.id !== id); deleteMappingTransientUploads(id); await saveConfig(); publishState(); return json(response, 200, {}); } if (request.method === 'PATCH' && url.pathname.startsWith('/api/mappings/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); const body = await readBody(request); const mapping = mappings.find((item) => item.id === id); if (!mapping) return json(response, 404, { error: '监控目录不存在' }); mapping.enabled = Boolean(body.enabled); await saveConfig(); await startWatcher(mapping); publishState(); return json(response, 200, mapping); } if (request.method === 'POST' && url.pathname === '/api/queue/pause') { paused = true; publishState(); return json(response, 200, state()); } if (request.method === 'POST' && url.pathname === '/api/queue/resume') { paused = false; pump(); return json(response, 200, state()); } json(response, 404, { error: 'not found' }); }
 async function apiOverview() { const assets = await apiPost('/assets/v1/get_assets', {}); let profile = {}; try { profile = await accountGet('/v1/user/me'); } catch { try { profile = (await apiPost('/activity/v1/get_user_data', {})).data || {}; } catch {} } return { assets: assets.data || {}, profile: profile?.data || profile || {} }; }
 function cloudFileExtension(record) {
   const supplied = String(record?.ext || '').trim().replace(/^\./, '').toLowerCase();
@@ -2397,69 +2455,201 @@ async function deleteWebDavEntry({ entry }) {
   webDavDirectoryCache.invalidate(entry.parentId);
   if (entry.isDirectory) webDavDirectoryCache.invalidateSubtree(entry.id);
 }
-async function moveWebDavEntry({ entry, parentId, name }) {
-  if (String(entry.parentId || '') !== String(parentId || '')) {
-    const result = await apiPost('/userres/v1/file/move_file', {
-      fileIds: [entry.id],
-      parentId: String(parentId || ''),
-    });
-    await waitOperation(result.data?.taskId);
-    webDavDirectoryCache.invalidate(entry.parentId);
-    webDavDirectoryCache.invalidate(parentId);
+function webDavTemporaryName(label) {
+  return `.__gy_dav_${label}_${crypto.randomUUID().replaceAll('-', '')}`;
+}
+async function forceWebDavChildren(parentId) {
+  webDavDirectoryCache.invalidate(parentId);
+  return (await listWebDavChildren(parentId, { force: true })).map(normalizeWebDavEntry);
+}
+async function renameWebDavEntry(entry, name) {
+  await renameRemote(entry.id, name);
+  webDavDirectoryCache.invalidate(entry.parentId);
+  entry.name = name;
+}
+async function restoreWebDavName(entry, name) {
+  if (!entry || entry.name === name) return;
+  try { await renameWebDavEntry(entry, name); }
+  catch (error) { status('error', `WebDAV 回滚名称失败：${entry.name} -> ${name}：${error.message}`); }
+}
+async function moveWebDavEntry({ entry, parentId, name, existing }) {
+  const originalParentId = String(entry.parentId || '');
+  const originalName = entry.name;
+  const destinationParentId = String(parentId || '');
+  let backup = null;
+  let moved = false;
+  if (existing) {
+    backup = { ...existing };
+    await renameWebDavEntry(backup, webDavTemporaryName('replaced'));
   }
-  if (entry.name !== name) {
-    await renameRemote(entry.id, name);
-    webDavDirectoryCache.invalidate(parentId);
+  try {
+    if (originalParentId !== destinationParentId) {
+      await renameWebDavEntry(entry, webDavTemporaryName('source'));
+      const result = await apiPost('/userres/v1/file/move_file', {
+        fileIds: [entry.id],
+        parentId: destinationParentId,
+      });
+      await waitOperation(result.data?.taskId);
+      moved = true;
+      webDavDirectoryCache.invalidate(originalParentId);
+      webDavDirectoryCache.invalidate(destinationParentId);
+      entry.parentId = destinationParentId;
+    }
+    if (entry.name !== name) await renameWebDavEntry(entry, name);
+  } catch (error) {
+    if (moved) {
+      try {
+        const rollback = await apiPost('/userres/v1/file/move_file', { fileIds: [entry.id], parentId: originalParentId });
+        await waitOperation(rollback.data?.taskId);
+        webDavDirectoryCache.invalidate(originalParentId);
+        webDavDirectoryCache.invalidate(destinationParentId);
+        entry.parentId = originalParentId;
+      } catch (rollbackError) {
+        status('error', `WebDAV 移动回滚失败：${rollbackError.message}`);
+      }
+    }
+    await restoreWebDavName(entry, originalName);
+    await restoreWebDavName(backup, existing?.name);
+    throw error;
+  }
+  if (backup) {
+    try { await deleteWebDavEntry({ entry: backup }); }
+    catch (error) { status('warning', `WebDAV 目标已替换，但旧版本暂存副本清理失败：${error.message}`); }
   }
 }
-async function copyWebDavEntry({ entry, parentId, name }) {
-  const before = (await listWebDavChildren(parentId)).map(normalizeWebDavEntry);
-  if (entry.name !== name && before.some((item) => item.name === entry.name)) {
-    throw new WebDavError(409, `目标目录中已有 ${entry.name}，无法安全完成改名复制`);
+async function copyWebDavEntry({ entry, parentId, name, existing }) {
+  const destinationParentId = String(parentId || '');
+  const originalName = entry.name;
+  const sourceTemporaryName = webDavTemporaryName('source');
+  let backup = null;
+  let copied = null;
+  if (existing) {
+    backup = { ...existing };
+    await renameWebDavEntry(backup, webDavTemporaryName('replaced'));
   }
-  const beforeIds = new Set(before.map((item) => item.id));
-  const result = await apiPost('/userres/v1/file/copy_file', {
-    fileIds: [entry.id],
-    parentId: String(parentId || ''),
-  });
-  await waitOperation(result.data?.taskId);
-  webDavDirectoryCache.invalidate(parentId);
-  if (entry.name === name) return;
-  const after = (await listWebDavChildren(parentId)).map(normalizeWebDavEntry);
-  const copied = after.find((item) => item.name === entry.name && !beforeIds.has(item.id));
-  if (!copied?.id) throw new WebDavError(409, '云端复制已完成，但无法定位副本进行重命名');
-  await renameRemote(copied.id, name);
+  try {
+    // The cloud copy API has no destination-name parameter. Temporarily using
+    // a collision-free source name makes same-directory "copy as" reliable.
+    await renameWebDavEntry(entry, sourceTemporaryName);
+    const beforeIds = new Set((await forceWebDavChildren(destinationParentId)).map((item) => item.id));
+    const result = await apiPost('/userres/v1/file/copy_file', {
+      fileIds: [entry.id],
+      parentId: destinationParentId,
+    });
+    await waitOperation(result.data?.taskId);
+    const after = await forceWebDavChildren(destinationParentId);
+    copied = after.find((item) => item.name === sourceTemporaryName && !beforeIds.has(item.id)) || null;
+    if (!copied?.id) throw new WebDavError(409, '云端复制已完成，但无法定位新副本');
+    copied.parentId = destinationParentId;
+    await restoreWebDavName(entry, originalName);
+    if (entry.name !== originalName) throw new WebDavError(503, '源文件名称回滚失败，已保留源文件和副本');
+    await renameWebDavEntry(copied, name);
+  } catch (error) {
+    await restoreWebDavName(entry, originalName);
+    if (copied) {
+      try { await deleteWebDavEntry({ entry: copied }); } catch {}
+    }
+    await restoreWebDavName(backup, existing?.name);
+    throw error;
+  }
+  if (backup) {
+    try { await deleteWebDavEntry({ entry: backup }); }
+    catch (error) { status('warning', `WebDAV 副本已创建，但旧版本暂存副本清理失败：${error.message}`); }
+  }
+}
+async function commitWebDavUpload(item, remoteFileId) {
+  const commit = item.webdav_commit;
+  if (!commit) return;
+  const parentId = String(commit.parent_id || '');
+  const targetName = String(commit.name || '');
+  const expectedExistingId = String(commit.existing_id || '');
+  const children = await forceWebDavChildren(parentId);
+  const uploaded = children.find((entry) => entry.id === String(remoteFileId || ''));
+  if (!uploaded) throw new WebDavError(503, '文件已入库，但目录列表尚未可见，将继续自动确认');
+  uploaded.parentId = parentId;
+  const target = children.find((entry) => entry.name === targetName);
+  if (target?.id === uploaded.id) return;
+  if (target && expectedExistingId && target.id !== expectedExistingId) {
+    throw new WebDavError(409, '上传期间目标文件已被其他客户端替换，已保留新上传的暂存副本');
+  }
+  if (target && !expectedExistingId) {
+    throw new WebDavError(412, '上传期间目标文件已由其他客户端创建，已保留新上传的暂存副本');
+  }
+  let backup = null;
+  if (target) {
+    backup = { ...target, parentId };
+    await renameWebDavEntry(backup, webDavTemporaryName('replaced'));
+  }
+  try {
+    await renameWebDavEntry(uploaded, targetName);
+  } catch (error) {
+    await restoreWebDavName(backup, targetName);
+    throw error;
+  }
+  if (backup) {
+    try { await deleteWebDavEntry({ entry: backup }); }
+    catch (error) { status('warning', `WebDAV 文件已替换，但旧版本暂存副本清理失败：${error.message}`); }
+  }
   webDavDirectoryCache.invalidate(parentId);
 }
 async function putWebDavFile({ request, parentId, name, existing }) {
-  const temporaryRoot = path.join(manualUploadRoot, 'webdav', crypto.randomUUID());
-  const temporaryName = existing ? `.__gy_dav_${crypto.randomUUID().replaceAll('-', '')}` : name;
+  const targetDigest = crypto.createHash('sha256').update(`${String(parentId || '')}\0${name}`).digest('hex');
+  const mappingId = '__webdav__';
+  const historyPath = path.join(dataDir, 'webdav-history', targetDigest);
+  const pendingKey = queueKey(mappingId, historyPath);
+  if (pendingUploads.has(pendingKey)) {
+    request.resume();
+    throw new WebDavError(503, '该 WebDAV 文件的上一次上传仍在等待云端入库', { 'retry-after': '5' });
+  }
+  const temporaryRoot = path.join(manualUploadRoot, `webdav-${crypto.randomUUID()}`);
+  const temporaryName = webDavTemporaryName('upload');
   const temporaryFile = path.join(temporaryRoot, temporaryName);
-  await fsp.mkdir(temporaryRoot, { recursive: true });
+  let preserveTemporary = false;
+  await fsp.mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
   try {
-    await pipeline(request, fs.createWriteStream(temporaryFile));
+    const clearIdleTimeout = armRequestBodyIdleTimeout(request, 'WebDAV 上传长时间没有接收到数据');
+    try {
+      await pipeline(request, fs.createWriteStream(temporaryFile, { mode: 0o600 }));
+    } finally {
+      clearIdleTimeout();
+    }
     const stat = await fsp.stat(temporaryFile);
     const item = {
-      mapping_id: '',
+      mapping_id: mappingId,
       file_path: temporaryFile,
+      history_path: historyPath,
       event_path: `[WebDAV]/${name}`,
+      cleanup_path: temporaryRoot,
       remote_parent_id: String(parentId || ''),
       remote_dir: '',
-      relative_path: name,
+      relative_path: temporaryName,
       change_kind: existing ? 'changed' : 'added',
       size: stat.size,
       mtime: stat.mtimeMs,
+      webdav_commit: {
+        parent_id: String(parentId || ''),
+        name,
+        existing_id: String(existing?.id || ''),
+      },
     };
     const uploaded = await upload(item);
     if (!uploaded.remoteFileId) {
-      throw new WebDavError(503, uploaded.pendingError || '文件已上传，但云端暂未确认入库');
+      preserveTemporary = true;
+      schedulePendingUploadRecovery();
+      throw new WebDavError(503, uploaded.pendingError || '文件已上传，但云端暂未确认入库', { 'retry-after': '5' });
     }
-    if (existing) await deleteWebDavEntry({ entry: existing });
-    if (temporaryName !== name) await renameRemote(String(uploaded.remoteFileId), name);
+    try {
+      await commitWebDavUpload(item, uploaded.remoteFileId);
+    } catch (error) {
+      preserveTemporary = true;
+      schedulePendingUploadRecovery();
+      throw error;
+    }
+    confirmPendingUploadRecord(pendingKey, uploaded.taskId, uploaded.remoteFileId);
     webDavDirectoryCache.invalidate(parentId);
     return { id: String(uploaded.remoteFileId) };
   } finally {
-    await fsp.rm(temporaryRoot, { recursive: true, force: true });
+    if (!preserveTemporary) await fsp.rm(temporaryRoot, { recursive: true, force: true });
   }
 }
 async function readWebDavFile({ request, response, entry, headOnly }) {
@@ -2468,11 +2658,20 @@ async function readWebDavFile({ request, response, entry, headOnly }) {
   for (const name of ['range', 'if-match', 'if-none-match', 'if-modified-since', 'if-unmodified-since']) {
     if (request.headers[name]) headers[name] = request.headers[name];
   }
-  const upstream = await fetch(download.download_url, {
-    method: 'GET',
-    headers,
-    signal: AbortSignal.timeout(ossTimeoutMs),
-  });
+  const controller = new AbortController();
+  const headerTimer = setTimeout(() => controller.abort(new Error('云端文件连接超时')), ossTimeoutMs);
+  let upstream;
+  try {
+    upstream = await fetch(download.download_url, {
+      method: 'GET',
+      headers,
+      signal: controller.signal,
+    });
+  } finally {
+    // The timeout above protects connection/headers only. Keeping a total
+    // AbortSignal on the body would truncate legitimate multi-hour downloads.
+    clearTimeout(headerTimer);
+  }
   if (!upstream.ok && upstream.status !== 206 && upstream.status !== 304) {
     throw new WebDavError(upstream.status === 404 ? 404 : 502, `云端文件读取失败（HTTP ${upstream.status}）`);
   }
@@ -2492,7 +2691,15 @@ async function readWebDavFile({ request, response, entry, headOnly }) {
     response.end();
     return;
   }
-  await pipeline(upstream.body, response);
+  const onIdle = () => response.destroy(new Error('WebDAV 下载连接长时间没有传输数据'));
+  request.socket.setTimeout(requestBodyIdleTimeoutMs);
+  request.socket.once('timeout', onIdle);
+  try {
+    await pipeline(upstream.body, response);
+  } finally {
+    request.socket.removeListener('timeout', onIdle);
+    request.socket.setTimeout(0);
+  }
 }
 const handleWebDav = createWebDavHandler({
   prefix: '/dav',
@@ -2516,7 +2723,12 @@ async function handleWebUpload(request, response, url) {
   let queued = false;
   await fsp.mkdir(temporaryRoot, { recursive: true });
   try {
-    await pipeline(request, fs.createWriteStream(temporaryFile));
+    const clearIdleTimeout = armRequestBodyIdleTimeout(request, '上传请求长时间没有接收到数据');
+    try {
+      await pipeline(request, fs.createWriteStream(temporaryFile, { mode: 0o600 }));
+    } finally {
+      clearIdleTimeout();
+    }
     const stat = await fsp.stat(temporaryFile);
     const parentId = url.searchParams.get('parentId') || '';
     const modified = Number(url.searchParams.get('lastModified')) || stat.mtimeMs;
@@ -2568,8 +2780,7 @@ async function routeApiV2(request, response, url) {
     const nextUsername = normalizeWebDavUsername(body.username);
     const nextPassword = normalizeWebDavPassword(body.password);
     webdavAccessControl.updateCredentials(request, nextUsername, nextPassword);
-    webdavUsername = nextUsername;
-    saveAppStateValue('webdav_username', webdavUsername);
+    webdavUsername = webdavAccessControl.username();
     return json(response, 200, {
       enabled: true,
       running: true,
@@ -2710,7 +2921,15 @@ async function routeApiV2(request, response, url) {
 }
 async function serveStatic(response, url) { const requested = url.pathname === '/' ? '/index.html' : url.pathname; const file = path.resolve(uiRoot, `.${requested}`); if (!file.startsWith(uiRoot + path.sep)) return json(response, 403, { error: 'forbidden' }); try { const content = await fsp.readFile(file); const type = file.endsWith('.html') ? 'text/html; charset=utf-8' : file.endsWith('.js') ? 'text/javascript; charset=utf-8' : file.endsWith('.css') ? 'text/css; charset=utf-8' : file.endsWith('.svg') ? 'image/svg+xml' : 'application/octet-stream'; response.writeHead(200, { 'content-type': type }); response.end(content); } catch { json(response, 404, { error: 'not found' }); } }
 
-await fsp.mkdir(dataDir, { recursive: true }); await fsp.mkdir(manualUploadRoot, { recursive: true }); await cleanupUnreferencedManualUploads(); await fsp.mkdir(watchRoot, { recursive: true }); await fsp.mkdir(archiveRoot, { recursive: true });
+await fsp.mkdir(dataDir, { recursive: true, mode: 0o700 });
+await fsp.mkdir(manualUploadRoot, { recursive: true, mode: 0o700 });
+if (process.platform !== 'win32') {
+  await fsp.chmod(dataDir, 0o700);
+  await fsp.chmod(manualUploadRoot, 0o700);
+}
+await cleanupUnreferencedManualUploads();
+await fsp.mkdir(watchRoot, { recursive: true });
+await fsp.mkdir(archiveRoot, { recursive: true });
 try { const config = JSON.parse(await fsp.readFile(configFile, 'utf8')); mappings = Array.isArray(config.mappings) ? config.mappings.map((item) => ({ source_policy: 'keep', archive_path: null, scan_existing: true, remote_parent_id: '', sync_types: DEFAULT_SYNC_TYPES, monitor_mode: 'native', auto_share: false, watch_error: null, ...item, local_path: allowedPath(item.local_path), archive_path: item.archive_path ? allowedArchivePath(item.archive_path) : null, sync_types: normalizeSyncTypes(item.sync_types), monitor_mode: normalizeMonitorMode(item.monitor_mode), auto_share: item.auto_share === true })) : []; savedShares = Array.isArray(config.saved_shares) ? config.saved_shares : []; } catch { mappings = []; savedShares = []; }
 restoreUploadCheckpoints();
 await restartWatchers();
@@ -2718,9 +2937,9 @@ restorePendingAutoShares();
 resumeHdhiveReceiptPolling();
 pump();
 const server = http.createServer(async (request, response) => {
-  const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
-  if (!enforceLoopbackHost(request, response) || !enforceMutationOrigin(request, response)) return;
   try {
+    const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+    if (!enforceLoopbackHost(request, response) || !enforceMutationOrigin(request, response)) return;
     if (request.method === 'GET' && url.pathname === '/api/access/status') {
       response.setHeader('cache-control', 'no-store');
       return json(response, 200, accessControl.status(request));
@@ -2746,15 +2965,22 @@ const server = http.createServer(async (request, response) => {
   }
   catch (error) {
     const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 400;
+    if (response.writableEnded) return;
+    if (response.headersSent) {
+      response.destroy(error);
+      return;
+    }
     json(response, statusCode, { error: error.message }, error.headers || {});
   }
 });
-server.requestTimeout = Math.max(requestTimeoutMs, ossTimeoutMs);
-server.headersTimeout = Math.min(requestTimeoutMs, 15_000);
+// Node's requestTimeout is a total body duration, so it must remain disabled for
+// multi-hour uploads. readBody/handleWebUpload/putWebDavFile enforce inactivity.
+server.requestTimeout = 0;
+server.headersTimeout = headersTimeoutMs;
 
 const webdavServer = http.createServer(async (request, response) => {
-  const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
   try {
+    const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
     if (!webdavAccessControl.required()) {
       response.writeHead(503, {
         'content-type': 'text/plain; charset=utf-8',
@@ -2774,6 +3000,11 @@ const webdavServer = http.createServer(async (request, response) => {
     response.end('not found');
   } catch (error) {
     const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 400;
+    if (response.writableEnded) return;
+    if (response.headersSent) {
+      response.destroy(error);
+      return;
+    }
     response.writeHead(statusCode, {
       'content-type': 'text/plain; charset=utf-8',
       'cache-control': 'no-store',
@@ -2782,8 +3013,8 @@ const webdavServer = http.createServer(async (request, response) => {
     response.end(error.message);
   }
 });
-webdavServer.requestTimeout = Math.max(requestTimeoutMs, ossTimeoutMs);
-webdavServer.headersTimeout = Math.min(requestTimeoutMs, 15_000);
+webdavServer.requestTimeout = 0;
+webdavServer.headersTimeout = headersTimeoutMs;
 webdavServer.listen(webdavPort, webdavHost, () => {
   const displayHost = webdavHost.includes(':') ? `[${webdavHost}]` : webdavHost;
   console.log(`Guangya WebDAV listening on http://${displayHost}:${webdavPort}/dav/, auth: ${webdavAccessControl.required() ? `enabled (${webdavUsername})` : 'not configured'}`);
@@ -2791,7 +3022,7 @@ webdavServer.listen(webdavPort, webdavHost, () => {
 
 server.listen(port, listenHost, async () => {
   const displayHost = listenHost.includes(':') ? `[${listenHost}]` : listenHost;
-  console.log(`Guangya Web listening on http://${displayHost}:${port}, file roots: ${fileRoots.join(', ')}, uploads: ${uploadConcurrency}, multipart: ${multipartMode}, OSS timeout: ${ossTimeoutMs}ms, retries: ${ossRetryMax}, parallel: ${ossParallel}, cloud confirm timeout: ${cloudConfirmTimeoutMs}ms, admin auth: ${accessControl.required() ? `enabled (${adminUsername})` : 'disabled (loopback only)'}`);
+  console.log(`Guangya Web listening on http://${displayHost}:${port}, file roots: ${fileRoots.join(', ')}, uploads: ${uploadConcurrency}, multipart: ${multipartMode}, OSS timeout: ${ossTimeoutMs}ms, retries: ${ossRetryMax}, parallel: ${ossParallel}, cloud confirm timeout: ${cloudConfirmTimeoutMs}ms, request body idle timeout: ${requestBodyIdleTimeoutMs}ms, trusted proxy: ${trustedProxy ? 'enabled' : 'disabled'}, admin auth: ${accessControl.required() ? `enabled (${adminUsername})` : 'disabled (loopback only)'}`);
   if (refreshToken) {
     try { await refreshSavedSession(); }
     catch (error) { status('warning', `已恢复上次登录，但刷新会话失败：${error.message}`); }
@@ -2809,6 +3040,37 @@ server.listen(port, listenHost, async () => {
   }
 });
 
+let gracefulShutdownPromise = null;
+const gracefulShutdownTimeoutMs = NATIVE_MOUNT_STOP_TIMEOUT_MS + 15_000;
+async function gracefulShutdown(signal) {
+  if (gracefulShutdownPromise) return gracefulShutdownPromise;
+  gracefulShutdownPromise = (async () => {
+    const hardStop = setTimeout(() => {
+      nativeMountManager.shutdown();
+      process.exit(1);
+    }, gracefulShutdownTimeoutMs);
+    hardStop.unref();
+    try {
+      // Stop accepting management/upload requests immediately, but keep the
+      // loopback WebDAV listener alive until rclone has flushed dirty VFS data.
+      const mainServerClosed = new Promise((resolve) => server.close(resolve));
+      await nativeMountManager.stop();
+      const webDavServerClosed = new Promise((resolve) => webdavServer.close(resolve));
+      await Promise.all([
+        mainServerClosed,
+        webDavServerClosed,
+      ]);
+      for (const watcher of watchers.values()) await watcher.close();
+      database.close();
+      process.exit(signal === 'SIGINT' || signal === 'SIGTERM' ? 0 : 1);
+    } finally {
+      clearTimeout(hardStop);
+    }
+  })();
+  return gracefulShutdownPromise;
+}
+process.once('SIGINT', () => { void gracefulShutdown('SIGINT'); });
+process.once('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });
 process.once('exit', () => nativeMountManager.shutdown());
 
 setInterval(() => {

@@ -115,6 +115,7 @@ function propertyResponse(prefix, segments, entry) {
         <D:supportedlock>
           <D:lockentry><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockentry>
         </D:supportedlock>
+        <D:lockdiscovery/>
       </D:prop>
       <D:status>HTTP/1.1 200 OK</D:status>
     </D:propstat>
@@ -150,15 +151,15 @@ function send(response, statusCode, body = '', headers = {}) {
   response.end(body);
 }
 
-async function findChild(listChildren, parentId, name) {
-  const children = (await listChildren(parentId)).map(normalizeWebDavEntry);
+async function findChild(listChildren, parentId, name, options) {
+  const children = (await listChildren(parentId, options)).map(normalizeWebDavEntry);
   const exact = children.find((entry) => entry.name === name);
   if (exact) return exact;
   const folded = children.filter((entry) => entry.name.toLocaleLowerCase() === name.toLocaleLowerCase());
   return folded.length === 1 ? folded[0] : null;
 }
 
-async function resolveEntry(listChildren, segments) {
+async function resolveEntry(listChildren, segments, options) {
   if (!segments.length) {
     return {
       entry: {
@@ -175,10 +176,10 @@ async function resolveEntry(listChildren, segments) {
   }
   let parentId = '';
   let entry = null;
-  for (const segment of segments) {
-    entry = await findChild(listChildren, parentId, segment);
+  for (const [index, segment] of segments.entries()) {
+    entry = await findChild(listChildren, parentId, segment, options);
     if (!entry) throw new WebDavError(404, `云端项目不存在：${segment}`);
-    if (segment !== segments.at(-1) && !entry.isDirectory) {
+    if (index < segments.length - 1 && !entry.isDirectory) {
       throw new WebDavError(409, `路径中包含文件：${segment}`);
     }
     const previousParentId = parentId;
@@ -188,13 +189,19 @@ async function resolveEntry(listChildren, segments) {
   return { entry, parentId: entry.parentId };
 }
 
-async function resolveParent(listChildren, segments) {
+async function resolveParent(listChildren, segments, options) {
   if (!segments.length) throw new WebDavError(403, '不能修改 WebDAV 根目录');
   const name = segments.at(-1);
-  if (segments.length === 1) return { parentId: '', name, existing: await findChild(listChildren, '', name) };
-  const { entry } = await resolveEntry(listChildren, segments.slice(0, -1));
+  if (segments.length === 1) {
+    const existing = await findChild(listChildren, '', name, options);
+    if (existing) existing.parentId = '';
+    return { parentId: '', name, existing };
+  }
+  const { entry } = await resolveEntry(listChildren, segments.slice(0, -1), options);
   if (!entry.isDirectory) throw new WebDavError(409, '目标父路径不是目录');
-  return { parentId: entry.id, name, existing: await findChild(listChildren, entry.id, name) };
+  const existing = await findChild(listChildren, entry.id, name, options);
+  if (existing) existing.parentId = entry.id;
+  return { parentId: entry.id, name, existing };
 }
 
 function destinationSegments(request, prefix) {
@@ -209,15 +216,15 @@ function destinationSegments(request, prefix) {
   return decodeWebDavPath(pathname, prefix);
 }
 
-function lockBody(token) {
+function lockBody(token, timeoutSeconds = 3600, depth = 'infinity') {
   return `<?xml version="1.0" encoding="utf-8"?>
 <D:prop xmlns:D="DAV:">
   <D:lockdiscovery>
     <D:activelock>
       <D:locktype><D:write/></D:locktype>
       <D:lockscope><D:exclusive/></D:lockscope>
-      <D:depth>infinity</D:depth>
-      <D:timeout>Second-3600</D:timeout>
+      <D:depth>${xmlEscape(depth)}</D:depth>
+      <D:timeout>Second-${timeoutSeconds}</D:timeout>
       <D:locktoken><D:href>${xmlEscape(token)}</D:href></D:locktoken>
     </D:activelock>
   </D:lockdiscovery>
@@ -236,6 +243,53 @@ export function createWebDavHandler({
 }) {
   if (![listChildren, createDirectory, deleteEntry, moveEntry, copyEntry, putFile, readFile].every((item) => typeof item === 'function')) {
     throw new TypeError('WebDAV backend 不完整');
+  }
+
+  const locks = new Map();
+  const pathKey = (segments) => JSON.stringify(segments);
+  const samePath = (left, right) => left.length === right.length
+    && left.every((segment, index) => segment === right[index]);
+  const isDescendant = (candidate, parent) => candidate.length > parent.length
+    && parent.every((segment, index) => candidate[index] === segment);
+  const suppliedLockTokens = (request) => new Set(
+    `${request.headers.if || ''} ${request.headers['lock-token'] || ''}`
+      .match(/opaquelocktoken:[A-Za-z0-9-]+/g) || [],
+  );
+  function pruneLocks() {
+    const currentTime = Date.now();
+    for (const [key, lock] of locks) if (lock.expiresAt <= currentTime) locks.delete(key);
+  }
+  function affectingLocks(segments) {
+    pruneLocks();
+    return [...locks.values()].filter((lock) => samePath(lock.segments, segments)
+      || (lock.depth === 'infinity' && isDescendant(segments, lock.segments)));
+  }
+  function assertLockTokens(request, paths) {
+    const supplied = suppliedLockTokens(request);
+    for (const segments of paths) {
+      if (affectingLocks(segments).some((lock) => !supplied.has(lock.token))) {
+        throw new WebDavError(423, '资源已被 WebDAV 写锁锁定');
+      }
+    }
+  }
+  function assertDescendantLockTokens(request, segments) {
+    pruneLocks();
+    const supplied = suppliedLockTokens(request);
+    if ([...locks.values()].some((lock) => isDescendant(lock.segments, segments) && !supplied.has(lock.token))) {
+      throw new WebDavError(423, '目录内存在未授权的 WebDAV 写锁');
+    }
+  }
+  function hasDescendantLocks(segments) {
+    pruneLocks();
+    return [...locks.values()].some((lock) => isDescendant(lock.segments, segments));
+  }
+  function timeoutSeconds(request) {
+    const values = String(request.headers.timeout || 'Second-3600').split(',');
+    for (const value of values) {
+      const matched = value.trim().match(/^Second-(\d+)$/i);
+      if (matched) return Math.max(1, Math.min(3600, Number(matched[1])));
+    }
+    return 3600;
   }
 
   return async function handleWebDav(request, response, url) {
@@ -266,9 +320,10 @@ export function createWebDavHandler({
     }
 
     if (method === 'PROPPATCH') {
-      const { entry } = await resolveEntry(listChildren, segments);
-      const body = `<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">${propertyResponse(prefix, segments, entry)}</D:multistatus>`;
-      return send(response, 207, body, { 'content-type': 'application/xml; charset=utf-8', dav: '1, 2' });
+      await resolveEntry(listChildren, segments, { force: true });
+      assertLockTokens(request, [segments]);
+      request.resume();
+      throw new WebDavError(403, '当前后端不支持修改 WebDAV 自定义属性');
     }
 
     if (method === 'GET' || method === 'HEAD') {
@@ -285,7 +340,8 @@ export function createWebDavHandler({
     }
 
     if (method === 'PUT') {
-      const target = await resolveParent(listChildren, segments);
+      assertLockTokens(request, [segments]);
+      const target = await resolveParent(listChildren, segments, { force: true });
       if (target.existing?.isDirectory) throw new WebDavError(405, '不能用文件覆盖目录');
       const result = await putFile({ request, ...target });
       return send(response, target.existing ? 204 : 201, '', {
@@ -294,44 +350,89 @@ export function createWebDavHandler({
     }
 
     if (method === 'MKCOL') {
-      const target = await resolveParent(listChildren, segments);
+      assertLockTokens(request, [segments]);
+      const target = await resolveParent(listChildren, segments, { force: true });
       if (target.existing) throw new WebDavError(405, '目标已经存在');
       await createDirectory({ parentId: target.parentId, name: target.name });
       return send(response, 201);
     }
 
     if (method === 'DELETE') {
-      const { entry } = await resolveEntry(listChildren, segments);
+      assertLockTokens(request, [segments]);
+      const { entry } = await resolveEntry(listChildren, segments, { force: true });
       if (!entry.id) throw new WebDavError(403, '不能删除 WebDAV 根目录');
+      if (entry.isDirectory) assertDescendantLockTokens(request, segments);
       await deleteEntry({ entry });
       return send(response, 204);
     }
 
     if (method === 'MOVE' || method === 'COPY') {
-      const { entry } = await resolveEntry(listChildren, segments);
+      const targetSegments = destinationSegments(request, prefix);
+      assertLockTokens(request, [segments, targetSegments]);
+      const { entry } = await resolveEntry(listChildren, segments, { force: true });
       if (!entry.id) throw new WebDavError(403, '不能移动或复制 WebDAV 根目录');
-      const destination = await resolveParent(listChildren, destinationSegments(request, prefix));
+      if (method === 'MOVE' && entry.isDirectory) assertDescendantLockTokens(request, segments);
       const overwrite = String(request.headers.overwrite || 'T').toUpperCase() !== 'F';
-      if (destination.existing?.id === entry.id && method === 'MOVE') return send(response, 204);
+      if (samePath(segments, targetSegments)) {
+        if (!overwrite) throw new WebDavError(412, '目标已经存在');
+        return send(response, 204);
+      }
+      if (entry.isDirectory && isDescendant(targetSegments, segments)) {
+        throw new WebDavError(409, '不能将目录移动或复制到自身子目录');
+      }
+      const destination = await resolveParent(listChildren, targetSegments, { force: true });
+      if (destination.existing?.id === entry.id) return send(response, 204);
       if (destination.existing && !overwrite) throw new WebDavError(412, '目标已经存在');
-      if (destination.existing) await deleteEntry({ entry: destination.existing });
+      if (destination.existing?.isDirectory) assertDescendantLockTokens(request, targetSegments);
       if (method === 'MOVE') {
-        await moveEntry({ entry, parentId: destination.parentId, name: destination.name });
+        await moveEntry({ entry, parentId: destination.parentId, name: destination.name, existing: destination.existing || null });
       } else {
-        await copyEntry({ entry, parentId: destination.parentId, name: destination.name });
+        await copyEntry({ entry, parentId: destination.parentId, name: destination.name, existing: destination.existing || null });
       }
       return send(response, destination.existing ? 204 : 201);
     }
 
     if (method === 'LOCK') {
+      request.resume();
+      const supplied = suppliedLockTokens(request);
+      const existingLock = affectingLocks(segments).find((lock) => supplied.has(lock.token));
+      const seconds = timeoutSeconds(request);
+      if (existingLock) {
+        existingLock.expiresAt = Date.now() + seconds * 1000;
+        return send(response, 200, lockBody(existingLock.token, seconds, existingLock.depth), {
+          'content-type': 'application/xml; charset=utf-8',
+          'lock-token': `<${existingLock.token}>`,
+          timeout: `Second-${seconds}`,
+        });
+      }
+      if (affectingLocks(segments).length) throw new WebDavError(423, '资源已被 WebDAV 写锁锁定');
+      try { await resolveEntry(listChildren, segments, { force: true }); }
+      catch (error) {
+        if (!(error instanceof WebDavError) || error.statusCode !== 404) throw error;
+        await resolveParent(listChildren, segments, { force: true });
+      }
+      const depth = String(request.headers.depth || 'infinity').toLowerCase() === '0' ? '0' : 'infinity';
+      if (depth === 'infinity' && hasDescendantLocks(segments)) {
+        throw new WebDavError(423, '目录内已有 WebDAV 写锁，不能创建重叠的深度锁');
+      }
       const token = `opaquelocktoken:${crypto.randomUUID()}`;
-      return send(response, 200, lockBody(token), {
+      locks.set(pathKey(segments), { token, segments: [...segments], depth, expiresAt: Date.now() + seconds * 1000 });
+      return send(response, 200, lockBody(token, seconds, depth), {
         'content-type': 'application/xml; charset=utf-8',
         'lock-token': `<${token}>`,
+        timeout: `Second-${seconds}`,
       });
     }
 
-    if (method === 'UNLOCK') return send(response, 204);
+    if (method === 'UNLOCK') {
+      pruneLocks();
+      const key = pathKey(segments);
+      const lock = locks.get(key);
+      const supplied = suppliedLockTokens(request);
+      if (!lock || !supplied.has(lock.token)) throw new WebDavError(409, 'WebDAV 锁不存在或令牌不匹配');
+      locks.delete(key);
+      return send(response, 204);
+    }
     throw new WebDavError(405, `不支持 WebDAV 方法：${method}`, {
       allow: 'OPTIONS, PROPFIND, PROPPATCH, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY, LOCK, UNLOCK',
     });

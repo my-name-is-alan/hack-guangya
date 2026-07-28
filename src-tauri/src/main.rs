@@ -18,11 +18,11 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::{self, OpenOptions},
-    io::{self, SeekFrom},
+    io::{self, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
 };
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -98,6 +98,14 @@ const CLOUD_FILE_TYPE_DOCUMENT: u8 = 4;
 const CLOUD_FILE_TYPE_ARCHIVE: u8 = 5;
 type SharedState = Arc<Mutex<RuntimeState>>;
 
+#[derive(Clone)]
+struct ApiAuthRuntime {
+    app: tauri::AppHandle,
+    state: SharedState,
+}
+
+static API_AUTH_RUNTIME: OnceLock<ApiAuthRuntime> = OnceLock::new();
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Mapping {
     id: String,
@@ -146,8 +154,10 @@ struct AppConfig {
     webdav_port: u16,
     #[serde(default = "default_webdav_username")]
     webdav_username: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     webdav_password: String,
+    #[serde(default)]
+    webdav_password_hash: String,
     #[serde(default)]
     native_mount: NativeMountOptions,
 }
@@ -163,6 +173,7 @@ impl Default for AppConfig {
             webdav_port: DEFAULT_WEBDAV_PORT,
             webdav_username: default_webdav_username(),
             webdav_password: String::new(),
+            webdav_password_hash: String::new(),
             native_mount: NativeMountOptions::default(),
         }
     }
@@ -240,10 +251,14 @@ struct RuntimeState {
     webdav_enabled: bool,
     webdav_port: u16,
     webdav_username: String,
-    webdav_password: String,
+    webdav_password_hash: String,
+    webdav_session_password: Option<String>,
+    webdav_password_verifier: Option<[u8; 32]>,
     webdav_running: bool,
     webdav_error: Option<String>,
-    native_mount: NativeMountManager,
+    native_mount: Arc<Mutex<NativeMountManager>>,
+    auth_refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    refreshed_access_tokens: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -287,6 +302,7 @@ struct MountInfo {
     endpoint: String,
     username: String,
     password: String,
+    password_hint: String,
     error: Option<String>,
     protocol: String,
 }
@@ -583,6 +599,78 @@ fn normalize_webdav_password(value: &str) -> Result<String, String> {
     }
     Ok(value.to_string())
 }
+
+const WEBDAV_PASSWORD_HASH_ITERATIONS: u32 = 120_000;
+
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    let mut initial = Hmac::<Sha256>::new_from_slice(password).expect("HMAC accepts any key");
+    initial.update(salt);
+    initial.update(&1_u32.to_be_bytes());
+    let mut previous = initial.finalize().into_bytes();
+    let mut output = previous;
+    for _ in 1..iterations.max(1) {
+        let mut mac = Hmac::<Sha256>::new_from_slice(password).expect("HMAC accepts any key");
+        mac.update(&previous);
+        previous = mac.finalize().into_bytes();
+        for (target, value) in output.iter_mut().zip(previous.iter()) {
+            *target ^= value;
+        }
+    }
+    output.into()
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+fn hash_webdav_password(password: &str) -> String {
+    let salt = *Uuid::new_v4().as_bytes();
+    let digest = pbkdf2_sha256(password.as_bytes(), &salt, WEBDAV_PASSWORD_HASH_ITERATIONS);
+    format!(
+        "pbkdf2-sha256${}${}${}",
+        WEBDAV_PASSWORD_HASH_ITERATIONS,
+        hex::encode(salt),
+        hex::encode(digest)
+    )
+}
+
+fn verify_webdav_password(password: &str, encoded: &str) -> bool {
+    let mut parts = encoded.split('$');
+    let Some("pbkdf2-sha256") = parts.next() else {
+        return false;
+    };
+    let Some(iterations) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+        return false;
+    };
+    if !(10_000..=1_000_000).contains(&iterations) {
+        return false;
+    }
+    let Some(salt) = parts.next().and_then(|value| hex::decode(value).ok()) else {
+        return false;
+    };
+    let Some(expected) = parts.next().and_then(|value| hex::decode(value).ok()) else {
+        return false;
+    };
+    if parts.next().is_some() || salt.len() < 16 || expected.len() != 32 {
+        return false;
+    }
+    constant_time_eq(
+        &pbkdf2_sha256(password.as_bytes(), &salt, iterations),
+        &expected,
+    )
+}
+
+fn webdav_password_verifier(password: &str) -> [u8; 32] {
+    Sha256::digest(password.as_bytes()).into()
+}
 fn default_cache_enabled() -> bool {
     true
 }
@@ -704,6 +792,19 @@ fn build_hdhive_target_url(
     target.set_fragment(None);
     Ok((target, format!("/{}", path_segments.join("/"))))
 }
+fn safe_response_preview(raw: &str, max_chars: usize) -> String {
+    raw.chars()
+        .filter_map(|character| match character {
+            '\r' | '\n' | '\t' => Some(' '),
+            character if character.is_control() => None,
+            character => Some(character),
+        })
+        .take(max_chars)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 fn normalize_transfer_concurrency(value: usize, fallback: usize) -> usize {
     if (1..=MAX_TRANSFER_CONCURRENCY).contains(&value) {
         value
@@ -794,8 +895,193 @@ fn normalize_monitor_mode(value: &str) -> String {
         default_monitor_mode()
     }
 }
-fn item_key(mapping_id: &str, path: &Path) -> String {
-    format!("{mapping_id}::{}", path.to_string_lossy())
+fn destination_item_key(
+    mapping_id: &str,
+    path: &Path,
+    remote_parent_id: &str,
+    remote_dir: &str,
+) -> String {
+    format!(
+        "{mapping_id}::{}\0{remote_parent_id}\0{remote_dir}",
+        path.to_string_lossy()
+    )
+}
+fn item_key(item: &UploadItem) -> String {
+    destination_item_key(
+        &item.mapping_id,
+        &item.file_path,
+        &item.remote_parent_id,
+        &item.remote_dir,
+    )
+}
+fn canonical_existing_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let canonical =
+        fs::canonicalize(path).map_err(|error| format!("无法读取{label}的真实路径：{error}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("{label}不是目录"));
+    }
+    Ok(canonical)
+}
+fn canonical_watch_path(path: &Path, root: &Path) -> Result<PathBuf, String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("读取监控事件路径失败：{error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err("监控事件路径不能是符号链接".to_string());
+    }
+    let canonical_root = canonical_existing_directory(root, "监控目录")?;
+    let canonical =
+        fs::canonicalize(path).map_err(|error| format!("无法读取监控事件真实路径：{error}"))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err("监控事件真实路径不在被监控目录内".to_string());
+    }
+    Ok(canonical)
+}
+fn canonical_upload_source(path: &Path, root: Option<&Path>) -> Result<PathBuf, String> {
+    let link_metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("读取源文件失败：{error}"))?;
+    if link_metadata.file_type().is_symlink() {
+        return Err("源文件不能是符号链接".to_string());
+    }
+    let canonical =
+        fs::canonicalize(path).map_err(|error| format!("无法读取源文件真实路径：{error}"))?;
+    if !canonical.is_file() {
+        return Err("源路径不是文件".to_string());
+    }
+    if let Some(root) = root {
+        let canonical_root = canonical_existing_directory(root, "监控目录")?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err("源文件真实路径不在被监控目录内，已拒绝上传".to_string());
+        }
+    }
+    Ok(canonical)
+}
+fn ensure_directory_tree_without_symlinks(root: &Path, relative: &Path) -> Result<PathBuf, String> {
+    let canonical_root = canonical_existing_directory(root, "归档目录")?;
+    let mut current = canonical_root.clone();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            if matches!(component, std::path::Component::CurDir) {
+                continue;
+            }
+            return Err("归档相对路径包含不安全的路径分量".to_string());
+        };
+        current.push(component);
+        loop {
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() {
+                        return Err("归档中间目录不能是符号链接，已保留源文件".to_string());
+                    }
+                    if !metadata.is_dir() {
+                        return Err("归档中间路径不是目录，已保留源文件".to_string());
+                    }
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match fs::create_dir(&current) {
+                        Ok(()) => break,
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                        Err(error) => return Err(format!("创建归档目录失败：{error}")),
+                    }
+                }
+                Err(error) => return Err(format!("核对归档中间目录失败：{error}")),
+            }
+        }
+        let resolved = fs::canonicalize(&current)
+            .map_err(|error| format!("核对归档目录真实路径失败：{error}"))?;
+        if !resolved.starts_with(&canonical_root) {
+            return Err("归档目标真实路径逃逸出归档目录，已保留源文件".to_string());
+        }
+        current = resolved;
+    }
+    Ok(current)
+}
+fn normalize_loaded_mapping_paths(mut mapping: Mapping) -> Mapping {
+    mapping.watch_error = None;
+    let canonical_local =
+        match canonical_existing_directory(Path::new(&mapping.local_path), "本地目录") {
+            Ok(path) => {
+                mapping.local_path = path.to_string_lossy().to_string();
+                Some(path)
+            }
+            Err(error) => {
+                mapping.watch_error = Some(error);
+                None
+            }
+        };
+    let canonical_archive = mapping
+        .archive_path
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|path| canonical_existing_directory(Path::new(path), "归档目录"));
+    match canonical_archive {
+        Some(Ok(path)) => mapping.archive_path = Some(path.to_string_lossy().to_string()),
+        Some(Err(error)) if mapping.source_policy == "archive" => {
+            mapping.watch_error = Some(error);
+        }
+        _ => {}
+    }
+    if mapping.source_policy == "archive" {
+        match (canonical_local.as_ref(), mapping.archive_path.as_deref()) {
+            (Some(local), Some(archive)) => {
+                if let Ok(archive) = fs::canonicalize(archive) {
+                    if archive == *local || archive.starts_with(local) {
+                        mapping.watch_error = Some("归档目录不能位于被监控目录内部".to_string());
+                    }
+                }
+            }
+            (_, None) => {
+                mapping.watch_error = Some("归档策略没有配置归档目录".to_string());
+            }
+            _ => {}
+        }
+    }
+    mapping
+}
+#[cfg(unix)]
+fn same_file_identity(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    first.dev() == second.dev() && first.ino() == second.ino()
+}
+#[cfg(not(unix))]
+fn same_file_identity(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+    first.len() == second.len() && modified_ms(first) == modified_ms(second)
+}
+fn mapping_upload_destination(
+    mapping: &Mapping,
+    file_path: &Path,
+) -> Result<(String, String, String), String> {
+    let canonical_root = canonical_existing_directory(Path::new(&mapping.local_path), "监控目录")?;
+    let canonical_file =
+        fs::canonicalize(file_path).map_err(|error| format!("无法读取源文件真实路径：{error}"))?;
+    if !canonical_file.starts_with(&canonical_root) {
+        return Err("源文件真实路径不在被监控目录内".to_string());
+    }
+    let relative = canonical_file
+        .strip_prefix(&canonical_root)
+        .map_err(|_| "源文件不在被监控目录内".to_string())?
+        .to_string_lossy()
+        .replace('\\', "/");
+    if relative.is_empty() {
+        return Err("无法计算源文件的相对路径".to_string());
+    }
+    let relative_dir = Path::new(&relative)
+        .parent()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    let remote_dir = [
+        if mapping.remote_parent_id.is_empty() {
+            normalize_remote_path(&mapping.remote_path)
+        } else {
+            String::new()
+        },
+        relative_dir,
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join("/");
+    Ok((mapping.remote_parent_id.clone(), remote_dir, relative))
 }
 fn stamp_matches(item: &UploadItem, stamp: &Stamp) -> bool {
     stamp.size == item.size && stamp.modified_ms == item.modified_ms
@@ -803,14 +1089,14 @@ fn stamp_matches(item: &UploadItem, stamp: &Stamp) -> bool {
 fn flash_preflight_cached(state: &RuntimeState, item: &UploadItem) -> bool {
     state
         .flash_preflight_cache
-        .get(&item_key(&item.mapping_id, &item.file_path))
+        .get(&item_key(item))
         .is_some_and(|cached| stamp_matches(item, &cached.stamp))
 }
 fn take_flash_preflight_token(
     state: &SharedState,
     item: &UploadItem,
 ) -> Result<Option<UploadToken>, String> {
-    let key = item_key(&item.mapping_id, &item.file_path);
+    let key = item_key(item);
     let cached = state
         .lock()
         .map_err(|error| error.to_string())?
@@ -832,7 +1118,7 @@ fn upload_already_scheduled(
     waiting_files: &HashMap<String, UploadItem>,
     item: &UploadItem,
 ) -> bool {
-    let key = item_key(&item.mapping_id, &item.file_path);
+    let key = item_key(item);
     history
         .get(&key)
         .is_some_and(|stamp| stamp_matches(item, stamp))
@@ -841,7 +1127,7 @@ fn upload_already_scheduled(
             .get(&key)
             .is_some_and(|stamp| stamp_matches(item, stamp))
         || queue.iter().any(|queued| {
-            item_key(&queued.mapping_id, &queued.file_path) == key
+            item_key(queued) == key
                 && queued.size == item.size
                 && queued.modified_ms == item.modified_ms
         })
@@ -1059,10 +1345,77 @@ fn load_config(path: &Path) -> AppConfig {
         .and_then(|raw| serde_json::from_str::<AppConfig>(&raw).ok())
         .unwrap_or_default()
 }
-fn save_config(state: &RuntimeState) {
-    if let Some(parent) = state.config_path.parent() {
-        let _ = fs::create_dir_all(parent);
+
+#[cfg(not(windows))]
+fn atomic_replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn atomic_replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr};
+
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn ReplaceFileW(
+            replaced: *const u16,
+            replacement: *const u16,
+            backup: *const u16,
+            flags: u32,
+            exclude: *mut c_void,
+            reserved: *mut c_void,
+        ) -> i32;
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
     }
+
+    const REPLACEFILE_WRITE_THROUGH: u32 = 0x0000_0001;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+    };
+    let destination_exists = destination.exists();
+    let source = wide(source);
+    let destination = wide(destination);
+    let success = unsafe {
+        if destination_exists {
+            ReplaceFileW(
+                destination.as_ptr(),
+                source.as_ptr(),
+                ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        } else {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+    };
+    if success == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn save_config_checked(state: &RuntimeState) -> Result<(), String> {
+    let parent = state
+        .config_path
+        .parent()
+        .ok_or_else(|| "配置文件路径没有上级目录".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| format!("创建配置目录失败：{error}"))?;
+    let native_mount_options = state
+        .native_mount
+        .lock()
+        .map_err(|error| format!("读取原生挂载设置失败：{error}"))?
+        .options();
     let payload = json!({
         "mappings": state.mappings,
         "saved_shares": state.saved_shares,
@@ -1072,13 +1425,56 @@ fn save_config(state: &RuntimeState) {
         "webdav_enabled": state.webdav_enabled,
         "webdav_port": state.webdav_port,
         "webdav_username": state.webdav_username,
-        "webdav_password": state.webdav_password,
-        "native_mount": state.native_mount.options()
+        "webdav_password_hash": state.webdav_password_hash,
+        "native_mount": native_mount_options
     });
-    let _ = fs::write(
-        &state.config_path,
-        serde_json::to_vec_pretty(&payload).unwrap_or_default(),
-    );
+    let bytes =
+        serde_json::to_vec_pretty(&payload).map_err(|error| format!("序列化配置失败：{error}"))?;
+    let temporary_path = parent.join(format!(
+        ".{}.{}.tmp",
+        state
+            .config_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("config"),
+        Uuid::new_v4().simple()
+    ));
+    let write_result = (|| -> Result<(), String> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut output = options
+            .open(&temporary_path)
+            .map_err(|error| format!("创建临时配置文件失败：{error}"))?;
+        output
+            .write_all(&bytes)
+            .map_err(|error| format!("写入临时配置文件失败：{error}"))?;
+        output
+            .sync_all()
+            .map_err(|error| format!("同步临时配置文件失败：{error}"))?;
+        drop(output);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary_path, fs::Permissions::from_mode(0o600))
+                .map_err(|error| format!("限制配置文件权限失败：{error}"))?;
+        }
+        atomic_replace_file(&temporary_path, &state.config_path)
+            .map_err(|error| format!("原子替换配置文件失败：{error}"))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    write_result
+}
+
+fn save_config(state: &RuntimeState) {
+    let _ = save_config_checked(state);
 }
 
 fn unix_timestamp() -> i64 {
@@ -1099,8 +1495,167 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     Ok(connection)
 }
 
+fn table_primary_key_columns(connection: &Connection, table: &str) -> Result<Vec<String>, String> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| format!("读取 {table} 表结构失败：{error}"))?;
+    let mut columns = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(5)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("查询 {table} 表结构失败：{error}"))?
+        .filter_map(|row| match row {
+            Ok((position, name)) if position > 0 => Some(Ok((position, name))),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 {table} 主键失败：{error}"))?;
+    columns.sort_by_key(|(position, _)| *position);
+    Ok(columns.into_iter().map(|(_, name)| name).collect())
+}
+
+fn migrate_upload_destination_identity(connection: &mut Connection) -> Result<(), String> {
+    let expected = vec![
+        "mapping_id".to_string(),
+        "file_path".to_string(),
+        "remote_parent_id".to_string(),
+        "remote_dir".to_string(),
+    ];
+    if table_primary_key_columns(connection, "uploaded_files")? != expected {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("开始迁移上传记录失败：{error}"))?;
+        transaction
+            .execute_batch(
+                "ALTER TABLE uploaded_files RENAME TO uploaded_files_legacy_destination;
+                 CREATE TABLE uploaded_files (
+                   mapping_id TEXT NOT NULL,
+                   file_path TEXT NOT NULL,
+                   size INTEGER NOT NULL,
+                   modified_ms TEXT NOT NULL,
+                   task_id TEXT,
+                   remote_file_id TEXT,
+                   upload_state TEXT NOT NULL DEFAULT 'cloud_confirmed',
+                   remote_parent_id TEXT NOT NULL DEFAULT '',
+                   remote_dir TEXT NOT NULL DEFAULT '',
+                   relative_path TEXT NOT NULL DEFAULT '',
+                   change_kind TEXT NOT NULL DEFAULT 'added',
+                   uploaded_at INTEGER NOT NULL,
+                   PRIMARY KEY (mapping_id, file_path, remote_parent_id, remote_dir)
+                 );
+                 INSERT OR REPLACE INTO uploaded_files
+                   (mapping_id, file_path, size, modified_ms, task_id, remote_file_id,
+                    upload_state, remote_parent_id, remote_dir, relative_path, change_kind,
+                    uploaded_at)
+                 SELECT mapping_id, file_path, size, modified_ms, task_id, remote_file_id,
+                        upload_state, remote_parent_id, remote_dir, relative_path, change_kind,
+                        uploaded_at
+                 FROM uploaded_files_legacy_destination
+                 ORDER BY uploaded_at;
+                 DROP TABLE uploaded_files_legacy_destination;",
+            )
+            .map_err(|error| format!("迁移上传记录目标身份失败：{error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交上传记录迁移失败：{error}"))?;
+    }
+
+    if table_primary_key_columns(connection, "upload_checkpoints")? != expected {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("开始迁移上传断点失败：{error}"))?;
+        transaction
+            .execute_batch(
+                "ALTER TABLE upload_checkpoints RENAME TO upload_checkpoints_legacy_destination;
+                 CREATE TABLE upload_checkpoints (
+                   mapping_id TEXT NOT NULL,
+                   file_path TEXT NOT NULL,
+                   remote_parent_id TEXT NOT NULL DEFAULT '',
+                   remote_dir TEXT NOT NULL DEFAULT '',
+                   size INTEGER NOT NULL,
+                   modified_ms TEXT NOT NULL,
+                   item_json TEXT NOT NULL,
+                   checkpoint_json TEXT NOT NULL,
+                   uploaded_bytes INTEGER NOT NULL DEFAULT 0,
+                   updated_at INTEGER NOT NULL,
+                   PRIMARY KEY (mapping_id, file_path, remote_parent_id, remote_dir)
+                 );",
+            )
+            .map_err(|error| format!("准备上传断点目标身份迁移失败：{error}"))?;
+        let rows = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT mapping_id, file_path, size, modified_ms, item_json,
+                            checkpoint_json, uploaded_bytes, updated_at
+                     FROM upload_checkpoints_legacy_destination",
+                )
+                .map_err(|error| format!("读取旧上传断点失败：{error}"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, u64>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                })
+                .map_err(|error| format!("查询旧上传断点失败：{error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("解析旧上传断点失败：{error}"))?;
+            rows
+        };
+        for (
+            mapping_id,
+            file_path,
+            size,
+            modified_ms,
+            item_json,
+            checkpoint_json,
+            uploaded_bytes,
+            updated_at,
+        ) in rows
+        {
+            let (remote_parent_id, remote_dir) = serde_json::from_str::<UploadItem>(&item_json)
+                .map(|item| (item.remote_parent_id, item.remote_dir))
+                .unwrap_or_default();
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO upload_checkpoints
+                       (mapping_id, file_path, remote_parent_id, remote_dir, size, modified_ms,
+                        item_json, checkpoint_json, uploaded_bytes, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        mapping_id,
+                        file_path,
+                        remote_parent_id,
+                        remote_dir,
+                        size,
+                        modified_ms,
+                        item_json,
+                        checkpoint_json,
+                        uploaded_bytes,
+                        updated_at
+                    ],
+                )
+                .map_err(|error| format!("迁移上传断点失败：{error}"))?;
+        }
+        transaction
+            .execute("DROP TABLE upload_checkpoints_legacy_destination", [])
+            .map_err(|error| format!("清理旧上传断点表失败：{error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交上传断点迁移失败：{error}"))?;
+    }
+    Ok(())
+}
+
 fn init_database(path: &Path) -> Result<(), String> {
-    let connection = open_database(path)?;
+    let mut connection = open_database(path)?;
     connection
         .execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -1124,18 +1679,20 @@ fn init_database(path: &Path) -> Result<(), String> {
                relative_path TEXT NOT NULL DEFAULT '',
                change_kind TEXT NOT NULL DEFAULT 'added',
                uploaded_at INTEGER NOT NULL,
-               PRIMARY KEY (mapping_id, file_path)
+               PRIMARY KEY (mapping_id, file_path, remote_parent_id, remote_dir)
              );
              CREATE TABLE IF NOT EXISTS upload_checkpoints (
                mapping_id TEXT NOT NULL,
                file_path TEXT NOT NULL,
+               remote_parent_id TEXT NOT NULL DEFAULT '',
+               remote_dir TEXT NOT NULL DEFAULT '',
                size INTEGER NOT NULL,
                modified_ms TEXT NOT NULL,
                item_json TEXT NOT NULL,
                checkpoint_json TEXT NOT NULL,
                uploaded_bytes INTEGER NOT NULL DEFAULT 0,
                updated_at INTEGER NOT NULL,
-               PRIMARY KEY (mapping_id, file_path)
+               PRIMARY KEY (mapping_id, file_path, remote_parent_id, remote_dir)
              );
              CREATE TABLE IF NOT EXISTS app_state (
                key TEXT PRIMARY KEY,
@@ -1252,6 +1809,7 @@ fn init_database(path: &Path) -> Result<(), String> {
     ] {
         let _ = connection.execute(migration, []);
     }
+    migrate_upload_destination_identity(&mut connection)?;
     connection
         .execute(
             "UPDATE uploaded_files
@@ -1499,12 +2057,32 @@ fn save_auth_session(
             "INSERT INTO auth_session (id, access_token, refresh_token, updated_at)
              VALUES (1, ?1, ?2, ?3)
              ON CONFLICT(id) DO UPDATE SET
-               access_token = COALESCE(excluded.access_token, auth_session.access_token),
-               refresh_token = COALESCE(excluded.refresh_token, auth_session.refresh_token),
+               access_token = excluded.access_token,
+               refresh_token = excluded.refresh_token,
                updated_at = excluded.updated_at",
             params![access_token, refresh_token, unix_timestamp()],
         )
         .map_err(|e| format!("保存登录状态失败：{e}"))?;
+    Ok(())
+}
+
+fn save_refreshed_auth_session(
+    path: &Path,
+    access_token: &str,
+    refresh_token: Option<&str>,
+) -> Result<(), String> {
+    let connection = open_database(path)?;
+    connection
+        .execute(
+            "INSERT INTO auth_session (id, access_token, refresh_token, updated_at)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+               access_token = excluded.access_token,
+               refresh_token = COALESCE(excluded.refresh_token, auth_session.refresh_token),
+               updated_at = excluded.updated_at",
+            params![access_token, refresh_token, unix_timestamp()],
+        )
+        .map_err(|e| format!("保存续期登录状态失败：{e}"))?;
     Ok(())
 }
 
@@ -1537,6 +2115,7 @@ fn invalidate_auth_session(app: &tauri::AppHandle, state: &SharedState) -> Resul
         let mut guard = state.lock().map_err(|e| e.to_string())?;
         guard.token = None;
         guard.refresh_token = None;
+        guard.refreshed_access_tokens.clear();
         reset_remote_cache(&mut guard.remote_cache);
         guard.db_path.clone()
     };
@@ -1549,7 +2128,8 @@ fn load_upload_history(path: &Path) -> Result<HashMap<String, Stamp>, String> {
     let connection = open_database(path)?;
     let mut statement = connection
         .prepare(
-            "SELECT mapping_id, file_path, size, modified_ms FROM uploaded_files
+            "SELECT mapping_id, file_path, size, modified_ms, remote_parent_id, remote_dir
+             FROM uploaded_files
              WHERE upload_state = ?1",
         )
         .map_err(|e| format!("读取上传记录失败：{e}"))?;
@@ -1559,16 +2139,30 @@ fn load_upload_history(path: &Path) -> Result<HashMap<String, Stamp>, String> {
             let file_path: String = row.get(1)?;
             let size: u64 = row.get(2)?;
             let modified_raw: String = row.get(3)?;
-            Ok((mapping_id, file_path, size, modified_raw))
+            let remote_parent_id: String = row.get(4)?;
+            let remote_dir: String = row.get(5)?;
+            Ok((
+                mapping_id,
+                file_path,
+                size,
+                modified_raw,
+                remote_parent_id,
+                remote_dir,
+            ))
         })
         .map_err(|e| format!("查询上传记录失败：{e}"))?;
     let mut history = HashMap::new();
     for row in rows {
-        let (mapping_id, file_path, size, modified_raw) =
+        let (mapping_id, file_path, size, modified_raw, remote_parent_id, remote_dir) =
             row.map_err(|e| format!("解析上传记录失败：{e}"))?;
         let modified_ms = modified_raw.parse::<u128>().unwrap_or(0);
         history.insert(
-            item_key(&mapping_id, Path::new(&file_path)),
+            destination_item_key(
+                &mapping_id,
+                Path::new(&file_path),
+                &remote_parent_id,
+                &remote_dir,
+            ),
             Stamp { size, modified_ms },
         );
     }
@@ -1659,7 +2253,7 @@ fn pending_upload_stamps(path: &Path) -> Result<HashMap<String, Stamp>, String> 
         .into_iter()
         .map(|pending| {
             (
-                item_key(&pending.item.mapping_id, &pending.item.file_path),
+                item_key(&pending.item),
                 Stamp {
                     size: pending.item.size,
                     modified_ms: pending.item.modified_ms,
@@ -1673,8 +2267,15 @@ fn clear_upload_checkpoint(path: &Path, item: &UploadItem) -> Result<(), String>
     let connection = open_database(path)?;
     connection
         .execute(
-            "DELETE FROM upload_checkpoints WHERE mapping_id = ?1 AND file_path = ?2",
-            params![item.mapping_id, item.file_path.to_string_lossy()],
+            "DELETE FROM upload_checkpoints
+             WHERE mapping_id = ?1 AND file_path = ?2
+               AND remote_parent_id = ?3 AND remote_dir = ?4",
+            params![
+                item.mapping_id,
+                item.file_path.to_string_lossy(),
+                item.remote_parent_id,
+                item.remote_dir
+            ],
         )
         .map_err(|error| format!("清除上传断点失败：{error}"))?;
     Ok(())
@@ -1689,8 +2290,14 @@ fn load_upload_checkpoint(
         .query_row(
             "SELECT size, modified_ms, checkpoint_json, uploaded_bytes
              FROM upload_checkpoints
-             WHERE mapping_id = ?1 AND file_path = ?2",
-            params![item.mapping_id, item.file_path.to_string_lossy()],
+             WHERE mapping_id = ?1 AND file_path = ?2
+               AND remote_parent_id = ?3 AND remote_dir = ?4",
+            params![
+                item.mapping_id,
+                item.file_path.to_string_lossy(),
+                item.remote_parent_id,
+                item.remote_dir
+            ],
             |row| {
                 Ok((
                     row.get::<_, u64>(0)?,
@@ -1736,10 +2343,10 @@ fn save_upload_checkpoint(
     connection
         .execute(
             "INSERT INTO upload_checkpoints
-               (mapping_id, file_path, size, modified_ms, item_json, checkpoint_json,
-                uploaded_bytes, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(mapping_id, file_path) DO UPDATE SET
+               (mapping_id, file_path, remote_parent_id, remote_dir, size, modified_ms,
+                item_json, checkpoint_json, uploaded_bytes, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(mapping_id, file_path, remote_parent_id, remote_dir) DO UPDATE SET
                size = excluded.size,
                modified_ms = excluded.modified_ms,
                item_json = excluded.item_json,
@@ -1749,6 +2356,8 @@ fn save_upload_checkpoint(
             params![
                 item.mapping_id,
                 item.file_path.to_string_lossy(),
+                item.remote_parent_id,
+                item.remote_dir,
                 item.size,
                 item.modified_ms.to_string(),
                 item_json,
@@ -1765,7 +2374,7 @@ fn load_resumable_uploads(path: &Path) -> Result<VecDeque<UploadItem>, String> {
     let connection = open_database(path)?;
     let mut statement = connection
         .prepare(
-            "SELECT mapping_id, file_path, size, modified_ms, item_json
+            "SELECT mapping_id, file_path, remote_parent_id, remote_dir, size, modified_ms, item_json
              FROM upload_checkpoints ORDER BY updated_at",
         )
         .map_err(|error| format!("读取待续传任务失败：{error}"))?;
@@ -1774,9 +2383,11 @@ fn load_resumable_uploads(path: &Path) -> Result<VecDeque<UploadItem>, String> {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, u64>(2)?,
+                row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
+                row.get::<_, u64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
             ))
         })
         .map_err(|error| format!("查询待续传任务失败：{error}"))?
@@ -1784,11 +2395,15 @@ fn load_resumable_uploads(path: &Path) -> Result<VecDeque<UploadItem>, String> {
         .map_err(|error| format!("解析待续传任务失败：{error}"))?;
     drop(statement);
     let mut restored = VecDeque::new();
-    for (mapping_id, file_path, size, modified_ms_value, item_json) in rows {
+    for (mapping_id, file_path, remote_parent_id, remote_dir, size, modified_ms_value, item_json) in
+        rows
+    {
         let parsed = serde_json::from_str::<UploadItem>(&item_json).ok();
         let valid = parsed.as_ref().is_some_and(|item| {
             item.mapping_id == mapping_id
                 && item.file_path == PathBuf::from(&file_path)
+                && item.remote_parent_id == remote_parent_id
+                && item.remote_dir == remote_dir
                 && item.size == size
                 && item.modified_ms.to_string() == modified_ms_value
                 && fs::metadata(&item.file_path).ok().is_some_and(|metadata| {
@@ -1802,8 +2417,10 @@ fn load_resumable_uploads(path: &Path) -> Result<VecDeque<UploadItem>, String> {
         } else {
             connection
                 .execute(
-                    "DELETE FROM upload_checkpoints WHERE mapping_id = ?1 AND file_path = ?2",
-                    params![mapping_id, file_path],
+                    "DELETE FROM upload_checkpoints
+                     WHERE mapping_id = ?1 AND file_path = ?2
+                       AND remote_parent_id = ?3 AND remote_dir = ?4",
+                    params![mapping_id, file_path, remote_parent_id, remote_dir],
                 )
                 .map_err(|error| format!("清理失效上传断点失败：{error}"))?;
         }
@@ -1824,7 +2441,7 @@ fn save_upload_record(
                (mapping_id, file_path, size, modified_ms, task_id, remote_file_id,
                 upload_state, remote_parent_id, remote_dir, relative_path, change_kind, uploaded_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-             ON CONFLICT(mapping_id, file_path) DO UPDATE SET
+             ON CONFLICT(mapping_id, file_path, remote_parent_id, remote_dir) DO UPDATE SET
                size = excluded.size,
                modified_ms = excluded.modified_ms,
                task_id = excluded.task_id,
@@ -1866,7 +2483,7 @@ fn remember_pending_upload(
         .map_err(|e| e.to_string())?
         .pending_cloud
         .insert(
-            item_key(&item.mapping_id, &item.file_path),
+            item_key(item),
             Stamp {
                 size: item.size,
                 modified_ms: item.modified_ms,
@@ -1886,7 +2503,7 @@ fn confirm_pending_record(
                     remote_parent_id = ?3, remote_dir = ?4, relative_path = ?5,
                     change_kind = ?6, uploaded_at = ?7
              WHERE mapping_id = ?8 AND file_path = ?9 AND task_id = ?10
-               AND upload_state = ?11",
+               AND upload_state = ?11 AND remote_parent_id = ?12 AND remote_dir = ?13",
             params![
                 outcome.remote_file_id,
                 UPLOAD_STATE_CLOUD_CONFIRMED,
@@ -1898,7 +2515,9 @@ fn confirm_pending_record(
                 item.mapping_id,
                 item.file_path.to_string_lossy(),
                 outcome.task_id,
-                UPLOAD_STATE_OSS_COMPLETE
+                UPLOAD_STATE_OSS_COMPLETE,
+                item.remote_parent_id,
+                item.remote_dir
             ],
         )
         .map(|changed| changed > 0)
@@ -1914,7 +2533,7 @@ fn remember_confirmed_upload(
     if !confirm_pending_record(&database, item, outcome)? {
         return Err("待确认上传记录已被移除或已由其他任务更新".into());
     }
-    let key = item_key(&item.mapping_id, &item.file_path);
+    let key = item_key(&item);
     let mut guard = state.lock().map_err(|e| e.to_string())?;
     guard.pending_cloud.remove(&key);
     guard.history.insert(
@@ -1932,12 +2551,15 @@ fn delete_pending_upload(path: &Path, pending: &PendingUpload) -> Result<bool, S
     connection
         .execute(
             "DELETE FROM uploaded_files
-             WHERE mapping_id = ?1 AND file_path = ?2 AND task_id = ?3 AND upload_state = ?4",
+             WHERE mapping_id = ?1 AND file_path = ?2 AND task_id = ?3 AND upload_state = ?4
+               AND remote_parent_id = ?5 AND remote_dir = ?6",
             params![
                 pending.item.mapping_id,
                 pending.item.file_path.to_string_lossy(),
                 pending.task_id,
-                UPLOAD_STATE_OSS_COMPLETE
+                UPLOAD_STATE_OSS_COMPLETE,
+                pending.item.remote_parent_id,
+                pending.item.remote_dir
             ],
         )
         .map(|changed| changed > 0)
@@ -2219,7 +2841,7 @@ fn auth_hook_script() -> &'static str {
     })();"#
 }
 
-async fn api_post(
+async fn api_post_once(
     token: &str,
     device_id: &str,
     endpoint: &str,
@@ -2278,6 +2900,154 @@ async fn api_post(
         return Err(message);
     }
     Ok(payload)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AuthRecoveryDecision {
+    RetryWithCurrent(String),
+    Refresh,
+    Invalidate,
+    SessionChanged,
+}
+
+fn auth_recovery_decision(
+    observed_token: &str,
+    current_token: Option<&str>,
+    refreshed_to_current: bool,
+    has_refresh_token: bool,
+) -> AuthRecoveryDecision {
+    match current_token {
+        Some(current) if current != observed_token && refreshed_to_current => {
+            AuthRecoveryDecision::RetryWithCurrent(current.to_string())
+        }
+        Some(current) if current != observed_token => AuthRecoveryDecision::SessionChanged,
+        Some(_) if has_refresh_token => AuthRecoveryDecision::Refresh,
+        Some(_) => AuthRecoveryDecision::Invalidate,
+        None => AuthRecoveryDecision::SessionChanged,
+    }
+}
+
+fn refreshed_token_chain_reaches_current(
+    refreshed_tokens: &HashMap<String, String>,
+    observed_token: &str,
+    current_token: &str,
+) -> bool {
+    let mut candidate = observed_token;
+    for _ in 0..=refreshed_tokens.len().min(32) {
+        let Some(next) = refreshed_tokens.get(candidate) else {
+            return false;
+        };
+        if next == current_token {
+            return true;
+        }
+        candidate = next;
+    }
+    false
+}
+
+fn is_api_auth_expired_error(message: &str) -> bool {
+    message.starts_with("登录态已失效")
+}
+
+fn invalidate_auth_session_if_current(
+    app: &tauri::AppHandle,
+    state: &SharedState,
+    expected_access_token: &str,
+) -> Result<bool, String> {
+    let persistence_result = {
+        let mut guard = state.lock().map_err(|error| error.to_string())?;
+        if guard.token.as_deref() != Some(expected_access_token) {
+            return Ok(false);
+        }
+        let result = clear_persisted_auth_session(&guard.db_path);
+        guard.token = None;
+        guard.refresh_token = None;
+        guard.refreshed_access_tokens.clear();
+        reset_remote_cache(&mut guard.remote_cache);
+        result
+    };
+    emit_state(app, state);
+    persistence_result?;
+    Ok(true)
+}
+
+async fn recover_api_auth_and_retry(
+    runtime: ApiAuthRuntime,
+    observed_token: String,
+    endpoint: &str,
+    body: Value,
+    allowed: &[i64],
+) -> Result<ApiResponse, String> {
+    let refresh_lock = runtime
+        .state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .auth_refresh_lock
+        .clone();
+    let _refresh_guard = refresh_lock.lock().await;
+    let decision = {
+        let guard = runtime.state.lock().map_err(|error| error.to_string())?;
+        let current_token = guard.token.as_deref();
+        auth_recovery_decision(
+            &observed_token,
+            current_token,
+            current_token.is_some_and(|current| {
+                refreshed_token_chain_reaches_current(
+                    &guard.refreshed_access_tokens,
+                    &observed_token,
+                    current,
+                )
+            }),
+            guard.refresh_token.is_some(),
+        )
+    };
+    match decision {
+        AuthRecoveryDecision::RetryWithCurrent(_) => {}
+        AuthRecoveryDecision::Refresh => {
+            if !refresh_saved_session(runtime.app.clone(), runtime.state.clone()).await? {
+                invalidate_auth_session_if_current(&runtime.app, &runtime.state, &observed_token)?;
+                return Err("登录态已失效，请重新打开官方登录页".to_string());
+            }
+        }
+        AuthRecoveryDecision::Invalidate => {
+            invalidate_auth_session_if_current(&runtime.app, &runtime.state, &observed_token)?;
+            return Err("登录态已失效，请重新打开官方登录页".to_string());
+        }
+        AuthRecoveryDecision::SessionChanged => {
+            return Err("登录账户已切换，请重新执行当前操作".to_string());
+        }
+    }
+    let (retry_token, retry_device_id) = shared_auth_context(&runtime.state)?;
+    let retry = api_post_once(&retry_token, &retry_device_id, endpoint, body, allowed).await;
+    if retry
+        .as_ref()
+        .err()
+        .is_some_and(|message| is_api_auth_expired_error(message))
+    {
+        invalidate_auth_session_if_current(&runtime.app, &runtime.state, &retry_token)?;
+    }
+    retry
+}
+
+async fn api_post(
+    token: &str,
+    device_id: &str,
+    endpoint: &str,
+    body: Value,
+    allowed: &[i64],
+) -> Result<ApiResponse, String> {
+    let runtime = API_AUTH_RUNTIME.get().cloned();
+    let effective_token = token.to_string();
+    let result = api_post_once(&effective_token, device_id, endpoint, body.clone(), allowed).await;
+    match result {
+        Err(message) if is_api_auth_expired_error(&message) => {
+            let Some(runtime) = runtime else {
+                return Err(message);
+            };
+            recover_api_auth_and_retry(runtime, effective_token, endpoint, body, allowed).await
+        }
+        result => result,
+    }
 }
 
 fn parse_api_response(raw: &str, status: u16, endpoint: &str) -> Result<ApiResponse, String> {
@@ -3722,8 +4492,14 @@ async fn hdhive_request(
         .text()
         .await
         .map_err(|error| format!("读取 Hdhive 响应失败：{error}"))?;
-    let payload: Value = serde_json::from_str(&raw)
-        .map_err(|error| format!("Hdhive 返回非 JSON 响应（HTTP {status_code}）：{error}"))?;
+    let payload: Value = serde_json::from_str(&raw).map_err(|error| {
+        let preview = safe_response_preview(&raw, 200);
+        if preview.is_empty() {
+            format!("Hdhive 返回非 JSON 响应（HTTP {status_code}）：{error}；响应正文为空")
+        } else {
+            format!("Hdhive 返回非 JSON 响应（HTTP {status_code}）：{error}；响应正文：{preview}")
+        }
+    })?;
     if !status_code.is_success() {
         return Err(payload
             .get("description")
@@ -4865,22 +5641,47 @@ fn file_available_for_upload(path: &Path) -> Result<bool, String> {
         .map_err(|error| format!("读取源文件失败：{error}"))
 }
 
-async fn prepare_upload_item(item: &UploadItem) -> Result<Option<UploadItem>, String> {
-    if !file_available_for_upload(&item.file_path)? {
+fn upload_source_root(state: &SharedState, item: &UploadItem) -> Result<Option<PathBuf>, String> {
+    if item.mapping_id == "__manual__" {
+        return Ok(None);
+    }
+    state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .mappings
+        .iter()
+        .find(|mapping| mapping.id == item.mapping_id && mapping.enabled)
+        .map(|mapping| Some(PathBuf::from(&mapping.local_path)))
+        .ok_or_else(|| "备份任务已停用或已被移除".to_string())
+}
+
+async fn prepare_upload_item(
+    item: &UploadItem,
+    source_root: Option<&Path>,
+) -> Result<Option<UploadItem>, String> {
+    let canonical_source = canonical_upload_source(&item.file_path, source_root)?;
+    if !file_available_for_upload(&canonical_source)? {
         return Ok(None);
     }
     let first =
-        fs::metadata(&item.file_path).map_err(|error| format!("读取源文件失败：{error}"))?;
+        fs::metadata(&canonical_source).map_err(|error| format!("读取源文件失败：{error}"))?;
     if !first.is_file() {
         return Err("源路径不是文件".into());
     }
     sleep(Duration::from_millis(FILE_STABILITY_WAIT_MS)).await;
-    if !file_available_for_upload(&item.file_path)? {
+    let second_canonical = canonical_upload_source(&item.file_path, source_root)?;
+    if second_canonical != canonical_source {
+        return Err("源文件真实路径在上传准备期间发生变化，已拒绝上传".to_string());
+    }
+    if !file_available_for_upload(&canonical_source)? {
         return Ok(None);
     }
     let second =
-        fs::metadata(&item.file_path).map_err(|error| format!("读取源文件失败：{error}"))?;
-    if first.len() != second.len() || modified_ms(&first) != modified_ms(&second) {
+        fs::metadata(&canonical_source).map_err(|error| format!("读取源文件失败：{error}"))?;
+    if !same_file_identity(&first, &second)
+        || first.len() != second.len()
+        || modified_ms(&first) != modified_ms(&second)
+    {
         return Ok(None);
     }
     let mut ready = item.clone();
@@ -4898,7 +5699,7 @@ async fn requeue_busy_upload(app: tauri::AppHandle, state: SharedState, mut item
         item.size = metadata.len();
         item.modified_ms = modified_ms(metadata);
     }
-    let key = item_key(&item.mapping_id, &item.file_path);
+    let key = item_key(&item);
     let queued = if let Ok(mut guard) = state.lock() {
         guard.waiting_files.remove(&key);
         if metadata.is_none() {
@@ -4920,9 +5721,7 @@ async fn requeue_busy_upload(app: tauri::AppHandle, state: SharedState, mut item
         ) {
             false
         } else {
-            guard
-                .queue
-                .retain(|queued| item_key(&queued.mapping_id, &queued.file_path) != key);
+            guard.queue.retain(|queued| item_key(queued) != key);
             guard.queue.push_back(item.clone());
             true
         }
@@ -4957,7 +5756,7 @@ async fn requeue_resumable_upload(app: tauri::AppHandle, state: SharedState, ite
         Ok(Some(value)) => value,
         _ => return,
     };
-    let key = item_key(&item.mapping_id, &item.file_path);
+    let key = item_key(&item);
     let queued = if let Ok(mut guard) = state.lock() {
         let mapping_active = item.mapping_id == "__manual__"
             || guard
@@ -4976,9 +5775,7 @@ async fn requeue_resumable_upload(app: tauri::AppHandle, state: SharedState, ite
         {
             false
         } else {
-            guard
-                .queue
-                .retain(|queued| item_key(&queued.mapping_id, &queued.file_path) != key);
+            guard.queue.retain(|queued| item_key(queued) != key);
             guard.queue.push_back(item.clone());
             true
         }
@@ -5689,6 +6486,55 @@ fn archive_file_without_overwrite(
     Err("无法生成唯一的归档文件名".into())
 }
 
+fn restore_staged_source(staged: &Path, original: &Path, message: String) -> String {
+    if fs::symlink_metadata(original).is_ok() {
+        return format!(
+            "{message}；原路径已出现新文件，待处理的原文件保留在 {}",
+            staged.display()
+        );
+    }
+    match fs::rename(staged, original) {
+        Ok(()) => message,
+        Err(error) => format!(
+            "{message}；恢复源文件失败，待处理文件保留在 {}：{error}",
+            staged.display()
+        ),
+    }
+}
+
+fn stage_source_for_policy(
+    source: &Path,
+    expected_size: u64,
+    expected_modified_ms: u128,
+) -> Result<PathBuf, String> {
+    let parent = source
+        .parent()
+        .ok_or_else(|| "源文件路径没有上级目录，已保留源文件".to_string())?;
+    let staged = parent.join(format!(".guangya-source-{}", Uuid::new_v4().simple()));
+    fs::rename(source, &staged).map_err(|error| format!("锁定上传后的源文件失败：{error}"))?;
+    let metadata = match fs::metadata(&staged) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err(restore_staged_source(
+                &staged,
+                source,
+                format!("锁定后核对源文件失败：{error}"),
+            ));
+        }
+    };
+    if !metadata.is_file()
+        || metadata.len() != expected_size
+        || modified_ms(&metadata) != expected_modified_ms
+    {
+        return Err(restore_staged_source(
+            &staged,
+            source,
+            "上传后源文件发生变化，已保留源文件且不会执行上传后策略".to_string(),
+        ));
+    }
+    Ok(staged)
+}
+
 fn apply_source_policy(state: &SharedState, item: &UploadItem) -> Result<Option<String>, String> {
     if item.mapping_id == "__manual__" {
         return Ok(None);
@@ -5704,40 +6550,77 @@ fn apply_source_policy(state: &SharedState, item: &UploadItem) -> Result<Option<
     if mapping.source_policy == "keep" {
         return Ok(None);
     }
-    let metadata = fs::metadata(&item.file_path).map_err(|e| format!("读取源文件失败：{e}"))?;
+    let source_root = canonical_existing_directory(Path::new(&mapping.local_path), "监控目录")?;
+    let source_path = canonical_upload_source(&item.file_path, Some(&source_root))?;
+    let metadata = fs::metadata(&source_path).map_err(|e| format!("读取源文件失败：{e}"))?;
     if metadata.len() != item.size || modified_ms(&metadata) != item.modified_ms {
         return Err("上传期间源文件发生变化，已保留源文件且不会执行上传后策略".into());
     }
+    let staged_source = stage_source_for_policy(&source_path, item.size, item.modified_ms)?;
     if mapping.source_policy == "delete" {
-        fs::remove_file(&item.file_path).map_err(|e| format!("删除源文件失败：{e}"))?;
+        if let Err(error) = fs::remove_file(&staged_source) {
+            return Err(restore_staged_source(
+                &staged_source,
+                &source_path,
+                format!("删除源文件失败：{error}"),
+            ));
+        }
         return Ok(Some("已按任务策略删除源文件".into()));
     }
     if mapping.source_policy != "archive" {
-        return Err(format!("未知的源文件策略：{}", mapping.source_policy));
+        return Err(restore_staged_source(
+            &staged_source,
+            &source_path,
+            format!("未知的源文件策略：{}", mapping.source_policy),
+        ));
     }
-    let archive_root = mapping
+    let archive_root = match mapping
         .archive_path
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "归档策略没有配置归档目录".to_string())?;
-    let source_root = PathBuf::from(&mapping.local_path);
-    let archive_root = PathBuf::from(archive_root);
-    if archive_root.starts_with(&source_root) {
-        return Err("归档目录不能位于被监控目录内部".into());
+    {
+        Some(path) => path,
+        None => {
+            return Err(restore_staged_source(
+                &staged_source,
+                &source_path,
+                "归档策略没有配置归档目录".to_string(),
+            ));
+        }
+    };
+    let archive_root = canonical_existing_directory(Path::new(&archive_root), "归档目录")
+        .map_err(|error| restore_staged_source(&staged_source, &source_path, error))?;
+    if archive_root == source_root || archive_root.starts_with(&source_root) {
+        return Err(restore_staged_source(
+            &staged_source,
+            &source_path,
+            "归档目录不能位于被监控目录内部".to_string(),
+        ));
     }
-    let relative = item
-        .file_path
-        .strip_prefix(&source_root)
-        .map_err(|_| "无法计算源文件的相对路径".to_string())?;
-    let requested_destination = archive_root.join(relative);
-    if let Some(parent) = requested_destination.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("创建归档目录失败：{e}"))?;
-    }
+    let relative = source_path.strip_prefix(&source_root).map_err(|_| {
+        restore_staged_source(
+            &staged_source,
+            &source_path,
+            "无法计算源文件的相对路径".to_string(),
+        )
+    })?;
+    let relative_parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let destination_parent = ensure_directory_tree_without_symlinks(&archive_root, relative_parent)
+        .map_err(|error| restore_staged_source(&staged_source, &source_path, error))?;
+    let file_name = relative.file_name().ok_or_else(|| {
+        restore_staged_source(
+            &staged_source,
+            &source_path,
+            "无法计算归档文件名".to_string(),
+        )
+    })?;
+    let requested_destination = destination_parent.join(file_name);
     let destination = archive_file_without_overwrite(
-        &item.file_path,
+        &staged_source,
         &requested_destination,
         item.size,
         item.modified_ms,
-    )?;
+    )
+    .map_err(|error| restore_staged_source(&staged_source, &source_path, error))?;
     Ok(Some(format!("已移动到归档目录：{}", destination.display())))
 }
 
@@ -5821,7 +6704,7 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
                     .position(|candidate| !flash_preflight_cached(&guard, candidate));
                 position.and_then(|position| {
                     let item = guard.queue.remove(position)?;
-                    let key = item_key(&item.mapping_id, &item.file_path);
+                    let key = item_key(&item);
                     guard.active_flash_preflights += 1;
                     guard.inflight.insert(
                         key.clone(),
@@ -5854,16 +6737,19 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
         let app2 = app.clone();
         let state2 = state.clone();
         tauri::async_runtime::spawn(async move {
-            let upload_key = item_key(&item.mapping_id, &item.file_path);
+            let upload_key = item_key(&item);
             let mut item = item;
-            let result = match prepare_upload_item(&item).await {
-                Ok(Some(ready)) => {
-                    item = ready;
-                    preflight_flash_upload(&app2, &state2, &item)
-                        .await
-                        .map(Some)
-                }
-                Ok(None) => Ok(None),
+            let result = match upload_source_root(&state2, &item) {
+                Ok(source_root) => match prepare_upload_item(&item, source_root.as_deref()).await {
+                    Ok(Some(ready)) => {
+                        item = ready;
+                        preflight_flash_upload(&app2, &state2, &item)
+                            .await
+                            .map(Some)
+                    }
+                    Ok(None) => Ok(None),
+                    Err(message) => Err(message),
+                },
                 Err(message) => Err(message),
             };
             let waiting_for_file = result.as_ref().ok().is_some_and(Option::is_none);
@@ -6109,15 +6995,13 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                 if let Some(item) = &item {
                     guard.active_uploads += 1;
                     guard.inflight.insert(
-                        item_key(&item.mapping_id, &item.file_path),
+                        item_key(item),
                         Stamp {
                             size: item.size,
                             modified_ms: item.modified_ms,
                         },
                     );
-                    guard
-                        .inflight_items
-                        .insert(item_key(&item.mapping_id, &item.file_path), item.clone());
+                    guard.inflight_items.insert(item_key(item), item.clone());
                 }
                 item
             }
@@ -6134,14 +7018,17 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
         let app2 = app.clone();
         let state2 = state.clone();
         tauri::async_runtime::spawn(async move {
-            let upload_key = item_key(&item.mapping_id, &item.file_path);
+            let upload_key = item_key(&item);
             let mut item = item;
-            let result = match prepare_upload_item(&item).await {
-                Ok(Some(ready)) => {
-                    item = ready;
-                    upload_item(&app2, &state2, &item).await.map(Some)
-                }
-                Ok(None) => Ok(None),
+            let result = match upload_source_root(&state2, &item) {
+                Ok(source_root) => match prepare_upload_item(&item, source_root.as_deref()).await {
+                    Ok(Some(ready)) => {
+                        item = ready;
+                        upload_item(&app2, &state2, &item).await.map(Some)
+                    }
+                    Ok(None) => Ok(None),
+                    Err(message) => Err(message),
+                },
                 Err(message) => Err(message),
             };
             let waiting_for_file = result.as_ref().ok().is_some_and(Option::is_none);
@@ -6263,11 +7150,21 @@ async fn enqueue_path(app: &tauri::AppHandle, state: &SharedState, event: FsEven
     let Some(mapping) = mapping else {
         return;
     };
-    let event_paths = collect_watch_event_files(&event.path, &mapping.sync_types);
+    if !event.path.exists() {
+        return;
+    }
+    let event_path = match canonical_watch_path(&event.path, Path::new(&mapping.local_path)) {
+        Ok(path) => path,
+        Err(error) => {
+            status(app, "warning", error);
+            return;
+        }
+    };
+    let event_paths = collect_watch_event_files(&event_path, &mapping.sync_types);
     if event_paths.is_empty() {
         return;
     }
-    if event_paths.len() != 1 || event_paths.first() != Some(&event.path) {
+    if event_paths.len() != 1 || event_paths.first() != Some(&event_path) {
         if let Ok(guard) = state.lock() {
             for path in event_paths {
                 let _ = guard.event_tx.send(FsEvent {
@@ -6278,36 +7175,22 @@ async fn enqueue_path(app: &tauri::AppHandle, state: &SharedState, event: FsEven
         }
         return;
     }
-    let Ok(meta) = fs::metadata(&event.path) else {
+    let Ok(meta) = fs::metadata(&event_path) else {
         return;
     };
-    let relative = event
-        .path
-        .strip_prefix(&mapping.local_path)
-        .ok()
-        .map(|path| path.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_default();
-    let relative_dir = Path::new(&relative)
-        .parent()
-        .map(|path| path.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_default();
-    let remote_dir = [
-        if mapping.remote_parent_id.is_empty() {
-            normalize_remote_path(&mapping.remote_path)
-        } else {
-            String::new()
-        },
-        relative_dir,
-    ]
-    .into_iter()
-    .filter(|part| !part.is_empty())
-    .collect::<Vec<_>>()
-    .join("/");
+    let (remote_parent_id, remote_dir, relative) =
+        match mapping_upload_destination(&mapping, &event_path) {
+            Ok(destination) => destination,
+            Err(error) => {
+                status(app, "warning", error);
+                return;
+            }
+        };
     let auto_share_enabled = mapping.auto_share;
     let mut item = UploadItem {
         mapping_id: mapping.id,
-        file_path: event.path.clone(),
-        remote_parent_id: mapping.remote_parent_id,
+        file_path: event_path.clone(),
+        remote_parent_id,
         remote_dir,
         relative_path: relative,
         change_kind: "added".to_string(),
@@ -6341,7 +7224,7 @@ async fn enqueue_path(app: &tauri::AppHandle, state: &SharedState, event: FsEven
     };
     let waiting_for_login = if let Ok(mut guard) = state.lock() {
         let waiting_for_login = guard.token.is_none();
-        let key = item_key(&item.mapping_id, &item.file_path);
+        let key = item_key(&item);
         if upload_already_scheduled(
             &guard.history,
             &guard.pending_cloud,
@@ -6365,9 +7248,7 @@ async fn enqueue_path(app: &tauri::AppHandle, state: &SharedState, event: FsEven
             if guard.history.contains_key(&key) {
                 item.change_kind = "changed".to_string();
             }
-            guard
-                .queue
-                .retain(|queued| item_key(&queued.mapping_id, &queued.file_path) != key);
+            guard.queue.retain(|queued| item_key(queued) != key);
             guard.queue.push_back(item.clone());
             waiting_for_login
         }
@@ -6405,7 +7286,7 @@ async fn enqueue_path(app: &tauri::AppHandle, state: &SharedState, event: FsEven
     }
     emit(
         app,
-        json!({ "type": "file", "state": if waiting_for_login { "waiting-login" } else { "queued" }, "file_path": event.path.to_string_lossy() }),
+        json!({ "type": "file", "state": if waiting_for_login { "waiting-login" } else { "queued" }, "file_path": event_path.to_string_lossy() }),
     );
     emit_state(app, state);
     drain_queue(app.clone(), state.clone());
@@ -6521,70 +7402,74 @@ fn seed_existing_files(state: &SharedState, mapping: &Mapping) {
     );
     if let Ok(mut guard) = state.lock() {
         for path in files {
-            if let Ok(metadata) = fs::metadata(&path) {
-                guard.history.insert(
-                    item_key(&mapping.id, &path),
-                    Stamp {
-                        size: metadata.len(),
-                        modified_ms: modified_ms(&metadata),
-                    },
-                );
-            }
+            let Ok(path) = canonical_upload_source(&path, Some(Path::new(&mapping.local_path)))
+            else {
+                continue;
+            };
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            let Ok((remote_parent_id, remote_dir, relative_path)) =
+                mapping_upload_destination(mapping, &path)
+            else {
+                continue;
+            };
+            let item = UploadItem {
+                mapping_id: mapping.id.clone(),
+                file_path: path,
+                remote_parent_id,
+                remote_dir,
+                relative_path,
+                change_kind: "added".to_string(),
+                size: metadata.len(),
+                modified_ms: modified_ms(&metadata),
+            };
+            guard.history.insert(
+                item_key(&item),
+                Stamp {
+                    size: item.size,
+                    modified_ms: item.modified_ms,
+                },
+            );
         }
     }
 }
 
-fn hydrate_pending_item(state: &SharedState, pending: &PendingUpload) -> UploadItem {
-    let mut item = pending.item.clone();
-    if item.mapping_id == "__manual__" {
-        return item;
-    }
-    let mapping = state.lock().ok().and_then(|guard| {
-        guard
-            .mappings
-            .iter()
-            .find(|mapping| mapping.id == item.mapping_id)
-            .cloned()
-    });
-    let Some(mapping) = mapping else {
-        return item;
-    };
-    let relative = item
-        .file_path
-        .strip_prefix(&mapping.local_path)
-        .ok()
-        .map(|path| path.to_string_lossy().replace('\\', "/"))
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| item.relative_path.clone());
-    let relative_dir = Path::new(&relative)
-        .parent()
-        .map(|path| path.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_default();
-    item.remote_parent_id = mapping.remote_parent_id.clone();
-    item.remote_dir = [
-        if mapping.remote_parent_id.is_empty() {
-            normalize_remote_path(&mapping.remote_path)
-        } else {
-            String::new()
-        },
-        relative_dir,
-    ]
-    .into_iter()
-    .filter(|part| !part.is_empty())
-    .collect::<Vec<_>>()
-    .join("/");
-    item.relative_path = relative;
-    item
+fn hydrate_pending_item(_state: &SharedState, pending: &PendingUpload) -> UploadItem {
+    // A cloud task belongs to the destination recorded when it was created. Retargeting here
+    // would confirm or delete the wrong composite-key row after a mapping was edited.
+    pending.item.clone()
 }
 
 fn queue_rejected_pending_upload(state: &SharedState, pending: &PendingUpload) -> bool {
-    let mut item = hydrate_pending_item(state, pending);
-    let key = item_key(&item.mapping_id, &item.file_path);
+    let pending_key = item_key(&pending.item);
     if let Ok(mut guard) = state.lock() {
-        guard.pending_cloud.remove(&key);
+        guard.pending_cloud.remove(&pending_key);
     } else {
         return false;
     }
+    let mut item = pending.item.clone();
+    if item.mapping_id != "__manual__" {
+        let mapping = state.lock().ok().and_then(|guard| {
+            guard
+                .mappings
+                .iter()
+                .find(|mapping| mapping.id == item.mapping_id && mapping.enabled)
+                .cloned()
+        });
+        let Some(mapping) = mapping else {
+            return false;
+        };
+        let Ok((remote_parent_id, remote_dir, relative_path)) =
+            mapping_upload_destination(&mapping, &item.file_path)
+        else {
+            return false;
+        };
+        item.remote_parent_id = remote_parent_id;
+        item.remote_dir = remote_dir;
+        item.relative_path = relative_path;
+    }
+    let key = item_key(&item);
     let Ok(metadata) = fs::metadata(&item.file_path) else {
         return false;
     };
@@ -6614,15 +7499,13 @@ fn queue_rejected_pending_upload(state: &SharedState, pending: &PendingUpload) -
     ) {
         return false;
     }
-    guard
-        .queue
-        .retain(|queued| item_key(&queued.mapping_id, &queued.file_path) != key);
+    guard.queue.retain(|queued| item_key(queued) != key);
     guard.queue.push_back(item);
     true
 }
 
 async fn recover_pending_upload(app: tauri::AppHandle, state: SharedState, pending: PendingUpload) {
-    let key = item_key(&pending.item.mapping_id, &pending.item.file_path);
+    let key = item_key(&pending.item);
     let (token, device_id, db_path) = match state.lock() {
         Ok(guard) => {
             let Some(token) = guard.token.clone() else {
@@ -6746,7 +7629,7 @@ async fn pending_upload_recovery_loop(app: tauri::AppHandle, state: SharedState)
             }
         };
         for pending in pending_uploads {
-            let key = item_key(&pending.item.mapping_id, &pending.item.file_path);
+            let key = item_key(&pending.item);
             let should_start = state.lock().ok().is_some_and(|mut guard| {
                 !guard.inflight.contains_key(&key) && guard.recovering_pending.insert(key.clone())
             });
@@ -6770,12 +7653,63 @@ async fn polling_loop(app: tauri::AppHandle, state: SharedState) {
                 guard
                     .mappings
                     .iter()
-                    .filter(|mapping| mapping.enabled && mapping.monitor_mode == "polling")
+                    .filter(|mapping| mapping.enabled)
                     .cloned()
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
         for mapping in mappings {
+            let mapping = normalize_loaded_mapping_paths(mapping);
+            let validation_error = mapping.watch_error.clone();
+            if let Ok(mut guard) = state.lock() {
+                if let Some(current) = guard
+                    .mappings
+                    .iter_mut()
+                    .find(|current| current.id == mapping.id)
+                {
+                    let changed = current.local_path != mapping.local_path
+                        || current.archive_path != mapping.archive_path
+                        || current.watch_error != mapping.watch_error;
+                    current.local_path = mapping.local_path.clone();
+                    current.archive_path = mapping.archive_path.clone();
+                    current.watch_error = mapping.watch_error.clone();
+                    if changed {
+                        save_config(&guard);
+                    }
+                }
+            }
+            if validation_error.is_some() {
+                continue;
+            }
+            if mapping.monitor_mode != "polling" {
+                let watcher_missing = state
+                    .lock()
+                    .map(|guard| !guard.watchers.contains_key(&mapping.id))
+                    .unwrap_or(false);
+                if watcher_missing {
+                    match install_watcher(&state, &mapping) {
+                        Ok(()) => {
+                            if mapping.scan_existing {
+                                enqueue_existing_files(&app, &state, &mapping);
+                            }
+                            emit_state(&app, &state);
+                        }
+                        Err(error) => {
+                            if let Ok(mut guard) = state.lock() {
+                                if let Some(current) = guard
+                                    .mappings
+                                    .iter_mut()
+                                    .find(|current| current.id == mapping.id)
+                                {
+                                    current.watch_error = Some(error);
+                                }
+                                save_config(&guard);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             let mut files = Vec::new();
             collect_existing_files(
                 Path::new(&mapping.local_path),
@@ -6826,11 +7760,16 @@ fn mount_info(state: &RuntimeState) -> MountInfo {
     MountInfo {
         enabled: state.webdav_enabled,
         running: state.webdav_running,
-        configured: !state.webdav_username.is_empty() && !state.webdav_password.is_empty(),
+        configured: !state.webdav_username.is_empty() && !state.webdav_password_hash.is_empty(),
         local_only: true,
         endpoint: format!("http://127.0.0.1:{}/", state.webdav_port),
         username: state.webdav_username.clone(),
         password: String::new(),
+        password_hint: if state.webdav_password_hash.is_empty() {
+            "尚未设置，请输入 12 位以上密码".to_string()
+        } else {
+            "已设置；输入新密码可更新".to_string()
+        },
         error: state.webdav_error.clone(),
         protocol: "webdav".to_string(),
     }
@@ -6843,24 +7782,50 @@ fn get_mount_info(state: tauri::State<'_, SharedState>) -> Result<MountInfo, Str
 }
 
 #[tauri::command]
-fn update_mount_credentials(
+async fn update_mount_credentials(
     state: tauri::State<'_, SharedState>,
     username: String,
     password: String,
 ) -> Result<MountInfo, String> {
     let username = normalize_webdav_username(&username)?;
     let password = normalize_webdav_password(&password)?;
+    let password_for_hash = password.clone();
+    let password_hash =
+        tokio::task::spawn_blocking(move || hash_webdav_password(&password_for_hash))
+            .await
+            .map_err(|error| format!("计算 WebDAV 密码哈希失败：{error}"))?;
+    let password_verifier = webdav_password_verifier(&password);
     let mut guard = state.lock().map_err(|error| error.to_string())?;
+    let previous_username = guard.webdav_username.clone();
+    let previous_hash = guard.webdav_password_hash.clone();
+    let previous_session_password = guard.webdav_session_password.clone();
+    let previous_verifier = guard.webdav_password_verifier;
     guard.webdav_username = username;
-    guard.webdav_password = password;
-    save_config(&guard);
+    guard.webdav_password_hash = password_hash;
+    guard.webdav_session_password = Some(password.clone());
+    guard.webdav_password_verifier = Some(password_verifier);
+    if let Err(error) = save_config_checked(&guard) {
+        guard.webdav_username = previous_username;
+        guard.webdav_password_hash = previous_hash;
+        guard.webdav_session_password = previous_session_password;
+        guard.webdav_password_verifier = previous_verifier;
+        return Err(error);
+    }
     Ok(mount_info(&guard))
 }
 
 #[tauri::command]
 fn get_native_mount_info(state: tauri::State<'_, SharedState>) -> Result<NativeMountInfo, String> {
-    let mut guard = state.lock().map_err(|error| error.to_string())?;
-    Ok(guard.native_mount.info())
+    let manager = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .native_mount
+        .clone();
+    let info = manager
+        .lock()
+        .map_err(|error| format!("读取原生挂载状态失败：{error}"))?
+        .info();
+    Ok(info)
 }
 
 #[tauri::command]
@@ -6868,31 +7833,86 @@ fn update_native_mount_options(
     state: tauri::State<'_, SharedState>,
     options: NativeMountOptions,
 ) -> Result<NativeMountInfo, String> {
-    let mut guard = state.lock().map_err(|error| error.to_string())?;
-    guard.native_mount.set_options(options)?;
-    save_config(&guard);
-    Ok(guard.native_mount.info())
+    let manager = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .native_mount
+        .clone();
+    let previous = {
+        let mut mount = manager
+            .lock()
+            .map_err(|error| format!("更新原生挂载设置失败：{error}"))?;
+        let previous = mount.options();
+        mount.set_options(options)?;
+        previous
+    };
+    let save_result = {
+        let guard = state.lock().map_err(|error| error.to_string())?;
+        save_config_checked(&guard)
+    };
+    if let Err(error) = save_result {
+        if let Ok(mut mount) = manager.lock() {
+            let _ = mount.set_options(previous);
+        }
+        return Err(error);
+    }
+    let info = manager
+        .lock()
+        .map_err(|error| format!("读取原生挂载状态失败：{error}"))?
+        .info();
+    Ok(info)
 }
 
 #[tauri::command]
-fn start_native_mount(state: tauri::State<'_, SharedState>) -> Result<NativeMountInfo, String> {
-    let mut guard = state.lock().map_err(|error| error.to_string())?;
-    if !guard.webdav_running {
-        return Err(guard
-            .webdav_error
-            .clone()
-            .unwrap_or_else(|| "WebDAV 本地服务尚未就绪".to_string()));
+fn start_native_mount(
+    state: tauri::State<'_, SharedState>,
+    password: Option<String>,
+) -> Result<NativeMountInfo, String> {
+    let (manager, endpoint, username, password_hash, session_password) = {
+        let guard = state.lock().map_err(|error| error.to_string())?;
+        if !guard.webdav_running {
+            return Err(guard
+                .webdav_error
+                .clone()
+                .unwrap_or_else(|| "WebDAV 本地服务尚未就绪".to_string()));
+        }
+        if guard.webdav_password_hash.is_empty() {
+            return Err("请先设置 WebDAV 挂载账号密码".to_string());
+        }
+        (
+            guard.native_mount.clone(),
+            format!("http://127.0.0.1:{}/", guard.webdav_port),
+            guard.webdav_username.clone(),
+            guard.webdav_password_hash.clone(),
+            guard.webdav_session_password.clone(),
+        )
+    };
+    let password = password
+        .filter(|value| !value.is_empty())
+        .or(session_password)
+        .ok_or_else(|| "为避免明文保存，请重新输入当前 WebDAV 密码后再挂载".to_string())?;
+    if !verify_webdav_password(&password, &password_hash) {
+        return Err("WebDAV 挂载密码不正确".to_string());
     }
-    let endpoint = format!("http://127.0.0.1:{}/", guard.webdav_port);
-    let username = guard.webdav_username.clone();
-    let password = guard.webdav_password.clone();
-    guard.native_mount.start(&endpoint, &username, &password)
+    let result = manager
+        .lock()
+        .map_err(|error| format!("启动原生挂载失败：{error}"))?
+        .start(&endpoint, &username, &password);
+    result
 }
 
 #[tauri::command]
 fn stop_native_mount(state: tauri::State<'_, SharedState>) -> Result<NativeMountInfo, String> {
-    let mut guard = state.lock().map_err(|error| error.to_string())?;
-    guard.native_mount.stop()
+    let manager = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .native_mount
+        .clone();
+    let result = manager
+        .lock()
+        .map_err(|error| format!("卸载原生挂载失败：{error}"))?
+        .stop();
+    result
 }
 
 #[tauri::command]
@@ -6903,18 +7923,17 @@ fn select_native_mount_target() -> Option<String> {
 }
 
 #[tauri::command]
-fn select_rclone_binary() -> Option<String> {
-    let mut dialog = rfd::FileDialog::new();
+fn select_rclone_binary(state: tauri::State<'_, SharedState>) -> Option<String> {
+    let dialog = rfd::FileDialog::new();
     #[cfg(windows)]
-    {
-        dialog = dialog.add_filter("rclone", &["exe"]);
-    }
-    dialog
-        .pick_file()
-        .map(|path| path.to_string_lossy().to_string())
+    let dialog = dialog.add_filter("rclone", &["exe"]);
+    let path = dialog.pick_file()?;
+    let manager = state.lock().ok()?.native_mount.clone();
+    manager.lock().ok()?.approve_rclone_path(&path).ok()?;
+    Some(path.to_string_lossy().to_string())
 }
 
-fn auth_context(state: &tauri::State<'_, SharedState>) -> Result<(String, String), String> {
+fn shared_auth_context(state: &SharedState) -> Result<(String, String), String> {
     let guard = state.lock().map_err(|e| e.to_string())?;
     Ok((
         guard
@@ -6923,6 +7942,10 @@ fn auth_context(state: &tauri::State<'_, SharedState>) -> Result<(String, String
             .ok_or_else(|| "请先登录光鸭云盘".to_string())?,
         guard.device_id.clone(),
     ))
+}
+
+fn auth_context(state: &tauri::State<'_, SharedState>) -> Result<(String, String), String> {
+    shared_auth_context(state.inner())
 }
 
 #[tauri::command]
@@ -7020,7 +8043,9 @@ fn collect_manual_uploads(path: &Path, remote_prefix: &str, files: &mut Vec<(Pat
         return;
     }
     if metadata.is_file() {
-        files.push((path.to_path_buf(), normalize_remote_path(remote_prefix)));
+        if let Ok(canonical) = fs::canonicalize(path) {
+            files.push((canonical, normalize_remote_path(remote_prefix)));
+        }
         return;
     }
     if !metadata.is_dir() {
@@ -7268,22 +8293,20 @@ fn queue_upload_paths(
                 size: metadata.len(),
                 modified_ms: modified_ms(&metadata),
             };
-            let key = item_key(&item.mapping_id, &item.file_path);
+            let key = item_key(&item);
             if guard
                 .inflight
                 .get(&key)
                 .is_some_and(|stamp| stamp_matches(&item, stamp))
                 || guard.queue.iter().any(|queued| {
-                    item_key(&queued.mapping_id, &queued.file_path) == key
+                    item_key(queued) == key
                         && queued.size == item.size
                         && queued.modified_ms == item.modified_ms
                 })
             {
                 continue;
             }
-            guard
-                .queue
-                .retain(|queued| item_key(&queued.mapping_id, &queued.file_path) != key);
+            guard.queue.retain(|queued| item_key(queued) != key);
             guard.queue.push_back(item);
             count += 1;
         }
@@ -8473,7 +9496,23 @@ async fn refresh_saved_session(app: tauri::AppHandle, state: SharedState) -> Res
             .unwrap_or("刷新登录状态失败")
             .to_string();
         if matches!(status_code, 400 | 401 | 403) {
-            invalidate_auth_session(&app, &state)?;
+            let invalidated = {
+                let mut guard = state.lock().map_err(|error| error.to_string())?;
+                if guard.refresh_token.as_deref() != Some(refresh_token.as_str()) {
+                    false
+                } else {
+                    clear_persisted_auth_session(&guard.db_path)?;
+                    guard.token = None;
+                    guard.refresh_token = None;
+                    guard.refreshed_access_tokens.clear();
+                    reset_remote_cache(&mut guard.remote_cache);
+                    true
+                }
+            };
+            if !invalidated {
+                return Ok(false);
+            }
+            emit_state(&app, &state);
             return Err(format!("登录态已失效，请重新扫码登录：{message}"));
         }
         return Err(message);
@@ -8499,19 +9538,56 @@ async fn refresh_saved_session(app: tauri::AppHandle, state: SharedState) -> Res
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
-    let db_path = {
+    {
         let mut guard = state.lock().map_err(|e| e.to_string())?;
+        if guard.refresh_token.as_deref() != Some(refresh_token.as_str()) {
+            return Ok(false);
+        }
+        save_refreshed_auth_session(&guard.db_path, &access_token, next_refresh.as_deref())?;
+        if let Some(previous_access_token) = guard.token.clone() {
+            if previous_access_token != access_token {
+                if guard.refreshed_access_tokens.len() >= 32 {
+                    guard.refreshed_access_tokens.clear();
+                }
+                guard
+                    .refreshed_access_tokens
+                    .insert(previous_access_token, access_token.clone());
+            }
+        }
         guard.token = Some(access_token.clone());
         if next_refresh.is_some() {
             guard.refresh_token = next_refresh.clone();
         }
         reset_remote_cache(&mut guard.remote_cache);
-        guard.db_path.clone()
-    };
-    save_auth_session(&db_path, Some(&access_token), next_refresh.as_deref())?;
+    }
     emit_state(&app, &state);
     drain_queue(app, state);
     Ok(true)
+}
+
+async fn refresh_saved_session_singleflight(
+    app: tauri::AppHandle,
+    state: SharedState,
+) -> Result<bool, String> {
+    let (observed_access_token, observed_refresh_token, refresh_lock) = {
+        let guard = state.lock().map_err(|error| error.to_string())?;
+        (
+            guard.token.clone(),
+            guard.refresh_token.clone(),
+            guard.auth_refresh_lock.clone(),
+        )
+    };
+    if observed_refresh_token.is_none() {
+        return Ok(false);
+    }
+    let _refresh_guard = refresh_lock.lock().await;
+    {
+        let guard = state.lock().map_err(|error| error.to_string())?;
+        if guard.token != observed_access_token || guard.refresh_token != observed_refresh_token {
+            return Ok(guard.token.is_some());
+        }
+    }
+    refresh_saved_session(app, state).await
 }
 
 async fn token_refresh_loop(app: tauri::AppHandle, state: SharedState) {
@@ -8525,7 +9601,7 @@ async fn token_refresh_loop(app: tauri::AppHandle, state: SharedState) {
         if !can_refresh {
             continue;
         }
-        if let Err(error) = refresh_saved_session(app.clone(), state.clone()).await {
+        if let Err(error) = refresh_saved_session_singleflight(app.clone(), state.clone()).await {
             status(
                 &app,
                 "warning",
@@ -8723,14 +9799,14 @@ async fn login_with_sms(
     let access_token = account_payload_string(&login_payload, &["access_token"])
         .ok_or_else(|| "登录接口没有返回 access_token".to_string())?;
     let refresh_token = account_payload_string(&login_payload, &["refresh_token"]);
-    let db_path = state
-        .lock()
-        .map_err(|error| error.to_string())?
-        .db_path
-        .clone();
-    save_auth_session(&db_path, Some(&access_token), refresh_token.as_deref())?;
     {
         let mut guard = state.lock().map_err(|error| error.to_string())?;
+        save_auth_session(
+            &guard.db_path,
+            Some(&access_token),
+            refresh_token.as_deref(),
+        )?;
+        guard.refreshed_access_tokens.clear();
         guard.token = Some(access_token);
         guard.refresh_token = refresh_token;
         guard.sms_verifications.remove(verification_id);
@@ -8804,17 +9880,13 @@ async fn poll_device_login(
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
     if let Some(token) = token {
-        let db_path = {
+        {
             let mut guard = state.lock().map_err(|e| e.to_string())?;
+            save_auth_session(&guard.db_path, Some(&token), refresh_token.as_deref())?;
+            guard.refreshed_access_tokens.clear();
             guard.token = Some(token.clone());
-            if refresh_token.is_some() {
-                guard.refresh_token = refresh_token.clone();
-            }
+            guard.refresh_token = refresh_token.clone();
             reset_remote_cache(&mut guard.remote_cache);
-            guard.db_path.clone()
-        };
-        if let Err(message) = save_auth_session(&db_path, Some(&token), refresh_token.as_deref()) {
-            status(&app, "error", message);
         }
         status(&app, "success", "扫码登录成功，可以开始使用云盘和备份任务");
         emit_state(&app, state.inner());
@@ -8875,17 +9947,16 @@ async fn capture_token(
     if token.len() < 20 {
         return Ok(());
     }
-    let db_path = {
+    {
         let mut guard = state.lock().map_err(|e| e.to_string())?;
         if guard.token.as_deref() == Some(token.as_str()) {
             return Ok(());
         }
+        save_auth_session(&guard.db_path, Some(&token), None)?;
+        guard.refreshed_access_tokens.clear();
         guard.token = Some(token.clone());
+        guard.refresh_token = None;
         reset_remote_cache(&mut guard.remote_cache);
-        guard.db_path.clone()
-    };
-    if let Err(message) = save_auth_session(&db_path, Some(&token), None) {
-        status(&app, "error", message);
     }
     status(&app, "success", "已捕获官方登录态，可以开始监控上传");
     emit_state(&app, state.inner());
@@ -8921,32 +9992,33 @@ fn add_mapping(
             return Err("开启自动分享前请先配置 Hdhive 地址和密钥".to_string());
         }
     }
+    let canonical_local = canonical_existing_directory(Path::new(&local_path), "本地目录")?;
+    let canonical_archive = archive_path
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| canonical_existing_directory(Path::new(&value), "归档目录"))
+        .transpose()?;
+    if source_policy == "archive" {
+        let archive_root = canonical_archive
+            .as_ref()
+            .ok_or_else(|| "归档策略需要选择归档目录".to_string())?;
+        if archive_root == &canonical_local || archive_root.starts_with(&canonical_local) {
+            return Err("归档目录不能位于被监控目录内部".into());
+        }
+    }
     let mapping = Mapping {
         id: Uuid::new_v4().to_string(),
-        local_path: PathBuf::from(local_path).to_string_lossy().to_string(),
+        local_path: canonical_local.to_string_lossy().to_string(),
         remote_path: normalize_remote_path(&remote_path),
         remote_parent_id,
         enabled: true,
         source_policy,
-        archive_path: archive_path.filter(|value| !value.trim().is_empty()),
+        archive_path: canonical_archive.map(|path| path.to_string_lossy().to_string()),
         scan_existing,
         sync_types: normalize_sync_types(&sync_types),
         watch_error: None,
         monitor_mode: normalize_monitor_mode(&monitor_mode),
         auto_share,
     };
-    if !Path::new(&mapping.local_path).is_dir() {
-        return Err("本地目录不存在".into());
-    }
-    if mapping.source_policy == "archive" {
-        let archive_path = mapping
-            .archive_path
-            .as_ref()
-            .ok_or_else(|| "归档策略需要选择归档目录".to_string())?;
-        if Path::new(archive_path).starts_with(Path::new(&mapping.local_path)) {
-            return Err("归档目录不能位于被监控目录内部".into());
-        }
-    }
     {
         let mut guard = state.lock().map_err(|e| e.to_string())?;
         guard.mappings.push(mapping.clone());
@@ -9020,7 +10092,6 @@ fn toggle_mapping(
         if let Err(error) = install_watcher(state.inner(), &mapping) {
             if let Ok(mut guard) = state.lock() {
                 if let Some(current) = guard.mappings.iter_mut().find(|item| item.id == id) {
-                    current.enabled = false;
                     current.watch_error = Some(error.clone());
                 }
                 save_config(&guard);
@@ -9101,7 +10172,6 @@ fn update_mapping_monitor_mode(
         if let Err(error) = install_watcher(state.inner(), &mapping) {
             if let Ok(mut guard) = state.lock() {
                 if let Some(current) = guard.mappings.iter_mut().find(|item| item.id == id) {
-                    current.enabled = false;
                     current.watch_error = Some(error.clone());
                 }
                 save_config(&guard);
@@ -9201,7 +10271,9 @@ async fn backfill_auto_shares(
         let connection = open_database(&db_path)?;
         let mut statement = connection
             .prepare(
-                "SELECT file_path, size, modified_ms, remote_file_id FROM uploaded_files
+                "SELECT file_path, size, modified_ms, remote_file_id,
+                        remote_parent_id, remote_dir, relative_path
+                 FROM uploaded_files
                  WHERE mapping_id=?1 AND upload_state=?2
                    AND remote_file_id IS NOT NULL AND remote_file_id <> ''",
             )
@@ -9213,6 +10285,9 @@ async fn backfill_auto_shares(
                     row.get::<_, u64>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             })
             .map_err(|error| format!("读取已有上传记录失败：{error}"))?
@@ -9221,21 +10296,34 @@ async fn backfill_auto_shares(
         rows
     };
     let mut scheduled = 0;
-    for (file_path, size, modified_raw, remote_file_id) in rows {
+    for (
+        file_path,
+        size,
+        modified_raw,
+        remote_file_id,
+        stored_parent_id,
+        stored_remote_dir,
+        stored_relative_path,
+    ) in rows
+    {
         let file_path = PathBuf::from(file_path);
-        let Ok(relative) = file_path.strip_prefix(&mapping.local_path) else {
+        let Ok((expected_parent_id, expected_remote_dir, expected_relative_path)) =
+            mapping_upload_destination(&mapping, &file_path)
+        else {
             continue;
         };
-        let relative_path = relative.to_string_lossy().replace('\\', "/");
-        if relative_path.is_empty() || relative_path.starts_with("../") {
+        if stored_parent_id != expected_parent_id
+            || stored_remote_dir != expected_remote_dir
+            || stored_relative_path != expected_relative_path
+        {
             continue;
         }
         let item = UploadItem {
             mapping_id: mapping.id.clone(),
             file_path,
-            remote_parent_id: mapping.remote_parent_id.clone(),
-            remote_dir: String::new(),
-            relative_path,
+            remote_parent_id: stored_parent_id,
+            remote_dir: stored_remote_dir,
+            relative_path: stored_relative_path,
             change_kind: "added".to_string(),
             size,
             modified_ms: modified_raw.parse().unwrap_or_default(),
@@ -9574,13 +10662,20 @@ fn run() {
             if config.webdav_username.trim().is_empty() {
                 config.webdav_username = default_webdav_username();
             }
-            if config.webdav_password.trim().is_empty() {
-                config.webdav_password = Uuid::new_v4().simple().to_string();
+            let legacy_webdav_password = normalize_webdav_password(&config.webdav_password).ok();
+            if config.webdav_password_hash.trim().is_empty() {
+                if let Some(password) = legacy_webdav_password.as_deref() {
+                    config.webdav_password_hash = hash_webdav_password(password);
+                }
             }
             let webdav_enabled = config.webdav_enabled;
             let webdav_port = config.webdav_port;
             let webdav_username = config.webdav_username.clone();
-            let webdav_password = config.webdav_password.clone();
+            let webdav_password_hash = config.webdav_password_hash.clone();
+            let webdav_session_password = legacy_webdav_password.clone();
+            let webdav_password_verifier = legacy_webdav_password
+                .as_deref()
+                .map(webdav_password_verifier);
             let native_mount_options = config.native_mount.clone();
             let upload_concurrency = normalize_transfer_concurrency(
                 config.upload_concurrency,
@@ -9597,7 +10692,7 @@ fn run() {
                 .map(|mut mapping| {
                     mapping.sync_types = normalize_sync_types(&mapping.sync_types);
                     mapping.monitor_mode = normalize_monitor_mode(&mapping.monitor_mode);
-                    mapping
+                    normalize_loaded_mapping_paths(mapping)
                 })
                 .collect::<Vec<_>>();
             let mut resumable_uploads = load_resumable_uploads(&db_path)?;
@@ -9644,15 +10739,22 @@ fn run() {
                 webdav_enabled,
                 webdav_port,
                 webdav_username,
-                webdav_password,
+                webdav_password_hash,
+                webdav_session_password,
+                webdav_password_verifier,
                 webdav_running: false,
                 webdav_error: None,
-                native_mount: NativeMountManager::new(
+                native_mount: Arc::new(Mutex::new(NativeMountManager::new(
                     native_mount_options,
                     native_mount_data_dir,
                     resource_dir,
-                ),
+                ))),
+                auth_refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+                refreshed_access_tokens: HashMap::new(),
             }));
+            if let Ok(guard) = state.lock() {
+                save_config_checked(&guard)?;
+            }
             app.manage(state.clone());
             let app_handle = app.handle().clone();
             if webdav_enabled {
@@ -9662,9 +10764,10 @@ fn run() {
                     webdav_port,
                 ));
             }
-            if let Ok(guard) = state.lock() {
-                save_config(&guard);
-            }
+            let _ = API_AUTH_RUNTIME.set(ApiAuthRuntime {
+                app: app_handle.clone(),
+                state: state.clone(),
+            });
             tauri::async_runtime::spawn(event_loop(app_handle.clone(), state.clone(), event_rx));
             if state
                 .lock()
@@ -9676,7 +10779,7 @@ fn run() {
                 let refresh_state = state.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Err(error) =
-                        refresh_saved_session(refresh_app.clone(), refresh_state).await
+                        refresh_saved_session_singleflight(refresh_app.clone(), refresh_state).await
                     {
                         status(
                             &refresh_app,
@@ -9703,7 +10806,6 @@ fn run() {
                                     .iter_mut()
                                     .find(|current| current.id == mapping.id)
                                 {
-                                    current.enabled = false;
                                     current.watch_error = Some(error.clone());
                                 }
                                 save_config(&guard);
@@ -9797,9 +10899,12 @@ fn run() {
         .run(|app_handle, event| {
             if matches!(event, tauri::RunEvent::Exit) {
                 let state = app_handle.state::<SharedState>();
-                if let Ok(mut guard) = state.lock() {
-                    guard.native_mount.shutdown();
-                };
+                let manager = state.lock().ok().map(|guard| guard.native_mount.clone());
+                if let Some(manager) = manager {
+                    if let Ok(mut mount) = manager.lock() {
+                        mount.shutdown();
+                    }
+                }
             }
         });
 }
@@ -9820,6 +10925,17 @@ mod tests {
         assert_eq!(
             normalize_webdav_password("correct horse battery staple").unwrap(),
             "correct horse battery staple"
+        );
+        let encoded = hash_webdav_password("correct horse battery staple");
+        assert!(verify_webdav_password(
+            "correct horse battery staple",
+            &encoded
+        ));
+        assert!(!verify_webdav_password("wrong password", &encoded));
+        assert!(!encoded.contains("correct horse battery staple"));
+        assert_eq!(
+            hex::encode(pbkdf2_sha256(b"password", b"salt", 1)),
+            "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
         );
     }
 
@@ -9918,6 +11034,16 @@ mod tests {
             ),
             "v1=83db0943a113d8cdd5786f9447ebf125c764a64fb935b577f43aae6a2a8c5c5d"
         );
+    }
+
+    #[test]
+    fn hdhive_response_preview_removes_controls_and_is_bounded() {
+        let raw = format!("  forbidden\n\u{1b}[31m{}  ", "x".repeat(300));
+        let preview = safe_response_preview(&raw, 200);
+        assert!(!preview.contains('\n'));
+        assert!(!preview.contains('\u{1b}'));
+        assert!(preview.chars().count() <= 200);
+        assert!(preview.starts_with("forbidden [31m"));
     }
 
     #[test]
@@ -10090,7 +11216,7 @@ mod tests {
         ));
 
         inflight.insert(
-            item_key(&item.mapping_id, &item.file_path),
+            item_key(&item),
             Stamp {
                 size: item.size,
                 modified_ms: item.modified_ms,
@@ -10118,7 +11244,7 @@ mod tests {
 
         inflight.clear();
         pending_cloud.insert(
-            item_key(&item.mapping_id, &item.file_path),
+            item_key(&item),
             Stamp {
                 size: item.size,
                 modified_ms: item.modified_ms,
@@ -10133,7 +11259,7 @@ mod tests {
             &changed
         ));
         pending_cloud.clear();
-        waiting_files.insert(item_key(&item.mapping_id, &item.file_path), item.clone());
+        waiting_files.insert(item_key(&item), item.clone());
         assert!(upload_already_scheduled(
             &history,
             &pending_cloud,
@@ -10280,6 +11406,94 @@ mod tests {
             .expect("clean stale upload checkpoints")
             .is_empty());
         fs::remove_dir_all(root).expect("remove upload checkpoint fixture");
+    }
+
+    #[test]
+    fn manual_upload_records_and_checkpoints_are_scoped_to_destination() {
+        let root = std::env::temp_dir().join(format!(
+            "guangya-upload-destination-scope-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create destination scope fixture");
+        let database = root.join("state.sqlite3");
+        let file_path = root.join("video.mkv");
+        fs::write(&file_path, b"video-content").expect("write destination scope fixture");
+        let metadata = fs::metadata(&file_path).expect("read destination scope metadata");
+        init_database(&database).expect("initialize destination scope database");
+        let first = UploadItem {
+            mapping_id: "__manual__".into(),
+            file_path: file_path.clone(),
+            remote_parent_id: "parent-a".into(),
+            remote_dir: "season-1".into(),
+            relative_path: String::new(),
+            change_kind: "added".into(),
+            size: metadata.len(),
+            modified_ms: modified_ms(&metadata),
+        };
+        let second = UploadItem {
+            remote_parent_id: "parent-b".into(),
+            remote_dir: "season-2".into(),
+            ..first.clone()
+        };
+        assert_ne!(item_key(&first), item_key(&second));
+        save_upload_record(
+            &database,
+            &first,
+            &UploadOutcome {
+                task_id: "task-a".into(),
+                remote_file_id: Some("file-a".into()),
+            },
+            UPLOAD_STATE_CLOUD_CONFIRMED,
+        )
+        .expect("save first destination record");
+        save_upload_record(
+            &database,
+            &second,
+            &UploadOutcome {
+                task_id: "task-b".into(),
+                remote_file_id: None,
+            },
+            UPLOAD_STATE_OSS_COMPLETE,
+        )
+        .expect("save second destination record");
+        assert!(load_upload_history(&database)
+            .expect("load destination history")
+            .contains_key(&item_key(&first)));
+        let pending = load_pending_uploads(&database).expect("load destination pending uploads");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].item.remote_parent_id, "parent-b");
+        assert_eq!(pending[0].item.remote_dir, "season-2");
+
+        let checkpoint = OssUploadCheckpoint {
+            task_id: "task-checkpoint".into(),
+            object_path: "objects/video.mkv".into(),
+            bucket_name: "bucket".into(),
+            end_point: "https://oss.example.com".into(),
+            provider: Some("oss".into()),
+            upload_id: "upload-id".into(),
+            part_size: 5,
+            completed_parts: BTreeMap::new(),
+        };
+        save_upload_checkpoint(&database, &first, &checkpoint, 1)
+            .expect("save first destination checkpoint");
+        save_upload_checkpoint(&database, &second, &checkpoint, 2)
+            .expect("save second destination checkpoint");
+        assert_eq!(
+            load_upload_checkpoint(&database, &first)
+                .unwrap()
+                .unwrap()
+                .uploaded_bytes,
+            1
+        );
+        assert_eq!(
+            load_upload_checkpoint(&database, &second)
+                .unwrap()
+                .unwrap()
+                .uploaded_bytes,
+            2
+        );
+        assert_eq!(load_resumable_uploads(&database).unwrap().len(), 2);
+        fs::remove_dir_all(root).expect("remove destination scope fixture");
     }
 
     #[test]
@@ -10653,7 +11867,7 @@ mod tests {
             .is_none());
         assert!(load_upload_history(&database)
             .expect("load preserved upload history")
-            .contains_key(&item_key(&upload.mapping_id, &upload.file_path)));
+            .contains_key(&item_key(&upload)));
 
         fs::remove_dir_all(root).expect("remove metadata cache test root");
     }
@@ -10799,6 +12013,59 @@ mod tests {
     }
 
     #[test]
+    fn staged_source_policy_preserves_a_replacement_created_during_archive() {
+        let root = std::env::temp_dir().join(format!("guangya-archive-race-{}", Uuid::new_v4()));
+        let watch = root.join("watch");
+        let archive = root.join("archive");
+        fs::create_dir_all(&watch).expect("watch directory");
+        fs::create_dir_all(&archive).expect("archive directory");
+        let source = watch.join("episode.mkv");
+        fs::write(&source, b"uploaded-version").expect("source fixture");
+        let metadata = fs::metadata(&source).expect("source metadata");
+        let staged = stage_source_for_policy(&source, metadata.len(), modified_ms(&metadata))
+            .expect("source should be staged atomically");
+
+        fs::write(&source, b"new-local-version").expect("replacement fixture");
+        let destination = archive.join("episode.mkv");
+        archive_file_without_overwrite(
+            &staged,
+            &destination,
+            metadata.len(),
+            modified_ms(&metadata),
+        )
+        .expect("staged upload should archive");
+
+        assert_eq!(fs::read(&source).unwrap(), b"new-local-version");
+        assert_eq!(fs::read(&destination).unwrap(), b"uploaded-version");
+        assert!(!staged.exists());
+        fs::remove_dir_all(root).expect("archive race fixture cleanup");
+    }
+
+    #[test]
+    fn unavailable_loaded_mapping_keeps_the_users_enabled_intent() {
+        let missing =
+            std::env::temp_dir().join(format!("guangya-offline-mapping-{}", Uuid::new_v4()));
+        let mapping = Mapping {
+            id: "offline".to_string(),
+            local_path: missing.to_string_lossy().to_string(),
+            remote_path: "backup".to_string(),
+            remote_parent_id: String::new(),
+            enabled: true,
+            source_policy: "keep".to_string(),
+            archive_path: None,
+            scan_existing: true,
+            sync_types: default_sync_types(),
+            watch_error: None,
+            monitor_mode: default_monitor_mode(),
+            auto_share: false,
+        };
+
+        let loaded = normalize_loaded_mapping_paths(mapping);
+        assert!(loaded.enabled);
+        assert!(loaded.watch_error.is_some());
+    }
+
+    #[test]
     fn exclusive_archive_copy_preserves_source_on_collision_or_mismatch() {
         let root = std::env::temp_dir().join(format!("guangya-copy-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("copy directory");
@@ -10890,7 +12157,7 @@ mod tests {
         .expect("upload history should persist");
         let history = load_upload_history(&database).expect("upload history should load");
         assert_eq!(
-            history.get(&item_key(&item.mapping_id, &item.file_path)),
+            history.get(&item_key(&item)),
             Some(&Stamp {
                 size: 128,
                 modified_ms: 42
@@ -10926,8 +12193,8 @@ mod tests {
         assert_eq!(pending[0].task_id, "task-pending");
         assert_eq!(pending[0].item.relative_path, "pending.png");
         let history = load_upload_history(&database).expect("confirmed history should load");
-        assert!(history.contains_key(&item_key(&item.mapping_id, &item.file_path)));
-        assert!(!history.contains_key(&item_key(&pending_item.mapping_id, &pending_item.file_path)));
+        assert!(history.contains_key(&item_key(&item)));
+        assert!(!history.contains_key(&item_key(&pending_item)));
         assert!(!confirm_pending_record(
             &database,
             &pending_item,
@@ -10951,7 +12218,7 @@ mod tests {
             .is_empty());
         assert!(load_upload_history(&database)
             .expect("confirmed rows should reload")
-            .contains_key(&item_key(&pending_item.mapping_id, &pending_item.file_path)));
+            .contains_key(&item_key(&pending_item)));
         let mut recreated_item = item.clone();
         recreated_item.mapping_id = "mapping-2".into();
         let reused = reuse_matching_confirmed_upload(&database, &recreated_item)
@@ -10961,16 +12228,87 @@ mod tests {
         assert_eq!(reused.1.remote_file_id.as_deref(), Some("file-1"));
         assert!(load_upload_history(&database)
             .expect("reused history should reload")
-            .contains_key(&item_key(
-                &recreated_item.mapping_id,
-                &recreated_item.file_path
-            )));
+            .contains_key(&item_key(&recreated_item)));
         remove_mapping_transient_uploads(&database, &item.mapping_id)
             .expect("transient uploads should be removable");
         let history = load_upload_history(&database).expect("history should reload");
-        assert!(history.contains_key(&item_key(&item.mapping_id, &item.file_path)));
-        assert!(history.contains_key(&item_key(&pending_item.mapping_id, &pending_item.file_path)));
+        assert!(history.contains_key(&item_key(&item)));
+        assert!(history.contains_key(&item_key(&pending_item)));
         fs::remove_dir_all(root).expect("test database should be removable");
+    }
+
+    #[test]
+    fn new_login_replaces_refresh_token_but_session_refresh_can_reuse_it() {
+        let root =
+            std::env::temp_dir().join(format!("guangya-auth-replacement-{}", Uuid::new_v4()));
+        let database = root.join("state.sqlite3");
+        init_database(&database).expect("initialize auth replacement database");
+        save_auth_session(
+            &database,
+            Some("account-a-access"),
+            Some("account-a-refresh"),
+        )
+        .expect("save first account");
+        save_auth_session(&database, Some("account-b-access"), None)
+            .expect("replace with account without refresh token");
+        let replaced = load_auth_session(&database).expect("load replaced account");
+        assert_eq!(replaced.access_token.as_deref(), Some("account-b-access"));
+        assert!(replaced.refresh_token.is_none());
+
+        save_auth_session(
+            &database,
+            Some("account-c-access"),
+            Some("account-c-refresh"),
+        )
+        .expect("save refreshable account");
+        save_refreshed_auth_session(&database, "account-c-renewed-access", None)
+            .expect("refresh access token without rotating refresh token");
+        let refreshed = load_auth_session(&database).expect("load refreshed account");
+        assert_eq!(
+            refreshed.access_token.as_deref(),
+            Some("account-c-renewed-access")
+        );
+        assert_eq!(
+            refreshed.refresh_token.as_deref(),
+            Some("account-c-refresh")
+        );
+        fs::remove_dir_all(root).expect("remove auth replacement fixture");
+    }
+
+    #[test]
+    fn api_auth_recovery_is_single_retry_without_reusing_a_stale_session() {
+        assert_eq!(
+            auth_recovery_decision("old-access", Some("old-access"), false, true),
+            AuthRecoveryDecision::Refresh
+        );
+        assert_eq!(
+            auth_recovery_decision("old-access", Some("new-access"), true, true),
+            AuthRecoveryDecision::RetryWithCurrent("new-access".to_string())
+        );
+        assert_eq!(
+            auth_recovery_decision("old-access", Some("new-account-access"), false, true),
+            AuthRecoveryDecision::SessionChanged
+        );
+        assert_eq!(
+            auth_recovery_decision("expired", Some("expired"), false, false),
+            AuthRecoveryDecision::Invalidate
+        );
+        assert_eq!(
+            auth_recovery_decision("expired", None, false, true),
+            AuthRecoveryDecision::SessionChanged
+        );
+        let chain = HashMap::from([
+            ("old-access".to_string(), "renewed-1".to_string()),
+            ("renewed-1".to_string(), "renewed-2".to_string()),
+        ]);
+        assert!(refreshed_token_chain_reaches_current(
+            &chain,
+            "old-access",
+            "renewed-2"
+        ));
+        assert!(is_api_auth_expired_error(
+            "登录态已失效，请重新打开官方登录页"
+        ));
     }
 
     #[test]
@@ -11000,12 +12338,146 @@ mod tests {
 
         init_database(&database).expect("legacy database should migrate");
         let history = load_upload_history(&database).expect("confirmed history");
-        assert!(history.contains_key(&item_key("mapping-1", Path::new("/watch/confirmed.mkv"))));
-        assert!(!history.contains_key(&item_key("mapping-1", Path::new("/watch/pending.mkv"))));
+        assert!(history.contains_key(&destination_item_key(
+            "mapping-1",
+            Path::new("/watch/confirmed.mkv"),
+            "",
+            ""
+        )));
+        assert!(!history.contains_key(&destination_item_key(
+            "mapping-1",
+            Path::new("/watch/pending.mkv"),
+            "",
+            ""
+        )));
         let pending = load_pending_uploads(&database).expect("pending migration");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].task_id, "task-2");
         fs::remove_dir_all(root).expect("migration fixture cleanup");
+    }
+
+    #[test]
+    fn sqlite_migrates_legacy_checkpoint_destination_from_item_json() {
+        let root = std::env::temp_dir().join(format!(
+            "guangya-checkpoint-migration-test-{}",
+            Uuid::new_v4()
+        ));
+        let database = root.join("state.sqlite3");
+        fs::create_dir_all(&root).expect("checkpoint migration directory");
+        let file_path = root.join("video.mkv");
+        fs::write(&file_path, b"video-content").expect("checkpoint migration file");
+        let metadata = fs::metadata(&file_path).expect("checkpoint migration metadata");
+        let item = UploadItem {
+            mapping_id: "__manual__".into(),
+            file_path: file_path.clone(),
+            remote_parent_id: "parent-migrated".into(),
+            remote_dir: "folder-migrated".into(),
+            relative_path: String::new(),
+            change_kind: "added".into(),
+            size: metadata.len(),
+            modified_ms: modified_ms(&metadata),
+        };
+        let checkpoint = OssUploadCheckpoint {
+            task_id: "task-migrated".into(),
+            object_path: "objects/video.mkv".into(),
+            bucket_name: "bucket".into(),
+            end_point: "https://oss.example.com".into(),
+            provider: Some("oss".into()),
+            upload_id: "upload-migrated".into(),
+            part_size: 5,
+            completed_parts: BTreeMap::new(),
+        };
+        let connection = open_database(&database).expect("legacy checkpoint database");
+        connection
+            .execute_batch(
+                "CREATE TABLE upload_checkpoints (
+                   mapping_id TEXT NOT NULL,
+                   file_path TEXT NOT NULL,
+                   size INTEGER NOT NULL,
+                   modified_ms TEXT NOT NULL,
+                   item_json TEXT NOT NULL,
+                   checkpoint_json TEXT NOT NULL,
+                   uploaded_bytes INTEGER NOT NULL DEFAULT 0,
+                   updated_at INTEGER NOT NULL,
+                   PRIMARY KEY (mapping_id, file_path)
+                 );",
+            )
+            .expect("legacy checkpoint schema");
+        connection
+            .execute(
+                "INSERT INTO upload_checkpoints
+                   (mapping_id, file_path, size, modified_ms, item_json, checkpoint_json,
+                    uploaded_bytes, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 5, 1)",
+                params![
+                    item.mapping_id,
+                    item.file_path.to_string_lossy(),
+                    item.size,
+                    item.modified_ms.to_string(),
+                    serde_json::to_string(&item).unwrap(),
+                    serde_json::to_string(&checkpoint).unwrap()
+                ],
+            )
+            .expect("legacy checkpoint row");
+        drop(connection);
+
+        init_database(&database).expect("legacy checkpoint database should migrate");
+        assert_eq!(
+            table_primary_key_columns(&open_database(&database).unwrap(), "upload_checkpoints")
+                .unwrap(),
+            vec!["mapping_id", "file_path", "remote_parent_id", "remote_dir"]
+        );
+        let restored = load_resumable_uploads(&database).expect("restored migrated checkpoint");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].remote_parent_id, "parent-migrated");
+        assert_eq!(restored[0].remote_dir, "folder-migrated");
+        assert_eq!(
+            load_upload_checkpoint(&database, &item)
+                .unwrap()
+                .unwrap()
+                .uploaded_bytes,
+            5
+        );
+        fs::remove_dir_all(root).expect("checkpoint migration fixture cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_source_checks_reject_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("guangya-symlink-boundary-{}", Uuid::new_v4()));
+        let watch = root.join("watch");
+        let outside = root.join("outside");
+        fs::create_dir_all(&watch).expect("watch directory");
+        fs::create_dir_all(&outside).expect("outside directory");
+        let outside_file = outside.join("secret.mkv");
+        fs::write(&outside_file, b"secret").expect("outside source");
+        let escaped = watch.join("escaped.mkv");
+        symlink(&outside_file, &escaped).expect("source symlink");
+
+        assert!(canonical_watch_path(&escaped, &watch).is_err());
+        assert!(canonical_upload_source(&escaped, Some(&watch)).is_err());
+        assert!(canonical_upload_source(&outside_file, Some(&watch)).is_err());
+
+        let archive_alias = root.join("archive-alias");
+        symlink(&watch, &archive_alias).expect("archive alias");
+        let canonical_watch = canonical_existing_directory(&watch, "监控目录").unwrap();
+        let canonical_archive = canonical_existing_directory(&archive_alias, "归档目录").unwrap();
+        assert_eq!(canonical_archive, canonical_watch);
+
+        let archive_root = root.join("archive");
+        fs::create_dir_all(&archive_root).expect("archive root");
+        let escaped_archive_parent = outside.join("must-not-be-created");
+        symlink(&outside, archive_root.join("linked-parent")).expect("archive middle symlink");
+        assert!(ensure_directory_tree_without_symlinks(
+            &archive_root,
+            Path::new("linked-parent/must-not-be-created/nested")
+        )
+        .is_err());
+        assert!(!escaped_archive_parent.exists());
+        fs::remove_dir_all(root).expect("symlink boundary fixture cleanup");
     }
 
     #[test]

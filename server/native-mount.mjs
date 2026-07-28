@@ -5,6 +5,12 @@ import { spawn, spawnSync } from 'node:child_process';
 
 const MAX_PARALLELISM = 16;
 const MAX_CACHE_SIZE_GB = 1024;
+const FUSE_UNMOUNT_TIMEOUT_MS = 5_000;
+const RCLONE_FLUSH_TIMEOUT_MS = 15_000;
+const RCLONE_TERMINATE_TIMEOUT_MS = 5_000;
+export const NATIVE_MOUNT_STOP_TIMEOUT_MS = (FUSE_UNMOUNT_TIMEOUT_MS * 2)
+  + RCLONE_FLUSH_TIMEOUT_MS
+  + RCLONE_TERMINATE_TIMEOUT_MS;
 
 export function defaultNativeMountOptions(platform = process.platform) {
   return {
@@ -19,7 +25,20 @@ export function defaultNativeMountOptions(platform = process.platform) {
 }
 
 export function normalizeNativeMountOptions(value = {}, platform = process.platform) {
-  const options = { ...defaultNativeMountOptions(platform), ...(value || {}) };
+  const defaults = defaultNativeMountOptions(platform);
+  const source = value && typeof value === 'object' ? value : {};
+  // Copy only the documented allowlist. This prevents a UI payload containing
+  // a password or another secret from being persisted in native_mount_options
+  // and later reflected by the status endpoint.
+  const options = {
+    rclone_path: source.rclone_path ?? defaults.rclone_path,
+    target: source.target ?? defaults.target,
+    access_mode: source.access_mode ?? defaults.access_mode,
+    vfs_cache_mode: source.vfs_cache_mode ?? defaults.vfs_cache_mode,
+    transfers: source.transfers ?? defaults.transfers,
+    read_streams: source.read_streams ?? defaults.read_streams,
+    cache_size_gb: source.cache_size_gb ?? defaults.cache_size_gb,
+  };
   options.rclone_path = String(options.rclone_path || '').trim();
   options.target = String(options.target || '').trim();
   options.access_mode = String(options.access_mode || '');
@@ -154,7 +173,19 @@ export function prepareNativeMountTarget(target, platform = process.platform) {
     return;
   }
   if (!path.isAbsolute(target)) throw new Error('挂载目录必须使用绝对路径');
-  fs.mkdirSync(target, { recursive: true });
+  try {
+    const stat = fs.lstatSync(target);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error('挂载目标必须是普通空目录，不能是符号链接');
+    }
+    if (fs.readdirSync(target).length > 0) {
+      throw new Error('挂载目录必须为空；为避免遮蔽现有文件，程序不会使用非空目录');
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+    fs.mkdirSync(target, { recursive: true, mode: 0o700 });
+  }
+  if (platform !== 'win32') fs.chmodSync(target, 0o700);
 }
 
 function restoreWindowsDirectoryTarget(target, platform) {
@@ -180,8 +211,13 @@ export function createNativeMountManager({
   enabled = true,
   platform = process.platform,
   defaultRclonePath = process.env.GUANGYA_RCLONE_PATH || '',
+  allowCustomRclonePath = process.env.GUANGYA_ALLOW_CUSTOM_RCLONE_PATH === '1',
 }) {
   let options = normalizeNativeMountOptions(initialOptions, platform);
+  const configuredRclonePath = String(defaultRclonePath || '').trim();
+  if (!allowCustomRclonePath && options.rclone_path && options.rclone_path !== configuredRclonePath) {
+    options.rclone_path = '';
+  }
   let child = null;
   let startedAt = null;
   let lastError = null;
@@ -189,7 +225,7 @@ export function createNativeMountManager({
   const logFile = path.join(dataDir, 'logs', 'native-mount.log');
 
   function executable() {
-    return options.rclone_path || String(defaultRclonePath || '').trim() || (platform === 'win32' ? 'rclone.exe' : 'rclone');
+    return options.rclone_path || configuredRclonePath || (platform === 'win32' ? 'rclone.exe' : 'rclone');
   }
 
   function refresh() {
@@ -226,6 +262,9 @@ export function createNativeMountManager({
 
   function setOptions(value) {
     const normalized = normalizeNativeMountOptions(value, platform);
+    if (!allowCustomRclonePath && normalized.rclone_path && normalized.rclone_path !== configuredRclonePath) {
+      throw new Error('为防止执行未受信任程序，rclone 路径只能由服务端 GUANGYA_RCLONE_PATH 配置');
+    }
     if (child && JSON.stringify(normalized) !== JSON.stringify(options)) {
       throw new Error('请先卸载当前原生挂载，再修改挂载参数');
     }
@@ -242,10 +281,17 @@ export function createNativeMountManager({
     const fuse = fusePrerequisite(platform);
     if (!fuse.available) throw new Error(fuse.message);
     await Promise.all([
-      fsp.mkdir(cacheDir, { recursive: true }),
-      fsp.mkdir(path.dirname(logFile), { recursive: true }),
+      fsp.mkdir(cacheDir, { recursive: true, mode: 0o700 }),
+      fsp.mkdir(path.dirname(logFile), { recursive: true, mode: 0o700 }),
     ]);
-    await fsp.writeFile(logFile, '');
+    if (platform !== 'win32') {
+      await Promise.all([
+        fsp.chmod(cacheDir, 0o700),
+        fsp.chmod(path.dirname(logFile), 0o700),
+      ]);
+    }
+    await fsp.writeFile(logFile, '', { mode: 0o600 });
+    if (platform !== 'win32') await fsp.chmod(logFile, 0o600);
     const obscuredPassword = obscurePassword(executable(), password);
     prepareNativeMountTarget(options.target, platform);
     let spawned;
@@ -289,13 +335,20 @@ export function createNativeMountManager({
       return info();
     }
     if (platform === 'darwin') {
-      spawnSync('umount', [options.target], { stdio: 'ignore', timeout: 10_000 });
+      spawnSync('umount', [options.target], { stdio: 'ignore', timeout: FUSE_UNMOUNT_TIMEOUT_MS });
     } else if (platform !== 'win32') {
-      let result = spawnSync('fusermount3', ['-u', options.target], { stdio: 'ignore', timeout: 10_000 });
-      if (result.error || result.status !== 0) result = spawnSync('fusermount', ['-u', options.target], { stdio: 'ignore', timeout: 10_000 });
+      let result = spawnSync('fusermount3', ['-u', options.target], { stdio: 'ignore', timeout: FUSE_UNMOUNT_TIMEOUT_MS });
+      if (result.error || result.status !== 0) {
+        result = spawnSync('fusermount', ['-u', options.target], { stdio: 'ignore', timeout: FUSE_UNMOUNT_TIMEOUT_MS });
+      }
     }
-    child.kill('SIGTERM');
-    await waitForExit(child, 2_000);
+    // rclone's write-back delay is 5 seconds. Give a normal unmount enough time
+    // to flush dirty VFS entries before asking the process to terminate.
+    await waitForExit(child, RCLONE_FLUSH_TIMEOUT_MS);
+    if (child.exitCode == null) {
+      child.kill('SIGTERM');
+      await waitForExit(child, RCLONE_TERMINATE_TIMEOUT_MS);
+    }
     if (child.exitCode == null) child.kill('SIGKILL');
     child = null;
     startedAt = null;

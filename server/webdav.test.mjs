@@ -39,18 +39,20 @@ function inMemoryBackend() {
     async deleteEntry({ entry }) {
       removeTree(entry.id);
     },
-    async moveEntry({ entry, parentId, name }) {
+    async moveEntry({ entry, parentId, name, existing }) {
       Object.assign(entries.get(entry.id), { parentId, name, modifiedAt: Date.now() });
+      if (existing) removeTree(existing.id);
     },
-    async copyEntry({ entry, parentId, name }) {
+    async copyEntry({ entry, parentId, name, existing }) {
       const source = entries.get(entry.id);
       add(parentId, name, source.isDirectory, source.content);
+      if (existing) removeTree(existing.id);
     },
     async putFile({ request, parentId, name, existing }) {
       const chunks = [];
       for await (const chunk of request) chunks.push(chunk);
-      if (existing) removeTree(existing.id);
       const created = add(parentId, name, false, Buffer.concat(chunks));
+      if (existing) removeTree(existing.id);
       return { id: created.id };
     },
     async readFile({ response, entry, headOnly }) {
@@ -62,6 +64,22 @@ function inMemoryBackend() {
       response.end(headOnly ? undefined : record.content);
     },
   };
+}
+
+async function startWebDavServer(t, backend) {
+  const handler = createWebDavHandler({ prefix: '/dav', ...backend });
+  const server = http.createServer(async (request, response) => {
+    try {
+      await handler(request, response, new URL(request.url, 'http://127.0.0.1'));
+    } catch (error) {
+      response.writeHead(error.statusCode || 500, error.headers || {});
+      response.end(error.message);
+    }
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => server.close());
+  return `http://127.0.0.1:${server.address().port}`;
 }
 
 test('WebDAV 协议层支持目录与文件完整 CRUD', async (t) => {
@@ -157,6 +175,131 @@ test('WebDAV MOVE 遵守 Overwrite: F', async (t) => {
     headers: { destination: `${base}/dav/b.txt`, overwrite: 'F' },
   });
   assert.equal(response.status, 412);
+});
+
+test('WebDAV 同源 COPY 不会删除源文件，覆盖失败也保留旧目标', async (t) => {
+  const backend = inMemoryBackend();
+  backend.entries.set('1', { id: '1', parentId: '', name: 'a.txt', isDirectory: false, content: Buffer.from('source'), modifiedAt: Date.now() });
+  backend.entries.set('2', { id: '2', parentId: '', name: 'b.txt', isDirectory: false, content: Buffer.from('target'), modifiedAt: Date.now() });
+  backend.copyEntry = async () => { throw new Error('模拟云端复制失败'); };
+  let deletes = 0;
+  const originalDelete = backend.deleteEntry;
+  backend.deleteEntry = async (...args) => { deletes += 1; return originalDelete(...args); };
+  const base = await startWebDavServer(t, backend);
+
+  const selfCopy = await fetch(`${base}/dav/a.txt`, {
+    method: 'COPY',
+    headers: { destination: `${base}/dav/a.txt` },
+  });
+  assert.equal(selfCopy.status, 204);
+  assert.equal(backend.entries.get('1').content.toString(), 'source');
+
+  const failedOverwrite = await fetch(`${base}/dav/a.txt`, {
+    method: 'COPY',
+    headers: { destination: `${base}/dav/b.txt` },
+  });
+  assert.equal(failedOverwrite.status, 500);
+  assert.equal(deletes, 0, '协议层不应在复制成功前删除旧目标');
+  assert.equal(backend.entries.get('2').content.toString(), 'target');
+});
+
+test('WebDAV 写锁会阻止无令牌变更并支持续期和解锁', async (t) => {
+  const backend = inMemoryBackend();
+  backend.entries.set('100', { id: '100', parentId: '', name: 'locked.txt', isDirectory: false, content: Buffer.from('old'), modifiedAt: Date.now() });
+  const base = await startWebDavServer(t, backend);
+  const locked = await fetch(`${base}/dav/locked.txt`, {
+    method: 'LOCK',
+    headers: { timeout: 'Second-120' },
+    body: '<D:lockinfo xmlns:D="DAV:"/>',
+  });
+  assert.equal(locked.status, 200, await locked.clone().text());
+  const tokenHeader = locked.headers.get('lock-token');
+  assert.match(tokenHeader || '', /^<opaquelocktoken:/);
+  const token = tokenHeader.slice(1, -1);
+
+  assert.equal((await fetch(`${base}/dav/locked.txt`, { method: 'PUT', body: 'blocked' })).status, 423);
+  const refreshed = await fetch(`${base}/dav/locked.txt`, {
+    method: 'LOCK',
+    headers: { if: `(<${token}>)`, timeout: 'Second-180' },
+  });
+  assert.equal(refreshed.status, 200);
+  assert.equal(refreshed.headers.get('lock-token'), `<${token}>`);
+  const changed = await fetch(`${base}/dav/locked.txt`, {
+    method: 'PUT',
+    headers: { if: `(<${token}>)` },
+    body: 'changed',
+  });
+  assert.equal(changed.status, 204);
+  assert.equal(await (await fetch(`${base}/dav/locked.txt`)).text(), 'changed');
+  assert.equal((await fetch(`${base}/dav/locked.txt`, {
+    method: 'UNLOCK',
+    headers: { 'lock-token': `<${token}>` },
+  })).status, 204);
+});
+
+test('WebDAV 深度锁回报真实 Depth 且拒绝覆盖已有子锁', async (t) => {
+  const backend = inMemoryBackend();
+  backend.entries.set('dir', { id: 'dir', parentId: '', name: 'dir', isDirectory: true, content: Buffer.alloc(0), modifiedAt: Date.now() });
+  backend.entries.set('child', { id: 'child', parentId: 'dir', name: 'child.txt', isDirectory: false, content: Buffer.from('child'), modifiedAt: Date.now() });
+  const base = await startWebDavServer(t, backend);
+
+  const childLock = await fetch(`${base}/dav/dir/child.txt`, {
+    method: 'LOCK',
+    headers: { depth: '0' },
+    body: '<D:lockinfo xmlns:D="DAV:"/>',
+  });
+  assert.equal(childLock.status, 200, await childLock.clone().text());
+
+  const overlapping = await fetch(`${base}/dav/dir`, {
+    method: 'LOCK',
+    headers: { depth: 'infinity' },
+    body: '<D:lockinfo xmlns:D="DAV:"/>',
+  });
+  assert.equal(overlapping.status, 423);
+
+  const shallow = await fetch(`${base}/dav/dir`, {
+    method: 'LOCK',
+    headers: { depth: '0' },
+    body: '<D:lockinfo xmlns:D="DAV:"/>',
+  });
+  assert.equal(shallow.status, 200, await shallow.clone().text());
+  assert.match(await shallow.text(), /<D:depth>0<\/D:depth>/);
+});
+
+test('WebDAV 删除或覆盖目录时保护其中的后代锁', async (t) => {
+  const backend = inMemoryBackend();
+  backend.entries.set('source', { id: 'source', parentId: '', name: 'source.txt', isDirectory: false, content: Buffer.from('source'), modifiedAt: Date.now() });
+  backend.entries.set('target', { id: 'target', parentId: '', name: 'target', isDirectory: true, content: Buffer.alloc(0), modifiedAt: Date.now() });
+  backend.entries.set('target-child', { id: 'target-child', parentId: 'target', name: 'child.txt', isDirectory: false, content: Buffer.from('target child'), modifiedAt: Date.now() });
+  const base = await startWebDavServer(t, backend);
+
+  const childLock = await fetch(`${base}/dav/target/child.txt`, {
+    method: 'LOCK',
+    headers: { depth: '0' },
+    body: '<D:lockinfo xmlns:D="DAV:"/>',
+  });
+  assert.equal(childLock.status, 200, await childLock.clone().text());
+
+  assert.equal((await fetch(`${base}/dav/target`, { method: 'DELETE' })).status, 423);
+  const overwrite = await fetch(`${base}/dav/source.txt`, {
+    method: 'MOVE',
+    headers: { destination: `${base}/dav/target` },
+  });
+  assert.equal(overwrite.status, 423);
+  assert.equal(backend.entries.has('source'), true);
+  assert.equal(backend.entries.has('target-child'), true);
+});
+
+test('WebDAV PROPPATCH 明确拒绝未实现的属性写入', async (t) => {
+  const backend = inMemoryBackend();
+  backend.entries.set('1', { id: '1', parentId: '', name: 'a.txt', isDirectory: false, content: Buffer.from('a'), modifiedAt: Date.now() });
+  const base = await startWebDavServer(t, backend);
+  const response = await fetch(`${base}/dav/a.txt`, {
+    method: 'PROPPATCH',
+    headers: { 'content-type': 'application/xml' },
+    body: '<D:propertyupdate xmlns:D="DAV:"/>',
+  });
+  assert.equal(response.status, 403);
 });
 
 test('Docker WebDAV 与管理端口和管理员凭据隔离', async (t) => {
