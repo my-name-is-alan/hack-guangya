@@ -1,8 +1,16 @@
 [[permission]]
 identifier = "allow-main-commands"
-description = "允许主窗口管理登录、监控目录和上传队列"
+description = "允许主窗口管理登录、挂载、监控目录和上传队列"
 commands.allow = [
   "get_state",
+  "get_mount_info",
+  "update_mount_credentials",
+  "get_native_mount_info",
+  "update_native_mount_options",
+  "start_native_mount",
+  "stop_native_mount",
+  "select_native_mount_target",
+  "select_rclone_binary",
   "clear_expired_session",
   "start_device_login",
   "request_sms_code",

@@ -147,9 +147,22 @@ function gateDocument(nonce) {
 </html>`;
 }
 
-export function createAccessControl({ database, initialCode = '', username = 'admin', rateLimit = {}, now = () => Date.now() }) {
+export function createAccessControl({
+  database,
+  initialCode = '',
+  username = 'admin',
+  tableName = 'access_control',
+  realm = 'Guangya Sync',
+  rateLimit = {},
+  now = () => Date.now(),
+}) {
+  if (!/^[a-z][a-z0-9_]*$/.test(tableName)) throw new Error('访问控制表名无效');
+  let currentUsername = String(username || '').trim();
+  if (!currentUsername || currentUsername.includes(':') || /[\u0000-\u001f\u007f]/.test(currentUsername)) {
+    throw new Error('访问用户名无效');
+  }
   database.exec(`
-    CREATE TABLE IF NOT EXISTS access_control (
+    CREATE TABLE IF NOT EXISTS ${tableName} (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       code_salt TEXT NOT NULL,
       code_hash TEXT NOT NULL,
@@ -157,9 +170,9 @@ export function createAccessControl({ database, initialCode = '', username = 'ad
     );
   `);
 
-  const selectRecord = database.prepare('SELECT code_salt, code_hash, updated_at FROM access_control WHERE id = 1');
+  const selectRecord = database.prepare(`SELECT code_salt, code_hash, updated_at FROM ${tableName} WHERE id = 1`);
   const saveRecord = database.prepare(`
-    INSERT INTO access_control (id, code_salt, code_hash, updated_at)
+    INSERT INTO ${tableName} (id, code_salt, code_hash, updated_at)
     VALUES (1, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       code_salt = excluded.code_salt,
@@ -329,7 +342,7 @@ export function createAccessControl({ database, initialCode = '', username = 'ad
         suppliedCode = decoded.slice(separator + 1);
       }
     } catch {}
-    const usernameMatches = equalText(suppliedUsername, username);
+    const usernameMatches = equalText(suppliedUsername, currentUsername);
     const result = await checkAttempt(request, suppliedCode, usernameMatches);
     return result.ok ? { ...result, method: 'basic' } : result;
   }
@@ -346,7 +359,7 @@ export function createAccessControl({ database, initialCode = '', username = 'ad
       required: needsCode,
       authenticated: !needsCode || hasSession(request),
       mode: needsCode ? 'access_code' : 'loopback',
-      username,
+      username: currentUsername,
     };
   }
 
@@ -365,7 +378,7 @@ export function createAccessControl({ database, initialCode = '', username = 'ad
     sessions.set(digest(token), now() + SESSION_TTL_SECONDS * 1000);
     return {
       ...authorizedResult('access_code'),
-      payload: { required: true, authenticated: true, mode: 'access_code', username },
+      payload: { required: true, authenticated: true, mode: 'access_code', username: currentUsername },
       cookie: sessionCookie(request, token),
     };
   }
@@ -376,13 +389,24 @@ export function createAccessControl({ database, initialCode = '', username = 'ad
     return sessionCookie(request, '', 0);
   }
 
+  function updateCredentials(request, nextUsername, code) {
+    const normalizedUsername = String(nextUsername || '').trim();
+    if (!normalizedUsername || normalizedUsername.includes(':') || /[\u0000-\u001f\u007f]/.test(normalizedUsername)) {
+      throw new Error('访问用户名无效');
+    }
+    persistCode(code);
+    currentUsername = normalizedUsername;
+    sessions.clear();
+    return sessionCookie(request, '', 0);
+  }
+
   function reject(response, result = unauthorizedResult()) {
     const statusCode = result.status === 429 ? 429 : 401;
     const headers = {
       'content-type': 'application/json; charset=utf-8',
       'cache-control': 'no-store',
     };
-    if (statusCode === 401) headers['www-authenticate'] = 'Basic realm="Guangya Sync", charset="UTF-8"';
+    if (statusCode === 401) headers['www-authenticate'] = `Basic realm="${String(realm).replaceAll('"', '')}", charset="UTF-8"`;
     if (statusCode === 429) headers['retry-after'] = String(result.retryAfterSeconds);
     response.writeHead(statusCode, headers);
     response.end(JSON.stringify(statusCode === 429
@@ -404,5 +428,5 @@ export function createAccessControl({ database, initialCode = '', username = 'ad
     response.end(body);
   }
 
-  return { authenticate, reject, required, serveGate, status, unlock, updateCode, verifyCode };
+  return { authenticate, reject, required, serveGate, status, unlock, updateCode, updateCredentials, verifyCode };
 }
