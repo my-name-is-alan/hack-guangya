@@ -1,14 +1,16 @@
 <script setup>
-import { computed, h, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
+import { computed, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
+import { useRoute } from 'vue-router';
 import { message, Modal } from 'antdv-next';
 import {
+  ArrowDownOutlined,
   ArrowLeftOutlined,
-  CloudDownloadOutlined,
-  CloudUploadOutlined,
+  ArrowUpOutlined,
+  CheckOutlined,
   CopyOutlined,
   DeleteOutlined,
-  DownOutlined,
   DownloadOutlined,
+  DragOutlined,
   EditOutlined,
   FileAddOutlined,
   FileExcelOutlined,
@@ -22,26 +24,39 @@ import {
   FileTextOutlined,
   FileWordOutlined,
   FileZipOutlined,
+  FolderAddOutlined,
   FolderOpenOutlined,
   FolderOutlined,
-  InboxOutlined,
-  LinkOutlined,
   ReloadOutlined,
+  ScissorOutlined,
   ShareAltOutlined,
   SwapOutlined,
   UploadOutlined,
   VideoCameraOutlined,
 } from '@antdv-next/icons';
+import CompactFileBreadcrumb from '../components/files/CompactFileBreadcrumb.vue';
+import FileSelectionBar from '../components/files/FileSelectionBar.vue';
+import GcidImportStatus from '../components/files/GcidImportStatus.vue';
+import ShareResultDialog from '../components/shares/ShareResultDialog.vue';
 import { bridge, isTauri } from '../bridge.js';
+import { useFileKeyboardShortcuts } from '../composables/useFileKeyboardShortcuts.js';
+import { FOLDER_OPEN_MODE, useFolderOpenPreference } from '../composables/useFolderOpenPreference.js';
+import { normalizeFolderName, validateFolderName } from '../folderName.js';
+import { gcidImportPercent, shouldConvertPasteToFile } from '../gcidImport.js';
+import { buildRenamePreview } from '../renameRules.js';
+import { parseGuangyaShareLink } from '../shareLink.js';
+import { readJsonResponse } from '../httpResponse.js';
+import { useTransfersStore } from '../stores/transfers.ts';
 import {
   appState,
   currentFolderId,
-  currentFolderName,
   currentPath,
   files,
   filesLoading,
+  filesPage,
+  filesPageSize,
+  filesTotal,
   loadFiles,
-  refreshState,
 } from '../store.js';
 import {
   errorText,
@@ -49,76 +64,181 @@ import {
   formatSize,
   formatTime,
   isFolder,
-  newDownloadId,
   pick,
+  receiptDisplayMessage,
+  uploadFileName,
   unwrapData,
 } from '../formatters.js';
 
-const emit = defineEmits(['share']);
+const transfers = useTransfersStore();
+const route = useRoute();
+const { folderOpenMode } = useFolderOpenPreference();
 
 const selectedKeys = ref([]);
 const dragActive = ref(false);
 const dragDepth = ref(0);
 const uploading = ref(false);
-const uploadProgress = ref(null);
-const uploadProgressTimer = ref(null);
-const uploadMenuItems = [{ key: 'folder', label: '上传文件夹' }];
-const fileContextMenu = reactive({ open: false, x: 0, y: 0, record: null });
+const operationBusy = ref(false);
+const fileInput = ref(null);
+const folderInput = ref(null);
+const focusedRowId = ref('');
+const fileClipboard = reactive({ mode: '', items: [] });
+const fileContextMenu = reactive({ open: false, x: 0, y: 0, record: null, keyboard: false });
+const createFolderDialog = reactive({ open: false, name: '', loading: false, touched: false });
+let selectionAnchorId = '';
+let gcidImportPollTimer = null;
+const uploadMenuItems = computed(() => [
+  { key: 'files', label: '选择文件' },
+  { key: 'folder', label: '选择文件夹' },
+  ...(!isTauri ? [{ type: 'divider' }, { key: 'server', label: '选择服务器文件' }] : []),
+]);
 const fileContextMenuItems = computed(() => {
   const record = fileContextMenu.record;
-  if (!record) return [];
-  if (isFolder(record)) {
-    return [
-      { key: 'open', icon: () => h(FolderOpenOutlined), label: '打开文件夹' },
-      { type: 'divider' },
-      { key: 'rename', icon: () => h(EditOutlined), label: '重命名' },
-      { type: 'divider' },
-      { key: 'copy', icon: () => h(CopyOutlined), label: '复制到…' },
-      { key: 'move', icon: () => h(SwapOutlined), label: '移动到…' },
-      { type: 'divider' },
-      { key: 'share', icon: () => h(ShareAltOutlined), label: '创建分享' },
-      { key: 'delete', icon: () => h(DeleteOutlined), label: '删除', danger: true },
-    ];
-  }
+  if (!record) return [
+    { key: 'createFolder', icon: () => h(FolderAddOutlined), label: '新建文件夹' },
+    { type: 'divider' },
+    {
+      key: 'paste',
+      icon: () => h(CheckOutlined),
+      label: fileClipboard.items.length
+        ? `粘贴${fileClipboard.mode === 'move' ? '已剪切' : '已复制'}的 ${fileClipboard.items.length} 项`
+        : '粘贴',
+      disabled: !fileClipboard.items.length,
+    },
+    { type: 'divider' },
+    { key: 'refresh', icon: () => h(ReloadOutlined), label: '刷新' },
+  ];
+
   return [
+    ...(isFolder(record)
+      ? [{ key: 'open', icon: () => h(FolderOpenOutlined), label: '打开文件夹' }, { type: 'divider' }]
+      : []),
+    { key: 'copy', icon: () => h(CopyOutlined), label: '复制 (Ctrl+C)' },
+    { key: 'cut', icon: () => h(ScissorOutlined), label: '剪切 (Ctrl+X)' },
+    { key: 'copyTo', icon: () => h(CopyOutlined), label: '复制到…' },
+    { key: 'moveTo', icon: () => h(SwapOutlined), label: '移动到…' },
+    { type: 'divider' },
+    { key: 'rename', icon: () => h(EditOutlined), label: '重命名 (F2)' },
     { key: 'download', icon: () => h(DownloadOutlined), label: '下载' },
-    { type: 'divider' },
-    { key: 'rename', icon: () => h(EditOutlined), label: '重命名' },
-    { type: 'divider' },
-    { key: 'copy', icon: () => h(CopyOutlined), label: '复制到…' },
-    { key: 'move', icon: () => h(SwapOutlined), label: '移动到…' },
-    { type: 'divider' },
     { key: 'share', icon: () => h(ShareAltOutlined), label: '创建分享' },
-    { key: 'delete', icon: () => h(DeleteOutlined), label: '删除', danger: true },
+    { type: 'divider' },
+    { key: 'delete', icon: () => h(DeleteOutlined), label: '删除 (Del)', danger: true },
   ];
 });
 
-const shareForm = reactive({ open: false, loading: false, url: '', password: '', name: '', remark: '' });
-const gcidImport = reactive({ open: false, loading: false, json: '' });
-const renameModal = reactive({ open: false, saving: false, records: [], mode: 'single', singleName: '', prefix: '', suffix: '', findText: '', replaceText: '', startNumber: 1, digits: 3, template: '' });
-const folderPicker = reactive({ open: false, loading: false, title: '', action: 'copy', sourceIds: [], path: [{ id: '', name: '全部文件' }], options: [] });
-const receivedShare = reactive({
-  open: false, loading: false, restoring: false, downloading: false,
-  url: '', password: '', info: null, files: [], selectedKeys: [], path: [], error: '',
+const gcidImport = reactive({
+  open: false,
+  detailsOpen: false,
+  loading: false,
+  sourcePath: '',
+  sourceName: '',
+  pastedJson: '',
+  destinationName: '',
+  concurrency: 4,
+  status: null,
 });
+const gcidImportRunning = computed(() => ['preparing', 'running'].includes(gcidImport.status?.status));
+const gcidImportProgress = computed(() => gcidImportPercent(gcidImport.status));
+const fileActionBarVisible = computed(() => selectedKeys.value.length > 0 || fileClipboard.items.length > 0);
+const createFolderError = computed(() => validateFolderName(
+  createFolderDialog.name,
+  files.value.map((item) => pick(item, ['fileName', 'name'], '')),
+));
+const serverFilePicker = reactive({
+  open: false,
+  loading: false,
+  submitting: false,
+  roots: [],
+  path: '',
+  parent: '',
+  displayPath: '/',
+  items: [],
+  selected: [],
+});
+const shareResult = reactive({
+  open: false,
+  creating: false,
+  saving: false,
+  label: '',
+  url: '',
+  code: '',
+  reused: false,
+  hdhiveEventId: '',
+  hdhiveStatus: '',
+  hdhiveMessage: '',
+});
+const shareAccess = reactive({
+  open: false,
+  records: [],
+  mode: 'none',
+  code: '',
+});
+const shareResultReceipt = computed(() => (appState.auto_share_receipts || [])
+  .find((receipt) => receipt.event_id === shareResult.hdhiveEventId) || null);
+const shareResultView = computed(() => ({
+  label: shareResult.label,
+  url: shareResult.url,
+  code: shareResult.code,
+  reused: shareResult.reused,
+  hdhiveStatus: shareResultReceipt.value?.status || shareResult.hdhiveStatus,
+  hdhiveMessage: receiptDisplayMessage(shareResultReceipt.value) || shareResult.hdhiveMessage,
+  hdhiveResourceUrl: shareResultReceipt.value?.resource_url || '',
+}));
+const activeServerRoot = computed(() => [...serverFilePicker.roots]
+  .sort((left, right) => right.length - left.length)
+  .find((root) => serverFilePicker.path === root || serverFilePicker.path.startsWith(root.endsWith('/') || root.endsWith('\\') ? root : `${root}${root.includes('\\') ? '\\' : '/'}`))
+  || serverFilePicker.roots[0]);
+const renameModal = reactive({ open: false, saving: false, records: [], mode: 'single', singleName: '', preserveExtension: true, rules: [] });
+let renameRuleId = 0;
+const renameRuleOptions = [
+  { label: '设置名称', value: 'set' },
+  { label: '查找替换', value: 'replace' },
+  { label: '正则替换', value: 'regex' },
+  { label: '添加前缀', value: 'prefix' },
+  { label: '添加后缀', value: 'suffix' },
+  { label: '追加序号', value: 'sequence' },
+  { label: '转为大写', value: 'upper' },
+  { label: '转为小写', value: 'lower' },
+];
+const renameRuleValuePlaceholders = {
+  set: '输入统一名称',
+  prefix: '输入要添加的前缀',
+  suffix: '输入要添加的后缀',
+};
+const folderPicker = reactive({ open: false, loading: false, title: '', action: 'copy', sourceIds: [], targetId: '', path: [{ id: '', name: '全部文件' }], options: [], page: 0, total: 0 });
 
 const fileColumns = [
   { title: '名称', key: 'name', ellipsis: true },
-  { title: '大小', key: 'size', width: 110 },
-  { title: '修改时间', key: 'time', width: 170 },
+  { title: '类型', key: 'type', width: 96 },
+  { title: '大小', key: 'size', width: 100 },
+  { title: '修改时间', key: 'time', width: 160 },
 ];
 const folderPickerColumns = [
   { title: '文件夹', key: 'name', ellipsis: true },
   { title: '修改时间', key: 'time', width: 170 },
 ];
+const filePagination = computed(() => ({
+  current: filesPage.value + 1,
+  pageSize: filesPageSize,
+  total: filesTotal.value,
+  showSizeChanger: false,
+  hideOnSinglePage: true,
+  showQuickJumper: filesTotal.value > filesPageSize * 5,
+}));
+const folderPickerPagination = computed(() => ({
+  current: folderPicker.page + 1,
+  pageSize: 100,
+  total: folderPicker.total,
+  showSizeChanger: false,
+  hideOnSinglePage: true,
+}));
 
 const rowSelection = computed(() => ({
   selectedRowKeys: selectedKeys.value,
-  onChange: (keys) => { selectedKeys.value = keys; },
-}));
-const receivedShareRowSelection = computed(() => ({
-  selectedRowKeys: receivedShare.selectedKeys,
-  onChange: (keys) => { receivedShare.selectedKeys = keys; },
+  onChange: (keys) => {
+    selectedKeys.value = keys;
+    selectionAnchorId = String(keys.at(-1) || '');
+  },
 }));
 const folderPickerRowSelection = computed(() => ({
   type: 'radio',
@@ -126,27 +246,6 @@ const folderPickerRowSelection = computed(() => ({
   onChange: (keys) => { folderPicker.targetId = keys[0] || ''; },
 }));
 
-const uploadProgressPercent = computed(() => {
-  const total = Number(uploadProgress.value?.total || 0);
-  if (!total) return 0;
-  return Math.min(100, Math.round((Number(uploadProgress.value?.uploaded || 0) / total) * 100));
-});
-const uploadProgressText = computed(() => {
-  if (!uploadProgress.value) return '';
-  if (uploadProgress.value.status === 'failed') return uploadProgress.value.message || '上传失败';
-  if (uploadProgress.value.status === 'completed') return `已完成 ${uploadProgress.value.uploaded}/${uploadProgress.value.total}`;
-  return `正在上传 ${uploadProgress.value.current || ''} · ${uploadProgress.value.uploaded}/${uploadProgress.value.total}`;
-});
-
-const receivedShareBreadcrumb = computed(() => [
-  { key: 'root', label: '分享根目录' },
-  ...receivedShare.path.map((folder) => ({ key: folder.id, label: folder.name })),
-]);
-const receivedShareCurrentFolderId = computed(() => receivedShare.path[receivedShare.path.length - 1]?.id || '');
-const receivedShareSelectedCount = computed(() => receivedShare.selectedKeys.length);
-const receivedShareFolderCount = computed(() => receivedShare.files.filter((item) => isFolder(item)).length);
-const receivedShareFileCount = computed(() => receivedShare.files.length - receivedShareFolderCount.value);
-const receivedShareTotalSize = computed(() => receivedShare.files.reduce((total, item) => total + Number(item.fileSize || 0), 0));
 
 function fileIcon(record) {
   if (isFolder(record)) return { icon: FolderOutlined, cls: 'folder' };
@@ -165,29 +264,228 @@ function fileIcon(record) {
   return { icon: FileOutlined, cls: 'other' };
 }
 
-function fileRowProps(record) {
+function fileTypeLabel(record) {
+  if (isFolder(record)) return '文件夹';
+  const extension = String(pick(record, ['fileSuffix', 'ext', 'extension'], '') || '').replace(/^\./, '');
+  return extension ? extension.toUpperCase() : '文件';
+}
+
+function fileModifiedTime(record) {
+  return formatTime(pick(record, ['lastUpdateTime', 'updateTime', 'utime', 'ctime', 'modifiedAt'], 0));
+}
+
+function selectRangeTo(record) {
+  const targetId = fileId(record);
+  const anchorIndex = files.value.findIndex((item) => String(fileId(item)) === String(selectionAnchorId));
+  const targetIndex = files.value.findIndex((item) => String(fileId(item)) === String(targetId));
+  if (anchorIndex < 0 || targetIndex < 0) {
+    selectedKeys.value = [targetId];
+    selectionAnchorId = String(targetId);
+    return;
+  }
+  const [start, end] = anchorIndex <= targetIndex ? [anchorIndex, targetIndex] : [targetIndex, anchorIndex];
+  selectedKeys.value = files.value.slice(start, end + 1).map(fileId).filter(Boolean);
+}
+
+function toggleRecordSelection(record) {
+  const id = fileId(record);
+  if (!id) return;
+  selectedKeys.value = selectedKeys.value.includes(id)
+    ? selectedKeys.value.filter((key) => key !== id)
+    : [...selectedKeys.value, id];
+  selectionAnchorId = String(id);
+}
+
+function handleFileRowClick(event, record) {
+  if (event.target?.closest?.('input, button, a, .ant-checkbox-wrapper, [role="button"]')) return;
+  const id = fileId(record);
+  if (!id) return;
+  event.currentTarget?.focus?.({ preventScroll: true });
+  focusedRowId.value = String(id);
+  if (
+    isFolder(record)
+    && folderOpenMode.value === FOLDER_OPEN_MODE.SINGLE_CLICK
+    && !event.shiftKey
+    && !event.ctrlKey
+    && !event.metaKey
+  ) {
+    enterFolder(record);
+    return;
+  }
+  if (event.shiftKey) selectRangeTo(record);
+  else if (event.ctrlKey || event.metaKey) toggleRecordSelection(record);
+  else {
+    selectedKeys.value = [id];
+    selectionAnchorId = String(id);
+  }
+}
+
+async function focusFileRow(index, extendSelection = false) {
+  if (!files.value.length) return;
+  const nextIndex = Math.max(0, Math.min(files.value.length - 1, index));
+  const record = files.value[nextIndex];
+  const id = String(fileId(record));
+  if (!id) return;
+  focusedRowId.value = id;
+  if (extendSelection) selectRangeTo(record);
+  else {
+    selectedKeys.value = [fileId(record)];
+    selectionAnchorId = id;
+  }
+  await nextTick();
+  const rows = document.querySelectorAll('.file-card .ant-table-tbody > tr[data-row-key]');
+  [...rows].find((row) => String(row.getAttribute('data-row-key')) === id)?.focus();
+}
+
+function fileRowProps(record, rowIndex) {
+  const id = String(fileId(record));
   return {
-    onDblclick: () => { if (isFolder(record)) enterFolder(record); },
+    tabindex: focusedRowId.value ? (focusedRowId.value === id ? 0 : -1) : (rowIndex === 0 ? 0 : -1),
+    'aria-selected': selectedKeys.value.includes(fileId(record)),
+    onClick: (event) => handleFileRowClick(event, record),
+    onFocus: () => { focusedRowId.value = id; },
+    onDblclick: () => {
+      if (isFolder(record) && folderOpenMode.value === FOLDER_OPEN_MODE.DOUBLE_CLICK) enterFolder(record);
+    },
+    onKeydown: (event) => {
+      if (fileContextMenu.open) {
+        if (handleFileContextMenuKeydown(event)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      const index = files.value.findIndex((item) => String(fileId(item)) === id);
+      if (event.key === 'Enter' && isFolder(record)) {
+        event.preventDefault();
+        enterFolder(record);
+      }
+      if (event.key === ' ') {
+        event.preventDefault();
+        toggleRecordSelection(record);
+      }
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        void focusFileRow(index + 1, event.shiftKey);
+      }
+      if (event.key === 'ArrowUp' && !event.altKey) {
+        event.preventDefault();
+        void focusFileRow(index - 1, event.shiftKey);
+      }
+      if (event.key === 'Home') {
+        event.preventDefault();
+        void focusFileRow(0, event.shiftKey);
+      }
+      if (event.key === 'End') {
+        event.preventDefault();
+        void focusFileRow(files.value.length - 1, event.shiftKey);
+      }
+      if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) {
+        event.preventDefault();
+        const bounds = event.currentTarget.getBoundingClientRect();
+        openFileContextMenu({ preventDefault() {}, clientX: bounds.left + 24, clientY: bounds.top + 24 }, record, true);
+      }
+    },
     onContextmenu: (event) => {
       event.preventDefault();
+      event.stopPropagation();
       openFileContextMenu(event, record);
     },
   };
 }
 
-function openFileContextMenu(event, record) {
+function openFileContextMenu(event, record, keyboard = false) {
   if (!appState.logged_in) return;
   const id = fileId(record);
   if (id && !selectedKeys.value.includes(id)) selectedKeys.value = [id];
-  fileContextMenu.open = true;
+  if (id) {
+    focusedRowId.value = String(id);
+    selectionAnchorId = String(id);
+  }
   fileContextMenu.x = event.clientX;
   fileContextMenu.y = event.clientY;
   fileContextMenu.record = record;
+  fileContextMenu.keyboard = keyboard;
+  fileContextMenu.open = true;
+  if (keyboard) void focusKeyboardContextMenu();
 }
 
-function closeFileContextMenu() {
+async function focusKeyboardContextMenu() {
+  await nextTick();
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => visibleFileContextMenuItems()[0]?.focus?.({ preventScroll: true }));
+  });
+}
+
+function visibleFileContextMenuItems() {
+  const menus = [...document.querySelectorAll('.ant-dropdown:not(.ant-dropdown-hidden)')]
+    .filter((element) => getComputedStyle(element).display !== 'none');
+  const menu = menus.at(-1);
+  return menu
+    ? [...menu.querySelectorAll('.ant-dropdown-menu-item:not(.ant-dropdown-menu-item-disabled), [role="menuitem"]:not([aria-disabled="true"])')]
+    : [];
+}
+
+function handleFileContextMenuKeydown(event) {
+  if (!fileContextMenu.open) return false;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    event.stopPropagation();
+    closeFileContextMenu(true);
+    return true;
+  }
+  const items = visibleFileContextMenuItems();
+  if (!items.length) return false;
+  if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+    event.preventDefault();
+    event.stopPropagation();
+    const currentIndex = items.indexOf(document.activeElement);
+    const nextIndex = event.key === 'Home'
+      ? 0
+      : event.key === 'End'
+        ? items.length - 1
+        : currentIndex < 0
+          ? (event.key === 'ArrowUp' ? items.length - 1 : 0)
+          : (currentIndex + (event.key === 'ArrowUp' ? -1 : 1) + items.length) % items.length;
+    items[nextIndex]?.focus?.({ preventScroll: true });
+    return true;
+  }
+  if (['Enter', ' '].includes(event.key) && items.includes(document.activeElement)) {
+    event.preventDefault();
+    event.stopPropagation();
+    document.activeElement?.click?.();
+    return true;
+  }
+  return false;
+}
+
+async function restoreFocusedFileRow(id) {
+  if (!id) return;
+  await nextTick();
+  const rows = document.querySelectorAll('.file-card .ant-table-tbody > tr[data-row-key]');
+  [...rows].find((row) => String(row.getAttribute('data-row-key')) === String(id))?.focus();
+}
+
+function closeFileContextMenu(restoreFocus = false) {
+  const shouldRestore = restoreFocus && fileContextMenu.keyboard;
+  const focusedId = focusedRowId.value;
   fileContextMenu.open = false;
   fileContextMenu.record = null;
+  fileContextMenu.keyboard = false;
+  if (shouldRestore) void restoreFocusedFileRow(focusedId);
+}
+
+function openBackgroundContextMenu(event) {
+  if (!appState.logged_in || event.target?.closest?.('.ant-table-tbody > tr')) return;
+  event.preventDefault();
+  fileContextMenu.open = true;
+  fileContextMenu.x = event.clientX;
+  fileContextMenu.y = event.clientY;
+  fileContextMenu.record = null;
+  fileContextMenu.keyboard = false;
+}
+
+function handleFileContextOpenChange(open) {
+  if (!open) closeFileContextMenu(true);
 }
 
 function selectedRecords() {
@@ -208,98 +506,351 @@ function contextTargetRecords() {
 
 async function handleFileContextMenuClick({ key }) {
   const record = fileContextMenu.record;
+  const targets = record ? contextTargetRecords() : [];
+  closeFileContextMenu(false);
+  if (key === 'createFolder') return openCreateFolder();
+  if (key === 'paste') return pasteFileClipboard();
+  if (key === 'refresh') return loadCloudFiles();
   if (!record) return;
-  closeFileContextMenu();
   if (key === 'open') return enterFolder(record);
-  if (key === 'download') return downloadCloudFiles([record]);
-  if (key === 'rename') return openRenameModal(contextTargetRecords());
-  if (key === 'copy') return openFolderPicker('copy', contextTargetRecords());
-  if (key === 'move') return openFolderPicker('move', contextTargetRecords());
-  if (key === 'share') return emit('share', [record]);
-  if (key === 'delete') return deleteCloudFiles(contextTargetRecords());
+  if (key === 'copy') return setFileClipboard('copy', targets);
+  if (key === 'cut') return setFileClipboard('move', targets);
+  if (key === 'download') return downloadCloudFiles(targets);
+  if (key === 'rename') return openRenameModal(targets);
+  if (key === 'copyTo') return openFolderPicker('copy', targets);
+  if (key === 'moveTo') return openFolderPicker('move', targets);
+  if (key === 'share') return createCloudShare(targets);
+  if (key === 'delete') return deleteCloudFiles(targets);
 }
 
-async function loadCloudFiles() {
-  try { await loadFiles(); } catch (error) { message.error(errorText(error)); }
+function clearSelection() {
+  selectedKeys.value = [];
+  selectionAnchorId = '';
+  closeFileContextMenu(false);
 }
+
+function selectAllFiles() {
+  selectedKeys.value = files.value.map(fileId).filter(Boolean);
+  selectionAnchorId = String(selectedKeys.value[0] || '');
+}
+
+function setFileClipboard(mode, records = selectedRecords()) {
+  const targets = (Array.isArray(records) ? records : []).filter(Boolean);
+  if (!targets.length) return;
+  fileClipboard.mode = mode;
+  fileClipboard.items = targets
+    .map((item) => ({ id: fileId(item), fileName: item.fileName, resType: item.resType }))
+    .filter((item) => item.id);
+  message.success(`已${mode === 'move' ? '剪切' : '复制'} ${fileClipboard.items.length} 项，可进入目标目录粘贴`);
+}
+
+function clearFileClipboard() {
+  fileClipboard.mode = '';
+  fileClipboard.items = [];
+}
+
+async function pasteFileClipboard() {
+  if (!fileClipboard.items.length || operationBusy.value) return;
+  operationBusy.value = true;
+  try {
+    const command = fileClipboard.mode === 'move' ? 'move_files' : 'copy_files';
+    await bridge.invoke(command, {
+      file_ids: [...new Set(fileClipboard.items.map((item) => item.id).filter(Boolean))],
+      parent_id: currentFolderId.value,
+    });
+    if (fileClipboard.mode === 'move') clearFileClipboard();
+    clearSelection();
+    await loadCloudFiles();
+    message.success(command === 'move_files' ? '已移动到当前目录' : '已复制到当前目录');
+  } catch (error) {
+    message.error(errorText(error));
+  } finally {
+    operationBusy.value = false;
+  }
+}
+
+function reconcileVisibleFileState() {
+  const visibleIds = new Set(files.value.map((item) => String(fileId(item))).filter(Boolean));
+  selectedKeys.value = selectedKeys.value.filter((id) => visibleIds.has(String(id)));
+  if (focusedRowId.value && !visibleIds.has(String(focusedRowId.value))) focusedRowId.value = '';
+  if (selectionAnchorId && !visibleIds.has(String(selectionAnchorId))) selectionAnchorId = String(selectedKeys.value.at(-1) || '');
+}
+
+async function loadCloudFiles(page = filesPage.value) {
+  try {
+    await loadFiles(page);
+    reconcileVisibleFileState();
+  } catch (error) {
+    message.error(errorText(error));
+  }
+}
+
+watch(() => route.query.focus, async (focusValue) => {
+  const focusId = String(focusValue || '');
+  if (!focusId) return;
+  const parentId = String(route.query.parent || '');
+  const parentName = String(route.query.parentName || '搜索结果目录');
+  currentPath.value = parentId
+    ? [{ id: '', name: '全部文件' }, { id: parentId, name: parentName }]
+    : [{ id: '', name: '全部文件' }];
+  clearSelection();
+  focusedRowId.value = '';
+  await loadCloudFiles(0);
+  if (files.value.some((item) => fileId(item) === focusId)) selectedKeys.value = [focusId];
+}, { immediate: true });
 
 function enterFolder(record) {
   currentPath.value = [...currentPath.value, { id: fileId(record), name: record.fileName }];
-  selectedKeys.value = [];
-  loadCloudFiles();
+  clearSelection();
+  focusedRowId.value = '';
+  loadCloudFiles(0);
 }
 function goBack() {
   if (currentPath.value.length <= 1) return;
   currentPath.value = currentPath.value.slice(0, -1);
-  selectedKeys.value = [];
-  loadCloudFiles();
+  clearSelection();
+  focusedRowId.value = '';
+  loadCloudFiles(0);
 }
 
-async function triggerUpload(kind) {
+function jumpToPath(index) {
+  if (index < 0 || index >= currentPath.value.length - 1) return;
+  currentPath.value = currentPath.value.slice(0, index + 1);
+  clearSelection();
+  focusedRowId.value = '';
+  loadCloudFiles(0);
+}
+
+function handleFileTableChange(pagination) {
+  const nextPage = Math.max(0, Number(pagination?.current || 1) - 1);
+  if (nextPage === filesPage.value) return;
+  clearSelection();
+  focusedRowId.value = '';
+  void loadCloudFiles(nextPage);
+}
+
+function openCreateFolder() {
+  if (!appState.logged_in) {
+    message.warning('请先登录光鸭云盘');
+    return;
+  }
+  Object.assign(createFolderDialog, { open: true, name: '', loading: false, touched: false });
+}
+
+async function submitCreateFolder() {
+  if (createFolderDialog.loading) return;
+  createFolderDialog.touched = true;
+  if (createFolderError.value) {
+    message.warning(createFolderError.value);
+    return;
+  }
+
+  const folderName = normalizeFolderName(createFolderDialog.name);
+  createFolderDialog.loading = true;
+  try {
+    await bridge.invoke('create_folder', {
+      parent_id: currentFolderId.value,
+      folder_name: folderName,
+    });
+    createFolderDialog.open = false;
+    await loadCloudFiles(0);
+    message.success(`文件夹“${folderName}”已创建`);
+  } catch (error) {
+    message.error(`新建文件夹失败：${errorText(error)}`);
+  } finally {
+    createFolderDialog.loading = false;
+  }
+}
+
+async function triggerUpload(kind = 'files') {
   if (!appState.logged_in) return;
   if (!isTauri) {
-    message.warning('Web 控制台暂不支持直接上传文件，请使用桌面端上传');
+    (kind === 'folder' ? folderInput.value : fileInput.value)?.click();
     return;
   }
   uploading.value = true;
   try {
-    const paths = kind === 'folder'
-      ? [await bridge.selectUploadFolder()].filter(Boolean)
+    const selection = kind === 'folder'
+      ? await bridge.selectUploadFolder()
       : await bridge.selectUploadFiles();
+    const paths = Array.isArray(selection) ? selection : selection ? [selection] : [];
     if (!paths.length) return;
-    startUploadProgress(paths.length);
-    await bridge.invoke('upload_files', { paths, parent_id: currentFolderId.value });
-    await loadCloudFiles();
-    message.success(`已提交 ${paths.length} 个上传任务`);
+    const count = await bridge.invoke('queue_upload_paths', { paths, parent_id: currentFolderId.value });
+    message.success(`已加入上传队列：${Number(count || paths.length)} 个文件`);
   } catch (error) {
     message.error(errorText(error));
   } finally {
     uploading.value = false;
   }
 }
-function handleUploadMenu({ key }) {
-  if (key === 'folder') triggerUpload('folder');
-}
-
-function startUploadProgress(total) {
-  stopUploadProgress();
-  uploadProgress.value = { status: 'running', total, uploaded: 0, current: '', message: '' };
-  uploadProgressTimer.value = setInterval(async () => {
-    try {
-      const state = unwrapData(await bridge.invoke('get_upload_progress'));
-      if (!state || !state.total) return;
-      uploadProgress.value = state;
-      if (['completed', 'failed'].includes(state.status)) stopUploadProgress(false);
-    } catch { /* 忽略轮询错误 */ }
-  }, 800);
-}
-function stopUploadProgress(clear = true) {
-  if (uploadProgressTimer.value) clearInterval(uploadProgressTimer.value);
-  uploadProgressTimer.value = null;
-  if (clear) uploadProgress.value = null;
-}
-function dismissUploadProgress() {
-  stopUploadProgress();
-}
 
 async function downloadCloudFiles(records) {
-  const targets = (Array.isArray(records) ? records : []).filter((record) => record && !isFolder(record));
+  const targets = (Array.isArray(records) ? records : []).filter(Boolean);
   if (!targets.length) return;
-  const hide = message.loading(`正在获取 ${targets.length} 个文件的下载地址…`, 0);
   try {
-    const results = [];
-    for (const record of targets) {
-      const data = unwrapData(await bridge.invoke('get_cloud_download', { file_id: fileId(record) }));
-      const url = pick(data, ['downloadUrl', 'download_url', 'url'], '');
-      if (!url) throw new Error(`未获取到「${record.fileName}」的下载地址`);
-      results.push({ id: newDownloadId(), name: record.fileName || '未命名文件', url, status: 'pending', progress: 0, error: '' });
-    }
-    window.dispatchEvent(new CustomEvent('guangya:add-downloads', { detail: results }));
-    message.success(`已添加 ${results.length} 个下载任务`);
+    const queued = await transfers.downloadRecords(targets);
+    if (isTauri && queued) message.success('已加入下载队列');
+  } catch (error) {
+    message.error(errorText(error));
+  }
+}
+
+function handleUploadMenuClick({ key }) {
+  if (key === 'server') {
+    void chooseServerUpload();
+    return;
+  }
+  void triggerUpload(key);
+}
+
+async function loadServerDirectory(relativePath = '') {
+  serverFilePicker.loading = true;
+  try {
+    const query = new URLSearchParams({ path: relativePath });
+    const response = await fetch(`/api/server-files?${query}`);
+    const payload = await readJsonResponse(response, '读取服务器目录失败');
+    Object.assign(serverFilePicker, {
+      roots: payload.roots || [],
+      path: payload.path || '',
+      parent: payload.parent || '',
+      displayPath: payload.display_path || '/',
+      items: payload.items || [],
+    });
   } catch (error) {
     message.error(errorText(error));
   } finally {
-    hide();
+    serverFilePicker.loading = false;
+  }
+}
+
+async function chooseServerUpload() {
+  if (isTauri) return;
+  serverFilePicker.open = true;
+  serverFilePicker.selected = [];
+  await loadServerDirectory('');
+}
+
+function toggleServerSelection(item, checked) {
+  const selected = new Set(serverFilePicker.selected);
+  if (checked) selected.add(item.path);
+  else selected.delete(item.path);
+  serverFilePicker.selected = [...selected];
+}
+
+async function confirmServerUpload() {
+  if (!serverFilePicker.selected.length) {
+    message.warning('请至少选择一个服务器文件或文件夹');
+    return;
+  }
+  serverFilePicker.submitting = true;
+  try {
+    const response = await fetch('/api/server-upload', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ paths: serverFilePicker.selected, parent_id: currentFolderId.value }),
+    });
+    const payload = await readJsonResponse(response, '加入服务器上传队列失败');
+    serverFilePicker.open = false;
+    if (payload.queued) message.success(`已加入上传队列：${payload.queued} 个文件${payload.skipped ? `，跳过已上传 ${payload.skipped} 个` : ''}`);
+    else message.info(`没有需要上传的文件，已跳过 ${payload.skipped || 0} 个已上传文件`);
+  } catch (error) {
+    message.error(errorText(error));
+  } finally {
+    serverFilePicker.submitting = false;
+  }
+}
+
+async function createCloudShare(records) {
+  const targets = (Array.isArray(records) ? records : []).filter(Boolean);
+  if (!targets.length || shareResult.creating) return;
+  shareAccess.records = targets;
+  shareAccess.mode = 'none';
+  shareAccess.code = '';
+  shareAccess.open = true;
+}
+
+async function confirmCloudShare() {
+  const targets = shareAccess.records;
+  if (!targets.length || shareResult.creating) return;
+  const code = shareAccess.code.trim();
+  if (shareAccess.mode === 'fixed' && !/^[A-Za-z0-9]{4}$/.test(code)) {
+    message.warning('固定访问码必须是 4 位英文或数字');
+    return;
+  }
+  const names = targets
+    .map((item) => String(pick(item, ['fileName', 'name'], '')).trim())
+    .filter(Boolean);
+  const title = names.length > 1 ? `${names[0]} 等 ${names.length} 项` : names[0] || '云盘分享';
+  const targetType = targets.length === 1 && isFolder(targets[0]) ? 'folder' : 'file';
+  const shareType = ({ none: 0, random: 1, fixed: 2 })[shareAccess.mode] ?? 0;
+  shareResult.creating = true;
+  const closeProgress = message.loading('正在创建分享，请稍候…', 0);
+  try {
+    const data = unwrapData(await bridge.invoke('create_share', {
+      file_ids: targets.map(fileId).filter(Boolean),
+      title,
+      target_type: targetType,
+      share_type: shareType,
+      code: shareType === 2 ? code : '',
+      auto_fill_code: false,
+    }));
+    const url = pick(data, ['shareUrl', 'share_url', 'url'], '');
+    if (!url) throw new Error('光鸭没有返回分享链接');
+    let code = String(pick(data, ['code', 'extractCode'], '') || '').trim();
+    if (!code) {
+      try { code = parseGuangyaShareLink(url).code; } catch { /* 部分历史链接不带标准域名。 */ }
+    }
+    Object.assign(shareResult, {
+      open: true,
+      label: title,
+      url,
+      code,
+      reused: data.reused_existing === true,
+      hdhiveEventId: String(pick(data, ['hdhive_event_id'], '') || ''),
+      hdhiveStatus: String(pick(data, ['hdhive_status'], 'disabled') || 'disabled'),
+      hdhiveMessage: String(pick(data, ['hdhive_message'], '光鸭分享已创建') || ''),
+    });
+    shareAccess.open = false;
+    if (['accepted', 'processing', 'completed'].includes(shareResult.hdhiveStatus)) {
+      message.success(shareResult.reused ? '已复用已有分享，Hdhive 将更新现有内容' : '分享已创建，Hdhive 正在处理');
+    } else if (shareResult.hdhiveStatus === 'disabled') {
+      message.success(shareResult.reused ? '已复用已有分享' : '分享已创建');
+    } else {
+      message.warning(shareResult.hdhiveMessage);
+    }
+  } catch (error) {
+    message.error(errorText(error));
+  } finally {
+    closeProgress?.();
+    shareResult.creating = false;
+  }
+}
+
+function shareUrlForSave(url, code) {
+  if (!code) return url;
+  try {
+    const parsed = new URL(url);
+    if (!parsed.searchParams.get('code')) parsed.searchParams.set('code', code);
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+async function saveCreatedShare() {
+  if (!shareResult.url || shareResult.saving) return;
+  shareResult.saving = true;
+  try {
+    await bridge.invoke('save_share_link', {
+      label: shareResult.label || '分享链接',
+      url: shareUrlForSave(shareResult.url, shareResult.code),
+    });
+    shareResult.open = false;
+    message.success('分享链接已加入收藏');
+  } catch (error) {
+    message.error(errorText(error));
+  } finally {
+    shareResult.saving = false;
   }
 }
 
@@ -328,57 +879,73 @@ async function deleteCloudFiles(records) {
   });
 }
 
+function createRenameRule(type = 'replace', seed = '') {
+  return {
+    id: ++renameRuleId,
+    type,
+    value: seed,
+    search: '',
+    replacement: '',
+    ignoreCase: false,
+    start: 1,
+    padding: 2,
+  };
+}
+
 function openRenameModal(records) {
   const targets = (Array.isArray(records) ? records : []).filter(Boolean);
   if (!targets.length) return;
   renameModal.records = targets;
-  renameModal.mode = targets.length > 1 ? 'batch' : 'single';
+  renameModal.mode = targets.length > 1 ? 'rules' : 'single';
   renameModal.singleName = targets[0]?.fileName || '';
-  renameModal.prefix = '';
-  renameModal.suffix = '';
-  renameModal.findText = '';
-  renameModal.replaceText = '';
-  renameModal.startNumber = 1;
-  renameModal.digits = 3;
-  renameModal.template = '';
+  renameModal.preserveExtension = true;
+  renameModal.rules = targets.length > 1 ? [createRenameRule('replace')] : [];
   renameModal.open = true;
 }
-function splitFileName(name) {
-  const value = String(name || '');
-  const index = value.lastIndexOf('.');
-  if (index <= 0) return { stem: value, ext: '' };
-  return { stem: value.slice(0, index), ext: value.slice(index) };
-}
-function previewRenameName(record, index) {
-  const { stem, ext } = splitFileName(record.fileName);
-  if (renameModal.mode === 'single') return renameModal.singleName || record.fileName;
-  if (renameModal.mode === 'affix') return `${renameModal.prefix}${stem}${renameModal.suffix}${ext}`;
-  if (renameModal.mode === 'replace') return `${stem.split(renameModal.findText).join(renameModal.replaceText)}${ext}`;
-  if (renameModal.mode === 'number') {
-    const number = String(Number(renameModal.startNumber || 1) + index).padStart(Number(renameModal.digits || 3), '0');
-    return `${renameModal.prefix}${number}${renameModal.suffix}${ext}`;
+
+const renamePreview = computed(() => {
+  if (!renameModal.records.length) return { rows: [], error: '' };
+  if (renameModal.mode === 'single') {
+    return buildRenamePreview(
+      renameModal.records,
+      [{ type: 'set', value: renameModal.singleName }],
+      false,
+    );
   }
-  if (renameModal.mode === 'template') {
-    const number = String(Number(renameModal.startNumber || 1) + index).padStart(Number(renameModal.digits || 3), '0');
-    const rendered = String(renameModal.template || '')
-      .replaceAll('{name}', stem)
-      .replaceAll('{num}', number)
-      .replaceAll('{ext}', ext.replace(/^\./, ''));
-    return rendered || record.fileName;
-  }
-  return record.fileName;
+  return buildRenamePreview(
+    renameModal.records,
+    renameModal.rules,
+    renameModal.preserveExtension,
+  );
+});
+
+const renameChangedCount = computed(() => renamePreview.value.rows
+  .filter((row) => row.currentName !== row.newName).length);
+
+function addRenameRule() {
+  renameModal.rules.push(createRenameRule('replace'));
 }
-const renamePreviewRows = computed(() => renameModal.records.map((record, index) => ({
-  key: fileId(record) || index,
-  before: record.fileName,
-  after: previewRenameName(record, index),
-})));
+
+function removeRenameRule(index) {
+  if (renameModal.rules.length <= 1) return;
+  renameModal.rules.splice(index, 1);
+}
+
+function moveRenameRule(index, direction) {
+  const target = index + direction;
+  if (target < 0 || target >= renameModal.rules.length) return;
+  const [rule] = renameModal.rules.splice(index, 1);
+  renameModal.rules.splice(target, 0, rule);
+}
+
 async function submitRename() {
   if (!renameModal.records.length) return;
-  const renames = renameModal.records.map((record, index) => ({
-    file_id: fileId(record),
-    new_name: previewRenameName(record, index),
-  })).filter((item) => item.file_id && item.new_name && item.new_name !== renameModal.records.find((record) => fileId(record) === item.file_id)?.fileName);
+  if (renamePreview.value.error) {
+    message.error(renamePreview.value.error);
+    return;
+  }
+  const renames = renamePreview.value.rows
+    .filter((item) => item.fileId && item.newName !== item.currentName);
   if (!renames.length) {
     message.info('文件名没有变化');
     return;
@@ -387,6 +954,7 @@ async function submitRename() {
   try {
     await bridge.invoke('batch_rename_files', { renames });
     renameModal.open = false;
+    clearSelection();
     await loadCloudFiles();
     message.success(`已重命名 ${renames.length} 项`);
   } catch (error) {
@@ -406,13 +974,16 @@ async function openFolderPicker(action, records) {
   folderPicker.path = [{ id: '', name: '全部文件' }];
   folderPicker.targetId = '';
   folderPicker.open = true;
-  await loadFolderPickerOptions('');
+  await loadFolderPickerOptions('', 0);
 }
-async function loadFolderPickerOptions(parentId) {
+async function loadFolderPickerOptions(parentId, page = 0) {
   folderPicker.loading = true;
   try {
-    const data = unwrapData(await bridge.invoke('list_files', { page: 0, parent_id: parentId }));
+    const normalizedPage = Math.max(0, Math.floor(Number(page) || 0));
+    const data = unwrapData(await bridge.invoke('list_files', { page: normalizedPage, parent_id: parentId }));
     folderPicker.options = (data.list || []).filter((item) => isFolder(item) && !folderPicker.sourceIds.includes(fileId(item)));
+    folderPicker.page = normalizedPage;
+    folderPicker.total = Math.max(folderPicker.options.length, Number(data.total ?? folderPicker.options.length) || 0);
   } catch (error) {
     message.error(errorText(error));
   } finally {
@@ -420,28 +991,41 @@ async function loadFolderPickerOptions(parentId) {
   }
 }
 function folderPickerRowProps(record) {
-  return { onDblclick: () => enterFolderPicker(record) };
+  return {
+    tabindex: 0,
+    onDblclick: () => enterFolderPicker(record),
+    onKeydown: (event) => {
+      if (event.key === 'Enter') enterFolderPicker(record);
+    },
+  };
 }
 function enterFolderPicker(record) {
   folderPicker.path = [...folderPicker.path, { id: fileId(record), name: record.fileName }];
   folderPicker.targetId = '';
-  loadFolderPickerOptions(fileId(record));
+  loadFolderPickerOptions(fileId(record), 0);
 }
 function folderPickerBack() {
   if (folderPicker.path.length <= 1) return;
   folderPicker.path = folderPicker.path.slice(0, -1);
   folderPicker.targetId = '';
-  loadFolderPickerOptions(folderPicker.path[folderPicker.path.length - 1]?.id || '');
+  loadFolderPickerOptions(folderPicker.path[folderPicker.path.length - 1]?.id || '', 0);
 }
 function folderPickerJump(index) {
   folderPicker.path = folderPicker.path.slice(0, index + 1);
   folderPicker.targetId = '';
-  loadFolderPickerOptions(folderPicker.path[index]?.id || '');
+  loadFolderPickerOptions(folderPicker.path[index]?.id || '', 0);
+}
+function handleFolderPickerTableChange(pagination) {
+  const nextPage = Math.max(0, Number(pagination?.current || 1) - 1);
+  if (nextPage === folderPicker.page) return;
+  folderPicker.targetId = '';
+  void loadFolderPickerOptions(folderPicker.path.at(-1)?.id || '', nextPage);
 }
 async function submitFolderPicker() {
   const command = folderPicker.action === 'copy' ? 'copy_files' : 'move_files';
   try {
-    await bridge.invoke(command, { file_ids: folderPicker.sourceIds, target_folder_id: folderPicker.targetId || '' });
+    const targetId = folderPicker.targetId || folderPicker.path.at(-1)?.id || '';
+    await bridge.invoke(command, { file_ids: [...new Set(folderPicker.sourceIds)], parent_id: targetId });
     folderPicker.open = false;
     selectedKeys.value = [];
     await loadCloudFiles();
@@ -451,57 +1035,137 @@ async function submitFolderPicker() {
   }
 }
 
-function openShareForm() {
-  shareForm.url = '';
-  shareForm.password = '';
-  shareForm.name = '';
-  shareForm.remark = '';
-  shareForm.open = true;
+function stopGcidImportPolling() {
+  clearInterval(gcidImportPollTimer);
+  gcidImportPollTimer = null;
 }
-async function submitShareForm() {
-  if (!shareForm.url.trim()) {
-    message.warning('请输入分享链接');
-    return;
+
+function resetGcidImportDraft() {
+  stopGcidImportPolling();
+  Object.assign(gcidImport, {
+    detailsOpen: false,
+    loading: false,
+    sourcePath: '',
+    sourceName: '',
+    pastedJson: '',
+    destinationName: '',
+    concurrency: 4,
+    status: null,
+  });
+}
+
+function applyGcidImportStatus(status) {
+  if (!status) return;
+  gcidImport.status = status;
+  if (status.source_path) {
+    gcidImport.sourcePath = status.source_path;
+    gcidImport.sourceName = status.source_name || uploadFileName(status.source_path);
   }
-  shareForm.loading = true;
-  try {
-    await bridge.invoke('save_share_link', {
-      url: shareForm.url.trim(),
-      password: shareForm.password.trim(),
-      name: shareForm.name.trim(),
-      remark: shareForm.remark.trim(),
-    });
-    shareForm.open = false;
-    await refreshState();
-    message.success('分享链接已收藏');
-  } catch (error) {
-    message.error(errorText(error));
-  } finally {
-    shareForm.loading = false;
+  if (status.destination_name) gcidImport.destinationName = status.destination_name;
+  if (!['preparing', 'running'].includes(status.status)) {
+    gcidImport.detailsOpen = false;
+    stopGcidImportPolling();
   }
 }
 
-function openGcidImport() {
-  gcidImport.json = '';
+async function refreshGcidImportStatus(jobId = gcidImport.status?.job_id) {
+  const status = unwrapData(await bridge.invoke('get_gcid_import_status', { job_id: jobId || null }));
+  if (status) applyGcidImportStatus(status);
+  return status;
+}
+
+function startGcidImportPolling() {
+  stopGcidImportPolling();
+  gcidImportPollTimer = setInterval(async () => {
+    try {
+      const previousStatus = gcidImport.status?.status;
+      const status = await refreshGcidImportStatus();
+      if (['preparing', 'running'].includes(previousStatus) && status && !['preparing', 'running'].includes(status.status)) {
+        await loadCloudFiles();
+        if (status.status === 'completed') message.success('GCID JSON 秒传导入完成');
+        else message.warning(status.error || 'GCID 导入结束，部分记录需要处理');
+      }
+    } catch {
+      // 后台任务继续运行，短暂轮询失败不打断导入。
+    }
+  }, 1000);
+}
+
+async function openGcidImport() {
+  try {
+    const latest = await refreshGcidImportStatus();
+    if (latest && ['preparing', 'running'].includes(latest.status)) {
+      startGcidImportPolling();
+      gcidImport.detailsOpen = true;
+      return;
+    }
+  } catch {
+    // 没有历史任务时直接创建新的导入。
+  }
+  resetGcidImportDraft();
+  gcidImport.destinationName = 'GCID 导入';
   gcidImport.open = true;
 }
+
+async function resumeGcidImport() {
+  try {
+    const latest = await refreshGcidImportStatus();
+    if (latest && ['preparing', 'running'].includes(latest.status)) startGcidImportPolling();
+  } catch {
+    // 当前没有可恢复的导入任务。
+  }
+}
+
+async function selectGcidImportFile() {
+  try {
+    const path = await bridge.invoke('select_gcid_import_file');
+    if (!path) return;
+    gcidImport.sourcePath = path;
+    gcidImport.sourceName = uploadFileName(path);
+    gcidImport.pastedJson = '';
+    if (!gcidImport.destinationName || gcidImport.destinationName === 'GCID 导入') {
+      gcidImport.destinationName = gcidImport.sourceName.replace(/\.json$/i, '') || 'GCID 导入';
+    }
+  } catch (error) {
+    message.error(errorText(error));
+  }
+}
+
 async function submitGcidImport() {
-  if (!gcidImport.json.trim()) {
-    message.warning('请粘贴 JSON 内容');
+  if (!gcidImport.sourcePath && !gcidImport.pastedJson.trim()) {
+    message.warning('请选择 GCID JSON 文件或粘贴 JSON 内容');
+    return;
+  }
+  if (!gcidImport.destinationName.trim()) {
+    message.warning('请输入云端目标文件夹名称');
     return;
   }
   gcidImport.loading = true;
   try {
-    const result = unwrapData(await bridge.invoke('import_gcid_json', {
-      json_text: gcidImport.json,
-      parent_id: currentFolderId.value,
+    let sourcePath = gcidImport.sourcePath;
+    if (!sourcePath) {
+      const staged = unwrapData(await bridge.invoke('stage_gcid_import_text', { content: gcidImport.pastedJson }));
+      sourcePath = staged.path;
+      gcidImport.sourcePath = staged.path;
+      gcidImport.sourceName = staged.name;
+    }
+    let status = gcidImport.status;
+    if (!status || status.source_path !== sourcePath || status.destination_parent_id !== currentFolderId.value || status.destination_name !== gcidImport.destinationName.trim()) {
+      status = unwrapData(await bridge.invoke('prepare_gcid_import', {
+        source_path: sourcePath,
+        destination_parent_id: currentFolderId.value,
+        destination_name: gcidImport.destinationName.trim(),
+      }));
+      applyGcidImportStatus(status);
+    }
+    status = unwrapData(await bridge.invoke('start_gcid_import', {
+      job_id: status.job_id,
+      concurrency: Math.min(16, Math.max(1, Math.round(Number(gcidImport.concurrency) || 4))),
     }));
+    applyGcidImportStatus(status);
+    startGcidImportPolling();
     gcidImport.open = false;
-    await loadCloudFiles();
-    const parts = [`成功 ${result.success || 0} 项`];
-    if (result.skipped) parts.push(`跳过 ${result.skipped} 项`);
-    if (result.failed) parts.push(`失败 ${result.failed} 项`);
-    message.success(`JSON 秒传完成：${parts.join('，')}`);
+    message.success('GCID 导入已启动，可在后台继续运行');
   } catch (error) {
     message.error(errorText(error));
   } finally {
@@ -509,152 +1173,175 @@ async function submitGcidImport() {
   }
 }
 
-function openReceivedShare() {
-  receivedShare.url = '';
-  receivedShare.password = '';
-  receivedShare.info = null;
-  receivedShare.files = [];
-  receivedShare.selectedKeys = [];
-  receivedShare.path = [];
-  receivedShare.error = '';
-  receivedShare.open = true;
-}
-async function loadReceivedShareFiles() {
-  if (!receivedShare.info) return;
-  receivedShare.loading = true;
-  receivedShare.error = '';
-  try {
-    const data = unwrapData(await bridge.invoke('list_received_share_files', {
-      share_url: receivedShare.url.trim(),
-      password: receivedShare.password.trim(),
-      share_id: receivedShare.info.share_id || '',
-      parent_id: receivedShareCurrentFolderId.value,
-    }));
-    receivedShare.files = data.list || [];
-    receivedShare.selectedKeys = [];
-  } catch (error) {
-    receivedShare.error = errorText(error);
-  } finally {
-    receivedShare.loading = false;
-  }
-}
-async function openReceivedShareLink() {
-  if (!receivedShare.url.trim()) {
-    message.warning('请输入分享链接');
+async function readDirectoryEntry(entry, prefix, result) {
+  if (entry.isFile) {
+    const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+    result.push({ file, relativePath: `${prefix}${file.name}` });
     return;
   }
-  receivedShare.loading = true;
-  receivedShare.error = '';
-  try {
-    const data = unwrapData(await bridge.invoke('open_received_share', {
-      share_url: receivedShare.url.trim(),
-      password: receivedShare.password.trim(),
-    }));
-    receivedShare.info = data;
-    receivedShare.path = [];
-    await loadReceivedShareFiles();
-  } catch (error) {
-    receivedShare.error = errorText(error);
-    receivedShare.info = null;
-  } finally {
-    receivedShare.loading = false;
+  if (!entry.isDirectory) return;
+  const reader = entry.createReader();
+  const entries = [];
+  while (true) {
+    const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+    if (!batch.length) break;
+    entries.push(...batch);
   }
+  for (const child of entries) await readDirectoryEntry(child, `${prefix}${entry.name}/`, result);
 }
-function enterReceivedShareFolder(record) {
-  if (!isFolder(record)) return;
-  receivedShare.path = [...receivedShare.path, { id: fileId(record), name: record.fileName }];
-  loadReceivedShareFiles();
-}
-function receivedShareBack() {
-  if (!receivedShare.path.length) return;
-  receivedShare.path = receivedShare.path.slice(0, -1);
-  loadReceivedShareFiles();
-}
-function receivedShareJump(index) {
-  receivedShare.path = index < 0 ? [] : receivedShare.path.slice(0, index + 1);
-  loadReceivedShareFiles();
-}
-function receivedShareRowProps(record) {
-  return { onDblclick: () => enterReceivedShareFolder(record) };
-}
-function receivedShareTargets() {
-  const ids = new Set(receivedShare.selectedKeys);
-  return receivedShare.files.filter((item) => ids.has(fileId(item)));
-}
-async function restoreReceivedShare() {
-  if (!receivedShare.info) return;
-  const targets = receivedShareTargets();
-  if (!targets.length) {
-    message.warning('请先选择要转存的文件或文件夹');
-    return;
+
+async function filesFromTransfer(dataTransfer) {
+  const entries = [...(dataTransfer.items || [])]
+    .map((item) => item.webkitGetAsEntry?.())
+    .filter(Boolean);
+  if (entries.length) {
+    const result = [];
+    for (const entry of entries) await readDirectoryEntry(entry, '', result);
+    return result;
   }
-  receivedShare.restoring = true;
+  return [...(dataTransfer.files || [])].map((file) => ({
+    file,
+    relativePath: file.webkitRelativePath || file.name,
+  }));
+}
+
+async function uploadWebFiles(entries) {
+  if (!entries.length) return;
+  uploading.value = true;
+  let cursor = 0;
+  let queued = 0;
+  let skipped = 0;
   try {
-    await bridge.invoke('restore_received_share', {
-      share_url: receivedShare.url.trim(),
-      password: receivedShare.password.trim(),
-      share_id: receivedShare.info.share_id || '',
-      file_ids: targets.map((item) => fileId(item)),
-      parent_id: currentFolderId.value,
-    });
-    message.success(`已转存 ${targets.length} 项到「${currentFolderName.value}」`);
-    receivedShare.open = false;
+    const worker = async () => {
+      while (cursor < entries.length) {
+        const entry = entries[cursor++];
+        const query = new URLSearchParams({
+          parentId: currentFolderId.value,
+          fileName: entry.file.name,
+          relativePath: entry.relativePath || entry.file.name,
+          lastModified: String(entry.file.lastModified || 0),
+        });
+        const eventPath = `[浏览器]/${entry.relativePath || entry.file.name}`;
+        transfers.handleSyncEvent({
+          type: 'file', state: 'uploading', file_path: eventPath,
+          uploaded_bytes: 0, total_bytes: entry.file.size, stage: '正在传到服务器',
+        });
+        const payload = await new Promise((resolve, reject) => {
+          const request = new XMLHttpRequest();
+          const startedAt = performance.now();
+          request.open('POST', `/api/upload?${query}`);
+          request.setRequestHeader('content-type', entry.file.type || 'application/octet-stream');
+          request.upload.onprogress = (event) => {
+            const total = event.lengthComputable ? event.total : entry.file.size;
+            const elapsed = Math.max((performance.now() - startedAt) / 1000, .001);
+            transfers.handleSyncEvent({
+              type: 'progress', file_path: eventPath,
+              percent: total ? Math.round(event.loaded / total * 100) : 0,
+              uploaded_bytes: event.loaded,
+              total_bytes: total,
+              bytes_per_second: event.loaded / elapsed,
+              stage: '正在传到服务器',
+            });
+          };
+          request.onerror = () => {
+            const error = new Error(`上传接口网络错误：${entry.file.name}`);
+            transfers.handleSyncEvent({ type: 'file', state: 'error', file_path: eventPath, total_bytes: entry.file.size, error: error.message });
+            reject(error);
+          };
+          request.onload = async () => {
+            try {
+              const response = new Response(request.responseText || '', {
+                status: request.status || 500,
+                headers: { 'content-type': request.getResponseHeader('content-type') || 'text/plain' },
+              });
+              const result = await readJsonResponse(response, `上传接口失败：${entry.file.name}`);
+              if (result.skipped) transfers.handleSyncEvent({ type: 'file', state: 'done', file_path: eventPath, uploaded_bytes: entry.file.size, total_bytes: entry.file.size, stage: '文件未变化，已跳过' });
+              resolve(result);
+            } catch (error) {
+              transfers.handleSyncEvent({ type: 'file', state: 'error', file_path: eventPath, total_bytes: entry.file.size, error: error.message });
+              reject(error);
+            }
+          };
+          request.send(entry.file);
+        });
+        queued += Number(payload.queued || 0);
+        skipped += Number(payload.skipped || 0);
+        if (payload.skipped) transfers.handleSyncEvent({ type: 'file', state: 'done', file_path: eventPath, stage: '文件未变化，已跳过' });
+      }
+    };
+    await Promise.all([worker(), worker()]);
+    if (queued) message.success(`已加入上传队列：${queued} 个文件${skipped ? `，跳过 ${skipped} 个` : ''}`);
+    else message.info(`没有需要上传的文件，已跳过 ${skipped} 个`);
     await loadCloudFiles();
   } catch (error) {
     message.error(errorText(error));
   } finally {
-    receivedShare.restoring = false;
+    uploading.value = false;
   }
 }
-async function downloadReceivedShare() {
-  if (!receivedShare.info) return;
-  const targets = receivedShareTargets().filter((item) => !isFolder(item));
-  if (!targets.length) {
-    message.warning('请先选择要下载的文件');
-    return;
-  }
-  receivedShare.downloading = true;
-  try {
-    const results = [];
-    for (const record of targets) {
-      const data = unwrapData(await bridge.invoke('get_received_share_download', {
-        share_url: receivedShare.url.trim(),
-        password: receivedShare.password.trim(),
-        share_id: receivedShare.info.share_id || '',
-        file_id: fileId(record),
-      }));
-      const url = pick(data, ['downloadUrl', 'download_url', 'url'], '');
-      if (!url) throw new Error(`未获取到「${record.fileName}」的下载地址`);
-      results.push({ id: newDownloadId(), name: record.fileName || '未命名文件', url, status: 'pending', progress: 0, error: '' });
-    }
-    window.dispatchEvent(new CustomEvent('guangya:add-downloads', { detail: results }));
-    message.success(`已添加 ${results.length} 个下载任务`);
-  } catch (error) {
-    message.error(errorText(error));
-  } finally {
-    receivedShare.downloading = false;
-  }
+
+async function handleWebInput(event) {
+  const entries = [...event.target.files].map((file) => ({ file, relativePath: file.webkitRelativePath || file.name }));
+  event.target.value = '';
+  await uploadWebFiles(entries);
 }
 
 function handleWindowDragOver(event) {
-  if (!isTauri || !appState.logged_in) return;
+  if (!appState.logged_in) return;
+  if (!event.dataTransfer?.types?.includes('Files')) return;
   event.preventDefault();
+  if (!isTauri) dragActive.value = true;
 }
-function handleWindowDrop(event) {
+function handleWindowDragLeave(event) {
+  if (!isTauri && event.relatedTarget == null) dragActive.value = false;
+}
+function handleWindowDragEnd() {
+  if (!isTauri) dragActive.value = false;
+}
+async function handleWindowDrop(event) {
   event.preventDefault();
+  if (isTauri || !appState.logged_in) return;
+  dragActive.value = false;
+  await uploadWebFiles(await filesFromTransfer(event.dataTransfer));
 }
 function handleWindowClick(event) {
   if (!fileContextMenu.open) return;
-  if (event.target?.closest?.('.file-context-menu')) return;
-  closeFileContextMenu();
+  if (event.target?.closest?.('.ant-dropdown, .ant-dropdown-menu')) return;
+  closeFileContextMenu(true);
 }
+
+useFileKeyboardShortcuts({
+  getState: () => ({
+    blocked: fileContextMenu.open || createFolderDialog.open || shareAccess.open || shareResult.open || shareResult.creating || renameModal.open || folderPicker.open || gcidImport.open || gcidImport.detailsOpen || serverFilePicker.open || operationBusy.value,
+    fileCount: files.value.length,
+    selectedCount: selectedKeys.value.length,
+    clipboardCount: fileClipboard.items.length,
+    canGoBack: currentPath.value.length > 1,
+    contextMenuOpen: fileContextMenu.open,
+  }),
+  actions: {
+    selectAll: selectAllFiles,
+    copy: () => setFileClipboard('copy'),
+    cut: () => setFileClipboard('move'),
+    paste: pasteFileClipboard,
+    rename: () => openRenameModal(selectedRecords()),
+    delete: () => deleteCloudFiles(selectedRecords()),
+    goBack,
+    refresh: () => loadCloudFiles(),
+    clearSelection,
+  },
+});
 
 let unlistenDrag = null;
 onMounted(async () => {
+  window.addEventListener('keydown', handleFileContextMenuKeydown, true);
   window.addEventListener('dragover', handleWindowDragOver);
+  window.addEventListener('dragleave', handleWindowDragLeave);
+  window.addEventListener('dragend', handleWindowDragEnd);
   window.addEventListener('drop', handleWindowDrop);
   window.addEventListener('click', handleWindowClick);
   if (isTauri) {
+    void resumeGcidImport();
     unlistenDrag = await bridge.subscribeDrag(async (phase, payload) => {
       if (phase === 'enter') {
         dragDepth.value += 1;
@@ -670,10 +1357,8 @@ onMounted(async () => {
         const paths = payload?.paths || [];
         if (!paths.length || !appState.logged_in) return;
         try {
-          startUploadProgress(paths.length);
-          await bridge.invoke('upload_files', { paths, parent_id: currentFolderId.value });
-          await loadCloudFiles();
-          message.success(`已提交 ${paths.length} 个上传任务`);
+          const count = await bridge.invoke('queue_upload_paths', { paths, parent_id: currentFolderId.value });
+          message.success(`已加入上传队列：${Number(count || paths.length)} 个文件`);
         } catch (error) {
           message.error(errorText(error));
         }
@@ -682,151 +1367,215 @@ onMounted(async () => {
   }
 });
 onBeforeUnmount(() => {
+  stopGcidImportPolling();
+  window.removeEventListener('keydown', handleFileContextMenuKeydown, true);
   window.removeEventListener('dragover', handleWindowDragOver);
+  window.removeEventListener('dragleave', handleWindowDragLeave);
+  window.removeEventListener('dragend', handleWindowDragEnd);
   window.removeEventListener('drop', handleWindowDrop);
   window.removeEventListener('click', handleWindowClick);
-  stopUploadProgress();
   unlistenDrag?.();
 });
 </script>
 
 <template>
   <div class="cloud-view">
-    <a-alert v-if="!isTauri" class="web-notice" type="info" show-icon message="Docker Web 控制台：可浏览、转存与下载云盘文件；上传与本地备份请使用桌面端。" />
-
     <a-card class="content-card file-card file-drop-surface" :class="{ 'drag-active': dragActive }" :bordered="false">
-      <div class="file-toolbar">
-        <a-flex align="center" gap="small" wrap="wrap">
-          <a-button :disabled="currentPath.length <= 1" @click="goBack"><template #icon><ArrowLeftOutlined /></template>返回</a-button>
-          <a-breadcrumb>
-            <a-breadcrumb-item v-for="item in currentPath" :key="item.id || 'root'">{{ item.name }}</a-breadcrumb-item>
-          </a-breadcrumb>
-        </a-flex>
-        <a-flex align="center" gap="small" wrap="wrap">
-          <a-button :disabled="!appState.logged_in" @click="openReceivedShare"><template #icon><InboxOutlined /></template>接收分享</a-button>
-          <a-button :disabled="!appState.logged_in" @click="openShareForm"><template #icon><LinkOutlined /></template>收藏链接</a-button>
-          <a-button v-if="isTauri" :disabled="!appState.logged_in" @click="openGcidImport"><template #icon><FileAddOutlined /></template>JSON 秒传</a-button>
-          <div class="upload-split">
-            <a-button type="primary" :disabled="!appState.logged_in" @click="triggerUpload('files')"><template #icon><UploadOutlined /></template>上传文件</a-button>
-            <a-dropdown :disabled="!appState.logged_in" :trigger="['click']" :menu="{ items: uploadMenuItems, onClick: handleUploadMenu }">
-              <a-button type="primary" class="upload-split-menu" aria-label="选择上传文件夹"><DownOutlined /></a-button>
-            </a-dropdown>
-          </div>
-          <a-button :loading="filesLoading" :disabled="!appState.logged_in" @click="loadCloudFiles"><template #icon><ReloadOutlined /></template>刷新</a-button>
-        </a-flex>
-      </div>
-
-      <div v-if="uploadProgress" class="upload-progress" :class="uploadProgress.status">
-        <a-flex align="center" gap="small">
-          <CloudUploadOutlined :spin="uploadProgress.status === 'running'" />
-          <div class="upload-progress-body">
-            <strong>{{ uploadProgressText }}</strong>
-            <a-progress :percent="uploadProgressPercent" :show-info="false" size="small" :status="uploadProgress.status === 'failed' ? 'exception' : uploadProgress.status === 'completed' ? 'success' : 'active'" />
-          </div>
-          <a-button v-if="uploadProgress.status !== 'running'" type="text" size="small" @click="dismissUploadProgress">关闭</a-button>
-        </a-flex>
-      </div>
-
-      <a-table :columns="fileColumns" :data-source="files" :loading="filesLoading" :row-key="fileId" :row-selection="rowSelection" :custom-row="fileRowProps" :pagination="false" :scroll="{ y: 'clamp(240px, calc(100vh - 330px), 640px)' }" size="small">
-        <template #emptyText>
-          <a-empty :description="appState.logged_in ? '此文件夹为空' : '登录后查看云盘文件'">
-            <a-button v-if="!appState.logged_in" type="primary" @click="$emit('login')">去登录</a-button>
-          </a-empty>
-        </template>
-        <template #bodyCell="{ column, record }">
-          <template v-if="column.key === 'name'">
-            <a-flex align="center" gap="small">
-              <div class="file-icon" :class="fileIcon(record).cls"><component :is="fileIcon(record).icon" /></div>
-              <div class="file-name-wrap">
-                <a v-if="isFolder(record)" class="file-name" @click.prevent="enterFolder(record)">{{ record.fileName }}</a>
-                <span v-else class="file-name">{{ record.fileName }}</span>
-                <a-tag v-if="!isFolder(record) && record.fileSuffix" class="ext-tag">{{ record.fileSuffix }}</a-tag>
-              </div>
-            </a-flex>
+      <input ref="fileInput" class="hidden-file-input" type="file" multiple @change="handleWebInput" />
+      <input ref="folderInput" class="hidden-file-input" type="file" multiple webkitdirectory directory @change="handleWebInput" />
+      <div class="file-toolbar" :class="{ 'selection-mode': fileActionBarVisible }">
+        <FileSelectionBar
+          v-if="fileActionBarVisible"
+          :selected-count="selectedKeys.length"
+          :clipboard-count="fileClipboard.items.length"
+          :clipboard-mode="fileClipboard.mode"
+          @copy="setFileClipboard('copy')"
+          @cut="setFileClipboard('move')"
+          @move="openFolderPicker('move', selectedRecords())"
+          @rename="openRenameModal(selectedRecords())"
+          @download="downloadCloudFiles(selectedRecords())"
+          @share="createCloudShare(selectedRecords())"
+          @delete="deleteCloudFiles(selectedRecords())"
+          @paste="pasteFileClipboard"
+          @clear-selection="clearSelection"
+          @clear-clipboard="clearFileClipboard"
+        >
+          <template #status>
+            <GcidImportStatus v-if="gcidImportRunning" v-model:open="gcidImport.detailsOpen" :status="gcidImport.status" :percent="gcidImportProgress" />
           </template>
-          <template v-else-if="column.key === 'size'">{{ isFolder(record) ? '—' : formatSize(record.fileSize) }}</template>
-          <template v-else-if="column.key === 'time'">{{ formatTime(record.lastUpdateTime) }}</template>
-        </template>
-      </a-table>
+        </FileSelectionBar>
 
-      <div class="file-footer">
-        <span>{{ files.length }} 个项目{{ selectedKeys.length ? ` · 已选 ${selectedKeys.length} 项` : '' }}</span>
-        <span v-if="isTauri && appState.logged_in">拖拽文件到此处可直接上传</span>
+        <template v-else>
+          <a-flex align="center" gap="small" class="file-path-actions">
+            <a-button :disabled="currentPath.length <= 1" @click="goBack"><template #icon><ArrowLeftOutlined /></template>返回</a-button>
+            <CompactFileBreadcrumb :segments="currentPath" @navigate="jumpToPath($event.index)" />
+          </a-flex>
+          <a-flex align="center" gap="small" class="file-primary-actions">
+            <GcidImportStatus v-if="gcidImportRunning" v-model:open="gcidImport.detailsOpen" :status="gcidImport.status" :percent="gcidImportProgress" />
+            <a-button :disabled="!appState.logged_in" @click="openCreateFolder"><template #icon><FolderAddOutlined /></template>新建文件夹</a-button>
+            <a-button v-if="isTauri && !gcidImportRunning" :disabled="!appState.logged_in" @click="openGcidImport"><template #icon><FileAddOutlined /></template>JSON 秒传</a-button>
+            <a-button v-if="isTauri" :loading="uploading" :disabled="!appState.logged_in" @click="triggerUpload('folder')"><template #icon><FolderOpenOutlined /></template>上传文件夹</a-button>
+            <a-button v-if="isTauri" type="primary" :loading="uploading" :disabled="!appState.logged_in" @click="triggerUpload('files')"><template #icon><UploadOutlined /></template>上传文件</a-button>
+            <a-dropdown v-else :menu="{ items: uploadMenuItems, onClick: handleUploadMenuClick }" :trigger="['click']">
+              <a-button type="primary" :loading="uploading" :disabled="!appState.logged_in"><template #icon><UploadOutlined /></template>上传</a-button>
+            </a-dropdown>
+            <a-button :loading="filesLoading" :disabled="!appState.logged_in" @click="loadCloudFiles()"><template #icon><ReloadOutlined /></template>刷新</a-button>
+          </a-flex>
+        </template>
       </div>
-      <div v-if="isTauri && appState.logged_in" class="drop-hint">
-        <div class="drop-hint-inner">
-          <CloudUploadOutlined />
-          <strong>松开鼠标上传到当前目录</strong>
-          <span>{{ currentFolderName }}</span>
+
+      <div class="file-list-region" @contextmenu="openBackgroundContextMenu">
+        <a-table :columns="fileColumns" :data-source="files" :loading="filesLoading" :row-key="fileId" :row-selection="rowSelection" :on-row="fileRowProps" :pagination="filePagination" :scroll="{ y: 'clamp(240px, calc(100vh - 330px), 640px)' }" size="small" @change="handleFileTableChange">
+          <template #emptyText>
+            <a-empty :description="appState.logged_in ? '此文件夹为空' : '登录后查看云盘文件'">
+              <a-button v-if="!appState.logged_in" type="primary" @click="$emit('login')">去登录</a-button>
+            </a-empty>
+          </template>
+          <template #bodyCell="{ column, record }">
+            <template v-if="column.key === 'name'">
+              <a-flex align="center" gap="small">
+                <div class="file-icon" :class="fileIcon(record).cls"><component :is="fileIcon(record).icon" /></div>
+                <div class="file-name-wrap">
+                  <span v-if="isFolder(record)" class="file-name clickable">{{ record.fileName }}</span>
+                  <span v-else class="file-name">{{ record.fileName }}</span>
+                </div>
+              </a-flex>
+            </template>
+            <template v-else-if="column.key === 'type'"><span class="file-type">{{ fileTypeLabel(record) }}</span></template>
+            <template v-else-if="column.key === 'size'">{{ isFolder(record) ? '—' : formatSize(record.fileSize) }}</template>
+            <template v-else-if="column.key === 'time'">{{ fileModifiedTime(record) }}</template>
+          </template>
+        </a-table>
+
+        <div class="file-footer">
+          <span>{{ filesTotal }} 个项目{{ selectedKeys.length ? ` · 已选 ${selectedKeys.length} 项` : '' }}</span>
         </div>
       </div>
     </a-card>
 
     <teleport to="body">
-      <a-dropdown v-model:open="fileContextMenu.open" :trigger="['contextmenu']" :menu="{ items: fileContextMenuItems, onClick: handleFileContextMenuClick }">
-        <span class="file-context-menu" :style="{ left: `${fileContextMenu.x}px`, top: `${fileContextMenu.y}px` }" />
+      <a-dropdown v-model:open="fileContextMenu.open" :trigger="['contextmenu']" :auto-focus="fileContextMenu.keyboard" :menu="{ items: fileContextMenuItems, onClick: handleFileContextMenuClick }" @open-change="handleFileContextOpenChange">
+        <span class="file-context-anchor" :style="{ left: `${fileContextMenu.x}px`, top: `${fileContextMenu.y}px` }" />
       </a-dropdown>
     </teleport>
 
-    <a-modal v-model:open="renameModal.open" title="重命名" :confirm-loading="renameModal.saving" ok-text="应用" cancel-text="取消" width="560px" @ok="submitRename">
+    <a-modal
+      v-model:open="shareAccess.open"
+      title="创建分享"
+      ok-text="创建分享"
+      cancel-text="取消"
+      :confirm-loading="shareResult.creating"
+      @ok="confirmCloudShare"
+    >
+      <a-form layout="vertical">
+        <a-form-item label="访问码">
+          <a-radio-group v-model:value="shareAccess.mode">
+            <a-radio-button value="none">不设置</a-radio-button>
+            <a-radio-button value="random">随机</a-radio-button>
+            <a-radio-button value="fixed">固定</a-radio-button>
+          </a-radio-group>
+        </a-form-item>
+        <a-form-item v-if="shareAccess.mode === 'fixed'" label="固定访问码" extra="仅支持 4 位英文字母或数字">
+          <a-input v-model:value="shareAccess.code" :maxlength="4" placeholder="4 位英文或数字" @press-enter="confirmCloudShare" />
+        </a-form-item>
+      </a-form>
+    </a-modal>
+
+    <ShareResultDialog v-model:open="shareResult.open" :result="shareResultView" :saving="shareResult.saving" @save="saveCreatedShare" />
+
+    <a-modal
+      v-model:open="renameModal.open"
+      title="重命名"
+      :confirm-loading="renameModal.saving"
+      :ok-button-props="{ disabled: Boolean(renamePreview.error) || renameChangedCount === 0 }"
+      ok-text="应用"
+      cancel-text="取消"
+      :width="renameModal.mode === 'single' ? 520 : 860"
+      @ok="submitRename"
+    >
       <template v-if="renameModal.mode === 'single'">
-        <a-input v-model:value="renameModal.singleName" placeholder="输入新的文件名" @press-enter="submitRename" />
+        <a-input v-model:value="renameModal.singleName" aria-label="新的文件名" placeholder="输入新的文件名" @press-enter="submitRename" />
+        <a-alert v-if="renamePreview.error" class="rename-preview-error" type="error" show-icon :message="renamePreview.error" />
       </template>
       <template v-else>
-        <a-tabs v-model:active-key="renameModal.mode" size="small">
-          <a-tab-pane key="affix" tab="前后缀">
-            <a-space direction="vertical" style="width:100%">
-              <a-input v-model:value="renameModal.prefix" addon-before="前缀" />
-              <a-input v-model:value="renameModal.suffix" addon-before="后缀" />
-            </a-space>
-          </a-tab-pane>
-          <a-tab-pane key="replace" tab="查找替换">
-            <a-space direction="vertical" style="width:100%">
-              <a-input v-model:value="renameModal.findText" addon-before="查找" />
-              <a-input v-model:value="renameModal.replaceText" addon-before="替换为" />
-            </a-space>
-          </a-tab-pane>
-          <a-tab-pane key="number" tab="序号重命名">
-            <a-space direction="vertical" style="width:100%">
-              <a-input v-model:value="renameModal.prefix" addon-before="前缀" />
-              <a-input v-model:value="renameModal.suffix" addon-before="后缀" />
-              <a-space>
-                <a-input-number v-model:value="renameModal.startNumber" :min="0" addon-before="起始" />
-                <a-input-number v-model:value="renameModal.digits" :min="1" :max="8" addon-before="位数" />
-              </a-space>
-            </a-space>
-          </a-tab-pane>
-          <a-tab-pane key="template" tab="模板">
-            <a-space direction="vertical" style="width:100%">
-              <a-input v-model:value="renameModal.template" placeholder="例如 {name}-副本-{num}" />
-              <small class="modal-hint">可用变量：{name} 原名、{num} 序号、{ext} 扩展名</small>
-              <a-space>
-                <a-input-number v-model:value="renameModal.startNumber" :min="0" addon-before="起始" />
-                <a-input-number v-model:value="renameModal.digits" :min="1" :max="8" addon-before="位数" />
-              </a-space>
-            </a-space>
-          </a-tab-pane>
-        </a-tabs>
-        <a-table class="rename-preview" :columns="[{ title: '原文件名', dataIndex: 'before', ellipsis: true }, { title: '新文件名', dataIndex: 'after', ellipsis: true }]" :data-source="renamePreviewRows" :pagination="false" size="small" :scroll="{ y: 220 }" />
+        <div class="rename-summary">
+          <div>
+            <strong>{{ renameModal.records.length }} 个项目</strong>
+            <span>规则将从上到下依次执行</span>
+          </div>
+          <a-checkbox v-model:checked="renameModal.preserveExtension">保留文件扩展名</a-checkbox>
+        </div>
+
+        <div class="rename-rules">
+          <div
+            v-for="(rule, index) in renameModal.rules"
+            :key="rule.id"
+            class="rename-rule"
+            :class="{ compact: !['replace', 'regex', 'sequence'].includes(rule.type) }"
+          >
+            <div class="rule-order" :title="`第 ${index + 1} 条规则`">
+              <DragOutlined aria-hidden="true" />
+              <span>{{ index + 1 }}</span>
+            </div>
+            <a-select v-model:value="rule.type" class="rule-type" :options="renameRuleOptions" :aria-label="`第 ${index + 1} 条规则类型`" />
+
+            <template v-if="['replace', 'regex'].includes(rule.type)">
+              <a-input v-model:value="rule.search" :aria-label="`第 ${index + 1} 条规则查找内容`" :placeholder="rule.type === 'regex' ? '正则表达式' : '查找内容'" />
+              <a-input v-model:value="rule.replacement" :aria-label="`第 ${index + 1} 条规则替换内容`" placeholder="替换为（可留空）" />
+              <a-checkbox v-model:checked="rule.ignoreCase">忽略大小写</a-checkbox>
+            </template>
+            <template v-else-if="rule.type === 'sequence'">
+              <a-input v-model:value="rule.value" :aria-label="`第 ${index + 1} 条规则序号格式`" placeholder="例如 -{n}" />
+              <a-input-number v-model:value="rule.start" :min="0" :precision="0" addon-before="起始" :aria-label="`第 ${index + 1} 条规则起始序号`" />
+              <a-input-number v-model:value="rule.padding" :min="1" :max="12" :precision="0" addon-before="位数" :aria-label="`第 ${index + 1} 条规则序号位数`" />
+            </template>
+            <template v-else-if="['set', 'prefix', 'suffix'].includes(rule.type)">
+              <a-input v-model:value="rule.value" :aria-label="`第 ${index + 1} 条规则内容`" :placeholder="renameRuleValuePlaceholders[rule.type]" />
+            </template>
+            <span v-else class="rule-description">{{ rule.type === 'upper' ? '将当前名称转为大写' : '将当前名称转为小写' }}</span>
+
+            <div class="rule-actions">
+              <a-button type="text" size="small" :disabled="index === 0" :aria-label="`上移第 ${index + 1} 条规则`" @click="moveRenameRule(index, -1)"><template #icon><ArrowUpOutlined /></template></a-button>
+              <a-button type="text" size="small" :disabled="index === renameModal.rules.length - 1" :aria-label="`下移第 ${index + 1} 条规则`" @click="moveRenameRule(index, 1)"><template #icon><ArrowDownOutlined /></template></a-button>
+              <a-button type="text" size="small" danger :disabled="renameModal.rules.length <= 1" :aria-label="`删除第 ${index + 1} 条规则`" @click="removeRenameRule(index)"><template #icon><DeleteOutlined /></template></a-button>
+            </div>
+          </div>
+        </div>
+
+        <a-button block @click="addRenameRule"><template #icon><FileAddOutlined /></template>添加规则</a-button>
+        <a-alert v-if="renamePreview.error" class="rename-preview-error" type="error" show-icon :message="renamePreview.error" />
+        <div v-else class="rename-preview">
+          <div class="preview-head">
+            <span>结果预览</span>
+            <span>{{ renameChangedCount }} / {{ renamePreview.rows.length }} 项将被修改</span>
+          </div>
+          <div class="preview-list">
+            <div v-for="row in renamePreview.rows" :key="row.fileId">
+              <span :title="row.currentName">{{ row.currentName }}</span>
+              <SwapOutlined aria-hidden="true" />
+              <strong :class="{ unchanged: row.currentName === row.newName }" :title="row.newName">{{ row.newName }}</strong>
+            </div>
+          </div>
+        </div>
       </template>
     </a-modal>
 
     <a-modal v-model:open="folderPicker.open" :title="folderPicker.title" ok-text="确定" cancel-text="取消" width="520px" @ok="submitFolderPicker">
       <div class="folder-picker-toolbar">
-        <a-button size="small" :disabled="folderPicker.path.length <= 1" @click="folderPickerBack"><template #icon><ArrowLeftOutlined /></template></a-button>
+        <a-button size="small" aria-label="返回上一级目录" :disabled="folderPicker.path.length <= 1" @click="folderPickerBack"><template #icon><ArrowLeftOutlined /></template></a-button>
         <a-breadcrumb>
           <a-breadcrumb-item v-for="(item, index) in folderPicker.path" :key="item.id || 'root'">
-            <a @click.prevent="folderPickerJump(index)">{{ item.name }}</a>
+            <button type="button" class="folder-crumb-button" @click="folderPickerJump(index)">{{ item.name }}</button>
           </a-breadcrumb-item>
         </a-breadcrumb>
       </div>
-      <a-table :columns="folderPickerColumns" :data-source="folderPicker.options" :loading="folderPicker.loading" :row-key="fileId" :row-selection="folderPickerRowSelection" :custom-row="folderPickerRowProps" :pagination="false" size="small" :scroll="{ y: 280 }">
+      <a-table :columns="folderPickerColumns" :data-source="folderPicker.options" :loading="folderPicker.loading" :row-key="fileId" :row-selection="folderPickerRowSelection" :on-row="folderPickerRowProps" :pagination="folderPickerPagination" size="small" :scroll="{ y: 280 }" @change="handleFolderPickerTableChange">
         <template #emptyText><a-empty description="此目录下没有可选文件夹" /></template>
         <template #bodyCell="{ column, record }">
           <template v-if="column.key === 'name'">
             <a-flex align="center" gap="small">
               <div class="file-icon folder"><FolderOutlined /></div>
-              <a class="file-name" @click.prevent="enterFolderPicker(record)">{{ record.fileName }}</a>
+              <span class="file-name clickable">{{ record.fileName }}</span>
             </a-flex>
           </template>
           <template v-else-if="column.key === 'time'">{{ formatTime(record.lastUpdateTime) }}</template>
@@ -835,64 +1584,198 @@ onBeforeUnmount(() => {
       <small class="modal-hint">不选择文件夹则{{ folderPicker.action === 'copy' ? '复制' : '移动' }}到当前目录：{{ folderPicker.path[folderPicker.path.length - 1]?.name }}</small>
     </a-modal>
 
-    <a-modal v-model:open="shareForm.open" title="收藏分享链接" :confirm-loading="shareForm.loading" ok-text="收藏" cancel-text="取消" @ok="submitShareForm">
+    <a-modal
+      v-model:open="createFolderDialog.open"
+      title="新建文件夹"
+      ok-text="创建"
+      cancel-text="取消"
+      :confirm-loading="createFolderDialog.loading"
+      :ok-button-props="{ disabled: Boolean(createFolderError) }"
+      @ok="submitCreateFolder"
+    >
       <a-form layout="vertical">
-        <a-form-item label="分享链接" required><a-input v-model:value="shareForm.url" placeholder="https://yun.139.com/shareweb#/w/i/…" /></a-form-item>
-        <a-form-item label="提取码"><a-input v-model:value="shareForm.password" placeholder="如有提取码请填写" /></a-form-item>
-        <a-form-item label="名称"><a-input v-model:value="shareForm.name" placeholder="便于识别的名称（可选）" /></a-form-item>
-        <a-form-item label="备注"><a-textarea v-model:value="shareForm.remark" :rows="2" placeholder="备注信息（可选）" /></a-form-item>
+        <a-form-item
+          label="文件夹名称"
+          required
+          :validate-status="createFolderDialog.touched && createFolderError ? 'error' : ''"
+          :help="createFolderDialog.touched ? createFolderError : ''"
+        >
+          <a-input
+            v-model:value="createFolderDialog.name"
+            autofocus
+            :disabled="createFolderDialog.loading"
+            placeholder="请输入文件夹名称"
+            @update:value="createFolderDialog.touched = true"
+            @press-enter="submitCreateFolder"
+          >
+            <template #prefix><FolderAddOutlined /></template>
+          </a-input>
+        </a-form-item>
+      </a-form>
+      <a-alert type="info" show-icon :message="`将在“${currentPath.map((item) => item.name).join(' / ')}”中新建文件夹`" />
+    </a-modal>
+
+    <a-modal
+      v-if="isTauri"
+      v-model:open="gcidImport.open"
+      title="导入 GCID JSON"
+      :width="520"
+      centered
+      wrap-class-name="gcid-import-modal"
+      ok-text="开始导入"
+      cancel-text="取消"
+      :confirm-loading="gcidImport.loading"
+      :ok-button-props="{ disabled: gcidImportRunning }"
+      :mask-closable="!gcidImport.loading"
+      @ok="submitGcidImport"
+    >
+      <div class="gcid-import-note">
+        <FileAddOutlined aria-hidden="true" />
+        <span>导入到「{{ currentPath.at(-1)?.name || '全部文件' }}」下的新文件夹，启动后可关闭窗口继续处理。</span>
+      </div>
+
+      <a-form layout="vertical" class="gcid-import-form">
+        <a-form-item label="JSON 来源">
+          <a-flex gap="small">
+            <a-input :value="gcidImport.sourceName || gcidImport.sourcePath" readonly placeholder="请选择 JSON 文件，或在下方粘贴内容" />
+            <a-button :disabled="gcidImportRunning" @click="selectGcidImportFile"><template #icon><FileAddOutlined /></template>选择文件</a-button>
+          </a-flex>
+        </a-form-item>
+        <a-form-item v-if="!gcidImport.sourcePath" label="或粘贴 JSON 内容">
+          <a-textarea v-model:value="gcidImport.pastedJson" :rows="4" :disabled="gcidImportRunning" placeholder="粘贴完整的光鸭 GCID 导出 JSON" />
+          <div v-if="shouldConvertPasteToFile(gcidImport.pastedJson)" class="form-help">内容较大，提交时会先写入本机暂存文件，避免一次性跨进程传输。</div>
+        </a-form-item>
+        <a-row :gutter="12">
+          <a-col :span="15">
+            <a-form-item label="云端目标文件夹" required>
+              <a-input v-model:value="gcidImport.destinationName" :disabled="gcidImportRunning" placeholder="例如：影视资源导入" />
+            </a-form-item>
+          </a-col>
+          <a-col :span="9">
+            <a-form-item label="并发数">
+              <a-input-number v-model:value="gcidImport.concurrency" :min="1" :max="16" :precision="0" :disabled="gcidImportRunning" style="width:100%" />
+            </a-form-item>
+          </a-col>
+        </a-row>
       </a-form>
     </a-modal>
 
-    <a-modal v-model:open="gcidImport.open" title="JSON 秒传导入" :confirm-loading="gcidImport.loading" ok-text="导入" cancel-text="取消" width="560px" @ok="submitGcidImport">
-      <a-alert type="info" show-icon message="粘贴包含 gcid 信息的 JSON，将文件秒传到当前目录。" style="margin-bottom: 12px" />
-      <a-textarea v-model:value="gcidImport.json" :rows="10" placeholder='[{"file_name":"…","gcid":"…","size":123}]' />
+    <a-modal
+      v-if="!isTauri"
+      v-model:open="serverFilePicker.open"
+      title="选择服务器文件或文件夹"
+      ok-text="加入上传队列"
+      cancel-text="取消"
+      :width="720"
+      :confirm-loading="serverFilePicker.submitting"
+      :ok-button-props="{ disabled: !serverFilePicker.selected.length }"
+      @ok="confirmServerUpload"
+    >
+      <div class="server-picker-toolbar">
+        <a-button size="small" :disabled="!serverFilePicker.parent" @click="loadServerDirectory(serverFilePicker.parent)"><ArrowUpOutlined />上一级</a-button>
+        <a-select v-if="serverFilePicker.roots.length > 1" :value="activeServerRoot" size="small" style="min-width:160px" :options="serverFilePicker.roots.map((root) => ({ label: root, value: root }))" @change="loadServerDirectory" />
+        <span>{{ serverFilePicker.displayPath }}</span>
+        <a-tag>已选 {{ serverFilePicker.selected.length }} 项</a-tag>
+      </div>
+      <a-spin :spinning="serverFilePicker.loading">
+        <div v-if="serverFilePicker.items.length" class="server-file-list">
+          <div v-for="item in serverFilePicker.items" :key="item.path" class="server-file-row">
+            <a-checkbox :checked="serverFilePicker.selected.includes(item.path)" @change="(event) => toggleServerSelection(item, event.target.checked)" />
+            <span class="file-icon" :class="item.type === 'directory' ? 'folder' : 'file'"><FolderOutlined v-if="item.type === 'directory'" /><FileOutlined v-else /></span>
+            <button type="button" class="server-file-name" @dblclick="item.type === 'directory' && loadServerDirectory(item.path)">{{ item.name }}</button>
+            <span class="server-file-size">{{ item.type === 'directory' ? '文件夹' : formatSize(item.size) }}</span>
+            <a-button v-if="item.type === 'directory'" type="link" size="small" @click="loadServerDirectory(item.path)">打开</a-button>
+          </div>
+        </div>
+        <a-empty v-else description="这个服务器目录为空" />
+      </a-spin>
+      <a-alert class="server-picker-tip" type="info" show-icon message="文件夹会递归上传并保留目录结构；未修改且已上传的文件会自动跳过。" />
     </a-modal>
 
-    <a-modal v-model:open="receivedShare.open" title="接收分享" :footer="null" width="720px">
-      <a-space direction="vertical" style="width:100%" :size="12">
-        <a-flex gap="small" wrap="wrap">
-          <a-input v-model:value="receivedShare.url" style="flex:1;min-width:240px" placeholder="分享链接 https://yun.139.com/shareweb#/w/i/…" @press-enter="openReceivedShareLink" />
-          <a-input v-model:value="receivedShare.password" style="width:140px" placeholder="提取码" @press-enter="openReceivedShareLink" />
-          <a-button type="primary" :loading="receivedShare.loading" @click="openReceivedShareLink">打开</a-button>
-        </a-flex>
-        <a-alert v-if="receivedShare.error" type="error" show-icon :message="receivedShare.error" />
-        <template v-if="receivedShare.info">
-          <div class="received-share-meta">
-            <strong>{{ receivedShare.info.share_name || '分享内容' }}</strong>
-            <span>{{ receivedShareFileCount }} 个文件 · {{ receivedShareFolderCount }} 个文件夹 · {{ formatSize(receivedShareTotalSize) }}</span>
-          </div>
-          <div class="folder-picker-toolbar">
-            <a-button size="small" :disabled="!receivedShare.path.length" @click="receivedShareBack"><template #icon><ArrowLeftOutlined /></template></a-button>
-            <a-breadcrumb>
-              <a-breadcrumb-item v-for="(item, index) in receivedShareBreadcrumb" :key="item.key">
-                <a @click.prevent="receivedShareJump(index - 1)">{{ item.label }}</a>
-              </a-breadcrumb-item>
-            </a-breadcrumb>
-          </div>
-          <a-table :columns="fileColumns" :data-source="receivedShare.files" :loading="receivedShare.loading" :row-key="fileId" :row-selection="receivedShareRowSelection" :custom-row="receivedShareRowProps" :pagination="false" size="small" :scroll="{ y: 300 }">
-            <template #emptyText><a-empty description="此目录为空" /></template>
-            <template #bodyCell="{ column, record }">
-              <template v-if="column.key === 'name'">
-                <a-flex align="center" gap="small">
-                  <div class="file-icon" :class="fileIcon(record).cls"><component :is="fileIcon(record).icon" /></div>
-                  <a v-if="isFolder(record)" class="file-name" @click.prevent="enterReceivedShareFolder(record)">{{ record.fileName }}</a>
-                  <span v-else class="file-name">{{ record.fileName }}</span>
-                </a-flex>
-              </template>
-              <template v-else-if="column.key === 'size'">{{ isFolder(record) ? '—' : formatSize(record.fileSize) }}</template>
-              <template v-else-if="column.key === 'time'">{{ formatTime(record.lastUpdateTime) }}</template>
-            </template>
-          </a-table>
-          <a-flex justify="space-between" align="center" wrap="wrap" gap="small">
-            <span class="modal-hint">已选 {{ receivedShareSelectedCount }} 项 · 转存到「{{ currentFolderName }}」</span>
-            <a-space>
-              <a-button :loading="receivedShare.downloading" :disabled="!receivedShareSelectedCount" @click="downloadReceivedShare"><template #icon><CloudDownloadOutlined /></template>下载所选</a-button>
-              <a-button type="primary" :loading="receivedShare.restoring" :disabled="!receivedShareSelectedCount" @click="restoreReceivedShare"><template #icon><InboxOutlined /></template>转存所选</a-button>
-            </a-space>
-          </a-flex>
-        </template>
-      </a-space>
-    </a-modal>
   </div>
 </template>
+
+<style scoped>
+.file-context-anchor {
+  position: fixed;
+  width: 1px;
+  height: 1px;
+  pointer-events: none;
+}
+
+.folder-crumb-button {
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+}
+
+.folder-crumb-button:not(.current):hover {
+  color: var(--primary, #262626);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.folder-crumb-button.current {
+  color: var(--text-2, #525252);
+  cursor: default;
+  opacity: 1;
+}
+
+.folder-crumb-button:focus-visible {
+  border-radius: 3px;
+  outline: 2px solid var(--primary, #52c41a);
+  outline-offset: 2px;
+}
+
+.file-path-actions {
+  flex: 1 1 auto !important;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.file-path-actions :deep(.ant-breadcrumb) {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.file-primary-actions {
+  flex: 0 0 auto;
+}
+
+.gcid-import-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 9px 11px;
+  border-radius: 8px;
+  color: var(--text-2, #525252);
+  background: var(--bg-toolbar, #fafafa);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.gcid-import-note > :deep(.anticon) {
+  margin-top: 3px;
+  color: var(--primary, #262626);
+}
+
+.gcid-import-form {
+  margin-top: 14px;
+}
+
+.gcid-import-form :deep(.ant-form-item) {
+  margin-bottom: 14px;
+}
+
+.file-list-region {
+  min-width: 0;
+}
+
+.file-type {
+  color: var(--text-2, #525252);
+  font-size: 11px;
+}
+</style>

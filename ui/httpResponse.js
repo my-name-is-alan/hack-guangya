@@ -14,6 +14,9 @@ export async function readJsonResponse(response, fallback = '请求失败') {
   }
 
   if (!response.ok) throw new Error(payload.error || payload.msg || `${fallback}（HTTP ${response.status}）`);
-  if (payload.code && payload.code !== 0) throw new Error(payload.msg || `光鸭接口失败：${payload.code}`);
+  const rawCode = payload.code;
+  const hasBusinessCode = typeof rawCode === 'number'
+    || (typeof rawCode === 'string' && /^-?\d+$/.test(rawCode.trim()));
+  if (hasBusinessCode && Number(rawCode) !== 0) throw new Error(payload.msg || `光鸭接口失败：${rawCode}`);
   return payload;
 }

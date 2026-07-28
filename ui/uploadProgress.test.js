@@ -43,6 +43,24 @@ test('upload speed is retained while uploading and uses MB/s instead of Mbps', (
   assert.equal(nextUploadProgress(result, { type: 'file', state: 'done' }, 30).bytesPerSecond, 0);
 });
 
+test('upload progress keeps source size and transferred byte counts', () => {
+  const totalBytes = 40 * 1024 * 1024;
+  const result = nextUploadProgress(
+    { percent: 0, state: 'preparing', stage: '正在准备', bytesPerSecond: 0, uploadedBytes: 0, totalBytes },
+    {
+      type: 'progress',
+      percent: 25,
+      uploaded_bytes: 10 * 1024 * 1024,
+      total_bytes: totalBytes,
+      stage: '正在上传',
+    },
+    20,
+  );
+  assert.equal(result.uploadedBytes, 10 * 1024 * 1024);
+  assert.equal(result.totalBytes, totalBytes);
+  assert.equal(nextUploadProgress(result, { type: 'file', state: 'done' }, 30).uploadedBytes, totalBytes);
+});
+
 test('a busy file remains pending without becoming an upload error', () => {
   const next = nextUploadProgress(
     { percent: 0, state: 'preparing', stage: '正在准备', bytesPerSecond: 0 },

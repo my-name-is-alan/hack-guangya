@@ -2,6 +2,7 @@
 import { computed, h, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
 import { message } from 'antdv-next';
 import appLogo from '../src-tauri/icons/128x128.png';
+import useIllustrationTheme from './illustrationTheme';
 import { buildRenamePreview } from './renameRules.js';
 import {
   formatUploadSpeed,
@@ -44,6 +45,7 @@ import {
   ReloadOutlined,
   SafetyCertificateOutlined,
   ScissorOutlined,
+  SearchOutlined,
   SettingOutlined,
   ShareAltOutlined,
   SwapOutlined,
@@ -126,30 +128,7 @@ const bridge = isTauri ? {
   login: () => webRequest('/api/auth/device/start', { method: 'POST', body: '{}' }),
 };
 
-const theme = {
-  token: {
-    colorPrimary: '#1677ff',
-    colorInfo: '#1677ff',
-    colorSuccess: '#16a672',
-    colorWarning: '#f59e0b',
-    colorError: '#e5484d',
-    borderRadius: 6,
-    borderRadiusLG: 8,
-    controlHeight: 28,
-    controlHeightSM: 22,
-    controlHeightLG: 34,
-    fontSize: 13,
-    colorBgLayout: '#f5f7fb',
-    colorText: '#172033',
-    colorTextSecondary: '#667085',
-    fontFamily: "Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif",
-  },
-  components: {
-    Layout: { bodyBg: '#f5f7fb', siderBg: '#ffffff', headerBg: '#f5f7fb' },
-    Menu: { itemBorderRadius: 6, itemHeight: 36, itemMarginInline: 8 },
-    Table: { headerBg: '#f8fafc', headerColor: '#667085', rowHoverBg: '#f5f9ff' },
-  },
-};
+const configProps = useIllustrationTheme();
 
 const navigation = [
   { key: 'cloud', label: '云盘文件', icon: () => h(CloudOutlined) },
@@ -188,10 +167,14 @@ const offlineTasks = ref([]);
 const offlineLoading = ref(false);
 const cloudShares = ref([]);
 const cloudSharesLoading = ref(false);
+const cloudShareQuery = ref('');
+const cloudSharePage = ref(1);
+const cloudSharePageSize = ref(20);
 const events = ref([]);
 const uploadProgress = ref({});
 const backupOpen = ref(false);
 const shareOpen = ref(false);
+const shareOptionsOpen = ref(false);
 const loginOpen = ref(false);
 const shareResultOpen = ref(false);
 const loginToken = ref('');
@@ -206,6 +189,13 @@ const gcidImport = reactive({
   status: null,
 });
 const lastShare = reactive({ label: '', url: '', code: '', reused: false, hdhiveStatus: '', hdhiveMessage: '', hdhiveEventId: '' });
+const shareTargets = ref([]);
+const shareOptions = reactive({ mode: 'none', code: '' });
+const shareAccessOptions = [
+  { value: 'none', label: '不设置访问码' },
+  { value: 'random', label: '随机访问码' },
+  { value: 'fixed', label: '固定访问码' },
+];
 const backupForm = reactive({ local_path: '', remote_path: '', remote_parent_id: '', source_policy: 'keep', archive_path: '', scan_existing: true, sync_types: [...defaultSyncExtensions], monitor_mode: 'native', auto_share: false });
 const hdhiveForm = reactive({ base_url: '', secret: '' });
 const transferSettingsOpen = ref(false);
@@ -282,10 +272,27 @@ const totalUploadSpeed = computed(() => recentUploads.value.reduce((total, uploa
 const activeUploadCount = computed(() => recentUploads.value.filter((upload) => !['done', 'error'].includes(upload.state)).length);
 const finishedUploadCount = computed(() => recentUploads.value.filter((upload) => ['done', 'error'].includes(upload.state)).length);
 const selectedFiles = computed(() => files.value.filter((item) => selectedFileIds.value.includes(fileId(item))));
-const createFolderError = computed(() => validateFolderName(
-  createFolderDialog.name,
-  files.value.map((item) => pick(item, ['fileName', 'name'], '')),
-));
+const filteredCloudShares = computed(() => {
+  const query = cloudShareQuery.value.trim().toLowerCase();
+  if (!query) return cloudShares.value;
+  return cloudShares.value.filter((record) => [
+    record.title,
+    record.shareTitle,
+    record.shareUrl,
+    record.code,
+    record.id,
+    record.shareId,
+  ].some((value) => String(value ?? '').toLowerCase().includes(query)));
+});
+const cloudSharePagination = computed(() => ({
+  current: cloudSharePage.value,
+  pageSize: cloudSharePageSize.value,
+  total: filteredCloudShares.value.length,
+  hideOnSinglePage: false,
+  showSizeChanger: true,
+  pageSizeOptions: ['20', '50', '100'],
+  showTotal: (total) => `共 ${total} 条分享`,
+}));
 const activeDownloadCount = computed(() => downloadTasks.value.filter((task) => ['preparing', 'downloading'].includes(task.status)).length);
 const queuedDownloadCount = computed(() => downloadTasks.value.filter((task) => task.status === 'queued').length);
 const finishedDownloadCount = computed(() => downloadTasks.value.filter((task) => ['completed', 'failed'].includes(task.status)).length);
@@ -515,6 +522,7 @@ async function loadCloudShares() {
   try {
     const data = unwrapData(await bridge.invoke('list_shares'));
     cloudShares.value = Array.isArray(data.list) ? data.list : [];
+    cloudSharePage.value = 1;
   } catch (error) {
     message.error(`分享列表加载失败：${errorText(error)}`);
   } finally {
@@ -525,13 +533,31 @@ function cloudShareStatus(record) {
   return ({ 1: ['分享中', 'success'], 2: ['已过期', 'warning'], 3: ['已取消', 'default'], 4: ['已封禁', 'error'] })[Number(record.shareStatus)] || ['未知', 'default'];
 }
 async function deleteCloudShare(record) {
+  const id = record.id ?? record.shareId ?? record.share_id;
+  if (id === undefined || id === null || id === '') {
+    message.error('当前分享缺少可取消的记录 ID，请刷新后重试');
+    return;
+  }
   try {
-    await bridge.invoke('delete_shares', { ids: [record.id] });
+    await bridge.invoke('delete_shares', { ids: [id] });
     message.success('已取消分享');
     await loadCloudShares();
   } catch (error) {
     message.error(errorText(error));
   }
+}
+async function copyCloudShare(record) {
+  const url = String(record.shareUrl || record.share_url || '').trim();
+  const code = String(record.code || record.extractCode || '').trim();
+  if (!url) {
+    message.warning('当前分享链接为空');
+    return;
+  }
+  await copyText(code ? `${url}\n提取码：${code}` : url);
+}
+function handleCloudShareTableChange(pagination) {
+  cloudSharePage.value = Number(pagination?.current || 1);
+  cloudSharePageSize.value = Number(pagination?.pageSize || 20);
 }
 async function openFolder(record) {
   if (!isFolder(record)) return;
@@ -554,50 +580,49 @@ async function goToPath(index) {
   currentFolderName.value = target.name;
   await loadFiles();
 }
-function openCreateFolder() {
-  if (!appState.logged_in) { message.warning('请先登录光鸭云盘'); return; }
-  Object.assign(createFolderDialog, { open: true, name: '', loading: false, touched: false });
+function createShare(items = selectedFiles.value) {
+  const targets = (Array.isArray(items) ? items : []).filter((item) => fileId(item));
+  if (!targets.length || shareCreating.value) return;
+  shareTargets.value = targets;
+  shareOptions.mode = 'none';
+  shareOptions.code = '';
+  shareOptionsOpen.value = true;
 }
-async function submitCreateFolder() {
-  if (createFolderDialog.loading) return;
-  createFolderDialog.touched = true;
-  if (createFolderError.value) {
-    message.warning(createFolderError.value);
+async function confirmCreateShare() {
+  const targets = shareTargets.value;
+  if (!targets.length || shareCreating.value) return;
+  const code = shareOptions.code.trim();
+  if (shareOptions.mode === 'fixed' && !/^[A-Za-z0-9]{4}$/.test(code)) {
+    message.warning('固定访问码必须是 4 位英文或数字');
     return;
   }
-  const folderName = normalizeFolderName(createFolderDialog.name);
-  createFolderDialog.loading = true;
-  try {
-    await bridge.invoke('create_folder', { parent_id: currentParentId.value, folder_name: folderName });
-    createFolderDialog.open = false;
-    await loadFiles();
-    message.success(`文件夹“${folderName}”已创建`);
-  } catch (error) {
-    message.error(`新建文件夹失败：${errorText(error)}`);
-  } finally {
-    createFolderDialog.loading = false;
-  }
-}
-async function createShare() {
-  if (!selectedFileIds.value.length || shareCreating.value) return;
   shareCreating.value = true;
   let closeProgress;
   try {
     closeProgress = message.loading('正在创建分享，请稍候…', 0);
-    const names = selectedFiles.value
+    const names = targets
       .map((item) => String(pick(item, ['fileName', 'name'], '')).trim())
       .filter(Boolean);
     const title = names.length > 1 ? `${names[0]} 等 ${names.length} 项` : names[0] || '云盘分享';
-    const targetType = selectedFiles.value.length === 1 && isFolder(selectedFiles.value[0]) ? 'folder' : 'file';
-    const data = unwrapData(await bridge.invoke('create_share', { file_ids: selectedFileIds.value, title, target_type: targetType }));
+    const targetType = targets.length === 1 && isFolder(targets[0]) ? 'folder' : 'file';
+    const shareType = ({ none: 0, random: 1, fixed: 2 })[shareOptions.mode] ?? 0;
+    const data = unwrapData(await bridge.invoke('create_share', {
+      file_ids: targets.map(fileId),
+      title,
+      target_type: targetType,
+      share_type: shareType,
+      code: shareType === 2 ? code : '',
+      auto_fill_code: false,
+    }));
     lastShare.url = pick(data, ['shareUrl', 'share_url', 'url']);
     lastShare.code = pick(data, ['code', 'extractCode']);
     lastShare.reused = data.reused_existing === true;
-    lastShare.label = files.value.find((item) => selectedFileIds.value.includes(fileId(item)))?.fileName || '云盘分享';
+    lastShare.label = names[0] || '云盘分享';
     lastShare.hdhiveStatus = pick(data, ['hdhive_status'], 'delivery_failed');
     lastShare.hdhiveMessage = pick(data, ['hdhive_message'], '光鸭分享成功，但未收到影巢回执');
     lastShare.hdhiveEventId = pick(data, ['hdhive_event_id']);
     if (!lastShare.url) throw new Error('光鸭没有返回分享链接');
+    shareOptionsOpen.value = false;
     shareResultOpen.value = true;
     if (['accepted', 'processing', 'completed'].includes(lastShare.hdhiveStatus)) message.success(lastShare.reused ? '已复用已有分享，影巢将只更新备注' : '光鸭分享成功，已提交影巢处理');
     else message.warning(lastShare.hdhiveMessage);
@@ -1258,7 +1283,7 @@ function contextAction(action) {
   else if (action === 'moveTo') chooseTransferTarget('move', items);
   else if (action === 'rename') openRename(items);
   else if (action === 'download') downloadCloudFiles(items);
-  else if (action === 'share') createShare();
+  else if (action === 'share') createShare(items);
   else if (action === 'delete') requestDelete(items);
   else if (action === 'paste') pasteClipboard();
   else if (action === 'uploadFile') triggerUpload('files');
@@ -1376,6 +1401,7 @@ async function uploadWebFiles(entries) {
         const entry = entries[cursor++];
         const query = new URLSearchParams({ parentId: currentParentId.value, fileName: entry.file.name, relativePath: entry.relativePath || entry.file.name, lastModified: String(entry.file.lastModified || 0) });
         const eventPath = `[浏览器]/${entry.relativePath || entry.file.name}`;
+        updateUploadProgress({ type: 'file', state: 'uploading', file_path: eventPath, uploaded_bytes: 0, total_bytes: entry.file.size, stage: '正在传到服务器' });
         const payload = await new Promise((resolve, reject) => {
           const request = new XMLHttpRequest();
           const startedAt = performance.now();
@@ -1384,18 +1410,18 @@ async function uploadWebFiles(entries) {
           request.upload.onprogress = (event) => {
             const elapsedSeconds = Math.max((performance.now() - startedAt) / 1000, 0.001);
             const total = event.lengthComputable ? event.total : entry.file.size;
-            updateUploadProgress({ type: 'progress', file_path: eventPath, percent: total ? Math.round(event.loaded / total * 100) : 0, bytes_per_second: event.loaded / elapsedSeconds, stage: '正在传到服务器' });
+            updateUploadProgress({ type: 'progress', file_path: eventPath, percent: total ? Math.round(event.loaded / total * 100) : 0, uploaded_bytes: event.loaded, total_bytes: total, bytes_per_second: event.loaded / elapsedSeconds, stage: '正在传到服务器' });
           };
-          request.onerror = () => { const error = new Error(`上传接口网络错误：${entry.file.name}`); updateUploadProgress({ type: 'file', state: 'error', file_path: eventPath, error: error.message }); reject(error); };
-          request.onabort = () => { const error = new Error(`上传已取消：${entry.file.name}`); updateUploadProgress({ type: 'file', state: 'error', file_path: eventPath, error: error.message }); reject(error); };
+          request.onerror = () => { const error = new Error(`上传接口网络错误：${entry.file.name}`); updateUploadProgress({ type: 'file', state: 'error', file_path: eventPath, total_bytes: entry.file.size, error: error.message }); reject(error); };
+          request.onabort = () => { const error = new Error(`上传已取消：${entry.file.name}`); updateUploadProgress({ type: 'file', state: 'error', file_path: eventPath, total_bytes: entry.file.size, error: error.message }); reject(error); };
           request.onload = async () => {
             try {
               const response = new Response(request.responseText || '', { status: request.status || 500, headers: { 'content-type': request.getResponseHeader('content-type') || 'text/plain' } });
               const result = await readJsonResponse(response, `上传接口失败：${entry.file.name}`);
-              if (result.skipped) updateUploadProgress({ type: 'file', state: 'done', file_path: eventPath, stage: '文件未变化，已跳过' });
+              if (result.skipped) updateUploadProgress({ type: 'file', state: 'done', file_path: eventPath, uploaded_bytes: entry.file.size, total_bytes: entry.file.size, stage: '文件未变化，已跳过' });
               resolve(result);
             } catch (error) {
-              updateUploadProgress({ type: 'file', state: 'error', file_path: eventPath, error: error.message });
+              updateUploadProgress({ type: 'file', state: 'error', file_path: eventPath, total_bytes: entry.file.size, error: error.message });
               reject(error);
             }
           };
@@ -1549,10 +1575,10 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <a-config-provider :theme="theme">
+  <a-config-provider v-bind="configProps">
     <a-app>
       <a-layout class="app-shell">
-        <a-layout-sider :width="240" class="sidebar" theme="light">
+        <a-layout-sider :width="220" class="sidebar" theme="light">
           <div class="brand">
             <div class="brand-mark"><img :src="appLogo" alt="光鸭文件夹同步" /></div>
             <div><strong>光鸭云盘</strong><span>GUANGYA SYNC</span></div>
@@ -1627,7 +1653,7 @@ onBeforeUnmount(() => {
                     <a-button :disabled="!selectedFileIds.length" :loading="operationBusy" @click="chooseTransferTarget('move')"><template #icon><SwapOutlined /></template>移动到</a-button>
                     <a-button :disabled="!selectedFileIds.length" @click="openRename()"><template #icon><EditOutlined /></template>{{ selectedFileIds.length > 1 ? '批量重命名' : '重命名' }}</a-button>
                     <a-button :disabled="!selectedFileIds.length" :loading="cloudDownloadBusy" @click="downloadCloudFiles()"><template #icon><DownloadOutlined /></template>下载</a-button>
-                    <a-button :disabled="!selectedFileIds.length" :loading="shareCreating" @click="createShare"><template #icon><ShareAltOutlined /></template>{{ shareCreating ? '创建中' : '分享' }}</a-button>
+                    <a-button :disabled="!selectedFileIds.length" :loading="shareCreating" @click="createShare()"><template #icon><ShareAltOutlined /></template>{{ shareCreating ? '创建中' : '分享' }}</a-button>
                     <a-button danger :disabled="!selectedFileIds.length" @click="requestDelete()"><template #icon><DeleteOutlined /></template>删除</a-button>
                   </a-flex>
                   <a-flex gap="small" align="center">
@@ -1662,8 +1688,8 @@ onBeforeUnmount(() => {
                 <div class="upload-progress-list">
                   <div v-for="upload in recentUploads" :key="upload.filePath" class="upload-progress-item">
                     <div class="upload-progress-heading">
-                      <div><strong :title="upload.fileName">{{ upload.fileName }}</strong><span :title="upload.filePath">{{ upload.filePath }}</span></div>
-                      <span>{{ upload.stage }}<template v-if="upload.state === 'uploading'"> · {{ formatUploadSpeed(upload.bytesPerSecond) }}</template></span>
+                      <div><strong>{{ upload.fileName }}</strong><span :title="upload.filePath">{{ upload.filePath }}</span></div>
+                      <span>{{ upload.stage }}<template v-if="upload.totalBytes"> · {{ formatSize(upload.uploadedBytes) }} / {{ formatSize(upload.totalBytes) }}</template><template v-if="upload.state === 'uploading' && upload.bytesPerSecond"> · {{ formatUploadSpeed(upload.bytesPerSecond) }}</template></span>
                     </div>
                     <a-progress :percent="upload.percent" :status="uploadProgressStatus(upload.state)" size="small" />
                   </div>
@@ -1840,16 +1866,16 @@ onBeforeUnmount(() => {
             </template>
 
             <template v-else>
-              <div class="section-toolbar"><div><h2>我的分享</h2><p>直接查询光鸭账号中的已有分享；相同文件或文件夹会自动复用，不会重复创建。</p></div><a-space><a-button @click="openReceivedShare"><template #icon><InboxOutlined /></template>接收分享</a-button><a-button :loading="cloudSharesLoading" @click="loadCloudShares"><template #icon><ReloadOutlined /></template>刷新</a-button></a-space></div>
+              <div class="section-toolbar"><div><h2>我的分享</h2><p>直接查询光鸭账号中的已有分享，并支持搜索、分页和取消分享。</p></div><a-space wrap><a-input v-model:value="cloudShareQuery" allow-clear style="width:240px" placeholder="搜索名称、链接或访问码" @change="cloudSharePage = 1"><template #prefix><SearchOutlined /></template></a-input><a-button @click="openReceivedShare"><template #icon><InboxOutlined /></template>接收分享</a-button><a-button :loading="cloudSharesLoading" @click="loadCloudShares"><template #icon><ReloadOutlined /></template>刷新</a-button></a-space></div>
               <a-card class="content-card" :bordered="false">
-                <a-table class="cloud-share-table" table-layout="fixed" :columns="cloudShareColumns" :data-source="cloudShares" :loading="cloudSharesLoading" :row-key="(item) => item.id || item.shareId" :pagination="{ pageSize: 20, hideOnSinglePage: true }" size="small">
+                <a-table :columns="cloudShareColumns" :data-source="filteredCloudShares" :loading="cloudSharesLoading" :row-key="(item) => item.id || item.shareId" :pagination="cloudSharePagination" size="small" @change="handleCloudShareTableChange">
                   <template #emptyText><a-empty description="当前账号还没有分享记录" /></template>
                   <template #bodyCell="{ column, record }">
                     <template v-if="column.key === 'title'"><a-flex class="cloud-share-title" align="center" gap="small"><a-avatar class="list-avatar"><ShareAltOutlined /></a-avatar><div><strong>{{ record.title || '未命名分享' }}</strong><div class="table-secondary">{{ record.shareUrl }}</div></div></a-flex></template>
                     <template v-else-if="column.key === 'type'"><a-tag :color="Number(record.resType) === 2 ? 'blue' : undefined">{{ Number(record.resType) === 2 ? '文件夹' : '文件' }}</a-tag></template>
                     <template v-else-if="column.key === 'status'"><a-tag :color="cloudShareStatus(record)[1]">{{ cloudShareStatus(record)[0] }}</a-tag></template>
                     <template v-else-if="column.key === 'time'">{{ formatTime(record.createTime) }}</template>
-                    <template v-else-if="column.key === 'actions'"><a-space class="cloud-share-actions" :size="4"><a-button size="small" @click="copyText(record.shareUrl)"><CopyOutlined />复制</a-button><a-button size="small" type="link" :href="record.shareUrl" target="_blank">打开</a-button><a-popconfirm v-if="Number(record.shareStatus) === 1" title="确定取消这个分享？链接将立即失效。" @confirm="deleteCloudShare(record)"><a-button size="small" danger type="text">取消分享</a-button></a-popconfirm></a-space></template>
+                    <template v-else-if="column.key === 'actions'"><a-space><a-button size="small" @click="copyCloudShare(record)"><CopyOutlined />复制</a-button><a-button size="small" type="link" :href="record.shareUrl" target="_blank">打开</a-button><a-popconfirm v-if="Number(record.shareStatus) === 1" title="确定取消这个分享？链接将立即失效。" @confirm="deleteCloudShare(record)"><a-button size="small" danger type="text">取消分享</a-button></a-popconfirm></a-space></template>
                   </template>
                 </a-table>
               </a-card>
@@ -2107,6 +2133,23 @@ onBeforeUnmount(() => {
         <a-form layout="vertical"><a-form-item label="名称"><a-input v-model:value="shareForm.label" placeholder="例如：项目资料"><template #prefix><ShareAltOutlined /></template></a-input></a-form-item><a-form-item label="分享链接" required><a-input v-model:value="shareForm.url" placeholder="https://..."><template #prefix><LinkOutlined /></template></a-input></a-form-item></a-form>
       </a-modal>
 
+      <a-modal v-model:open="shareOptionsOpen" title="创建分享" ok-text="创建分享" cancel-text="取消" :confirm-loading="shareCreating" @ok="confirmCreateShare">
+        <a-form layout="vertical">
+          <a-form-item label="分享内容">
+            <a-input :value="shareTargets.map((item) => pick(item, ['fileName', 'name'], '未命名')).join('、')" readonly />
+          </a-form-item>
+          <a-form-item label="访问码">
+            <a-select v-model:value="shareOptions.mode" :options="shareAccessOptions" />
+          </a-form-item>
+          <a-form-item v-if="shareOptions.mode === 'fixed'" label="固定访问码" required>
+            <a-input v-model:value="shareOptions.code" :maxlength="4" placeholder="4 位英文或数字" @press-enter="confirmCreateShare" />
+            <div class="form-help">固定访问码必须是 4 位英文或数字。</div>
+          </a-form-item>
+          <a-alert v-else-if="shareOptions.mode === 'random'" type="info" show-icon message="光鸭将在创建时随机生成访问码" />
+          <a-alert v-else type="info" show-icon message="任何拿到链接的人都可以直接访问" />
+        </a-form>
+      </a-modal>
+
       <a-modal v-model:open="receivedShare.open" title="接收光鸭分享" :width="820" :footer="null" :mask-closable="!receivedShare.restoring && !receivedShare.downloading">
         <a-flex vertical gap="middle">
           <a-alert type="info" show-icon message="不会自动监听剪贴板；只有点击“粘贴剪贴板”时才会读取。" />
@@ -2139,7 +2182,7 @@ onBeforeUnmount(() => {
 
       <a-modal v-model:open="shareResultOpen" :title="lastShare.reused ? '已复用已有分享' : '分享创建成功'" :footer="null">
         <a-result status="success" :title="lastShare.reused ? '相同内容已存在，未重复创建' : '分享链接已生成'" :sub-title="lastShare.code ? `提取码：${lastShare.code}` : '此分享不需要提取码'">
-          <template #extra><a-flex vertical gap="middle"><a-input :value="lastShare.url" readonly><template #prefix><LinkOutlined /></template><template #suffix><a-button type="text" @click="copyText(lastShare.url)"><CopyOutlined /></a-button></template></a-input><a-alert :type="receiptAlertType(lastShareHdhiveStatus)" show-icon :message="lastShareHdhiveMessage" /><a v-if="lastShareReceipt?.resource_url" :href="lastShareReceipt.resource_url" target="_blank" rel="noreferrer">查看影巢资源</a><a-flex justify="center" gap="small"><a-button @click="shareResultOpen = false">完成</a-button><a-button type="primary" @click="saveCreatedShare">加入收藏</a-button></a-flex></a-flex></template>
+          <template #extra><a-flex vertical gap="middle"><a-input :value="lastShare.url" readonly><template #prefix><LinkOutlined /></template><template #suffix><a-button type="text" @click="copyText(lastShare.code ? `${lastShare.url}\n提取码：${lastShare.code}` : lastShare.url)"><CopyOutlined /></a-button></template></a-input><a-alert :type="receiptAlertType(lastShareHdhiveStatus)" show-icon :message="lastShareHdhiveMessage" /><a v-if="lastShareReceipt?.resource_url" :href="lastShareReceipt.resource_url" target="_blank" rel="noreferrer">查看影巢资源</a><a-flex justify="center" gap="small"><a-button @click="shareResultOpen = false">完成</a-button><a-button type="primary" @click="saveCreatedShare">加入收藏</a-button></a-flex></a-flex></template>
         </a-result>
       </a-modal>
 

@@ -15,3 +15,21 @@ test('JSON 错误响应显示服务端错误信息', async () => {
     /队列不可用/,
   );
 });
+
+test('分享结果中的随机提取码不会被当成业务错误码', async () => {
+  const payload = {
+    code: 'j8if',
+    share_url: 'https://www.guangyapan.com/s/share-1?code=j8if',
+  };
+  assert.deepEqual(
+    await readJsonResponse(new Response(JSON.stringify(payload), { status: 200 })),
+    payload,
+  );
+});
+
+test('数字字符串业务码仍会按接口错误处理', async () => {
+  await assert.rejects(
+    readJsonResponse(new Response(JSON.stringify({ code: '117', msg: '登录态已失效' }), { status: 200 })),
+    /登录态已失效/,
+  );
+});

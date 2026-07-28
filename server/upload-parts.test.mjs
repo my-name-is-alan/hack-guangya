@@ -37,7 +37,18 @@ test('OSS 分片越过安全片数边界后按 MiB 向上扩容', () => {
   );
 });
 
+test('OSS 固定分片档位仍遵守安全片数上限', () => {
+  assert.equal(uploadPartSize(100 * MIB, '4m'), 4 * MIB);
+  assert.equal(uploadPartSize(GIB, '8m'), 8 * MIB);
+  assert.equal(uploadPartSize(10 * GIB, '16m'), 16 * MIB);
+
+  const oversized = 16 * MIB * OSS_MULTIPART_TARGET_PARTS + 1;
+  assert.equal(uploadPartSize(oversized, '4m'), 17 * MIB);
+  assert.ok(partCount(oversized, uploadPartSize(oversized, '4m')) <= OSS_MULTIPART_TARGET_PARTS);
+});
+
 test('OSS 分片拒绝无效文件大小', () => {
   assert.throws(() => uploadPartSize(-1), RangeError);
   assert.throws(() => uploadPartSize(Number.MAX_SAFE_INTEGER + 1), RangeError);
+  assert.throws(() => uploadPartSize(MIB, '32m'), RangeError);
 });

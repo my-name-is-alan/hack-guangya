@@ -3,20 +3,58 @@ import { readJsonResponse } from './httpResponse.js';
 const tauriInvoke = window.__TAURI__?.core?.invoke;
 const tauriListen = window.__TAURI__?.event?.listen;
 export const isTauri = Boolean(tauriInvoke && tauriListen);
+const authExpiredListeners = new Set();
 
 const camelizeArgs = (args = {}) => Object.fromEntries(
   Object.entries(args).map(([key, value]) => [key.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase()), value]),
 );
 
+const errorMessage = (error) => String(error?.message || error || '');
+const isAuthExpiredError = (error) => errorMessage(error).includes('登录态已失效');
+const notifyAuthExpired = (error) => {
+  if (!isAuthExpiredError(error)) return;
+  for (const listener of authExpiredListeners) listener(errorMessage(error));
+};
+const subscribeAuthExpired = (callback) => {
+  authExpiredListeners.add(callback);
+  return () => authExpiredListeners.delete(callback);
+};
+
 async function webRequest(url, options = {}) {
-  const response = await fetch(url, { headers: { 'content-type': 'application/json' }, ...options });
-  return readJsonResponse(response, `请求 ${url} 失败`);
+  try {
+    const response = await fetch(url, {
+      credentials: 'same-origin',
+      ...options,
+      headers: { 'content-type': 'application/json', ...(options.headers || {}) },
+    });
+    return await readJsonResponse(response, `请求 ${url} 失败`);
+  } catch (error) {
+    notifyAuthExpired(error);
+    throw error;
+  }
 }
 export { webRequest };
 
+async function invokeTauri(command, args = {}) {
+  try {
+    return await tauriInvoke(command, camelizeArgs(args));
+  } catch (error) {
+    if (isAuthExpiredError(error)) {
+      try {
+        await tauriInvoke('clear_expired_session');
+      } catch {
+        // 原始登录失效错误更有用；清理失败由下一次启动继续校验。
+      }
+      notifyAuthExpired(error);
+    }
+    throw error;
+  }
+}
+
 export const bridge = isTauri ? {
-  invoke: (command, args = {}) => tauriInvoke(command, camelizeArgs(args)),
+  invoke: invokeTauri,
   subscribe: (callback) => tauriListen('sync-event', ({ payload }) => callback(payload)),
+  subscribeAuthExpired,
   subscribeDrag: async (callback) => {
     const unlisteners = await Promise.all([
       tauriListen('tauri://drag-enter', ({ payload }) => callback('enter', payload)),
@@ -34,7 +72,15 @@ export const bridge = isTauri ? {
   invoke: async (command, args = {}) => {
     if (command === 'get_state') return webRequest('/api/state');
     if (command === 'get_overview') return webRequest('/api/overview');
+    if (command === 'get_access_status') return webRequest('/api/access/status');
+    if (command === 'unlock_access') return webRequest('/api/access/unlock', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'update_access_code') return webRequest('/api/access/code', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'list_files') return webRequest(`/api/files?page=${args.page || 0}&parentId=${encodeURIComponent(args.parent_id || '')}`);
+    if (command === 'search_files') {
+      const params = new URLSearchParams({ query: String(args.query || ''), type: String(args.file_type || ''), extension: String(args.extension || ''), page: String(args.page || 0) });
+      return webRequest(`/api/search?${params}`);
+    }
+    if (command === 'create_folder') return webRequest('/api/files/create-folder', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'copy_files') return webRequest('/api/files/copy', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'move_files') return webRequest('/api/files/move', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'delete_files') return webRequest('/api/files/delete', { method: 'POST', body: JSON.stringify(args) });
@@ -42,7 +88,7 @@ export const bridge = isTauri ? {
     if (command === 'get_cloud_download') return webRequest('/api/files/download', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'create_share') return webRequest('/api/share', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'list_shares') return webRequest('/api/shares');
-    if (command === 'delete_shares') return webRequest('/api/shares/delete', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'delete_shares') return webRequest('/api/shares/delete', { method: 'POST', body: JSON.stringify({ ...args, ids: args.ids || args.share_ids }) });
     if (command === 'open_received_share') return webRequest('/api/received-share/open', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'list_received_share_files') return webRequest('/api/received-share/files', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'restore_received_share') return webRequest('/api/received-share/restore', { method: 'POST', body: JSON.stringify(args) });
@@ -62,14 +108,23 @@ export const bridge = isTauri ? {
     if (command === 'retry_auto_share_event') return webRequest(`/api/auto-share/events/${encodeURIComponent(args.event_id)}/retry`, { method: 'POST', body: JSON.stringify({ tmdb_id: args.tmdb_id, media_type: args.media_type }) });
     if (command === 'pause_queue') return webRequest('/api/queue/pause', { method: 'POST' });
     if (command === 'resume_queue') return webRequest('/api/queue/resume', { method: 'POST' });
+    if (command === 'get_transfer_settings' || command === 'get_settings') return webRequest('/api/settings');
+    if (command === 'update_transfer_settings') return webRequest('/api/settings/transfer', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'get_cache_settings') return webRequest('/api/settings/cache');
+    if (command === 'update_cache_settings') return webRequest('/api/settings/cache', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'get_metadata_cache_stats' || command === 'get_cache_stats') return webRequest('/api/cache');
+    if (command === 'clear_metadata_cache' || command === 'clear_cache') return webRequest('/api/cache/clear', { method: 'POST', body: '{}' });
+    if (command === 'request_sms_code') return webRequest('/api/auth/sms/send', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'login_with_sms') return webRequest('/api/auth/sms/login', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'poll_device_login') return webRequest('/api/auth/device/poll', { method: 'POST', body: JSON.stringify(args) });
-    return null;
+    throw new Error(`Docker Web 端暂不支持命令：${command}`);
   },
   subscribe: async (callback) => {
     const source = new EventSource('/api/events');
     source.onmessage = (event) => callback(JSON.parse(event.data));
     return () => source.close();
   },
+  subscribeAuthExpired,
   subscribeDrag: async () => () => {},
   selectFolder: async () => null,
   selectUploadFiles: async () => [],
