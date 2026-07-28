@@ -27,9 +27,14 @@ GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.15
 GUANGYA_HTTP_PORT=8080
 GUANGYA_ADMIN_USERNAME=admin
 GUANGYA_ADMIN_PASSWORD=替换为上面生成的强随机密码
+GUANGYA_WEBDAV_PORT=19090
+GUANGYA_WEBDAV_USERNAME=guangya
+GUANGYA_WEBDAV_PASSWORD=
 ```
 
 `GUANGYA_ADMIN_PASSWORD` 为空时 Compose 会拒绝启动。`.env` 包含敏感信息，不要提交到 Git，也不要发到聊天或工单。
+
+WebDAV 与管理界面使用独立凭据。`GUANGYA_WEBDAV_PASSWORD` 可以留空，启动后在网页“设置 → 挂载”中设置；若在 `.env` 中填写，它只用于状态库尚未初始化时的首次配置。
 
 ## 2. 启动和检查
 
@@ -70,6 +75,80 @@ volumes:
 ```
 
 不要把 `/data` 加入 `GUANGYA_FILE_ROOTS`，也不要让多个容器同时使用同一个 `/data`。
+
+### 3.1 把云盘挂载到宿主机或其他容器
+
+Docker WebDAV 使用独立的容器端口 `19090`。仓库提供的 Compose 固定把它发布到宿主机回环地址，不会直接暴露到公网：
+
+```text
+http://127.0.0.1:19090/dav/
+```
+
+- 用户名和密码：在“设置 → 挂载”中设置，不复用管理员凭据；
+- 密码：至少 12 位，状态接口不会回显；
+- 认证：HTTP Basic；
+- CRUD：`PROPFIND/PROPPATCH/GET/HEAD/PUT/MKCOL/MOVE/COPY/DELETE`；
+- 文件锁：提供兼容系统文件管理器的 `LOCK/UNLOCK`。
+
+管理端口 `8080` 不提供 `/dav/`。请保留 Compose 中这一行的 `127.0.0.1`，不要改成 `0.0.0.0`：
+
+```yaml
+ports:
+  - "127.0.0.1:${GUANGYA_WEBDAV_PORT:-19090}:19090"
+```
+
+Linux 宿主机可以使用 `davfs2`：
+
+```bash
+sudo apt-get install -y davfs2
+sudo mkdir -p /mnt/guangya
+sudo mount -t davfs http://127.0.0.1:19090/dav/ /mnt/guangya
+```
+
+需要大文件随机读取或让其他容器共享挂载点时，推荐 rclone：
+
+```bash
+rclone config create guangya webdav \
+  url http://127.0.0.1:19090/dav/ \
+  vendor other \
+  user guangya \
+  pass "$(rclone obscure '替换为独立WebDAV密码')"
+
+rclone mount guangya: /mnt/guangya \
+  --vfs-cache-mode full \
+  --dir-cache-time 30s
+```
+
+在同一个 Compose 网络中的其他容器可直接访问私有地址 `http://guangya-sync:19090/dav/`。如果要在容器内执行 FUSE 挂载，需要显式提供 `/dev/fuse` 和相应权限；普通业务容器优先直接使用 WebDAV，不要无条件开启 `privileged`。
+
+需要从其他电脑挂载时，不要为 WebDAV 配置公网端口或公网反向代理。请使用 VPN/组网，或先建立 SSH 本地端口转发：
+
+```bash
+ssh -N -L 19090:127.0.0.1:19090 user@服务器地址
+```
+
+随后在客户端连接 `http://127.0.0.1:19090/dav/`。这样 WebDAV Basic 凭据不会直接经过公网明文传输。
+
+WebDAV 直接操作光鸭云端，不会把文件内容永久复制到 `/data`；只有写入过程中的临时文件和现有断点/状态记录会短暂使用 `/data`。因此 `/data` 仍需要足够空间容纳单个正在写入的最大文件。
+
+### 3.2 Linux Docker 原生 FUSE 挂载（显式启用）
+
+镜像内置 rclone 与 FUSE3 用户态组件，但基础 Compose 不授予 `/dev/fuse` 或 `SYS_ADMIN`。只有可信的 Linux Docker 主机需要把挂载目录传播给宿主机时，才叠加仓库提供的覆盖文件：
+
+```bash
+mkdir -p mount
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.fuse.yml \
+  up -d
+```
+
+启动后进入网页“设置 → 挂载 → 原生挂载”，目标填写 `/mnt/guangya`，选择只读/读写、VFS 缓存、上传并行、读取并行和缓存上限，再输入当前 WebDAV 挂载密码启动。宿主机目录由 `GUANGYA_NATIVE_MOUNT_ROOT` 控制，默认 `./mount`。
+
+服务端只持久化 WebDAV 密码哈希，因此每次容器重启后启动原生挂载都需要重新输入密码；密码不会写入 rclone 配置。停止容器前应先在菜单中卸载，容器退出也会终止托管进程。
+
+> [!WARNING]
+> `docker-compose.fuse.yml` 包含 `SYS_ADMIN`、`/dev/fuse` 和 `apparmor:unconfined`。不要把它作为默认生产配置，也不要用于不可信镜像。Docker Desktop for Windows/macOS 无法用这种方式把 Linux VM 内挂载可靠地传播成宿主机盘符，请改用对应桌面客户端。
 
 ## 4. 光鸭登录
 

@@ -5,6 +5,10 @@ release/
 target/
 ui/target/
 src-tauri/gen/schemas/
+src-tauri/resources/rclone
+src-tauri/resources/rclone.exe
+src-tauri/resources/rclone.version.json
+src-tauri/resources/rclone-COPYING.txt
 
 # Runtime data and user-selected folders
 docker-data/

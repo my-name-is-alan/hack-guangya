@@ -15,6 +15,10 @@ if ! command -v systemctl >/dev/null 2>&1; then
   echo "未检测到 systemd，无法安装系统服务。" >&2
   exit 1
 fi
+if ! command -v fusermount3 >/dev/null 2>&1; then
+  apt-get update
+  apt-get install -y --no-install-recommends fuse3
+fi
 
 SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR=/opt/guangya-sync
@@ -41,10 +45,10 @@ fi
 install -d -m 0755 "$INSTALL_DIR"
 cp -a "$SOURCE_DIR/app/." "$INSTALL_DIR/"
 chown -R root:root "$INSTALL_DIR"
-chmod 0755 "$INSTALL_DIR/node/bin/node"
+chmod 0755 "$INSTALL_DIR/node/bin/node" "$INSTALL_DIR/bin/rclone"
 
 install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 \
-  "$STATE_DIR" "$STATE_DIR/data" "$STATE_DIR/watch" "$STATE_DIR/archive"
+  "$STATE_DIR" "$STATE_DIR/data" "$STATE_DIR/watch" "$STATE_DIR/archive" "$STATE_DIR/mount"
 
 if [ ! -f "$ENV_FILE" ]; then
   install -o root -g root -m 0600 "$SOURCE_DIR/guangya-sync.env" "$ENV_FILE"
@@ -60,6 +64,8 @@ append_env_default GUANGYA_ADMIN_USERNAME admin
 append_env_default GUANGYA_WATCH_ROOT /var/lib/guangya-sync/watch
 append_env_default GUANGYA_ARCHIVE_ROOT /var/lib/guangya-sync/archive
 append_env_default GUANGYA_FILE_ROOTS /var/lib/guangya-sync/watch,/var/lib/guangya-sync/archive
+append_env_default GUANGYA_RCLONE_PATH /opt/guangya-sync/bin/rclone
+append_env_default GUANGYA_NATIVE_MOUNT_TARGET /var/lib/guangya-sync/mount
 append_env_default GUANGYA_OSS_TIMEOUT_MS 600000
 append_env_default GUANGYA_OSS_RETRY_MAX 3
 append_env_default GUANGYA_OSS_PARALLEL 3

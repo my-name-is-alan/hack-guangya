@@ -1,9 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod native_mount;
+mod webdav;
+
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::{stream, StreamExt};
 use hmac::{Hmac, Mac};
 use md5::Md5;
+use native_mount::{NativeMountInfo, NativeMountManager, NativeMountOptions};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, DATE, ETAG};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -59,6 +63,8 @@ const UPLOAD_STATE_OSS_COMPLETE: &str = "oss_complete";
 const UPLOAD_STATE_CLOUD_CONFIRMED: &str = "cloud_confirmed";
 const AUTO_SHARE_QUIET_SECS: i64 = 30;
 const TOKEN_REFRESH_INTERVAL_SECS: u64 = 20 * 60;
+const DEFAULT_WEBDAV_PORT: u16 = 19_090;
+const DEFAULT_WEBDAV_USERNAME: &str = "guangya";
 const MAX_GCID_IMPORT_CONCURRENCY: usize = 16;
 const MAX_GCID_IMPORT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_GCID_IMPORT_ATTEMPTS: i64 = 5;
@@ -134,6 +140,16 @@ struct AppConfig {
     download_concurrency: usize,
     #[serde(default = "default_multipart_part_size")]
     multipart_part_size: String,
+    #[serde(default = "default_true")]
+    webdav_enabled: bool,
+    #[serde(default = "default_webdav_port")]
+    webdav_port: u16,
+    #[serde(default = "default_webdav_username")]
+    webdav_username: String,
+    #[serde(default)]
+    webdav_password: String,
+    #[serde(default)]
+    native_mount: NativeMountOptions,
 }
 impl Default for AppConfig {
     fn default() -> Self {
@@ -143,6 +159,11 @@ impl Default for AppConfig {
             upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
             download_concurrency: DEFAULT_DOWNLOAD_CONCURRENCY,
             multipart_part_size: default_multipart_part_size(),
+            webdav_enabled: true,
+            webdav_port: DEFAULT_WEBDAV_PORT,
+            webdav_username: default_webdav_username(),
+            webdav_password: String::new(),
+            native_mount: NativeMountOptions::default(),
         }
     }
 }
@@ -216,6 +237,13 @@ struct RuntimeState {
     auto_share_processing: HashSet<String>,
     gcid_import_running: HashSet<String>,
     sms_verifications: HashMap<String, SmsVerificationSession>,
+    webdav_enabled: bool,
+    webdav_port: u16,
+    webdav_username: String,
+    webdav_password: String,
+    webdav_running: bool,
+    webdav_error: Option<String>,
+    native_mount: NativeMountManager,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -248,6 +276,19 @@ struct MetadataCacheStats {
     remote_cache_bytes: u64,
     remote_cache_entries: u64,
     policy: CacheSettings,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MountInfo {
+    enabled: bool,
+    running: bool,
+    configured: bool,
+    local_only: bool,
+    endpoint: String,
+    username: String,
+    password: String,
+    error: Option<String>,
+    protocol: String,
 }
 
 #[derive(Debug, Clone)]
@@ -518,6 +559,29 @@ fn default_download_concurrency() -> usize {
 }
 fn default_multipart_part_size() -> String {
     DEFAULT_MULTIPART_PART_SIZE.to_string()
+}
+fn default_webdav_port() -> u16 {
+    DEFAULT_WEBDAV_PORT
+}
+fn default_webdav_username() -> String {
+    DEFAULT_WEBDAV_USERNAME.to_string()
+}
+fn normalize_webdav_username(value: &str) -> Result<String, String> {
+    let normalized = value.trim();
+    if normalized.chars().count() < 3
+        || normalized.chars().count() > 64
+        || normalized.contains(':')
+        || normalized.chars().any(char::is_control)
+    {
+        return Err("WebDAV 用户名必须为 3 到 64 个字符，且不能包含冒号或控制字符".to_string());
+    }
+    Ok(normalized.to_string())
+}
+fn normalize_webdav_password(value: &str) -> Result<String, String> {
+    if value.chars().count() < 12 || value.chars().count() > 256 {
+        return Err("WebDAV 密码必须为 12 到 256 个字符".to_string());
+    }
+    Ok(value.to_string())
 }
 fn default_cache_enabled() -> bool {
     true
@@ -1004,7 +1068,12 @@ fn save_config(state: &RuntimeState) {
         "saved_shares": state.saved_shares,
         "upload_concurrency": state.upload_concurrency,
         "download_concurrency": state.download_concurrency,
-        "multipart_part_size": state.multipart_part_size
+        "multipart_part_size": state.multipart_part_size,
+        "webdav_enabled": state.webdav_enabled,
+        "webdav_port": state.webdav_port,
+        "webdav_username": state.webdav_username,
+        "webdav_password": state.webdav_password,
+        "native_mount": state.native_mount.options()
     });
     let _ = fs::write(
         &state.config_path,
@@ -6753,6 +6822,98 @@ fn get_state(state: tauri::State<'_, SharedState>) -> Snapshot {
         })
 }
 
+fn mount_info(state: &RuntimeState) -> MountInfo {
+    MountInfo {
+        enabled: state.webdav_enabled,
+        running: state.webdav_running,
+        configured: !state.webdav_username.is_empty() && !state.webdav_password.is_empty(),
+        local_only: true,
+        endpoint: format!("http://127.0.0.1:{}/", state.webdav_port),
+        username: state.webdav_username.clone(),
+        password: String::new(),
+        error: state.webdav_error.clone(),
+        protocol: "webdav".to_string(),
+    }
+}
+
+#[tauri::command]
+fn get_mount_info(state: tauri::State<'_, SharedState>) -> Result<MountInfo, String> {
+    let guard = state.lock().map_err(|error| error.to_string())?;
+    Ok(mount_info(&guard))
+}
+
+#[tauri::command]
+fn update_mount_credentials(
+    state: tauri::State<'_, SharedState>,
+    username: String,
+    password: String,
+) -> Result<MountInfo, String> {
+    let username = normalize_webdav_username(&username)?;
+    let password = normalize_webdav_password(&password)?;
+    let mut guard = state.lock().map_err(|error| error.to_string())?;
+    guard.webdav_username = username;
+    guard.webdav_password = password;
+    save_config(&guard);
+    Ok(mount_info(&guard))
+}
+
+#[tauri::command]
+fn get_native_mount_info(state: tauri::State<'_, SharedState>) -> Result<NativeMountInfo, String> {
+    let mut guard = state.lock().map_err(|error| error.to_string())?;
+    Ok(guard.native_mount.info())
+}
+
+#[tauri::command]
+fn update_native_mount_options(
+    state: tauri::State<'_, SharedState>,
+    options: NativeMountOptions,
+) -> Result<NativeMountInfo, String> {
+    let mut guard = state.lock().map_err(|error| error.to_string())?;
+    guard.native_mount.set_options(options)?;
+    save_config(&guard);
+    Ok(guard.native_mount.info())
+}
+
+#[tauri::command]
+fn start_native_mount(state: tauri::State<'_, SharedState>) -> Result<NativeMountInfo, String> {
+    let mut guard = state.lock().map_err(|error| error.to_string())?;
+    if !guard.webdav_running {
+        return Err(guard
+            .webdav_error
+            .clone()
+            .unwrap_or_else(|| "WebDAV 本地服务尚未就绪".to_string()));
+    }
+    let endpoint = format!("http://127.0.0.1:{}/", guard.webdav_port);
+    let username = guard.webdav_username.clone();
+    let password = guard.webdav_password.clone();
+    guard.native_mount.start(&endpoint, &username, &password)
+}
+
+#[tauri::command]
+fn stop_native_mount(state: tauri::State<'_, SharedState>) -> Result<NativeMountInfo, String> {
+    let mut guard = state.lock().map_err(|error| error.to_string())?;
+    guard.native_mount.stop()
+}
+
+#[tauri::command]
+fn select_native_mount_target() -> Option<String> {
+    rfd::FileDialog::new()
+        .pick_folder()
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn select_rclone_binary() -> Option<String> {
+    let mut dialog = rfd::FileDialog::new();
+    #[cfg(windows)]
+    {
+        dialog = dialog.add_filter("rclone", &["exe"]);
+    }
+    dialog
+        .pick_file()
+        .map(|path| path.to_string_lossy().to_string())
+}
+
 fn auth_context(state: &tauri::State<'_, SharedState>) -> Result<(String, String), String> {
     let guard = state.lock().map_err(|e| e.to_string())?;
     Ok((
@@ -9318,6 +9479,11 @@ fn run() {
                 .app_data_dir()
                 .map_err(|e| e.to_string())?
                 .join("state.sqlite3");
+            let native_mount_data_dir = db_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf();
+            let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
             init_database(&db_path)?;
             let auth_session = load_auth_session(&db_path)?;
             let upload_history = load_upload_history(&db_path)?;
@@ -9356,7 +9522,29 @@ fn run() {
                 .or(load_app_state(&db_path, "hdhive_instance_id")?)
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
             save_app_state(&db_path, "hdhive_instance_id", &hdhive_instance_id)?;
-            let config = load_config(&config_path);
+            let mut config = load_config(&config_path);
+            if let Some(port) = std::env::var("GUANGYA_WEBDAV_PORT")
+                .ok()
+                .and_then(|value| value.parse::<u16>().ok())
+            {
+                if port > 0 {
+                    config.webdav_port = port;
+                }
+            }
+            if config.webdav_port == 0 {
+                config.webdav_port = DEFAULT_WEBDAV_PORT;
+            }
+            if config.webdav_username.trim().is_empty() {
+                config.webdav_username = default_webdav_username();
+            }
+            if config.webdav_password.trim().is_empty() {
+                config.webdav_password = Uuid::new_v4().simple().to_string();
+            }
+            let webdav_enabled = config.webdav_enabled;
+            let webdav_port = config.webdav_port;
+            let webdav_username = config.webdav_username.clone();
+            let webdav_password = config.webdav_password.clone();
+            let native_mount_options = config.native_mount.clone();
             let upload_concurrency = normalize_transfer_concurrency(
                 config.upload_concurrency,
                 DEFAULT_UPLOAD_CONCURRENCY,
@@ -9416,9 +9604,30 @@ fn run() {
                 auto_share_processing: HashSet::new(),
                 gcid_import_running: HashSet::new(),
                 sms_verifications: HashMap::new(),
+                webdav_enabled,
+                webdav_port,
+                webdav_username,
+                webdav_password,
+                webdav_running: false,
+                webdav_error: None,
+                native_mount: NativeMountManager::new(
+                    native_mount_options,
+                    native_mount_data_dir,
+                    resource_dir,
+                ),
             }));
             app.manage(state.clone());
             let app_handle = app.handle().clone();
+            if webdav_enabled {
+                tauri::async_runtime::spawn(webdav::serve(
+                    app_handle.clone(),
+                    state.clone(),
+                    webdav_port,
+                ));
+            }
+            if let Ok(guard) = state.lock() {
+                save_config(&guard);
+            }
             tauri::async_runtime::spawn(event_loop(app_handle.clone(), state.clone(), event_rx));
             if state
                 .lock()
@@ -9484,6 +9693,14 @@ fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
+            get_mount_info,
+            update_mount_credentials,
+            get_native_mount_info,
+            update_native_mount_options,
+            start_native_mount,
+            stop_native_mount,
+            select_native_mount_target,
+            select_rclone_binary,
             clear_expired_session,
             start_device_login,
             request_sms_code,
@@ -9537,13 +9754,36 @@ fn run() {
             clear_metadata_cache,
             resume_queue
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                let state = app_handle.state::<SharedState>();
+                if let Ok(mut guard) = state.lock() {
+                    guard.native_mount.shutdown();
+                };
+            }
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webdav_credentials_require_safe_explicit_values() {
+        assert_eq!(
+            normalize_webdav_username("  mount-user  ").unwrap(),
+            "mount-user"
+        );
+        assert!(normalize_webdav_username("ab").is_err());
+        assert!(normalize_webdav_username("bad:user").is_err());
+        assert!(normalize_webdav_password("short").is_err());
+        assert_eq!(
+            normalize_webdav_password("correct horse battery staple").unwrap(),
+            "correct horse battery staple"
+        );
+    }
 
     #[test]
     fn default_mapping_syncs_media_only() {

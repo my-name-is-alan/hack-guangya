@@ -1,6 +1,6 @@
 {
   "name": "guangya-folder-sync",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "type": "module",
   "packageManager": "pnpm@11.15.1",
   "engines": {
@@ -12,6 +12,7 @@
     "tauri": "tauri",
     "dev": "tauri dev",
     "build": "tauri build",
+    "prepare:rclone": "node scripts/prepare-rclone.mjs",
     "ui:dev": "vite --host 127.0.0.1 --port 1420",
     "ui:build": "vite build",
     "ui:test": "node --test ui/*.test.js",

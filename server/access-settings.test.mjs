@@ -122,6 +122,125 @@ test('访问控制保留正确 unlock、Cookie 会话与旧 Basic 登录', async
   }
 });
 
+test('独立访问控制表支持修改用户名且不会复用管理员凭据', async () => {
+  const database = new DatabaseSync(':memory:');
+  try {
+    const admin = createAccessControl({
+      database,
+      initialCode: 'administrator password',
+      username: 'admin',
+    });
+    const webdav = createAccessControl({
+      database,
+      initialCode: 'initial webdav password',
+      username: 'mount-user',
+      tableName: 'webdav_access_control',
+      realm: 'Guangya WebDAV',
+    });
+
+    assert.equal((await webdav.authenticate(accessRequest('192.0.2.30', {
+      authorization: basic('admin', 'administrator password'),
+    }))).status, 401);
+    assert.equal((await webdav.authenticate(accessRequest('192.0.2.31', {
+      authorization: basic('mount-user', 'initial webdav password'),
+    }))).status, 200);
+
+    webdav.updateCredentials(accessRequest('192.0.2.32'), 'storage-user', 'replacement webdav password');
+    assert.equal(webdav.status(accessRequest('192.0.2.33')).username, 'storage-user');
+    assert.equal((await webdav.authenticate(accessRequest('192.0.2.34', {
+      authorization: basic('mount-user', 'initial webdav password'),
+    }))).status, 401);
+    assert.equal((await webdav.authenticate(accessRequest('192.0.2.35', {
+      authorization: basic('storage-user', 'replacement webdav password'),
+    }))).status, 200);
+    assert.equal(await admin.verifyCode('administrator password'), true);
+
+    const rejected = responseRecorder();
+    webdav.reject(rejected);
+    assert.match(rejected.headers['www-authenticate'], /Guangya WebDAV/);
+  } finally {
+    database.close();
+  }
+});
+
+test('WebDAV 使用独立本机端口和独立持久化账号密码', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-webdav-access-test-'));
+  let instance;
+  try {
+    instance = await startTestServer(root);
+    const mainBase = `http://127.0.0.1:${instance.port}`;
+    const davBase = `http://127.0.0.1:${instance.webdavPort}/dav/`;
+
+    assert.equal((await fetch(`${mainBase}/dav/`)).status, 404);
+    assert.equal((await fetch(davBase, { method: 'OPTIONS' })).status, 503);
+
+    const saved = await fetch(`${mainBase}/api/mount/credentials`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        username: 'storage-user',
+        password: 'correct horse battery staple',
+      }),
+    });
+    assert.equal(saved.status, 200, await saved.clone().text());
+    const mount = await saved.json();
+    assert.equal(mount.configured, true);
+    assert.equal(mount.local_only, true);
+    assert.equal(mount.endpoint, davBase);
+    assert.equal(mount.password, '');
+
+    assert.equal((await fetch(davBase, {
+      method: 'OPTIONS',
+      headers: { authorization: basic('admin', 'correct horse battery staple') },
+    })).status, 401);
+    assert.equal((await fetch(davBase, {
+      method: 'OPTIONS',
+      headers: { authorization: basic('storage-user', 'correct horse battery staple') },
+    })).status, 204);
+    const nativeOptions = await fetch(`${mainBase}/api/mount/native/options`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        options: {
+          target: process.platform === 'win32' ? 'Y:' : '/mnt/test-guangya',
+          access_mode: 'read_only',
+          vfs_cache_mode: 'writes',
+          transfers: 6,
+          read_streams: 3,
+          cache_size_gb: 24,
+          rclone_path: 'missing-rclone-for-api-test',
+        },
+      }),
+    });
+    assert.equal(nativeOptions.status, 200, await nativeOptions.clone().text());
+    assert.equal((await nativeOptions.json()).access_mode, 'read_only');
+    const wrongNativePassword = await fetch(`${mainBase}/api/mount/native/start`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ password: 'wrong webdav password' }),
+    });
+    assert.equal(wrongNativePassword.status, 400);
+    assert.match((await wrongNativePassword.json()).error, /密码错误/);
+
+    await stopTestServer(instance);
+    instance = await startTestServer(root);
+    const restartedDav = `http://127.0.0.1:${instance.webdavPort}/dav/`;
+    assert.equal((await fetch(restartedDav, {
+      method: 'OPTIONS',
+      headers: { authorization: basic('storage-user', 'correct horse battery staple') },
+    })).status, 204);
+    const restartedMount = await fetch(`http://127.0.0.1:${instance.port}/api/mount`).then((response) => response.json());
+    assert.equal(restartedMount.username, 'storage-user');
+    assert.equal(restartedMount.password, '');
+    const restartedNative = await fetch(`http://127.0.0.1:${instance.port}/api/mount/native`).then((response) => response.json());
+    assert.equal(restartedNative.access_mode, 'read_only');
+    assert.equal(restartedNative.transfers, 6);
+  } finally {
+    await stopTestServer(instance);
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('访问码支持静态门禁、会话 Cookie、旧 Basic、改码轮换与持久化', async () => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-access-code-test-'));
   const initialCode = 'correct horse battery staple';

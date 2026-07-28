@@ -72,6 +72,13 @@ export const bridge = isTauri ? {
   invoke: async (command, args = {}) => {
     if (command === 'get_state') return webRequest('/api/state');
     if (command === 'get_overview') return webRequest('/api/overview');
+    if (command === 'get_mount_info') return webRequest('/api/mount');
+    if (command === 'update_mount_credentials') return webRequest('/api/mount/credentials', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'get_native_mount_info') return webRequest('/api/mount/native');
+    if (command === 'update_native_mount_options') return webRequest('/api/mount/native/options', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'start_native_mount') return webRequest('/api/mount/native/start', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'stop_native_mount') return webRequest('/api/mount/native/stop', { method: 'POST', body: '{}' });
+    if (command === 'select_native_mount_target' || command === 'select_rclone_binary') return null;
     if (command === 'get_access_status') return webRequest('/api/access/status');
     if (command === 'unlock_access') return webRequest('/api/access/unlock', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'update_access_code') return webRequest('/api/access/code', { method: 'POST', body: JSON.stringify(args) });

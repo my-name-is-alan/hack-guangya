@@ -1,0 +1,16 @@
+services:
+  guangya-sync:
+    environment:
+      GUANGYA_NATIVE_MOUNT_ENABLED: "1"
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - type: bind
+        source: ${GUANGYA_NATIVE_MOUNT_ROOT:-./mount}
+        target: /mnt/guangya
+        bind:
+          propagation: rshared

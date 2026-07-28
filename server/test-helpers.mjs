@@ -36,6 +36,7 @@ export async function startTestServer(root, extraEnv = {}) {
     fsp.mkdir(dataDir, { recursive: true }),
   ]);
   const port = await freePort();
+  const webdavPort = await freePort();
   const child = spawn(process.execPath, [path.join(here, 'server.mjs')], {
     cwd: path.resolve(here, '..'),
     env: {
@@ -47,6 +48,8 @@ export async function startTestServer(root, extraEnv = {}) {
       GUANGYA_FILE_ROOTS: watchRoot,
       GUANGYA_ADMIN_PASSWORD: '',
       LISTEN_HOST: '127.0.0.1',
+      GUANGYA_WEBDAV_PORT: String(webdavPort),
+      GUANGYA_WEBDAV_PUBLIC_PORT: String(webdavPort),
       ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -59,7 +62,7 @@ export async function startTestServer(root, extraEnv = {}) {
     if (child.exitCode != null) throw new Error(`测试服务器提前退出：\n${output}`);
     return false;
   });
-  return { child, port, dataDir, watchRoot, archiveRoot, output: () => output };
+  return { child, port, webdavPort, dataDir, watchRoot, archiveRoot, output: () => output };
 }
 
 export async function stopTestServer(instance) {

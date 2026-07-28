@@ -9,6 +9,7 @@
 
 - 应用内扫码登录和验证码登录：二维码、用户验证码和轮询状态都在工作台内显示，不保存账号密码；授权会话保存到当前系统用户的本地 SQLite，重启后自动恢复。
 - 云盘文件管理：浏览根目录和子目录，拖入文件或文件夹上传，并支持批量复制、剪切、移动、删除和创建分享；文件操作会等待云端异步任务完成后再刷新。
+- 本地目录挂载：通过 WebDAV 将整个云盘映射为 Windows 盘符、macOS Finder 目录或 Linux/FUSE 目录；支持列目录、读取、新建、覆盖、重命名、移动、复制和删除，Docker Web 同样提供 `/dav/`。
 - 批量重命名：规则按顺序链式执行，支持普通替换、正则替换、前后缀、序号模板及大小写转换，执行前实时预览并检查重名。
 - 桌面操作习惯：支持右键菜单，以及 `Ctrl+A`、`Ctrl+C`、`Ctrl+X`、`Ctrl+V`、`F2`、`Delete` 快捷键。
 - 离线下载：提交磁力、HTTP、HTTPS、ED2K 地址到云端任务。
@@ -29,7 +30,49 @@ pnpm tauri dev
 pnpm tauri build
 ```
 
-安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.15_x64-setup.exe`
+安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.16_x64-setup.exe`
+
+## WebDAV 本地挂载
+
+登录光鸭后，打开“设置 → 挂载”设置独立的 WebDAV 用户名和密码，并查看各平台命令。桌面端默认只监听：
+
+```text
+http://127.0.0.1:19090/
+```
+
+默认用户名是 `guangya`。用户名和密码都能在挂载设置页修改；密码至少 12 位且不会由状态接口回显，已有盘符或目录在修改后需要重新连接。端口冲突时可在启动前设置 `GUANGYA_WEBDAV_PORT`。
+
+常用挂载方式：
+
+```powershell
+# Windows：* 会安全地提示输入密码
+net use Z: "http://127.0.0.1:19090/" /user:guangya * /persistent:yes
+```
+
+```bash
+# macOS：也可在 Finder 中选择“前往 → 连接服务器”
+mkdir -p "$HOME/Guangya"
+mount_webdav "http://127.0.0.1:19090/" "$HOME/Guangya"
+
+# Linux：先安装 davfs2
+sudo mkdir -p /mnt/guangya
+sudo mount -t davfs "http://127.0.0.1:19090/" /mnt/guangya
+```
+
+WebDAV 是在线文件系统，不是离线镜像。打开大文件时由系统 WebDAV 客户端或 rclone 的 VFS 缓存负责按需读取；写入会继续走现有的 OSS 分片上传与云端入库确认。Windows 内置 WebClient 被策略禁用或需要更稳定的大文件缓存时，建议改用 `rclone mount --vfs-cache-mode full`。
+
+## 原生挂载（rclone / FUSE）
+
+“设置 → 挂载”默认提供软件托管的原生挂载模式。桌面安装包内置经过 SHA256 校验的官方 rclone `v1.74.4`，无需单独配置 remote：
+
+- Windows 使用 WinFsp，可填写 `X:` 等未占用盘符，也可选择 `G:\guangya` 这类空目录；Windows 目录挂载要求叶子路径在启动时不存在，因此程序只会临时移除空目录并在卸载后恢复，非空目录会被拒绝且绝不覆盖；
+- macOS 使用 macFUSE 或 FUSE-T，目标为本机绝对目录；
+- Linux 使用 FUSE3，目标为本机绝对目录；
+- 退出软件时会停止托管的 rclone 进程并自动卸载。
+
+挂载菜单可选择只读或读写、VFS 缓存模式、上传并行数、读取分块并行数和缓存空间上限。读写模式建议使用“完整缓存”或“仅写入缓存”；只读模式会把 `--read-only` 直接传给 rclone，从文件系统层拒绝新建、覆盖、删除和重命名。
+
+原生挂载仍通过只监听本机的 WebDAV 服务访问光鸭接口，不会新增公网端口。rclone 密码通过标准输入转换并仅注入子进程环境，不写入 rclone 配置文件。
 
 ## Docker Web
 
@@ -52,6 +95,27 @@ docker compose up -d
 完整的环境变量、目录挂载、HDHive、升级、回滚、备份与反向代理配置见 [DOCKER.md](./DOCKER.md)。
 
 Docker 会明确监听 `0.0.0.0:8080`，未设置管理密码或密码留空时 Compose 会拒绝启动。打开 `http://localhost:8080`，使用上述管理账号登录。需要从其他机器访问时，请同时限制防火墙来源；跨不可信网络应在前面配置 HTTPS 反向代理，避免通过明文 HTTP 传输管理凭据。
+
+Docker WebDAV 使用独立端口和独立账号密码，不复用管理端口或管理员凭据。Compose 默认只把端口发布到服务器本机回环地址：
+
+```text
+http://127.0.0.1:19090/dav/
+```
+
+启动后在“设置 → 挂载”设置 WebDAV 用户名和密码；也可用 `GUANGYA_WEBDAV_USERNAME`、`GUANGYA_WEBDAV_PASSWORD` 完成首次初始化。管理端口 `8080` 不再提供 `/dav/`。不要把 `19090` 改成 `0.0.0.0` 公网发布；需要从其他电脑挂载时，使用 VPN/组网或 SSH 本地端口转发，再连接客户端自己的 `127.0.0.1:19090`：
+
+```bash
+ssh -N -L 19090:127.0.0.1:19090 user@服务器地址
+```
+
+Linux Docker 主机如确实需要把原生 FUSE 挂载暴露给宿主机，可显式叠加权限文件：
+
+```bash
+mkdir -p mount
+docker compose -f docker-compose.yml -f docker-compose.fuse.yml up -d
+```
+
+该覆盖文件会授予 `/dev/fuse`、`SYS_ADMIN` 和共享挂载传播，仅应在可信的 Linux Docker 主机使用。默认 Compose 不授予这些权限；Docker Desktop for Windows/macOS 应使用桌面程序原生挂载，而不是尝试把 Linux VM 内的 FUSE 挂载传播到宿主系统。
 
 默认挂载关系为：
 
@@ -96,7 +160,7 @@ pnpm web
 pnpm package:ubuntu
 ```
 
-输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.15.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
+输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.16.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
 
 ## 接口边界
 

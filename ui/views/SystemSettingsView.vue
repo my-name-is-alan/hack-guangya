@@ -3,6 +3,7 @@ import { shallowRef } from 'vue'
 import {
   CloudServerOutlined,
   DatabaseOutlined,
+  FolderOpenOutlined,
   LockOutlined,
   SettingOutlined,
   SwapOutlined,
@@ -13,6 +14,7 @@ import AccessCodeSettingsPanel from '../components/settings/AccessCodeSettingsPa
 import AccountSettingsPanel from '../components/settings/AccountSettingsPanel.vue'
 import CacheSettingsPanel from '../components/settings/CacheSettingsPanel.vue'
 import HdhiveSettingsPanel from '../components/settings/HdhiveSettingsPanel.vue'
+import MountSettingsPanel from '../components/settings/MountSettingsPanel.vue'
 import PreferenceSettingsPanel from '../components/settings/PreferenceSettingsPanel.vue'
 import TransferSettingsPanel from '../components/settings/TransferSettingsPanel.vue'
 
@@ -40,6 +42,11 @@ const activeTab = shallowRef('account')
       <a-tab-pane key="transfer">
         <template #tab><span class="setting-tab"><SwapOutlined />传输</span></template>
         <TransferSettingsPanel />
+      </a-tab-pane>
+
+      <a-tab-pane key="mount">
+        <template #tab><span class="setting-tab"><FolderOpenOutlined />挂载</span></template>
+        <MountSettingsPanel />
       </a-tab-pane>
 
       <a-tab-pane key="hdhive">

@@ -10,7 +10,10 @@ import chokidar from 'chokidar';
 import OSS from 'ali-oss';
 import { autoShareTargetFor, shareFilePayload, signHdhiveRequest } from './auto-share.mjs';
 import { createAccessControl } from './access-control.mjs';
+import { createDirectoryCache } from './directory-cache.mjs';
+import { createNativeMountManager, normalizeNativeMountOptions } from './native-mount.mjs';
 import { uploadPartSize } from './upload-parts.mjs';
+import { createWebDavHandler, normalizeWebDavEntry, WebDavError } from './webdav.mjs';
 import { parseGuangyaShareLink } from '../ui/shareLink.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -22,6 +25,18 @@ const requestedListenHost = String(process.env.LISTEN_HOST || process.env.HOST |
 const loopbackHosts = new Set(['127.0.0.1', '::1', 'localhost']);
 if (!adminPassword && !loopbackHosts.has(requestedListenHost.toLowerCase())) throw new Error('未配置 GUANGYA_ADMIN_PASSWORD 时只允许监听回环地址');
 const listenHost = requestedListenHost;
+const defaultWebDavPort = process.env.NODE_TEST_CONTEXT ? 0 : 19090;
+const webdavPort = Number(process.env.GUANGYA_WEBDAV_PORT ?? defaultWebDavPort);
+if (!Number.isInteger(webdavPort) || webdavPort < 0 || webdavPort > 65535) throw new Error('GUANGYA_WEBDAV_PORT 必须是 0 到 65535 的整数');
+const webdavPublicPort = Number(process.env.GUANGYA_WEBDAV_PUBLIC_PORT || webdavPort);
+if (!Number.isInteger(webdavPublicPort) || webdavPublicPort < 0 || webdavPublicPort > 65535) throw new Error('GUANGYA_WEBDAV_PUBLIC_PORT 必须是 0 到 65535 的整数');
+const requestedWebDavHost = String(process.env.GUANGYA_WEBDAV_HOST || '127.0.0.1').trim();
+const allowWebDavNonLoopback = process.env.GUANGYA_WEBDAV_ALLOW_NON_LOOPBACK === '1';
+if (!loopbackHosts.has(requestedWebDavHost.toLowerCase()) && !allowWebDavNonLoopback) {
+  throw new Error('WebDAV 默认只允许监听回环地址；容器内部监听需显式设置 GUANGYA_WEBDAV_ALLOW_NON_LOOPBACK=1');
+}
+const webdavHost = requestedWebDavHost;
+const webdavEndpoint = `http://127.0.0.1:${webdavPublicPort}/dav/`;
 const configuredDataDir = path.resolve(process.env.DATA_DIR || path.join(here, '..', '.web-data'));
 const configuredWatchRoot = path.resolve(process.env.GUANGYA_WATCH_ROOT || path.join(here, '..', 'watch'));
 const configuredArchiveRoot = path.resolve(process.env.GUANGYA_ARCHIVE_ROOT || path.join(here, '..', 'archive'));
@@ -212,6 +227,44 @@ function saveAppStateValue(key, value) {
   database.prepare('INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
     .run(key, String(value), Math.floor(Date.now() / 1000));
 }
+function normalizeWebDavUsername(value) {
+  const normalized = String(value || '').trim();
+  if (normalized.length < 3 || normalized.length > 64 || normalized.includes(':') || /[\u0000-\u001f\u007f]/.test(normalized)) {
+    throw new Error('WebDAV 用户名必须为 3 到 64 个字符，且不能包含冒号或控制字符');
+  }
+  return normalized;
+}
+function normalizeWebDavPassword(value) {
+  const normalized = String(value ?? '');
+  if (normalized.length < 12 || normalized.length > 256) throw new Error('WebDAV 密码必须为 12 到 256 个字符');
+  return normalized;
+}
+let webdavUsername = normalizeWebDavUsername(
+  appStateValue('webdav_username') || process.env.GUANGYA_WEBDAV_USERNAME || 'guangya',
+);
+const initialWebDavPassword = String(process.env.GUANGYA_WEBDAV_PASSWORD || '');
+if (initialWebDavPassword) normalizeWebDavPassword(initialWebDavPassword);
+const webdavAccessControl = createAccessControl({
+  database,
+  initialCode: initialWebDavPassword,
+  username: webdavUsername,
+  tableName: 'webdav_access_control',
+  realm: 'Guangya WebDAV',
+});
+saveAppStateValue('webdav_username', webdavUsername);
+let storedNativeMountOptions = {};
+try {
+  storedNativeMountOptions = JSON.parse(appStateValue('native_mount_options') || '{}');
+} catch {}
+if (!storedNativeMountOptions.target && process.env.GUANGYA_NATIVE_MOUNT_TARGET) {
+  storedNativeMountOptions.target = String(process.env.GUANGYA_NATIVE_MOUNT_TARGET);
+}
+const nativeMountEnabled = process.env.GUANGYA_NATIVE_MOUNT_ENABLED === '1' || !fs.existsSync('/.dockerenv');
+const nativeMountManager = createNativeMountManager({
+  dataDir,
+  initialOptions: storedNativeMountOptions,
+  enabled: nativeMountEnabled,
+});
 function storedConcurrency(key, fallback) {
   const value = Number(appStateValue(key));
   return Number.isInteger(value) && value >= 1 && value <= 8 ? value : fallback;
@@ -2288,6 +2341,159 @@ async function batchRename(renames) {
   for (let index = 0; index < staged.length; index += 1) { const entry = staged[index]; try { await renameRemote(entry.item.fileId, entry.item.newName); } catch (error) { for (const rollback of staged.slice(0, index).reverse()) { try { await renameRemote(rollback.item.fileId, rollback.item.currentName); } catch {} } for (const rollback of staged.slice(index).reverse()) { try { await renameRemote(rollback.item.fileId, rollback.item.currentName); } catch {} } throw new Error(`目标重命名失败（${entry.item.newName}）：${error.message}`); } }
   return { renamed: staged.length };
 }
+const webDavDirectoryCache = createDirectoryCache();
+async function fetchWebDavChildren(parentId) {
+  const records = [];
+  for (let page = 0; page < 1000; page += 1) {
+    const result = await apiPost('/userres/v1/file/get_file_list', {
+      page,
+      pageSize: 100,
+      parentId: String(parentId || ''),
+      orderBy: 0,
+      sortType: 0,
+      needSubFolderStat: true,
+    });
+    const list = Array.isArray(result.data?.list) ? result.data.list : [];
+    records.push(...list);
+    const total = Number(result.data?.total || records.length);
+    if (!list.length || records.length >= total) break;
+  }
+  return records;
+}
+async function listWebDavChildren(parentId, options) {
+  if (!token) throw new WebDavError(503, '请先登录光鸭云盘');
+  webDavDirectoryCache.setScope(
+    crypto.createHash('sha256').update(String(token)).digest('base64url'),
+  );
+  const normalizedParentId = String(parentId || '');
+  return webDavDirectoryCache.get(
+    normalizedParentId,
+    () => fetchWebDavChildren(normalizedParentId),
+    options,
+  );
+}
+async function createWebDavDirectory({ parentId, name }) {
+  const result = await apiPost('/userres/v1/file/create_dir', {
+    parentId: String(parentId || ''),
+    dirName: name,
+    failIfNameExist: true,
+  });
+  webDavDirectoryCache.invalidate(parentId);
+  return result.data || {};
+}
+async function deleteWebDavEntry({ entry }) {
+  const result = await apiPost('/userres/v1/file/delete_file', { fileIds: [entry.id] });
+  await waitOperation(result.data?.taskId);
+  webDavDirectoryCache.invalidate(entry.parentId);
+  if (entry.isDirectory) webDavDirectoryCache.invalidateSubtree(entry.id);
+}
+async function moveWebDavEntry({ entry, parentId, name }) {
+  if (String(entry.parentId || '') !== String(parentId || '')) {
+    const result = await apiPost('/userres/v1/file/move_file', {
+      fileIds: [entry.id],
+      parentId: String(parentId || ''),
+    });
+    await waitOperation(result.data?.taskId);
+    webDavDirectoryCache.invalidate(entry.parentId);
+    webDavDirectoryCache.invalidate(parentId);
+  }
+  if (entry.name !== name) {
+    await renameRemote(entry.id, name);
+    webDavDirectoryCache.invalidate(parentId);
+  }
+}
+async function copyWebDavEntry({ entry, parentId, name }) {
+  const before = (await listWebDavChildren(parentId)).map(normalizeWebDavEntry);
+  if (entry.name !== name && before.some((item) => item.name === entry.name)) {
+    throw new WebDavError(409, `目标目录中已有 ${entry.name}，无法安全完成改名复制`);
+  }
+  const beforeIds = new Set(before.map((item) => item.id));
+  const result = await apiPost('/userres/v1/file/copy_file', {
+    fileIds: [entry.id],
+    parentId: String(parentId || ''),
+  });
+  await waitOperation(result.data?.taskId);
+  webDavDirectoryCache.invalidate(parentId);
+  if (entry.name === name) return;
+  const after = (await listWebDavChildren(parentId)).map(normalizeWebDavEntry);
+  const copied = after.find((item) => item.name === entry.name && !beforeIds.has(item.id));
+  if (!copied?.id) throw new WebDavError(409, '云端复制已完成，但无法定位副本进行重命名');
+  await renameRemote(copied.id, name);
+  webDavDirectoryCache.invalidate(parentId);
+}
+async function putWebDavFile({ request, parentId, name, existing }) {
+  const temporaryRoot = path.join(manualUploadRoot, 'webdav', crypto.randomUUID());
+  const temporaryName = existing ? `.__gy_dav_${crypto.randomUUID().replaceAll('-', '')}` : name;
+  const temporaryFile = path.join(temporaryRoot, temporaryName);
+  await fsp.mkdir(temporaryRoot, { recursive: true });
+  try {
+    await pipeline(request, fs.createWriteStream(temporaryFile));
+    const stat = await fsp.stat(temporaryFile);
+    const item = {
+      mapping_id: '',
+      file_path: temporaryFile,
+      event_path: `[WebDAV]/${name}`,
+      remote_parent_id: String(parentId || ''),
+      remote_dir: '',
+      relative_path: name,
+      change_kind: existing ? 'changed' : 'added',
+      size: stat.size,
+      mtime: stat.mtimeMs,
+    };
+    const uploaded = await upload(item);
+    if (!uploaded.remoteFileId) {
+      throw new WebDavError(503, uploaded.pendingError || '文件已上传，但云端暂未确认入库');
+    }
+    if (existing) await deleteWebDavEntry({ entry: existing });
+    if (temporaryName !== name) await renameRemote(String(uploaded.remoteFileId), name);
+    webDavDirectoryCache.invalidate(parentId);
+    return { id: String(uploaded.remoteFileId) };
+  } finally {
+    await fsp.rm(temporaryRoot, { recursive: true, force: true });
+  }
+}
+async function readWebDavFile({ request, response, entry, headOnly }) {
+  const download = await getCloudDownload({ file_ids: [entry.id], packaged: false });
+  const headers = {};
+  for (const name of ['range', 'if-match', 'if-none-match', 'if-modified-since', 'if-unmodified-since']) {
+    if (request.headers[name]) headers[name] = request.headers[name];
+  }
+  const upstream = await fetch(download.download_url, {
+    method: 'GET',
+    headers,
+    signal: AbortSignal.timeout(ossTimeoutMs),
+  });
+  if (!upstream.ok && upstream.status !== 206 && upstream.status !== 304) {
+    throw new WebDavError(upstream.status === 404 ? 404 : 502, `云端文件读取失败（HTTP ${upstream.status}）`);
+  }
+  const responseHeaders = {
+    'accept-ranges': upstream.headers.get('accept-ranges') || 'bytes',
+    'content-type': upstream.headers.get('content-type') || 'application/octet-stream',
+    etag: upstream.headers.get('etag') || entry.etag,
+    'last-modified': upstream.headers.get('last-modified') || new Date(entry.modifiedAt).toUTCString(),
+  };
+  for (const name of ['content-length', 'content-range', 'content-disposition']) {
+    const value = upstream.headers.get(name);
+    if (value) responseHeaders[name] = value;
+  }
+  response.writeHead(upstream.status, responseHeaders);
+  if (headOnly || !upstream.body) {
+    await upstream.body?.cancel();
+    response.end();
+    return;
+  }
+  await pipeline(upstream.body, response);
+}
+const handleWebDav = createWebDavHandler({
+  prefix: '/dav',
+  listChildren: listWebDavChildren,
+  createDirectory: createWebDavDirectory,
+  deleteEntry: deleteWebDavEntry,
+  moveEntry: moveWebDavEntry,
+  copyEntry: copyWebDavEntry,
+  putFile: putWebDavFile,
+  readFile: readWebDavFile,
+});
 async function handleWebUpload(request, response, url) {
   if (!token) throw new Error('请先登录光鸭云盘');
   const fileName = path.basename(url.searchParams.get('fileName') || 'upload.bin');
@@ -2333,6 +2539,65 @@ async function routeApiV2(request, response, url) {
     return;
   }
   if (request.method === 'GET' && url.pathname === '/api/settings') return json(response, 200, settingsState());
+  if (request.method === 'GET' && url.pathname === '/api/mount') {
+    return json(response, 200, {
+      enabled: true,
+      running: true,
+      configured: webdavAccessControl.required(),
+      local_only: true,
+      protocol: 'webdav',
+      endpoint: webdavEndpoint,
+      username: webdavUsername,
+      password: '',
+      password_hint: webdavAccessControl.required() ? '已设置；输入新密码可更新' : '尚未设置，请输入 12 位以上密码',
+      error: null,
+    });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/mount/credentials') {
+    const body = await readBody(request, { maxBytes: 4 * 1024 });
+    const nextUsername = normalizeWebDavUsername(body.username);
+    const nextPassword = normalizeWebDavPassword(body.password);
+    webdavAccessControl.updateCredentials(request, nextUsername, nextPassword);
+    webdavUsername = nextUsername;
+    saveAppStateValue('webdav_username', webdavUsername);
+    return json(response, 200, {
+      enabled: true,
+      running: true,
+      configured: true,
+      local_only: true,
+      protocol: 'webdav',
+      endpoint: webdavEndpoint,
+      username: webdavUsername,
+      password: '',
+      password_hint: '已设置；输入新密码可更新',
+      error: null,
+    }, { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'GET' && url.pathname === '/api/mount/native') {
+    return json(response, 200, nativeMountManager.info(), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/mount/native/options') {
+    const body = await readBody(request, { maxBytes: 16 * 1024 });
+    const options = normalizeNativeMountOptions(body.options || body);
+    const result = nativeMountManager.setOptions(options);
+    saveAppStateValue('native_mount_options', JSON.stringify(nativeMountManager.options()));
+    return json(response, 200, result, { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/mount/native/start') {
+    if (!webdavAccessControl.required()) throw new Error('请先设置独立的 WebDAV 账号密码');
+    const body = await readBody(request, { maxBytes: 4 * 1024 });
+    const password = normalizeWebDavPassword(body.password);
+    if (!(await webdavAccessControl.verifyCode(password))) throw new Error('WebDAV 挂载密码错误');
+    const result = await nativeMountManager.start({
+      endpoint: `http://127.0.0.1:${webdavPort}/dav/`,
+      username: webdavUsername,
+      password,
+    });
+    return json(response, 200, result, { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/mount/native/stop') {
+    return json(response, 200, await nativeMountManager.stop(), { 'cache-control': 'no-store' });
+  }
   if (request.method === 'POST' && url.pathname === '/api/settings/transfer') {
     const body = await readBody(request);
     const transfer = updateTransferSettings(body);
@@ -2473,8 +2738,46 @@ const server = http.createServer(async (request, response) => {
     json(response, statusCode, { error: error.message }, error.headers || {});
   }
 });
-server.requestTimeout = requestTimeoutMs;
+server.requestTimeout = Math.max(requestTimeoutMs, ossTimeoutMs);
 server.headersTimeout = Math.min(requestTimeoutMs, 15_000);
+
+const webdavServer = http.createServer(async (request, response) => {
+  const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+  try {
+    if (!webdavAccessControl.required()) {
+      response.writeHead(503, {
+        'content-type': 'text/plain; charset=utf-8',
+        'cache-control': 'no-store',
+        'retry-after': '60',
+      });
+      response.end('请先在光鸭设置页配置独立的 WebDAV 账号和密码');
+      return;
+    }
+    const authorization = await webdavAccessControl.authenticate(request);
+    if (!authorization.ok) return webdavAccessControl.reject(response, authorization);
+    if (url.pathname === '/dav' || url.pathname.startsWith('/dav/')) {
+      await handleWebDav(request, response, url);
+      return;
+    }
+    response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+    response.end('not found');
+  } catch (error) {
+    const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 400;
+    response.writeHead(statusCode, {
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-store',
+      ...(error.headers || {}),
+    });
+    response.end(error.message);
+  }
+});
+webdavServer.requestTimeout = Math.max(requestTimeoutMs, ossTimeoutMs);
+webdavServer.headersTimeout = Math.min(requestTimeoutMs, 15_000);
+webdavServer.listen(webdavPort, webdavHost, () => {
+  const displayHost = webdavHost.includes(':') ? `[${webdavHost}]` : webdavHost;
+  console.log(`Guangya WebDAV listening on http://${displayHost}:${webdavPort}/dav/, auth: ${webdavAccessControl.required() ? `enabled (${webdavUsername})` : 'not configured'}`);
+});
+
 server.listen(port, listenHost, async () => {
   const displayHost = listenHost.includes(':') ? `[${listenHost}]` : listenHost;
   console.log(`Guangya Web listening on http://${displayHost}:${port}, file roots: ${fileRoots.join(', ')}, uploads: ${uploadConcurrency}, multipart: ${multipartMode}, OSS timeout: ${ossTimeoutMs}ms, retries: ${ossRetryMax}, parallel: ${ossParallel}, cloud confirm timeout: ${cloudConfirmTimeoutMs}ms, admin auth: ${accessControl.required() ? `enabled (${adminUsername})` : 'disabled (loopback only)'}`);
@@ -2487,11 +2790,15 @@ server.listen(port, listenHost, async () => {
     const selfTestHeaders = adminPassword ? { authorization: `Basic ${Buffer.from(`${adminUsername}:${adminPassword}`).toString('base64')}` } : {};
     const response = await fetch(`http://127.0.0.1:${port}/api/state`, { headers: selfTestHeaders });
     console.log(`SELF_TEST ${response.status} ${await response.text()}`);
+    nativeMountManager.shutdown();
     await new Promise((resolve) => server.close(resolve));
+    await new Promise((resolve) => webdavServer.close(resolve));
     for (const watcher of watchers.values()) await watcher.close();
     process.exit(0);
   }
 });
+
+process.once('exit', () => nativeMountManager.shutdown());
 
 setInterval(() => {
   if (!refreshToken) return;

@@ -1,12 +1,12 @@
 # 光鸭文件夹同步 Ubuntu 原生服务
 
-此安装包自带 Node.js 24 Linux x64 运行时和生产依赖，不需要安装 Docker、Node.js 或 pnpm。支持使用 systemd 的 Ubuntu 20.04、22.04、24.04 x86_64。
+此安装包自带 Node.js 24、rclone Linux x64 运行时和生产依赖，不需要安装 Docker、Node.js 或 pnpm。支持使用 systemd 的 Ubuntu 20.04、22.04、24.04 x86_64；安装器会在缺少时通过 apt 安装 FUSE3。
 
 ## 安装
 
 ```bash
-tar -xzf guangya-sync-native-ubuntu-x64-0.1.15.tar.gz
-cd guangya-sync-native-ubuntu-x64-0.1.15
+tar -xzf guangya-sync-native-ubuntu-x64-0.1.16.tar.gz
+cd guangya-sync-native-ubuntu-x64-0.1.16
 sudo ./install.sh
 ```
 
@@ -35,6 +35,20 @@ GUANGYA_ARCHIVE_ROOT=/mnt/archive
 
 ```bash
 sudo guangya-sync restart
+```
+
+## 原生挂载
+
+网页“设置 → 挂载”支持由服务托管 rclone/FUSE 原生挂载。默认目标为：
+
+```text
+/var/lib/guangya-sync/mount
+```
+
+可在菜单中选择只读/读写、VFS 缓存、上传并行、读取并行和缓存空间上限。服务端只保存 WebDAV 密码哈希，每次服务重启后启动原生挂载都需要重新输入当前 WebDAV 挂载密码。修改默认目标可编辑：
+
+```bash
+GUANGYA_NATIVE_MOUNT_TARGET=/var/lib/guangya-sync/mount
 ```
 
 管理账号和监听地址也保存在同一配置文件中：
