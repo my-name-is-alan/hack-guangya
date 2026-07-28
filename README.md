@@ -1,6 +1,6 @@
 # 光鸭云盘工作台
 
-这是一个基于 Tauri 2 的 Windows 桌面端，同时提供 Docker Web 和 Ubuntu 原生 Web 服务。它使用光鸭云盘公开网站当前的 OAuth Device Code 和文件接口，重点解决官方客户端没有“监控文件夹自动备份”的问题。
+这是一个基于 Tauri 2 的 Windows/macOS 桌面端，同时提供 Docker Web 和 Ubuntu 原生 Web 服务。它使用光鸭云盘公开网站当前的 OAuth Device Code 和文件接口，重点解决官方客户端没有“监控文件夹自动备份”的问题。
 
 > [!IMPORTANT]
 > 这是非官方社区工具，与光鸭云盘官方没有隶属或授权关系。公开仓库只包含源码、测试和构建配置；登录令牌、Hdhive 密钥、SQLite 状态库、监控/归档目录、安装包及构建缓存均不提交。请从 `.env.example` 创建本地 `.env`，不要把真实凭据写入仓库。
@@ -31,6 +31,8 @@ pnpm tauri build
 ```
 
 安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.16_x64-setup.exe`
+
+macOS 的本机测试包和 Developer ID 正式发布包统一通过 `pnpm package:macos` 构建，详细的签名、公证和凭据环境变量说明见 [BUILD_MACOS.md](./BUILD_MACOS.md)。
 
 ## WebDAV 本地挂载
 
@@ -79,7 +81,7 @@ WebDAV 是在线文件系统，不是离线镜像。打开大文件时由系统 
 Docker Hub 镜像：[`94xhzy/guangya-sync`](https://hub.docker.com/r/94xhzy/guangya-sync)，推荐固定使用版本标签：
 
 ```bash
-docker pull 94xhzy/guangya-sync:0.1.15
+docker pull 94xhzy/guangya-sync:0.1.16
 ```
 
 先准备管理账号。用户名默认是 `admin`；请生成独立的强随机密码，复制 `.env.example` 为 `.env` 并填入 `GUANGYA_ADMIN_PASSWORD`：

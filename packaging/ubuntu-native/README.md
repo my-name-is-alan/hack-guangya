@@ -57,9 +57,16 @@ GUANGYA_NATIVE_MOUNT_TARGET=/var/lib/guangya-sync/mount
 HOST=0.0.0.0
 GUANGYA_ADMIN_USERNAME=admin
 GUANGYA_ADMIN_PASSWORD=安装时生成的强随机密码
+GUANGYA_TRUST_PROXY=false
+GUANGYA_HEADERS_TIMEOUT_MS=15000
+GUANGYA_REQUEST_TIMEOUT_MS=30000
 ```
 
 修改管理密码后需要重启服务。不要把 `/etc/guangya-sync.env` 的内容粘贴到日志或问题报告中。
+
+安装包同时携带 rclone 的 `COPYING` 许可证文件，位于 `/opt/guangya-sync/bin/rclone-COPYING.txt`。
+
+`GUANGYA_HEADERS_TIMEOUT_MS` 是接收完整 HTTP 请求头的总时限；`GUANGYA_REQUEST_TIMEOUT_MS` 是请求体的空闲时限，不是上传总时长。只有当直连服务端口已被阻断，且反向代理会清除/覆盖 `Forwarded` 与 `X-Forwarded-*` 头时，才能设置 `GUANGYA_TRUST_PROXY=true`。
 
 弱网环境下，OSS 分片默认等待 10 分钟并自动重试 3 次。可在 `/etc/guangya-sync.env` 调整：
 
@@ -98,7 +105,7 @@ sudo guangya-sync logs
 guangya-sync version
 ```
 
-升级时重新执行新版 `sudo ./install.sh`，已有 `/etc/guangya-sync.env` 和 `/var/lib/guangya-sync/data/state.sqlite3` 不会被覆盖；旧配置缺少监听地址、管理用户名或管理密码等安全项时，安装器会补齐。仅当管理密码缺失或为空时才会生成并显示新密码，已有密码绝不会输出。旧版配置若仍是 `GUANGYA_FILE_ROOTS=/`，升级会尊重这项现有配置；建议手动改为实际需要的目录白名单。
+升级时重新执行新版 `sudo ./install.sh`。安装器会先在 `/opt` 中准备完整的新版本，再停止旧服务、原子切换目录并显式重启；启动失败时会自动恢复原安装。已有 `/etc/guangya-sync.env` 和 `/var/lib/guangya-sync/data/state.sqlite3` 不会被覆盖。旧配置缺少监听地址、管理用户名或管理密码等安全项时，安装器会补齐。仅当管理密码缺失或为空时才会生成并显示新密码，已有密码绝不会输出。旧版配置若仍是 `GUANGYA_FILE_ROOTS=/`，升级会尊重这项现有配置；建议手动改为实际需要的目录白名单。
 
 卸载但保留配置和数据：
 

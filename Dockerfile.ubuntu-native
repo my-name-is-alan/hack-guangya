@@ -11,7 +11,19 @@ COPY src-tauri/icons/128x128.png ./src-tauri/icons/128x128.png
 COPY ui ./ui
 RUN pnpm ui:build
 
-FROM rclone/rclone:1.74.4 AS rclone-bin
+FROM alpine:3.22 AS rclone-bin
+ARG RCLONE_VERSION=1.74.4
+ARG TARGETARCH
+RUN set -eux; \
+    apk add --no-cache ca-certificates unzip wget; \
+    test "${TARGETARCH}" = amd64; \
+    archive="rclone-v${RCLONE_VERSION}-linux-amd64.zip"; \
+    expected=fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d; \
+    wget -q "https://downloads.rclone.org/v${RCLONE_VERSION}/${archive}" -O /tmp/rclone.zip; \
+    echo "${expected}  /tmp/rclone.zip" | sha256sum -c -; \
+    unzip -q /tmp/rclone.zip -d /tmp/rclone; \
+    install -m 0755 "/tmp/rclone/rclone-v${RCLONE_VERSION}-linux-amd64/rclone" /usr/local/bin/rclone; \
+    install -D -m 0644 "/tmp/rclone/rclone-v${RCLONE_VERSION}-linux-amd64/COPYING" /usr/local/share/licenses/rclone/COPYING
 
 FROM node:24-bookworm-slim AS package-build
 ARG VERSION
@@ -22,8 +34,10 @@ WORKDIR /build
 COPY packaging/ubuntu-native/runtime-package.json ./package.json
 RUN npm install --omit=dev --ignore-scripts
 COPY server ./server
+COPY ui/shareLink.js ./ui/shareLink.js
 COPY --from=ui-build /app/dist ./dist
 COPY --from=rclone-bin /usr/local/bin/rclone /build/rclone
+COPY --from=rclone-bin /usr/local/share/licenses/rclone/COPYING /build/rclone-COPYING.txt
 COPY packaging/ubuntu-native /packaging
 RUN set -eux; \
     bundle="guangya-sync-native-ubuntu-x64-${VERSION}"; \
@@ -31,15 +45,19 @@ RUN set -eux; \
     mkdir -p "${root}/app/node/bin" "${root}/app/bin" /release; \
     cp /usr/local/bin/node "${root}/app/node/bin/node"; \
     cp /build/rclone "${root}/app/bin/rclone"; \
+    cp /build/rclone-COPYING.txt "${root}/app/bin/rclone-COPYING.txt"; \
     if [ -f /usr/local/LICENSE ]; then cp /usr/local/LICENSE "${root}/app/node/LICENSE"; fi; \
     cp -a /build/node_modules "${root}/app/node_modules"; \
     cp -a /build/server "${root}/app/server"; \
+    cp -a /build/ui "${root}/app/ui"; \
     cp -a /build/dist "${root}/app/dist"; \
+    test -f "${root}/app/ui/shareLink.js"; \
     cp /packaging/install.sh /packaging/uninstall.sh /packaging/guangya-syncctl "${root}/"; \
     cp /packaging/guangya-sync.service /packaging/guangya-sync.env "${root}/"; \
     cp /packaging/README.md "${root}/README.md"; \
     printf '%s\n' "${VERSION}" > "${root}/app/VERSION"; \
     chmod 0755 "${root}/install.sh" "${root}/uninstall.sh" "${root}/guangya-syncctl" "${root}/app/node/bin/node" "${root}/app/bin/rclone"; \
+    chmod 0644 "${root}/app/bin/rclone-COPYING.txt"; \
     tar -czf "/release/${bundle}.tar.gz" -C /bundle "${bundle}"; \
     cd /release; \
     sha256sum "${bundle}.tar.gz" > "${bundle}.tar.gz.sha256"

@@ -26,7 +26,7 @@ function run(command, args, options = {}) {
   if (result.status !== 0) throw new Error(`${command} 执行失败，退出码 ${result.status}`);
 }
 
-run('docker', ['build', '-f', 'Dockerfile.ubuntu-native', '--build-arg', `VERSION=${metadata.version}`, '-t', imageTag, '.']);
+run('docker', ['build', '--platform', 'linux/amd64', '-f', 'Dockerfile.ubuntu-native', '--build-arg', `VERSION=${metadata.version}`, '-t', imageTag, '.']);
 try {
   run('docker', ['create', '--name', containerName, imageTag, '/package-export']);
   run('docker', ['cp', `${containerName}:/${archiveName}`, path.join(releaseDir, archiveName)]);

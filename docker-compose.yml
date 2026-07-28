@@ -1,9 +1,10 @@
 services:
   guangya-sync:
-    image: ${GUANGYA_IMAGE:-94xhzy/guangya-sync:0.1.15}
+    image: ${GUANGYA_IMAGE:-94xhzy/guangya-sync:0.1.16}
     pull_policy: always
     container_name: guangya-sync
     restart: unless-stopped
+    stop_grace_period: 60s
     ports:
       - "${GUANGYA_HTTP_PORT:-8080}:8080"
       - "127.0.0.1:${GUANGYA_WEBDAV_PORT:-19090}:19090"
@@ -19,6 +20,9 @@ services:
       DATA_DIR: /data
       GUANGYA_ADMIN_USERNAME: ${GUANGYA_ADMIN_USERNAME:-admin}
       GUANGYA_ADMIN_PASSWORD: ${GUANGYA_ADMIN_PASSWORD:?请先在 .env 中设置强随机管理密码}
+      GUANGYA_TRUST_PROXY: ${GUANGYA_TRUST_PROXY:-false}
+      GUANGYA_HEADERS_TIMEOUT_MS: ${GUANGYA_HEADERS_TIMEOUT_MS:-15000}
+      GUANGYA_REQUEST_TIMEOUT_MS: ${GUANGYA_REQUEST_TIMEOUT_MS:-30000}
       GUANGYA_WATCH_ROOT: /watch
       GUANGYA_ARCHIVE_ROOT: /archive
       GUANGYA_FILE_ROOTS: /watch,/archive

@@ -26,6 +26,35 @@ STATE_DIR=/var/lib/guangya-sync
 SERVICE_USER=guangya-sync
 SERVICE_GROUP=guangya-sync
 ENV_FILE=/etc/guangya-sync.env
+STAGING_DIR=
+BACKUP_DIR=
+OLD_INSTALL_MOVED=0
+NEW_INSTALL_MOVED=0
+SERVICE_WAS_ACTIVE=0
+INSTALL_COMMITTED=0
+
+rollback_install() {
+  local exit_code=$?
+  if [ "$INSTALL_COMMITTED" -ne 1 ]; then
+    if [ "$NEW_INSTALL_MOVED" -eq 1 ]; then
+      systemctl stop guangya-sync.service >/dev/null 2>&1 || true
+      rm -rf "$INSTALL_DIR"
+    fi
+    if [ "$OLD_INSTALL_MOVED" -eq 1 ] && [ -d "$BACKUP_DIR" ]; then
+      mv "$BACKUP_DIR" "$INSTALL_DIR"
+    fi
+    if [ "$SERVICE_WAS_ACTIVE" -eq 1 ] && [ -d "$INSTALL_DIR" ]; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl start guangya-sync.service >/dev/null 2>&1 || true
+    fi
+  fi
+  if [ -n "$STAGING_DIR" ] && [ -d "$STAGING_DIR" ]; then
+    rm -rf "$STAGING_DIR"
+  fi
+  return "$exit_code"
+}
+
+trap rollback_install EXIT
 
 append_env_default() {
   local key="$1"
@@ -42,10 +71,14 @@ if ! id "$SERVICE_USER" >/dev/null 2>&1; then
   useradd --system --gid "$SERVICE_GROUP" --home-dir "$STATE_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
 fi
 
-install -d -m 0755 "$INSTALL_DIR"
-cp -a "$SOURCE_DIR/app/." "$INSTALL_DIR/"
-chown -R root:root "$INSTALL_DIR"
-chmod 0755 "$INSTALL_DIR/node/bin/node" "$INSTALL_DIR/bin/rclone"
+# Build the complete replacement beside the live installation. The final
+# rename happens only after the old service has stopped, so old server code can
+# never run against newly copied dist assets.
+STAGING_DIR="$(mktemp -d /opt/.guangya-sync.install.XXXXXX)"
+BACKUP_DIR="${STAGING_DIR}.previous"
+cp -a "$SOURCE_DIR/app/." "$STAGING_DIR/"
+chown -R root:root "$STAGING_DIR"
+chmod 0755 "$STAGING_DIR/node/bin/node" "$STAGING_DIR/bin/rclone"
 
 install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 \
   "$STATE_DIR" "$STATE_DIR/data" "$STATE_DIR/watch" "$STATE_DIR/archive" "$STATE_DIR/mount"
@@ -61,6 +94,9 @@ chmod 0600 "$ENV_FILE"
 
 append_env_default HOST 0.0.0.0
 append_env_default GUANGYA_ADMIN_USERNAME admin
+append_env_default GUANGYA_TRUST_PROXY false
+append_env_default GUANGYA_HEADERS_TIMEOUT_MS 15000
+append_env_default GUANGYA_REQUEST_TIMEOUT_MS 30000
 append_env_default GUANGYA_WATCH_ROOT /var/lib/guangya-sync/watch
 append_env_default GUANGYA_ARCHIVE_ROOT /var/lib/guangya-sync/archive
 append_env_default GUANGYA_FILE_ROOTS /var/lib/guangya-sync/watch,/var/lib/guangya-sync/archive
@@ -94,13 +130,33 @@ install -o root -g root -m 0644 "$SOURCE_DIR/guangya-sync.service" /etc/systemd/
 install -o root -g root -m 0755 "$SOURCE_DIR/guangya-syncctl" /usr/local/bin/guangya-sync
 
 systemctl daemon-reload
-systemctl enable --now guangya-sync.service
+if systemctl is-active --quiet guangya-sync.service; then
+  SERVICE_WAS_ACTIVE=1
+fi
+systemctl stop guangya-sync.service
+if [ -d "$INSTALL_DIR" ]; then
+  mv "$INSTALL_DIR" "$BACKUP_DIR"
+  OLD_INSTALL_MOVED=1
+fi
+mv "$STAGING_DIR" "$INSTALL_DIR"
+NEW_INSTALL_MOVED=1
+systemctl enable guangya-sync.service
+if ! systemctl restart guangya-sync.service; then
+  journalctl -u guangya-sync.service -n 60 --no-pager >&2 || true
+  exit 1
+fi
 sleep 1
 
 if ! systemctl is-active --quiet guangya-sync.service; then
   journalctl -u guangya-sync.service -n 60 --no-pager >&2 || true
   exit 1
 fi
+
+if [ "$OLD_INSTALL_MOVED" -eq 1 ]; then
+  rm -rf "$BACKUP_DIR"
+fi
+INSTALL_COMMITTED=1
+trap - EXIT
 
 echo "安装完成。"
 echo "访问地址：http://服务器IP:8080"

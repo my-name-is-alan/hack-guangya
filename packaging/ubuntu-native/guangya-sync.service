@@ -12,8 +12,11 @@ EnvironmentFile=/etc/guangya-sync.env
 ExecStart=/opt/guangya-sync/node/bin/node /opt/guangya-sync/server/server.mjs
 Restart=on-failure
 RestartSec=3
-TimeoutStopSec=20
+TimeoutStopSec=60
 KillSignal=SIGTERM
+# Ubuntu FUSE3 relies on the setuid-root fusermount3 helper for an unprivileged
+# service user. Enabling NoNewPrivileges would make native mounts fail.
+NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
 LimitNOFILE=65535

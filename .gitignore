@@ -38,6 +38,8 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+__pycache__/
+*.py[cod]
 
 # Local design source; the exported PNG is tracked instead.
 /logo.psd

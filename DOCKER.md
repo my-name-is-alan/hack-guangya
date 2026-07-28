@@ -1,6 +1,6 @@
 # Docker Web 部署配置
 
-本文档适用于 Docker Hub 镜像 `94xhzy/guangya-sync:0.1.15`。容器提供光鸭云盘 Web 管理界面、服务器目录监控、断点续传、自动分享与 HDHive 投稿。
+本文档适用于 Docker Hub 镜像 `94xhzy/guangya-sync:0.1.16`。容器提供光鸭云盘 Web 管理界面、服务器目录监控、断点续传、自动分享与 HDHive 投稿。
 
 ## 1. 准备目录和配置
 
@@ -23,13 +23,16 @@ openssl rand -hex 24
 把结果写入 `.env`：
 
 ```dotenv
-GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.15
+GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.16
 GUANGYA_HTTP_PORT=8080
 GUANGYA_ADMIN_USERNAME=admin
 GUANGYA_ADMIN_PASSWORD=替换为上面生成的强随机密码
 GUANGYA_WEBDAV_PORT=19090
 GUANGYA_WEBDAV_USERNAME=guangya
 GUANGYA_WEBDAV_PASSWORD=
+GUANGYA_TRUST_PROXY=false
+GUANGYA_HEADERS_TIMEOUT_MS=15000
+GUANGYA_REQUEST_TIMEOUT_MS=30000
 ```
 
 `GUANGYA_ADMIN_PASSWORD` 为空时 Compose 会拒绝启动。`.env` 包含敏感信息，不要提交到 Git，也不要发到聊天或工单。
@@ -193,12 +196,17 @@ GUANGYA_CLOUD_CONFIRM_TIMEOUT_MS=600000
 GUANGYA_CLOUD_CONFIRM_POLL_MS=1000
 GUANGYA_FILE_STABILITY_MS=1200
 GUANGYA_FILE_BUSY_RETRY_MS=3000
+GUANGYA_HEADERS_TIMEOUT_MS=15000
+GUANGYA_REQUEST_TIMEOUT_MS=30000
 ```
 
 - 上传、下载并发范围为 `1–8`，也能在网页设置中修改。
 - `GUANGYA_FILE_STABILITY_MS` 控制文件停止变化多久后开始上传。
 - 文件被其他程序占用时，会按 `GUANGYA_FILE_BUSY_RETRY_MS` 重试。
 - OSS 分片断点保存在 `/data`；容器重启后会继续未完成的上传。
+- `GUANGYA_HEADERS_TIMEOUT_MS` 是接收完整 HTTP 请求头的总时限，默认 15 秒。
+- `GUANGYA_REQUEST_TIMEOUT_MS` 是请求体接收期间的空闲时限，不是大文件上传的总时长；持续有数据到达时可长时间上传。
+- Compose 会为停止和升级预留 60 秒，让原生挂载先卸载并完成 VFS 写回；不要把 `stop_grace_period` 调低到应用内部的 45 秒退出预算以下。
 
 ## 7. 升级、固定版本与回滚
 
@@ -213,13 +221,13 @@ docker compose logs --tail=100 guangya-sync
 生产环境建议固定版本标签或不可变摘要：
 
 ```dotenv
-GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.15
+GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.16
 ```
 
-当前 `0.1.15`/`latest` 发布摘要：
+当前 `0.1.16`/`latest` 发布摘要（发布后将下面占位值替换为实际摘要）：
 
 ```dotenv
-GUANGYA_IMAGE=94xhzy/guangya-sync@sha256:aa5e855d3c2800095335a73bad03dcdb07c32cc355b1a192852da228131d741a
+GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.16
 ```
 
 回滚时把 `GUANGYA_IMAGE` 改回已验证的旧标签或摘要，再执行：
@@ -260,13 +268,14 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Forwarded "";
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_buffering off;
     }
 }
 ```
 
-同时用防火墙限制宿主机 `8080` 端口只允许本机或可信内网访问。
+同时用防火墙限制宿主机 `8080` 端口只允许代理访问。确认客户端无法绕过代理直连服务，且代理像上面示例一样清除 `Forwarded`、覆盖 `X-Forwarded-For`/`X-Forwarded-Proto` 后，才可在 `.env` 设置 `GUANGYA_TRUST_PROXY=true`。默认必须保持 `false`，否则客户端可伪造转发头，影响限流 IP 和 Secure Cookie 判定。
 
 ## 10. 常用命令
 
@@ -276,5 +285,5 @@ docker compose logs -f guangya-sync
 docker compose restart guangya-sync
 docker compose down
 docker compose pull
-docker image inspect 94xhzy/guangya-sync:0.1.15
+docker image inspect 94xhzy/guangya-sync:0.1.16
 ```

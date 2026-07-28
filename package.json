@@ -17,6 +17,9 @@
     "ui:build": "vite build",
     "ui:test": "node --test ui/*.test.js",
     "server:test": "node --test server/*.test.mjs",
+    "release:test": "node --test scripts/*.test.mjs",
+    "check": "pnpm ui:test && pnpm server:test && pnpm release:test && pnpm exec vue-tsc --noEmit && cargo test --manifest-path src-tauri/Cargo.toml",
+    "package:macos": "bash scripts/package-macos.sh",
     "package:ubuntu": "node scripts/package-ubuntu-native.mjs",
     "web": "node server/server.mjs"
   },
