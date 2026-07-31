@@ -16,7 +16,13 @@ import {
   NATIVE_MOUNT_STOP_TIMEOUT_MS,
   normalizeNativeMountOptions,
 } from './native-mount.mjs';
-import { uploadPartSize } from './upload-parts.mjs';
+import {
+  createOssPartConcurrencyLimiter,
+  createUploadCheckpointSaver,
+  createUploadSpeedTracker,
+  multipartCheckpointHasAllParts,
+  uploadPartSize,
+} from './upload-parts.mjs';
 import { createWebDavHandler, normalizeWebDavEntry, WebDavError } from './webdav.mjs';
 import { parseGuangyaShareLink } from '../ui/shareLink.js';
 
@@ -88,7 +94,8 @@ const oauthClientId = 'aMe-8VSlkrbQXpUR';
 function envInteger(name, fallback, minimum, maximum) { const parsed = Number(process.env[name]); return Number.isFinite(parsed) ? Math.max(minimum, Math.min(maximum, Math.round(parsed))) : fallback; }
 const ossTimeoutMs = envInteger('GUANGYA_OSS_TIMEOUT_MS', 600_000, 120_000, 3_600_000);
 const ossRetryMax = envInteger('GUANGYA_OSS_RETRY_MAX', 3, 0, 10);
-const ossParallel = envInteger('GUANGYA_OSS_PARALLEL', 3, 1, 8);
+const defaultOssPartConcurrency = envInteger('GUANGYA_OSS_PARALLEL', 3, 1, 8);
+const ossPartConcurrencyLimiter = createOssPartConcurrencyLimiter();
 const defaultUploadConcurrency = envInteger('GUANGYA_UPLOAD_CONCURRENCY', 2, 1, 8);
 const defaultDownloadConcurrency = envInteger('GUANGYA_DOWNLOAD_CONCURRENCY', 2, 1, 8);
 const defaultMonitorMode = String(process.env.GUANGYA_DEFAULT_MONITOR_MODE || 'native').toLowerCase() === 'polling' ? 'polling' : 'native';
@@ -307,6 +314,7 @@ function storedConcurrency(key, fallback) {
 const multipartModes = new Set(['auto', '4m', '8m', '16m']);
 let uploadConcurrency = storedConcurrency('transfer_upload_concurrency', defaultUploadConcurrency);
 let downloadConcurrency = storedConcurrency('transfer_download_concurrency', defaultDownloadConcurrency);
+let ossPartConcurrency = storedConcurrency('transfer_oss_part_concurrency', defaultOssPartConcurrency);
 let multipartMode = String(appStateValue('transfer_multipart') || 'auto').toLowerCase();
 if (!multipartModes.has(multipartMode)) multipartMode = 'auto';
 let cacheEnabled = appStateValue('cache_enabled') !== 'false';
@@ -320,6 +328,7 @@ let hdhiveEnabled = appStateValue('hdhive_enabled') !== 'false';
 let hdhiveGeneration = 0;
 saveAppStateValue('transfer_upload_concurrency', uploadConcurrency);
 saveAppStateValue('transfer_download_concurrency', downloadConcurrency);
+saveAppStateValue('transfer_oss_part_concurrency', ossPartConcurrency);
 saveAppStateValue('transfer_multipart', multipartMode);
 saveAppStateValue('cache_enabled', cacheEnabled);
 saveAppStateValue('cache_max_entries', cacheMaxEntries);
@@ -333,6 +342,7 @@ const queue = new Map();
 const flashPreflightCache = new Map();
 const history = new Map(database.prepare("SELECT mapping_id, file_path, size, modified_ms FROM uploaded_files WHERE status = 'cloud_confirmed'").all().map((row) => [`${row.mapping_id}::${path.resolve(row.file_path)}`, `${row.size}:${row.modified_ms}`]));
 const pendingUploads = new Map(database.prepare("SELECT mapping_id, file_path, size, modified_ms, task_id, item_json, remote_parent_id, remote_dir, relative_path FROM uploaded_files WHERE status = 'oss_complete'").all().map((row) => [`${row.mapping_id}::${path.resolve(row.file_path)}`, row]));
+const pendingUploadReservations = new Set();
 const inflight = new Map();
 const inflightItems = new Map();
 const waitingFiles = new Map();
@@ -352,7 +362,10 @@ const smsChallenges = new Map();
 let paused = false;
 let active = 0;
 let activeFlashPreflights = 0;
+let activeOssUploads = 0;
+const ossIdleWaiters = new Set();
 const flashPreflightConcurrency = 1;
+const pendingRecoveryConcurrency = 4;
 const flashPreflightTokenMaxAgeMs = 10 * 60 * 1000;
 const fileStabilityMs = Math.max(200, Number(process.env.GUANGYA_FILE_STABILITY_MS || 1200));
 const fileBusyRetryMs = Math.max(500, Number(process.env.GUANGYA_FILE_BUSY_RETRY_MS || 3000));
@@ -426,6 +439,7 @@ function transferSettings() {
   return {
     upload_concurrency: uploadConcurrency,
     download_concurrency: downloadConcurrency,
+    oss_part_concurrency: ossPartConcurrency,
     multipart: multipartMode,
     multipart_part_size: multipartMode,
   };
@@ -450,16 +464,26 @@ function validateConcurrency(value, label) {
   return parsed;
 }
 function updateTransferSettings(body) {
-  if (Object.hasOwn(body, 'upload_concurrency')) uploadConcurrency = validateConcurrency(body.upload_concurrency, '上传并发数');
-  if (Object.hasOwn(body, 'download_concurrency')) downloadConcurrency = validateConcurrency(body.download_concurrency, '下载并发数');
+  const nextUploadConcurrency = Object.hasOwn(body, 'upload_concurrency')
+    ? validateConcurrency(body.upload_concurrency, '上传并发数') : uploadConcurrency;
+  const nextDownloadConcurrency = Object.hasOwn(body, 'download_concurrency')
+    ? validateConcurrency(body.download_concurrency, '下载并发数') : downloadConcurrency;
+  const nextOssPartConcurrency = Object.hasOwn(body, 'oss_part_concurrency')
+    ? validateConcurrency(body.oss_part_concurrency, 'OSS 分片并发数') : ossPartConcurrency;
+  let nextMultipartMode = multipartMode;
   const requestedMultipart = body.multipart ?? body.multipart_mode ?? body.multipart_part_size;
   if (requestedMultipart != null) {
     const normalized = String(requestedMultipart).toLowerCase();
     if (!multipartModes.has(normalized)) throw new Error('分片设置必须是 auto、4m、8m 或 16m');
-    multipartMode = normalized;
+    nextMultipartMode = normalized;
   }
+  uploadConcurrency = nextUploadConcurrency;
+  downloadConcurrency = nextDownloadConcurrency;
+  ossPartConcurrency = nextOssPartConcurrency;
+  multipartMode = nextMultipartMode;
   saveAppStateValue('transfer_upload_concurrency', uploadConcurrency);
   saveAppStateValue('transfer_download_concurrency', downloadConcurrency);
+  saveAppStateValue('transfer_oss_part_concurrency', ossPartConcurrency);
   saveAppStateValue('transfer_multipart', multipartMode);
   publishState();
   pump();
@@ -534,7 +558,7 @@ function clearManagedCaches() {
   remoteCache.set('', '');
   return cacheState();
 }
-function state() { return { logged_in: Boolean(token), paused, pending: queue.size + waitingFiles.size + pendingUploads.size, active_uploads: active, upload_concurrency: uploadConcurrency, download_concurrency: downloadConcurrency, multipart: multipartMode, multipart_part_size: multipartMode, mappings, saved_shares: savedShares, hdhive: { enabled: hdhiveEnabled, configured: Boolean(hdhiveBaseUrl && hdhiveSecret), base_url: hdhiveBaseUrl, instance_id: hdhiveInstanceId }, auto_share_receipts: autoShareReceipts() }; }
+function state() { return { logged_in: Boolean(token), paused, pending: queue.size + waitingFiles.size + pendingUploads.size, active_uploads: active, upload_concurrency: uploadConcurrency, download_concurrency: downloadConcurrency, oss_part_concurrency: ossPartConcurrency, multipart: multipartMode, multipart_part_size: multipartMode, mappings, saved_shares: savedShares, hdhive: { enabled: hdhiveEnabled, configured: Boolean(hdhiveBaseUrl && hdhiveSecret), base_url: hdhiveBaseUrl, instance_id: hdhiveInstanceId }, auto_share_receipts: autoShareReceipts() }; }
 function publish(payload) { const line = `data: ${JSON.stringify(payload)}\n\n`; for (const response of clients) response.write(line); }
 function publishState() { publish({ type: 'state', state: state() }); }
 function status(level, message) { publish({ type: 'status', level, message }); }
@@ -621,6 +645,13 @@ function clearUploadCheckpoint(item) {
   database.prepare('DELETE FROM upload_checkpoints WHERE mapping_id = ? AND file_path = ?')
     .run(...uploadCheckpointIdentity(item));
 }
+function clearCompletedUploadCheckpoint(item) {
+  try {
+    clearUploadCheckpoint(item);
+  } catch (error) {
+    status('warning', `文件已完成 OSS 上传，但清理本地上传断点失败：${error.message}`);
+  }
+}
 function loadUploadCheckpoint(item) {
   const [mappingId, filePath] = uploadCheckpointIdentity(item);
   const row = database.prepare('SELECT * FROM upload_checkpoints WHERE mapping_id = ? AND file_path = ?')
@@ -704,6 +735,17 @@ function restoreUploadCheckpoints() {
         continue;
       }
       const key = queueKey(item.mapping_id, uploadHistoryPath(item));
+      const pending = pendingUploads.get(key);
+      const checkpointStamp = `${row.size}:${row.modified_ms}`;
+      const alreadyRecorded = history.get(key) === checkpointStamp
+        || (pending
+          && Number(pending.size) === Number(row.size)
+          && String(pending.modified_ms) === String(row.modified_ms));
+      if (alreadyRecorded) {
+        database.prepare('DELETE FROM upload_checkpoints WHERE mapping_id = ? AND file_path = ?')
+          .run(row.mapping_id, row.file_path);
+        continue;
+      }
       if (!queue.has(key) && !pendingUploads.has(key) && !history.has(key)) queue.set(key, item);
     } catch {
       // 源文件已不存在时保留 OSS 端分片到服务端自然过期，本地不再排队。
@@ -725,6 +767,12 @@ function confirmPendingUploadRecord(key, taskId, remoteFileId) {
   if (Number(result.changes || 0) !== 1) return null;
   pendingUploads.delete(key);
   history.set(key, `${row.size}:${row.modified_ms}`);
+  try {
+    database.prepare('DELETE FROM upload_checkpoints WHERE mapping_id = ? AND file_path = ?')
+      .run(row.mapping_id, row.file_path);
+  } catch (error) {
+    status('warning', `文件已确认入库，但再次清理本地上传断点失败：${error.message}`);
+  }
   return row;
 }
 function clearPendingUpload(key) {
@@ -1618,19 +1666,22 @@ function isCloudIndexPendingMessage(message) { return /文件上传中|上传处
 function isExplicitPermanentCloudTaskFailure(error) {
   return error?.retryable === false && (Number.isFinite(error?.apiCode) || Number.isFinite(error?.httpStatus));
 }
+async function checkTask(taskId) {
+  try {
+    const response = await apiPost('/userres/v1/file/get_info_by_task_id', { taskId }, [145, 146, 155, 163]);
+    return response.data?.fileId ? response.data : null;
+  } catch (error) {
+    if (isCloudIndexPendingMessage(error.message)) return null;
+    if (isExplicitPermanentCloudTaskFailure(error)) error.permanentCloudTaskFailure = true;
+    throw error;
+  }
+}
 async function waitTask(taskId, eventPath) {
   const deadline = Date.now() + cloudConfirmTimeoutMs;
   let attempt = 0;
   while (Date.now() < deadline) {
-    try {
-      const response = await apiPost('/userres/v1/file/get_info_by_task_id', { taskId }, [145, 146, 155, 163]);
-      if (response.data?.fileId) return response.data;
-    } catch (error) {
-      if (!isCloudIndexPendingMessage(error.message)) {
-        if (isExplicitPermanentCloudTaskFailure(error)) error.permanentCloudTaskFailure = true;
-        throw error;
-      }
-    }
+    const data = await checkTask(taskId);
+    if (data) return data;
     attempt += 1;
     publish({ type: 'progress', file_path: eventPath, percent: 100, bytes_per_second: 0, stage: '文件已上传，云端正在入库' });
     const delayMs = Math.min(cloudConfirmPollMs * Math.max(1, Math.ceil(attempt / 5)), 5_000, Math.max(0, deadline - Date.now()));
@@ -1648,7 +1699,20 @@ async function calculateFileHash(filePath, algorithm) {
   for await (const chunk of stream) hash.update(chunk);
   return hash.digest('hex');
 }
-async function calculateFileGcid(filePath, size, modifiedMs, eventPath) {
+async function waitForOssIdle() {
+  while (activeOssUploads > 0) {
+    await new Promise((resolve) => ossIdleWaiters.add(resolve));
+  }
+}
+function beginOssUpload() { activeOssUploads += 1; }
+function endOssUpload() {
+  activeOssUploads = Math.max(0, activeOssUploads - 1);
+  if (activeOssUploads > 0) return;
+  const waiters = [...ossIdleWaiters];
+  ossIdleWaiters.clear();
+  for (const resolve of waiters) resolve();
+}
+async function calculateFileGcid(filePath, size, modifiedMs, eventPath, { yieldToOss = false } = {}) {
   const resolvedPath = path.resolve(filePath);
   const modified = String(modifiedMs);
   const cached = cacheEnabled
@@ -1664,14 +1728,23 @@ async function calculateFileGcid(filePath, size, modifiedMs, eventPath) {
   const buffer = Buffer.allocUnsafe(chunkSize);
   const outer = crypto.createHash('sha1');
   let position = 0;
+  let lastProgressAt = 0;
+  let lastProgressPercent = -1;
   try {
     while (position < size) {
+      if (yieldToOss) await waitForOssIdle();
       const length = Math.min(chunkSize, size - position);
       const { bytesRead } = await handle.read(buffer, 0, length, position);
       if (!bytesRead) break;
       outer.update(crypto.createHash('sha1').update(buffer.subarray(0, bytesRead)).digest());
       position += bytesRead;
-      publish({ type: 'progress', file_path: eventPath, percent: 0, bytes_per_second: 0, stage: `正在计算秒传指纹 ${size ? Math.floor(position * 100 / size) : 100}%` });
+      const progressPercent = size ? Math.floor(position * 100 / size) : 100;
+      const progressAt = Date.now();
+      if (progressPercent >= 100 || progressPercent >= lastProgressPercent + 1 || progressAt - lastProgressAt >= 250) {
+        publish({ type: 'progress', file_path: eventPath, percent: 0, bytes_per_second: 0, stage: `正在计算秒传指纹 ${progressPercent}%` });
+        lastProgressAt = progressAt;
+        lastProgressPercent = progressPercent;
+      }
     }
   } finally {
     await handle.close();
@@ -1776,7 +1849,7 @@ async function preflightFlashUpload(item) {
   let instantUpload = response.code === 156;
   if (!instantUpload && stat.size >= 1024 * 1024) {
     try {
-      const gcid = await calculateFileGcid(item.file_path, stat.size, stat.mtimeMs, eventPath);
+      const gcid = await calculateFileGcid(item.file_path, stat.size, stat.mtimeMs, eventPath, { yieldToOss: true });
       const flash = await apiPost('/userres/v1/check_can_flash_upload', { taskId, gcid });
       instantUpload = flash.data?.canFlashUpload === true;
       if (instantUpload && flash.data?.taskId) taskId = String(flash.data.taskId);
@@ -1786,14 +1859,14 @@ async function preflightFlashUpload(item) {
   }
   if (!instantUpload) return { kind: 'miss', data };
 
-  clearUploadCheckpoint(item);
-  publish({ type: 'progress', file_path: eventPath, percent: 100, uploaded_bytes: stat.size, total_bytes: stat.size, bytes_per_second: 0, stage: '已命中秒传' });
   if (item.mapping_id) savePendingUploadRecord(item, { taskId, remoteFileId: null });
+  clearCompletedUploadCheckpoint(item);
+  publish({ type: 'progress', file_path: eventPath, percent: 100, uploaded_bytes: stat.size, total_bytes: stat.size, bytes_per_second: 0, stage: '已命中秒传' });
   publish({ type: 'file', state: 'processing', file_path: eventPath, uploaded_bytes: stat.size, total_bytes: stat.size, stage: '已秒传，正在等待云端入库' });
   schedulePendingUploadRecovery(0);
   return { kind: 'accepted' };
 }
-async function upload(item) {
+async function upload(item, { waitForCloud = false } = {}) {
   const source = await validateWatchedSource(item);
   item.file_path = source.absolute;
   const stat = source.stat;
@@ -1864,10 +1937,15 @@ async function upload(item) {
       : undefined;
     const uploadedAtStart = Math.max(0, Number(checkpoint?.uploadedBytes || 0));
     let lastUploadedBytes = uploadedAtStart;
+    let hasPersistedMultipartCheckpoint = Boolean(checkpoint?.checkpoint);
+    const checkpointSaver = createUploadCheckpointSaver(({ params, checkpoint: nextCheckpoint, uploadedBytes }) => {
+      saveUploadCheckpoint(item, params, nextCheckpoint, uploadedBytes);
+      hasPersistedMultipartCheckpoint = true;
+    }, { initialUploadedBytes: uploadedAtStart });
     publish({ type: 'file', state: 'uploading', file_path: eventPath, uploaded_bytes: uploadedAtStart, total_bytes: stat.size });
     publish({ type: 'progress', file_path: eventPath, percent: stat.size ? Math.round(uploadedAtStart * 100 / stat.size) : 0, uploaded_bytes: uploadedAtStart, total_bytes: stat.size, stage: checkpoint ? '正在从断点继续上传' : '正在连接 OSS' });
-    const uploadStartedAt = Date.now();
     for (let attempt = 0; ; attempt += 1) {
+      const selectedPartSize = uploadPartSize(stat.size, multipartMode);
       const client = new OSS({
         region: currentParams.region,
         accessKeyId: currentParams.creds.accessKeyID,
@@ -1883,60 +1961,90 @@ async function upload(item) {
           return true;
         },
       });
+      const ossPartLease = await ossPartConcurrencyLimiter.acquire(ossPartConcurrency);
+      const completedPartCount = Array.isArray(multipartCheckpoint?.doneParts)
+        ? multipartCheckpoint.doneParts.length
+        : 0;
+      const pendingPartCount = Math.max(1, Math.ceil(stat.size / selectedPartSize) - completedPartCount);
+      const speedTracker = createUploadSpeedTracker({
+        initialUploadedBytes: lastUploadedBytes,
+        minimumGrowthSamples: Math.min(ossPartLease.parallel, pendingPartCount),
+      });
+      let multipartError = null;
+      beginOssUpload();
       try {
         await client.multipartUpload(currentParams.objectPath, item.file_path, {
           checkpoint: multipartCheckpoint,
-          partSize: uploadPartSize(stat.size, multipartMode),
-          parallel: ossParallel,
+          partSize: selectedPartSize,
+          parallel: ossPartLease.parallel,
           timeout: ossTimeoutMs,
           progress: (fraction, nextCheckpoint) => {
             const normalized = Math.max(0, Math.min(1, Number(fraction) || 0));
             const uploadedBytes = Math.round(normalized * stat.size);
             lastUploadedBytes = Math.max(lastUploadedBytes, uploadedBytes);
-            const elapsedSeconds = Math.max((Date.now() - uploadStartedAt) / 1000, 0.001);
-            const transferredThisRun = Math.max(0, uploadedBytes - uploadedAtStart);
             if (nextCheckpoint) {
               multipartCheckpoint = { ...nextCheckpoint, file: item.file_path };
-              saveUploadCheckpoint(item, currentParams, nextCheckpoint, uploadedBytes);
+              const allPartsConfirmed = multipartCheckpointHasAllParts(nextCheckpoint, stat.size, selectedPartSize);
+              if (allPartsConfirmed) lastUploadedBytes = stat.size;
+              checkpointSaver.stage({
+                params: currentParams,
+                checkpoint: nextCheckpoint,
+                uploadedBytes: lastUploadedBytes,
+              }, { force: !hasPersistedMultipartCheckpoint || allPartsConfirmed });
             }
-            publish({ type: 'progress', file_path: eventPath, percent: Math.round(normalized * 100), uploaded_bytes: uploadedBytes, total_bytes: stat.size, bytes_per_second: transferredThisRun / elapsedSeconds, stage: checkpoint ? '正在断点续传' : '正在上传' });
+            const speed = speedTracker.update(lastUploadedBytes);
+            publish({ type: 'progress', file_path: eventPath, percent: Math.round(normalized * 100), uploaded_bytes: uploadedBytes, total_bytes: stat.size, bytes_per_second: speed.bytesPerSecond, average_bytes_per_second: speed.averageBytesPerSecond, stage: checkpoint ? '正在断点续传' : '正在上传' });
           },
         });
-        break;
+        checkpointSaver.flush();
       } catch (error) {
-        if (error.code === 'SecurityTokenExpired') {
-          const resumed = await resumeUploadParams(currentParams, stat.size);
-          currentParams = resumed.params;
-          taskId = currentParams.taskId || taskId;
-          if (multipartCheckpoint) saveUploadCheckpoint(item, currentParams, multipartCheckpoint, lastUploadedBytes);
-          continue;
-        }
-        if (attempt < ossRetryMax) {
-          await new Promise((resolve) => setTimeout(resolve, Math.min(2_000 * (attempt + 1), 10_000)));
-          continue;
-        }
-        const message = ['ResponseTimeoutError', 'ConnectionTimeoutError'].includes(error.name)
-          ? `OSS 分片上传连续超时（单次 ${Math.round(ossTimeoutMs / 1000)} 秒）：${error.message}`
-          : `OSS 分片上传中断：${error.message}`;
-        const resumableError = new Error(message);
-        resumableError.requeueUpload = Boolean(loadUploadCheckpoint(item));
-        throw resumableError;
+        checkpointSaver.flush();
+        multipartError = error;
+      } finally {
+        ossPartLease.release();
+        endOssUpload();
       }
+      if (!multipartError) break;
+      if (multipartError.code === 'SecurityTokenExpired') {
+        const resumed = await resumeUploadParams(currentParams, stat.size);
+        currentParams = resumed.params;
+        taskId = currentParams.taskId || taskId;
+        if (multipartCheckpoint) checkpointSaver.stage({
+          params: currentParams,
+          checkpoint: multipartCheckpoint,
+          uploadedBytes: lastUploadedBytes,
+        }, { force: true });
+        continue;
+      }
+      if (attempt < ossRetryMax) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(2_000 * (attempt + 1), 10_000)));
+        continue;
+      }
+      const message = ['ResponseTimeoutError', 'ConnectionTimeoutError'].includes(multipartError.name)
+        ? `OSS 分片上传连续超时（单次 ${Math.round(ossTimeoutMs / 1000)} 秒）：${multipartError.message}`
+        : `OSS 分片上传中断：${multipartError.message}`;
+      const resumableError = new Error(message);
+      resumableError.requeueUpload = Boolean(loadUploadCheckpoint(item));
+      throw resumableError;
     }
-    clearUploadCheckpoint(item);
   } else {
-    clearUploadCheckpoint(item);
     publish({ type: 'progress', file_path: eventPath, percent: 100, uploaded_bytes: stat.size, total_bytes: stat.size, stage: '已命中秒传' });
   }
   if (item.mapping_id) {
     const pendingTask = { taskId, remoteFileId: null };
     savePendingUploadRecord(item, pendingTask);
   }
+  clearCompletedUploadCheckpoint(item);
   publish({ type: 'progress', file_path: eventPath, percent: 100, uploaded_bytes: stat.size, total_bytes: stat.size, bytes_per_second: 0, stage: '已上传，正在等待云端入库' });
   publish({ type: 'file', state: 'processing', file_path: eventPath, uploaded_bytes: stat.size, total_bytes: stat.size, stage: '已上传，正在等待云端入库' });
-  let taskData;
-  try { taskData = await waitTask(taskId, eventPath); }
-  catch (error) {
+  if (!waitForCloud) {
+    schedulePendingUploadRecovery(0);
+    return { taskId, remoteFileId: null, pending: true };
+  }
+  try {
+    const taskData = await waitTask(taskId, eventPath);
+    return { taskId, remoteFileId: taskData?.fileId || null };
+  } catch (error) {
     const key = queueKey(item.mapping_id, uploadHistoryPath(item));
     if (error.permanentCloudTaskFailure) {
       clearPendingUpload(key);
@@ -1944,9 +2052,13 @@ async function upload(item) {
       throw error;
     }
     schedulePendingUploadRecovery();
-    return { taskId, remoteFileId: null, pending: true, pendingError: error.message };
+    return {
+      taskId,
+      remoteFileId: null,
+      pending: true,
+      pendingError: error.message,
+    };
   }
-  return { taskId, remoteFileId: taskData?.fileId || null };
 }
 function archiveDestination(baseDestination, modifiedMs, attempt) {
   if (attempt === 0) return baseDestination;
@@ -2070,6 +2182,8 @@ function scheduleCloudUploadRetry(key, item, reason) {
       queue.set(key, refreshed);
       publish({ type: 'file', state: 'queued', file_path: uploadEventPath(refreshed), stage: '正在重新上传' });
     } catch (error) {
+      const retryError = new Error(`${reason}；自动重传失败：${error.message}`);
+      recordAutoShareFailure(item, retryError);
       status('error', `云端明确拒绝上传任务，无法自动重传：${uploadEventPath(item)}：${error.message}`);
       if (item.cleanup_path && isWithinRoot(manualUploadRoot, item.cleanup_path)) await fsp.rm(item.cleanup_path, { recursive: true, force: true });
     } finally {
@@ -2087,38 +2201,55 @@ function schedulePendingUploadRecovery(delayMs = Math.max(1_000, cloudConfirmPol
     void recoverPendingUploads();
   }, delayMs);
 }
+async function recoverPendingUpload(key, row) {
+  if (!token || inflight.has(key) || pendingUploadReservations.has(key) || !pendingUploads.has(key)) return;
+  const item = rebuildPendingItem(row);
+  const eventPath = item ? uploadEventPath(item) : row.file_path;
+  if (!row.task_id) {
+    clearPendingUpload(key);
+    if (item) scheduleCloudUploadRetry(key, item, '缺少云端任务 ID');
+    else status('error', `未确认上传记录缺少任务 ID，已清除但无法自动重传：${eventPath}`);
+    return;
+  }
+  publish({ type: 'file', state: 'processing', file_path: eventPath, stage: '正在恢复云端入库确认' });
+  try {
+    const data = await checkTask(row.task_id);
+    if (!data) return;
+    if (!item) {
+      if (!confirmPendingUploadRecord(key, row.task_id, data.fileId)) return;
+      status('warning', `已恢复云端入库确认，但旧记录缺少任务上下文，未执行自动分享和源文件策略：${eventPath}`);
+    } else {
+      await finalizeConfirmedUpload(key, item, { taskId: row.task_id, remoteFileId: data.fileId }, true);
+    }
+  } catch (error) {
+    if (error.permanentCloudTaskFailure || (item?.webdav_commit && isPermanentWebDavCommitFailure(error))) {
+      clearPendingUpload(key);
+      if (item?.webdav_commit) {
+        if (item.cleanup_path && isWithinRoot(manualUploadRoot, item.cleanup_path)) await fsp.rm(item.cleanup_path, { recursive: true, force: true });
+        status('error', `WebDAV 暂存文件无法提交到目标路径，已解除本地阻塞：${eventPath}：${error.message}`);
+      } else if (item) scheduleCloudUploadRetry(key, item, error.message);
+      else status('error', `云端明确拒绝未确认上传任务，已清除记录但无法自动重传：${eventPath}：${error.message}`);
+    } else {
+      status('warning', `云端入库仍未确认，将保留记录并稍后重试：${eventPath}：${error.message}`);
+    }
+  }
+}
 async function recoverPendingUploads() {
   if (!token || pendingRecoveryPromise) return pendingRecoveryPromise;
   pendingRecoveryPromise = (async () => {
-    for (const [key, row] of [...pendingUploads]) {
-      if (!token || inflight.has(key) || !pendingUploads.has(key)) continue;
-      const item = rebuildPendingItem(row);
-      const eventPath = item ? uploadEventPath(item) : row.file_path;
-      if (!row.task_id) {
-        clearPendingUpload(key);
-        if (item) scheduleCloudUploadRetry(key, item, '缺少云端任务 ID');
-        else status('error', `未确认上传记录缺少任务 ID，已清除但无法自动重传：${eventPath}`);
-        continue;
+    const entries = [...pendingUploads];
+    let nextIndex = 0;
+    const worker = async () => {
+      while (nextIndex < entries.length) {
+        const [key, row] = entries[nextIndex];
+        nextIndex += 1;
+        await recoverPendingUpload(key, row);
       }
-      publish({ type: 'file', state: 'processing', file_path: eventPath, stage: '正在恢复云端入库确认' });
-      try {
-        const data = await waitTask(row.task_id, eventPath);
-        if (!item) {
-          if (!confirmPendingUploadRecord(key, row.task_id, data.fileId)) continue;
-          status('warning', `已恢复云端入库确认，但旧记录缺少任务上下文，未执行自动分享和源文件策略：${eventPath}`);
-        } else {
-          await finalizeConfirmedUpload(key, item, { taskId: row.task_id, remoteFileId: data.fileId }, true);
-        }
-      } catch (error) {
-        if (error.permanentCloudTaskFailure) {
-          clearPendingUpload(key);
-          if (item) scheduleCloudUploadRetry(key, item, error.message);
-          else status('error', `云端明确拒绝未确认上传任务，已清除记录但无法自动重传：${eventPath}：${error.message}`);
-        } else {
-          status('warning', `云端入库仍未确认，将保留记录并稍后重试：${eventPath}：${error.message}`);
-        }
-      }
-    }
+    };
+    await Promise.all(Array.from(
+      { length: Math.min(pendingRecoveryConcurrency, entries.length) },
+      worker,
+    ));
   })().finally(() => {
     pendingRecoveryPromise = null;
     publishState();
@@ -2142,7 +2273,7 @@ async function cleanupUnreferencedManualUploads() {
   }
 }
 function pumpFlashPreflight() {
-  if (paused || !token || active === 0 || activeFlashPreflights >= flashPreflightConcurrency) return;
+  if (paused || !token || active === 0 || activeOssUploads > 0 || activeFlashPreflights >= flashPreflightConcurrency) return;
   const candidate = [...queue.entries()].find(([key, item]) => !flashPreflightCached(key, item));
   if (!candidate) return;
   const [key, item] = candidate;
@@ -2220,7 +2351,7 @@ function pump() {
     }).then(async (taskData) => {
       if (taskData.pending) {
         preserveSource = true;
-        status('warning', `文件已上传到 OSS，云端尚未确认入库；已保留记录并会自动重试：${uploadEventPath(item)}：${taskData.pendingError}`);
+        if (taskData.pendingError) status('warning', `文件已上传到 OSS，云端尚未确认入库；已保留记录并会自动重试：${uploadEventPath(item)}：${taskData.pendingError}`);
         publish({ type: 'file', state: 'processing', file_path: uploadEventPath(item), stage: '等待云端入库，下次将自动恢复确认' });
         return;
       }
@@ -2592,21 +2723,26 @@ async function commitWebDavUpload(item, remoteFileId) {
   }
   webDavDirectoryCache.invalidate(parentId);
 }
+function isPermanentWebDavCommitFailure(error) {
+  if (error instanceof WebDavError) return [409, 412].includes(error.statusCode);
+  return isExplicitPermanentCloudTaskFailure(error);
+}
 async function putWebDavFile({ request, parentId, name, existing }) {
   const targetDigest = crypto.createHash('sha256').update(`${String(parentId || '')}\0${name}`).digest('hex');
   const mappingId = '__webdav__';
   const historyPath = path.join(dataDir, 'webdav-history', targetDigest);
   const pendingKey = queueKey(mappingId, historyPath);
-  if (pendingUploads.has(pendingKey)) {
+  if (pendingUploads.has(pendingKey) || pendingUploadReservations.has(pendingKey)) {
     request.resume();
     throw new WebDavError(503, '该 WebDAV 文件的上一次上传仍在等待云端入库', { 'retry-after': '5' });
   }
+  pendingUploadReservations.add(pendingKey);
   const temporaryRoot = path.join(manualUploadRoot, `webdav-${crypto.randomUUID()}`);
   const temporaryName = webDavTemporaryName('upload');
   const temporaryFile = path.join(temporaryRoot, temporaryName);
   let preserveTemporary = false;
-  await fsp.mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
   try {
+    await fsp.mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
     const clearIdleTimeout = armRequestBodyIdleTimeout(request, 'WebDAV 上传长时间没有接收到数据');
     try {
       await pipeline(request, fs.createWriteStream(temporaryFile, { mode: 0o600 }));
@@ -2632,7 +2768,7 @@ async function putWebDavFile({ request, parentId, name, existing }) {
         existing_id: String(existing?.id || ''),
       },
     };
-    const uploaded = await upload(item);
+    const uploaded = await upload(item, { waitForCloud: true });
     if (!uploaded.remoteFileId) {
       preserveTemporary = true;
       schedulePendingUploadRecovery();
@@ -2641,6 +2777,10 @@ async function putWebDavFile({ request, parentId, name, existing }) {
     try {
       await commitWebDavUpload(item, uploaded.remoteFileId);
     } catch (error) {
+      if (isPermanentWebDavCommitFailure(error)) {
+        clearPendingUpload(pendingKey);
+        throw error;
+      }
       preserveTemporary = true;
       schedulePendingUploadRecovery();
       throw error;
@@ -2649,6 +2789,7 @@ async function putWebDavFile({ request, parentId, name, existing }) {
     webDavDirectoryCache.invalidate(parentId);
     return { id: String(uploaded.remoteFileId) };
   } finally {
+    pendingUploadReservations.delete(pendingKey);
     if (!preserveTemporary) await fsp.rm(temporaryRoot, { recursive: true, force: true });
   }
 }
@@ -3022,7 +3163,7 @@ webdavServer.listen(webdavPort, webdavHost, () => {
 
 server.listen(port, listenHost, async () => {
   const displayHost = listenHost.includes(':') ? `[${listenHost}]` : listenHost;
-  console.log(`Guangya Web listening on http://${displayHost}:${port}, file roots: ${fileRoots.join(', ')}, uploads: ${uploadConcurrency}, multipart: ${multipartMode}, OSS timeout: ${ossTimeoutMs}ms, retries: ${ossRetryMax}, parallel: ${ossParallel}, cloud confirm timeout: ${cloudConfirmTimeoutMs}ms, request body idle timeout: ${requestBodyIdleTimeoutMs}ms, trusted proxy: ${trustedProxy ? 'enabled' : 'disabled'}, admin auth: ${accessControl.required() ? `enabled (${adminUsername})` : 'disabled (loopback only)'}`);
+  console.log(`Guangya Web listening on http://${displayHost}:${port}, file roots: ${fileRoots.join(', ')}, uploads: ${uploadConcurrency}, multipart: ${multipartMode}, OSS timeout: ${ossTimeoutMs}ms, retries: ${ossRetryMax}, parallel: ${ossPartConcurrency}, cloud confirm timeout: ${cloudConfirmTimeoutMs}ms, request body idle timeout: ${requestBodyIdleTimeoutMs}ms, trusted proxy: ${trustedProxy ? 'enabled' : 'disabled'}, admin auth: ${accessControl.required() ? `enabled (${adminUsername})` : 'disabled (loopback only)'}`);
   if (refreshToken) {
     try { await refreshSavedSession(); }
     catch (error) { status('warning', `已恢复上次登录，但刷新会话失败：${error.message}`); }

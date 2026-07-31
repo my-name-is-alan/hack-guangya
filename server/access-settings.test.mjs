@@ -432,23 +432,39 @@ test('传输、HDHive 与缓存设置持久化，清理缓存不触碰其他状�
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-settings-cache-test-'));
   let instance;
   try {
-    instance = await startTestServer(root);
+    instance = await startTestServer(root, { GUANGYA_OSS_PARALLEL: '6' });
     const base = `http://127.0.0.1:${instance.port}`;
     const defaults = await fetch(`${base}/api/settings`).then((response) => response.json());
-    assert.deepEqual(defaults.transfer, { upload_concurrency: 2, download_concurrency: 2, multipart: 'auto', multipart_part_size: 'auto' });
+    assert.deepEqual(defaults.transfer, { upload_concurrency: 2, download_concurrency: 2, oss_part_concurrency: 6, multipart: 'auto', multipart_part_size: 'auto' });
+    assert.equal((await fetch(`${base}/api/state`).then((response) => response.json())).oss_part_concurrency, 6);
+    assert.match(instance.output(), /parallel: 6/);
     assert.deepEqual(defaults.cache, { enabled: true, max_entries: 10_000 });
     assert.equal(defaults.hdhive.enabled, true);
 
     const updatedResponse = await fetch(`${base}/api/settings/transfer`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ upload_concurrency: 4, download_concurrency: 5, multipart: '8m' }),
+      body: JSON.stringify({ upload_concurrency: 4, download_concurrency: 5, oss_part_concurrency: 7, multipart: '8m' }),
     });
     assert.equal(updatedResponse.status, 200, await updatedResponse.clone().text());
-    assert.deepEqual((await updatedResponse.json()).transfer, { upload_concurrency: 4, download_concurrency: 5, multipart: '8m', multipart_part_size: '8m' });
+    const updated = await updatedResponse.json();
+    assert.deepEqual(updated.transfer, { upload_concurrency: 4, download_concurrency: 5, oss_part_concurrency: 7, multipart: '8m', multipart_part_size: '8m' });
+    assert.equal(updated.oss_part_concurrency, 7);
+    assert.equal((await fetch(`${base}/api/state`).then((response) => response.json())).oss_part_concurrency, 7);
     assert.equal((await fetch(`${base}/api/settings/transfer`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ upload_concurrency: 9 }),
     })).status, 400);
+    for (const oss_part_concurrency of [0, 9, 1.5]) {
+      assert.equal((await fetch(`${base}/api/settings/transfer`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ oss_part_concurrency }),
+      })).status, 400);
+    }
+    assert.equal((await fetch(`${base}/api/settings/transfer`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ upload_concurrency: 6, oss_part_concurrency: 9 }),
+    })).status, 400);
+    const unchanged = await fetch(`${base}/api/settings`).then((response) => response.json());
+    assert.equal(unchanged.upload_concurrency, 4);
+    assert.equal(unchanged.oss_part_concurrency, 7);
 
     const disabled = await fetch(`${base}/api/hdhive/config`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: false }),
@@ -500,10 +516,12 @@ test('传输、HDHive 与缓存设置持久化，清理缓存不触碰其他状�
     database.close();
 
     await stopTestServer(instance);
-    instance = await startTestServer(root);
+    instance = await startTestServer(root, { GUANGYA_OSS_PARALLEL: '2' });
     const restartedBase = `http://127.0.0.1:${instance.port}`;
     const restored = await fetch(`${restartedBase}/api/settings`).then((response) => response.json());
-    assert.deepEqual(restored.transfer, { upload_concurrency: 4, download_concurrency: 5, multipart: '8m', multipart_part_size: '8m' });
+    assert.deepEqual(restored.transfer, { upload_concurrency: 4, download_concurrency: 5, oss_part_concurrency: 7, multipart: '8m', multipart_part_size: '8m' });
+    assert.equal((await fetch(`${restartedBase}/api/state`).then((response) => response.json())).oss_part_concurrency, 7);
+    assert.match(instance.output(), /parallel: 7/);
     assert.deepEqual(restored.cache, { enabled: false, max_entries: 100 });
     assert.deepEqual(await fetch(`${restartedBase}/api/settings/cache`).then((response) => response.json()), { enabled: false, max_entries: 100 });
     assert.equal(restored.hdhive.enabled, false);

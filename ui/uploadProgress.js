@@ -66,7 +66,7 @@ export function nextUploadProgress(previous, payload, updatedAt = Date.now()) {
 
 export function formatUploadSpeed(bytesPerSecond) {
   const value = Number(bytesPerSecond);
-  return `${((Number.isFinite(value) && value > 0 ? value : 0) / (1024 * 1024)).toFixed(2)} MB/s`;
+  return `${((Number.isFinite(value) && value > 0 ? value : 0) / (1024 * 1024)).toFixed(2)} MiB/s`;
 }
 
 export function uploadProgressStatus(state) {

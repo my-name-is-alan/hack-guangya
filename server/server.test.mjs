@@ -9,6 +9,7 @@ import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { signHdhiveRequest } from './auto-share.mjs';
+import { startTestServer, stopTestServer } from './test-helpers.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -30,6 +31,42 @@ async function waitUntil(check, timeout = 8_000) {
   }
   throw new Error('等待备份任务状态超时');
 }
+
+test('启动恢复会清理与待入库记录共存的残留断点', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-pending-checkpoint-test-'));
+  const source = path.join(root, 'watch', 'pending.bin');
+  let instance;
+  try {
+    instance = await startTestServer(root, { GUANGYA_TOKEN: '' });
+    await fsp.writeFile(source, 'already uploaded');
+    const stat = await fsp.stat(source);
+    await stopTestServer(instance);
+    instance = null;
+
+    const mappingId = '__manual__:pending-checkpoint';
+    const item = { mapping_id: mappingId, file_path: source, size: stat.size, mtime: stat.mtimeMs };
+    const database = new DatabaseSync(path.join(root, 'data', 'state.sqlite3'));
+    database.prepare("INSERT INTO uploaded_files (mapping_id, file_path, size, modified_ms, task_id, status, item_json, uploaded_at) VALUES (?, ?, ?, ?, ?, 'oss_complete', ?, ?)")
+      .run(mappingId, source, stat.size, String(stat.mtimeMs), 'completed-task', JSON.stringify(item), 1);
+    database.prepare('INSERT INTO upload_checkpoints (mapping_id, file_path, size, modified_ms, params_json, checkpoint_json, uploaded_bytes, item_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(mappingId, source, stat.size, String(stat.mtimeMs), '{}', JSON.stringify({ uploadId: 'stale-upload' }), stat.size, JSON.stringify(item), 1);
+    database.close();
+
+    instance = await startTestServer(root, { GUANGYA_TOKEN: '' });
+    const state = await fetch(`http://127.0.0.1:${instance.port}/api/state`).then((response) => response.json());
+    assert.equal(state.pending, 1, '残留断点不应与 pending 记录同时入队');
+    const verified = new DatabaseSync(path.join(root, 'data', 'state.sqlite3'));
+    assert.equal(
+      verified.prepare('SELECT COUNT(*) AS count FROM upload_checkpoints').get().count,
+      0,
+      '已有待入库记录时应清理本地残留断点',
+    );
+    verified.close();
+  } finally {
+    await stopTestServer(instance);
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
 
 test('Docker 自动续期确认失效后清空会话并回到未登录状态', async () => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-expired-session-test-'));
@@ -1250,7 +1287,7 @@ test('Web 重启后先恢复未确认任务，再重新上传期间变化的源�
   async function startServer(port) {
     const child = spawn(process.execPath, [path.join(here, 'server.mjs')], {
       cwd: path.resolve(here, '..'),
-      env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, GUANGYA_WATCH_ROOT: watchRoot, GUANGYA_ARCHIVE_ROOT: archiveRoot, GUANGYA_FILE_ROOTS: root, GUANGYA_API_BASE: `http://127.0.0.1:${apiServer.address().port}`, GUANGYA_TOKEN: 'test-token', GUANGYA_CLOUD_CONFIRM_TIMEOUT_MS: '1000', GUANGYA_CLOUD_CONFIRM_POLL_MS: '10', GUANGYA_FILE_STABILITY_MS: '200' },
+      env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, GUANGYA_WATCH_ROOT: watchRoot, GUANGYA_ARCHIVE_ROOT: archiveRoot, GUANGYA_FILE_ROOTS: root, GUANGYA_API_BASE: `http://127.0.0.1:${apiServer.address().port}`, GUANGYA_TOKEN: 'test-token', GUANGYA_CLOUD_CONFIRM_TIMEOUT_MS: '5000', GUANGYA_CLOUD_CONFIRM_POLL_MS: '10', GUANGYA_FILE_STABILITY_MS: '200' },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let output = '';
@@ -1270,7 +1307,7 @@ test('Web 重启后先恢复未确认任务，再重新上传期间变化的源�
     await waitUntil(async () => {
       const current = await fetch(`http://127.0.0.1:${firstPort}/api/state`).then((response) => response.json());
       return uploadTokenRequests === 1 && current.pending === 1 && current.active_uploads === 0;
-    }, 10_000).catch((error) => { throw new Error(`${error.message}\n${running.output()}`); });
+    }, 2_000).catch((error) => { throw new Error(`OSS 完成后应在云端确认超时前释放上传槽：${error.message}\n${running.output()}`); });
     await fsp.access(sourceFile);
     await fsp.writeFile(sourceFile, 'pending upload changed while confirming');
     await new Promise((resolve) => setTimeout(resolve, 500));
@@ -1301,6 +1338,171 @@ test('Web 重启后先恢复未确认任务，再重新上传期间变化的源�
   } finally {
     if (running) await stopServer(running.child);
     await new Promise((resolve) => apiServer.close(resolve));
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('待入库任务永久失败且源文件丢失时记录自动分享失败', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-pending-auto-share-failure-test-'));
+  const mappingId = 'mapping-auto-share-missing-source';
+  const missingFile = path.join(root, 'watch', 'missing.mkv');
+  let instance;
+  let apiServer;
+  try {
+    instance = await startTestServer(root, { GUANGYA_TOKEN: '' });
+    await stopTestServer(instance);
+    instance = null;
+
+    await fsp.writeFile(path.join(root, 'data', 'config.json'), JSON.stringify({
+      mappings: [{
+        id: mappingId,
+        local_path: path.join(root, 'watch'),
+        remote_path: '',
+        remote_parent_id: '',
+        enabled: true,
+        source_policy: 'keep',
+        archive_path: null,
+        scan_existing: false,
+        sync_types: ['mkv'],
+        monitor_mode: 'native',
+        auto_share: true,
+      }],
+      saved_shares: [],
+    }));
+    const item = {
+      mapping_id: mappingId,
+      file_path: missingFile,
+      relative_path: 'missing.mkv',
+      change_kind: 'added',
+      remote_parent_id: '',
+      remote_dir: '',
+      size: 123,
+      mtime: 456,
+    };
+    const seeded = new DatabaseSync(path.join(root, 'data', 'state.sqlite3'));
+    seeded.prepare(`
+      INSERT INTO uploaded_files
+        (mapping_id, file_path, size, modified_ms, task_id, remote_file_id, status, item_json,
+         remote_parent_id, remote_dir, relative_path, uploaded_at)
+      VALUES (?, ?, ?, ?, ?, NULL, 'oss_complete', ?, '', '', ?, ?)
+    `).run(
+      mappingId,
+      missingFile,
+      item.size,
+      String(item.mtime),
+      'permanent-failure-task',
+      JSON.stringify(item),
+      item.relative_path,
+      Math.floor(Date.now() / 1000),
+    );
+    seeded.close();
+
+    apiServer = http.createServer(async (request, response) => {
+      for await (const _chunk of request) { /* consume request body */ }
+      response.setHeader('content-type', 'application/json');
+      if (request.url === '/userres/v1/file/get_info_by_task_id') {
+        response.end(JSON.stringify({ code: 400, msg: '云端已拒绝该上传任务' }));
+      } else {
+        response.statusCode = 404;
+        response.end(JSON.stringify({ code: 404, msg: 'not found' }));
+      }
+    });
+    apiServer.listen(0, '127.0.0.1');
+    await once(apiServer, 'listening');
+
+    instance = await startTestServer(root, {
+      GUANGYA_API_BASE: `http://127.0.0.1:${apiServer.address().port}`,
+      GUANGYA_TOKEN: 'test-token',
+      GUANGYA_FILE_BUSY_RETRY_MS: '500',
+      GUANGYA_CLOUD_CONFIRM_POLL_MS: '10',
+      GUANGYA_CLOUD_CONFIRM_TIMEOUT_MS: '1000',
+    });
+    await waitUntil(() => {
+      const database = new DatabaseSync(path.join(root, 'data', 'state.sqlite3'));
+      const pending = database.prepare("SELECT COUNT(*) AS count FROM uploaded_files WHERE status = 'oss_complete'").get().count;
+      const failure = database.prepare('SELECT error FROM auto_share_failures WHERE mapping_id = ? AND target_key = ?').get(mappingId, 'missing.mkv');
+      database.close();
+      return pending === 0 && failure;
+    }, 5_000);
+
+    const verified = new DatabaseSync(path.join(root, 'data', 'state.sqlite3'));
+    const failure = verified.prepare('SELECT relative_path, error FROM auto_share_failures WHERE mapping_id = ? AND target_key = ?').get(mappingId, 'missing.mkv');
+    verified.close();
+    assert.equal(failure.relative_path, 'missing.mkv');
+    assert.match(failure.error, /云端已拒绝该上传任务/);
+    assert.match(failure.error, /ENOENT|不存在/);
+  } finally {
+    await stopTestServer(instance);
+    if (apiServer?.listening) await new Promise((resolve) => apiServer.close(resolve));
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('待入库恢复使用有界并发且四个慢任务不会阻塞后续确认', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-pending-concurrency-test-'));
+  let instance;
+  let apiServer;
+  try {
+    instance = await startTestServer(root, { GUANGYA_TOKEN: '' });
+    await stopTestServer(instance);
+    instance = null;
+
+    const databaseFile = path.join(root, 'data', 'state.sqlite3');
+    const seeded = new DatabaseSync(databaseFile);
+    const insert = seeded.prepare(`
+      INSERT INTO uploaded_files
+        (mapping_id, file_path, size, modified_ms, task_id, remote_file_id, status, item_json,
+         remote_parent_id, remote_dir, relative_path, uploaded_at)
+      VALUES (?, ?, 1, '1', ?, NULL, 'oss_complete', NULL, '', '', '', ?)
+    `);
+    for (let index = 1; index <= 4; index += 1) {
+      insert.run(`__manual__:slow-${index}`, path.join(root, `slow-${index}.bin`), `slow-task-${index}`, index);
+    }
+    insert.run('__manual__:ready', path.join(root, 'ready.bin'), 'ready-task', 5);
+    seeded.close();
+
+    apiServer = http.createServer(async (request, response) => {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
+      response.setHeader('content-type', 'application/json');
+      if (request.url !== '/userres/v1/file/get_info_by_task_id') {
+        response.statusCode = 404;
+        response.end(JSON.stringify({ code: 404, msg: 'not found' }));
+      } else if (String(body.taskId).startsWith('slow-task-')) {
+        response.end(JSON.stringify({ code: 145, data: {} }));
+      } else {
+        assert.equal(body.taskId, 'ready-task');
+        response.end(JSON.stringify({ code: 0, data: { fileId: 'ready-file' } }));
+      }
+    });
+    apiServer.listen(0, '127.0.0.1');
+    await once(apiServer, 'listening');
+
+    instance = await startTestServer(root, {
+      GUANGYA_API_BASE: `http://127.0.0.1:${apiServer.address().port}`,
+      GUANGYA_TOKEN: 'test-token',
+      GUANGYA_CLOUD_CONFIRM_POLL_MS: '10',
+      GUANGYA_CLOUD_CONFIRM_TIMEOUT_MS: '1000',
+    });
+    await waitUntil(() => {
+      const verified = new DatabaseSync(databaseFile);
+      const ready = verified.prepare('SELECT status, remote_file_id FROM uploaded_files WHERE task_id = ?').get('ready-task');
+      verified.close();
+      return ready?.status === 'cloud_confirmed' && ready.remote_file_id === 'ready-file';
+    }, 800);
+
+    const verified = new DatabaseSync(databaseFile);
+    for (let index = 1; index <= 4; index += 1) {
+      assert.equal(
+        verified.prepare('SELECT status FROM uploaded_files WHERE task_id = ?').get(`slow-task-${index}`).status,
+        'oss_complete',
+      );
+    }
+    verified.close();
+  } finally {
+    await stopTestServer(instance);
+    if (apiServer?.listening) await new Promise((resolve) => apiServer.close(resolve));
     await fsp.rm(root, { recursive: true, force: true });
   }
 });

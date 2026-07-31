@@ -1244,7 +1244,7 @@ async fn put_file(
             size: metadata.len(),
             modified_ms,
         };
-        let uploaded = upload_item(&context.app, &context.state, &item)
+        let uploaded = upload_item(&context.app, &context.state, &item, None)
             .await
             .map_err(|error| DavError::new(StatusCode::BAD_GATEWAY, error))?;
         let remote_id = uploaded.remote_file_id.ok_or_else(|| {

@@ -19,3 +19,11 @@ test('TransfersView displays download failure reasons instead of hiding them beh
   assert.match(source, /<a-tooltip :title="downloadDetail\(item\)" :trigger="\['hover', 'focus'\]"/)
   assert.match(source, /text-overflow:\s*ellipsis/)
 })
+
+test('TransfersView labels the backend window speed and shows a measuring state', async () => {
+  const source = await transfersViewSource
+
+  assert.match(source, /最近约 5 秒的已确认上传速度/)
+  assert.match(source, /item\.state === 'uploading'/)
+  assert.match(source, /测速中…/)
+})

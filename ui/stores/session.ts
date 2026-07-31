@@ -20,6 +20,7 @@ const defaultState = () => ({
   upload_concurrency: 2,
   download_concurrency: 2,
   multipart_part_size: 'auto',
+  oss_part_concurrency: 4,
   mappings: [] as any[],
   saved_shares: [] as any[],
   share_links: [] as any[],

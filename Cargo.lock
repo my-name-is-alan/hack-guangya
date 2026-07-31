@@ -1772,6 +1772,7 @@ version = "0.1.16"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "bytes",
  "futures-util",
  "hex",
  "hmac 0.12.1",

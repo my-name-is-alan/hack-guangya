@@ -8,6 +8,17 @@ import { once } from 'node:events';
 import { createWebDavHandler, WebDavError } from './webdav.mjs';
 import { startTestServer, stopTestServer } from './test-helpers.mjs';
 
+async function readJson(request) {
+  const chunks = [];
+  for await (const chunk of request) chunks.push(chunk);
+  return chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
+}
+
+function sendJson(response, payload, status = 200) {
+  response.writeHead(status, { 'content-type': 'application/json' });
+  response.end(JSON.stringify(payload));
+}
+
 function inMemoryBackend() {
   const entries = new Map();
   let nextId = 1;
@@ -336,4 +347,105 @@ test('Docker WebDAV 与管理端口和管理员凭据隔离', async (t) => {
   assert.equal(mount.endpoint, davBase);
   assert.equal(mount.username, 'storage-user');
   assert.equal(mount.password, '');
+});
+
+test('主服务 WebDAV PUT 等待云端入库并在永久冲突后解除目标阻塞', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-webdav-put-test-'));
+  const cloudEntries = new Map();
+  const uploadTasks = new Map();
+  let nextTask = 1;
+  let createConflictDuringConfirmation = false;
+  const apiServer = http.createServer(async (request, response) => {
+    const body = await readJson(request);
+    if (request.url === '/userres/v1/file/get_file_list') {
+      return sendJson(response, {
+        code: 0,
+        data: { list: [...cloudEntries.values()], total: cloudEntries.size },
+      });
+    }
+    if (request.url === '/userres/v1/get_res_center_token') {
+      const taskId = `webdav-task-${nextTask++}`;
+      uploadTasks.set(taskId, { name: body.name, confirmed: false });
+      return sendJson(response, { code: 156, data: { taskId } });
+    }
+    if (request.url === '/userres/v1/file/get_info_by_task_id') {
+      const task = uploadTasks.get(body.taskId);
+      assert.ok(task, `未知上传任务：${body.taskId}`);
+      const fileId = `webdav-remote-${body.taskId}`;
+      if (!task.confirmed) {
+        task.confirmed = true;
+        cloudEntries.set(fileId, {
+          fileId,
+          fileName: task.name,
+          resType: 1,
+          fileSize: 14,
+          updatedAt: Date.now(),
+        });
+        if (createConflictDuringConfirmation) {
+          cloudEntries.set('concurrent-target', {
+            fileId: 'concurrent-target',
+            fileName: 'conflict.txt',
+            resType: 1,
+            fileSize: 1,
+            updatedAt: Date.now(),
+          });
+        }
+      }
+      return sendJson(response, { code: 0, data: { fileId } });
+    }
+    if (request.url === '/userres/v1/file/rename') {
+      const entry = cloudEntries.get(String(body.fileId));
+      assert.ok(entry, `未知云端文件：${body.fileId}`);
+      entry.fileName = body.newName;
+      return sendJson(response, { code: 0, data: {} });
+    }
+    return sendJson(response, { code: 404, msg: 'not found' }, 404);
+  });
+  apiServer.listen(0, '127.0.0.1');
+  await once(apiServer, 'listening');
+
+  const username = 'storage-user';
+  const password = 'correct horse battery staple';
+  const authorization = `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`;
+  let instance;
+  try {
+    instance = await startTestServer(root, {
+      GUANGYA_API_BASE: `http://127.0.0.1:${apiServer.address().port}`,
+      GUANGYA_TOKEN: 'test-token',
+      GUANGYA_WEBDAV_USERNAME: username,
+      GUANGYA_WEBDAV_PASSWORD: password,
+      GUANGYA_CLOUD_CONFIRM_POLL_MS: '10',
+      GUANGYA_CLOUD_CONFIRM_TIMEOUT_MS: '1000',
+    });
+    const davBase = `http://127.0.0.1:${instance.webdavPort}/dav`;
+    const put = (name, body) => fetch(`${davBase}/${name}`, {
+      method: 'PUT',
+      headers: { authorization },
+      body,
+    });
+
+    const created = await put('uploaded.txt', 'hello webdav');
+    assert.equal(created.status, 201, await created.text());
+    assert.ok([...cloudEntries.values()].some((entry) => entry.fileName === 'uploaded.txt'));
+
+    createConflictDuringConfirmation = true;
+    const conflicted = await put('conflict.txt', 'first attempt');
+    assert.equal(conflicted.status, 412, await conflicted.text());
+    let state = await fetch(`http://127.0.0.1:${instance.port}/api/state`).then((response) => response.json());
+    assert.equal(state.pending, 0, '永久提交冲突应清除 pending，避免目标路径永久返回 503');
+    assert.deepEqual(await fsp.readdir(path.join(instance.dataDir, 'manual-uploads')), []);
+
+    createConflictDuringConfirmation = false;
+    cloudEntries.delete('concurrent-target');
+    const retried = await put('conflict.txt', 'second attempt');
+    assert.equal(retried.status, 201, await retried.text());
+    state = await fetch(`http://127.0.0.1:${instance.port}/api/state`).then((response) => response.json());
+    assert.equal(state.pending, 0);
+    assert.ok([...cloudEntries.values()].some((entry) => entry.fileName === 'conflict.txt'));
+    assert.deepEqual(await fsp.readdir(path.join(instance.dataDir, 'manual-uploads')), []);
+  } finally {
+    await stopTestServer(instance);
+    await new Promise((resolve) => apiServer.close(resolve));
+    await fsp.rm(root, { recursive: true, force: true });
+  }
 });

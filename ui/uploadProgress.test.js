@@ -32,14 +32,14 @@ test('an explicit queued event can restart the same file path', () => {
   assert.equal(result.percent, 0);
 });
 
-test('upload speed is retained while uploading and uses MB/s instead of Mbps', () => {
+test('upload speed is retained while uploading and uses the binary MiB/s unit', () => {
   const result = nextUploadProgress(
     { percent: 10, state: 'uploading', stage: '正在上传', bytesPerSecond: 0, updatedAt: 10 },
     { type: 'progress', percent: 20, bytes_per_second: 10 * 1024 * 1024, stage: '正在上传' },
     20,
   );
   assert.equal(result.bytesPerSecond, 10 * 1024 * 1024);
-  assert.equal(formatUploadSpeed(result.bytesPerSecond), '10.00 MB/s');
+  assert.equal(formatUploadSpeed(result.bytesPerSecond), '10.00 MiB/s');
   assert.equal(nextUploadProgress(result, { type: 'file', state: 'done' }, 30).bytesPerSecond, 0);
 });
 

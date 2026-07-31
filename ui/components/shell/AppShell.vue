@@ -100,7 +100,11 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleGlobalKeydown)
           <button v-if="activeTransferCount" type="button" class="transfer-summary" @click="openTransfers">
             <span class="transfer-label">{{ activeTransferCount }} 个任务</span>
             <span class="transfer-bar"><i :style="{ width: `${overallPercent}%` }" /></span>
-            <small><span>{{ overallPercent }}%</span><span v-if="uploadSpeed" class="transfer-speed"> · {{ formatUploadSpeed(uploadSpeed) }}</span></small>
+            <small>
+              <span>{{ overallPercent }}%</span>
+              <span v-if="uploadSpeed" class="transfer-speed" title="最近约 5 秒的上传速度"> · {{ formatUploadSpeed(uploadSpeed) }}</span>
+              <span v-else-if="activeUploads.some(item => item.state === 'uploading')" class="transfer-speed"> · 测速中…</span>
+            </small>
           </button>
 
           <a-dropdown :trigger="['click']" :menu="accountMenu">

@@ -4,6 +4,7 @@ mod native_mount;
 mod webdav;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use hmac::{Hmac, Mac};
 use md5::Md5;
@@ -21,14 +22,17 @@ use std::{
     io::{self, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
 };
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    sync::{
+        mpsc::{self, UnboundedReceiver, UnboundedSender},
+        oneshot, Semaphore,
+    },
     time::{sleep, Duration, Instant},
 };
 use uuid::Uuid;
@@ -44,6 +48,8 @@ const FLASH_PREFLIGHT_CONCURRENCY: usize = 1;
 const FLASH_PREFLIGHT_TOKEN_MAX_AGE_SECS: u64 = 10 * 60;
 const DEFAULT_MULTIPART_PART_SIZE: &str = "auto";
 const MULTIPART_PART_SIZE_OPTIONS: &[&str] = &["auto", "4m", "8m", "16m"];
+const DEFAULT_OSS_PART_CONCURRENCY: usize = 4;
+const MAX_OSS_PART_CONCURRENCY: usize = 8;
 const DEFAULT_CACHE_MAX_ENTRIES: usize = 10_000;
 const MIN_CACHE_MAX_ENTRIES: usize = 100;
 const MAX_CACHE_MAX_ENTRIES: usize = 100_000;
@@ -57,6 +63,13 @@ const OSS_REQUEST_TIMEOUT_SECS: u64 = 600;
 const OSS_MULTIPART_TARGET_PARTS: u64 = 9_000;
 const OSS_MIB: u64 = 1024 * 1024;
 const OSS_LARGE_FILE_PART_SIZE: u64 = 16 * OSS_MIB;
+const MAX_OSS_BUFFER_BYTES_PER_FILE: u64 = 128 * OSS_MIB;
+const OSS_BUFFER_PERMIT_BYTES: u64 = 4 * OSS_MIB;
+const MAX_TOTAL_OSS_BUFFER_BYTES: u64 = 256 * OSS_MIB;
+const OSS_CHECKPOINT_FLUSH_BYTES: u64 = 64 * OSS_MIB;
+const OSS_CHECKPOINT_FLUSH_INTERVAL_SECS: u64 = 2;
+const OSS_SPEED_WINDOW_SECS: u64 = 5;
+const GCID_PROGRESS_EMIT_INTERVAL_MS: u64 = 250;
 const CLOUD_CONFIRM_TIMEOUT_SECS: u64 = 600;
 const PENDING_UPLOAD_RETRY_SECS: u64 = 15;
 const UPLOAD_STATE_OSS_COMPLETE: &str = "oss_complete";
@@ -148,6 +161,8 @@ struct AppConfig {
     download_concurrency: usize,
     #[serde(default = "default_multipart_part_size")]
     multipart_part_size: String,
+    #[serde(default = "default_oss_part_concurrency")]
+    oss_part_concurrency: usize,
     #[serde(default = "default_true")]
     webdav_enabled: bool,
     #[serde(default = "default_webdav_port")]
@@ -169,6 +184,7 @@ impl Default for AppConfig {
             upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
             download_concurrency: DEFAULT_DOWNLOAD_CONCURRENCY,
             multipart_part_size: default_multipart_part_size(),
+            oss_part_concurrency: DEFAULT_OSS_PART_CONCURRENCY,
             webdav_enabled: true,
             webdav_port: DEFAULT_WEBDAV_PORT,
             webdav_username: default_webdav_username(),
@@ -187,6 +203,7 @@ struct Snapshot {
     upload_concurrency: usize,
     download_concurrency: usize,
     multipart_part_size: String,
+    oss_part_concurrency: usize,
     mappings: Vec<Mapping>,
     saved_shares: Vec<SavedShare>,
     hdhive: HdhivePublicConfig,
@@ -238,6 +255,10 @@ struct RuntimeState {
     upload_concurrency: usize,
     download_concurrency: usize,
     multipart_part_size: String,
+    oss_part_concurrency: usize,
+    oss_part_semaphore: Arc<Semaphore>,
+    upload_checkpoint_writer: UploadCheckpointWriter,
+    active_oss_uploads: usize,
     cache_enabled: bool,
     cache_max_entries: usize,
     device_id: String,
@@ -261,6 +282,30 @@ struct RuntimeState {
     refreshed_access_tokens: HashMap<String, String>,
 }
 
+struct ActiveOssUploadGuard {
+    state: SharedState,
+}
+
+impl ActiveOssUploadGuard {
+    fn new(state: &SharedState) -> Result<Self, String> {
+        state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .active_oss_uploads += 1;
+        Ok(Self {
+            state: state.clone(),
+        })
+    }
+}
+
+impl Drop for ActiveOssUploadGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.active_oss_uploads = guard.active_oss_uploads.saturating_sub(1);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct HdhivePublicConfig {
     enabled: bool,
@@ -274,6 +319,7 @@ struct TransferSettings {
     upload_concurrency: usize,
     download_concurrency: usize,
     multipart_part_size: String,
+    oss_part_concurrency: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -394,6 +440,45 @@ struct OssUploadCheckpoint {
 struct PersistedUploadCheckpoint {
     checkpoint: OssUploadCheckpoint,
     uploaded_bytes: u64,
+}
+
+#[derive(Clone)]
+struct UploadCheckpointWriter {
+    sender: UnboundedSender<UploadCheckpointWriterCommand>,
+}
+
+#[derive(Clone)]
+struct UploadCheckpointWrite {
+    item: UploadItem,
+    checkpoint: OssUploadCheckpoint,
+    uploaded_bytes: u64,
+}
+
+enum UploadCheckpointWriterCommand {
+    Save(UploadCheckpointWrite),
+    Flush {
+        key: String,
+        latest: Option<UploadCheckpointWrite>,
+        acknowledgement: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+#[derive(Default)]
+struct UploadCheckpointWriteBatch {
+    writes: HashMap<String, UploadCheckpointWrite>,
+    acknowledgements: HashMap<String, Vec<oneshot::Sender<Result<(), String>>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UploadSpeedSample {
+    bytes_per_second: f64,
+    average_bytes_per_second: f64,
+}
+
+struct UploadSpeedTracker {
+    samples: VecDeque<(Duration, u64)>,
+    completed_parts: usize,
+    minimum_samples: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -553,6 +638,7 @@ fn snapshot(state: &RuntimeState) -> Snapshot {
         upload_concurrency: state.upload_concurrency,
         download_concurrency: state.download_concurrency,
         multipart_part_size: state.multipart_part_size.clone(),
+        oss_part_concurrency: state.oss_part_concurrency,
         mappings: state.mappings.clone(),
         saved_shares: state.saved_shares.clone(),
         hdhive: HdhivePublicConfig {
@@ -575,6 +661,9 @@ fn default_download_concurrency() -> usize {
 }
 fn default_multipart_part_size() -> String {
     DEFAULT_MULTIPART_PART_SIZE.to_string()
+}
+fn default_oss_part_concurrency() -> usize {
+    DEFAULT_OSS_PART_CONCURRENCY
 }
 fn default_webdav_port() -> u16 {
     DEFAULT_WEBDAV_PORT
@@ -823,6 +912,13 @@ fn validate_multipart_part_size(value: &str) -> Result<String, String> {
 fn normalize_multipart_part_size(value: &str) -> String {
     validate_multipart_part_size(value).unwrap_or_else(|_| default_multipart_part_size())
 }
+fn normalize_oss_part_concurrency(value: usize) -> usize {
+    if (1..=MAX_OSS_PART_CONCURRENCY).contains(&value) {
+        value
+    } else {
+        DEFAULT_OSS_PART_CONCURRENCY
+    }
+}
 fn default_true() -> bool {
     true
 }
@@ -862,11 +958,9 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
 }
 fn oss_part_size(size: u64) -> u64 {
     let tier_size = if size <= 100 * 1024 * 1024 {
-        OSS_MIB
-    } else if size <= 1024 * 1024 * 1024 {
-        2 * OSS_MIB
-    } else if size <= 10 * 1024 * 1024 * 1024 {
         4 * OSS_MIB
+    } else if size <= 1024 * 1024 * 1024 {
+        8 * OSS_MIB
     } else {
         OSS_LARGE_FILE_PART_SIZE
     };
@@ -887,6 +981,94 @@ fn configured_oss_part_size(size: u64, multipart_part_size: &str) -> u64 {
     let minimum_size = ceil_div_u64(size, OSS_MULTIPART_TARGET_PARTS);
     let aligned_minimum_size = ceil_div_u64(minimum_size, OSS_MIB).saturating_mul(OSS_MIB);
     configured_size.max(aligned_minimum_size)
+}
+fn effective_oss_part_concurrency(part_size: u64, requested: usize) -> usize {
+    let requested = normalize_oss_part_concurrency(requested);
+    let memory_limited = (MAX_OSS_BUFFER_BYTES_PER_FILE / part_size.max(1)).max(1);
+    requested.min(usize::try_from(memory_limited).unwrap_or(usize::MAX))
+}
+fn oss_buffer_permits(part_size: u64) -> u32 {
+    let total_permits = MAX_TOTAL_OSS_BUFFER_BYTES / OSS_BUFFER_PERMIT_BYTES;
+    let required = ceil_div_u64(part_size.max(1), OSS_BUFFER_PERMIT_BYTES);
+    u32::try_from(required.min(total_permits).max(1)).unwrap_or(u32::MAX)
+}
+fn should_flush_upload_checkpoint(
+    last_saved_bytes: u64,
+    uploaded_bytes: u64,
+    total_bytes: u64,
+    elapsed: Duration,
+) -> bool {
+    uploaded_bytes >= total_bytes
+        || uploaded_bytes.saturating_sub(last_saved_bytes) >= OSS_CHECKPOINT_FLUSH_BYTES
+        || elapsed >= Duration::from_secs(OSS_CHECKPOINT_FLUSH_INTERVAL_SECS)
+}
+impl UploadSpeedTracker {
+    fn new(minimum_samples: usize) -> Self {
+        Self {
+            samples: VecDeque::from([(Duration::ZERO, 0)]),
+            completed_parts: 0,
+            minimum_samples: minimum_samples.max(1),
+        }
+    }
+
+    fn observe(&mut self, elapsed: Duration, uploaded_bytes: u64) -> UploadSpeedSample {
+        let elapsed_seconds = elapsed.as_secs_f64().max(0.001);
+        let average_bytes_per_second = uploaded_bytes as f64 / elapsed_seconds;
+        let uploaded_bytes = uploaded_bytes.max(
+            self.samples
+                .back()
+                .map(|(_, bytes)| *bytes)
+                .unwrap_or_default(),
+        );
+        self.completed_parts = self.completed_parts.saturating_add(1);
+        self.samples.push_back((elapsed, uploaded_bytes));
+
+        let cutoff = elapsed.saturating_sub(Duration::from_secs(OSS_SPEED_WINDOW_SECS));
+        while self.samples.len() > 1
+            && self
+                .samples
+                .get(1)
+                .is_some_and(|(sample_elapsed, _)| *sample_elapsed <= cutoff)
+        {
+            self.samples.pop_front();
+        }
+        let (baseline_elapsed, baseline_bytes) =
+            self.samples.front().copied().unwrap_or((Duration::ZERO, 0));
+        let window_seconds = elapsed
+            .saturating_sub(baseline_elapsed)
+            .as_secs_f64()
+            .max(0.001);
+        let window_bytes_per_second =
+            uploaded_bytes.saturating_sub(baseline_bytes) as f64 / window_seconds;
+
+        // Completed-part accounting cannot see bytes that are still in flight.
+        // Keep the public speed at zero until the entire first real request wave
+        // has returned ETags, then report only measured window throughput.
+        let bytes_per_second = if self.completed_parts >= self.minimum_samples {
+            window_bytes_per_second
+        } else {
+            0.0
+        };
+        UploadSpeedSample {
+            bytes_per_second,
+            average_bytes_per_second,
+        }
+    }
+}
+fn should_emit_gcid_progress(
+    last_emit_elapsed: Duration,
+    last_percent: u64,
+    elapsed: Duration,
+    percent: u64,
+    finished: bool,
+) -> bool {
+    finished
+        || (percent != last_percent
+            && elapsed.saturating_sub(last_emit_elapsed)
+                >= Duration::from_millis(GCID_PROGRESS_EMIT_INTERVAL_MS))
+}
+fn background_gcid_may_run(active_oss_uploads: usize) -> bool {
+    active_oss_uploads == 0
 }
 fn normalize_monitor_mode(value: &str) -> String {
     if value.eq_ignore_ascii_case("polling") {
@@ -1422,6 +1604,7 @@ fn save_config_checked(state: &RuntimeState) -> Result<(), String> {
         "upload_concurrency": state.upload_concurrency,
         "download_concurrency": state.download_concurrency,
         "multipart_part_size": state.multipart_part_size,
+        "oss_part_concurrency": state.oss_part_concurrency,
         "webdav_enabled": state.webdav_enabled,
         "webdav_port": state.webdav_port,
         "webdav_username": state.webdav_username,
@@ -2370,26 +2553,176 @@ fn save_upload_checkpoint(
     Ok(())
 }
 
+async fn save_upload_checkpoint_async(
+    path: &Path,
+    item: &UploadItem,
+    checkpoint: &OssUploadCheckpoint,
+    uploaded_bytes: u64,
+) -> Result<(), String> {
+    let path = path.to_path_buf();
+    let item = item.clone();
+    let checkpoint = checkpoint.clone();
+    tokio::task::spawn_blocking(move || {
+        save_upload_checkpoint(&path, &item, &checkpoint, uploaded_bytes)
+    })
+    .await
+    .map_err(|error| format!("等待保存上传断点失败：{error}"))?
+}
+
+impl UploadCheckpointWriteBatch {
+    fn push(&mut self, command: UploadCheckpointWriterCommand) {
+        match command {
+            UploadCheckpointWriterCommand::Save(write) => {
+                self.writes.insert(item_key(&write.item), write);
+            }
+            UploadCheckpointWriterCommand::Flush {
+                key,
+                latest,
+                acknowledgement,
+            } => {
+                if let Some(write) = latest {
+                    self.writes.insert(key.clone(), write);
+                }
+                self.acknowledgements
+                    .entry(key)
+                    .or_default()
+                    .push(acknowledgement);
+            }
+        }
+    }
+}
+
+impl UploadCheckpointWriter {
+    fn new(database: PathBuf) -> Self {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        tauri::async_runtime::spawn(run_upload_checkpoint_writer(database, receiver));
+        Self { sender }
+    }
+
+    fn enqueue(
+        &self,
+        item: &UploadItem,
+        checkpoint: &OssUploadCheckpoint,
+        uploaded_bytes: u64,
+    ) -> Result<(), String> {
+        self.sender
+            .send(UploadCheckpointWriterCommand::Save(UploadCheckpointWrite {
+                item: item.clone(),
+                checkpoint: checkpoint.clone(),
+                uploaded_bytes,
+            }))
+            .map_err(|_| "上传断点写入任务已停止".to_string())
+    }
+
+    async fn flush(
+        &self,
+        item: &UploadItem,
+        checkpoint: Option<&OssUploadCheckpoint>,
+        uploaded_bytes: u64,
+    ) -> Result<(), String> {
+        let key = item_key(item);
+        let latest = checkpoint.map(|checkpoint| UploadCheckpointWrite {
+            item: item.clone(),
+            checkpoint: checkpoint.clone(),
+            uploaded_bytes,
+        });
+        let (acknowledgement, completion) = oneshot::channel();
+        self.sender
+            .send(UploadCheckpointWriterCommand::Flush {
+                key,
+                latest,
+                acknowledgement,
+            })
+            .map_err(|_| "上传断点写入任务已停止".to_string())?;
+        completion
+            .await
+            .map_err(|_| "等待上传断点写入确认失败".to_string())?
+    }
+}
+
+async fn run_upload_checkpoint_writer(
+    database: PathBuf,
+    mut receiver: UnboundedReceiver<UploadCheckpointWriterCommand>,
+) {
+    while let Some(first) = receiver.recv().await {
+        let mut batch = UploadCheckpointWriteBatch::default();
+        batch.push(first);
+        while let Ok(command) = receiver.try_recv() {
+            batch.push(command);
+        }
+
+        let mut results = HashMap::new();
+        for (key, write) in batch.writes {
+            let result = save_upload_checkpoint_async(
+                &database,
+                &write.item,
+                &write.checkpoint,
+                write.uploaded_bytes,
+            )
+            .await;
+            results.insert(key, result);
+        }
+        for (key, acknowledgements) in batch.acknowledgements {
+            let result = results.get(&key).cloned().unwrap_or(Ok(()));
+            for acknowledgement in acknowledgements {
+                let _ = acknowledgement.send(result.clone());
+            }
+        }
+    }
+}
+
 fn load_resumable_uploads(path: &Path) -> Result<VecDeque<UploadItem>, String> {
     let connection = open_database(path)?;
+    connection
+        .execute(
+            "DELETE FROM upload_checkpoints
+             WHERE EXISTS (
+               SELECT 1 FROM uploaded_files AS uploaded
+               WHERE uploaded.mapping_id = upload_checkpoints.mapping_id
+                 AND uploaded.file_path = upload_checkpoints.file_path
+                 AND uploaded.remote_parent_id = upload_checkpoints.remote_parent_id
+                 AND uploaded.remote_dir = upload_checkpoints.remote_dir
+                 AND uploaded.size = upload_checkpoints.size
+                 AND uploaded.modified_ms = upload_checkpoints.modified_ms
+                 AND uploaded.upload_state IN (?1, ?2)
+             )",
+            params![UPLOAD_STATE_OSS_COMPLETE, UPLOAD_STATE_CLOUD_CONFIRMED],
+        )
+        .map_err(|error| format!("清理已完成上传的残留断点失败：{error}"))?;
     let mut statement = connection
         .prepare(
-            "SELECT mapping_id, file_path, remote_parent_id, remote_dir, size, modified_ms, item_json
-             FROM upload_checkpoints ORDER BY updated_at",
+            "SELECT checkpoint.mapping_id, checkpoint.file_path,
+                    checkpoint.remote_parent_id, checkpoint.remote_dir,
+                    checkpoint.size, checkpoint.modified_ms, checkpoint.item_json
+             FROM upload_checkpoints AS checkpoint
+             WHERE NOT EXISTS (
+               SELECT 1 FROM uploaded_files AS uploaded
+               WHERE uploaded.mapping_id = checkpoint.mapping_id
+                 AND uploaded.file_path = checkpoint.file_path
+                 AND uploaded.remote_parent_id = checkpoint.remote_parent_id
+                 AND uploaded.remote_dir = checkpoint.remote_dir
+                 AND uploaded.size = checkpoint.size
+                 AND uploaded.modified_ms = checkpoint.modified_ms
+                 AND uploaded.upload_state IN (?1, ?2)
+             )
+             ORDER BY checkpoint.updated_at",
         )
         .map_err(|error| format!("读取待续传任务失败：{error}"))?;
     let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, u64>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        })
+        .query_map(
+            params![UPLOAD_STATE_OSS_COMPLETE, UPLOAD_STATE_CLOUD_CONFIRMED],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
         .map_err(|error| format!("查询待续传任务失败：{error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("解析待续传任务失败：{error}"))?;
@@ -5236,6 +5569,7 @@ async fn oss_signed_request(
     total_bytes: u64,
 ) -> Result<reqwest::Response, String> {
     let url = oss_request_url(checkpoint, query)?;
+    let body = body.map(Bytes::from);
     for attempt in 0..=OSS_WRITE_RETRY_TIMES {
         let date = httpdate::fmt_http_date(std::time::SystemTime::now());
         let string_to_sign = oss_string_to_sign(
@@ -5322,7 +5656,9 @@ async fn upload_oss(
     item: &UploadItem,
     app: &tauri::AppHandle,
     multipart_part_size: &str,
-    db_path: &Path,
+    oss_part_concurrency: usize,
+    oss_part_semaphore: Arc<Semaphore>,
+    checkpoint_writer: &UploadCheckpointWriter,
     persisted: Option<PersistedUploadCheckpoint>,
 ) -> Result<(), String> {
     let credentials = token_data
@@ -5385,7 +5721,6 @@ async fn upload_oss(
             0,
         )
         .await?;
-        clear_upload_checkpoint(db_path, item)?;
         return Ok(());
     }
 
@@ -5410,7 +5745,7 @@ async fn upload_oss(
         checkpoint.upload_id = xml_tag_value(&response_body, "UploadId")
             .filter(|value| !value.is_empty())
             .ok_or_else(|| "OSS 没有返回分片任务 ID".to_string())?;
-        save_upload_checkpoint(db_path, item, &checkpoint, 0)?;
+        checkpoint_writer.flush(item, Some(&checkpoint), 0).await?;
     }
 
     let total_parts = ceil_div_u64(size, checkpoint.part_size);
@@ -5432,15 +5767,24 @@ async fn upload_oss(
         }),
     );
     let request_checkpoint = checkpoint.clone();
+    let effective_part_concurrency =
+        effective_oss_part_concurrency(checkpoint.part_size, oss_part_concurrency);
     let pending_parts = (1..=total_parts as u32)
         .filter(|part| !checkpoint.completed_parts.contains_key(part))
         .collect::<Vec<_>>();
+    let initial_parallelism = effective_part_concurrency.min(pending_parts.len()).max(1);
+    let mut speed_tracker = UploadSpeedTracker::new(initial_parallelism);
     let mut part_uploads = stream::iter(pending_parts)
         .map(|part| {
             let client = &client;
             let request_checkpoint = &request_checkpoint;
             let file_path = &item.file_path;
+            let oss_part_semaphore = oss_part_semaphore.clone();
             async move {
+                let _permit = oss_part_semaphore
+                    .acquire_many_owned(oss_buffer_permits(request_checkpoint.part_size))
+                    .await
+                    .map_err(|_| "OSS 分片并发控制已关闭".to_string())?;
                 let offset = u64::from(part - 1) * request_checkpoint.part_size;
                 let length = request_checkpoint.part_size.min(size - offset);
                 let mut file = tokio::fs::File::open(file_path)
@@ -5482,29 +5826,80 @@ async fn upload_oss(
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| "OSS 分片响应缺少 ETag".to_string())?
                     .to_string();
-                Ok::<_, String>((part, etag))
+                Ok::<_, String>((part, etag, length))
             }
         })
-        .buffer_unordered(3);
-    while let Some(result) = part_uploads.next().await {
-        let (part, etag) = result?;
-        checkpoint.completed_parts.insert(part, etag);
-        let uploaded = oss_checkpoint_uploaded_bytes(&checkpoint, size);
-        save_upload_checkpoint(db_path, item, &checkpoint, uploaded)?;
-        emit(
-            app,
-            json!({
-                "type": "progress",
-                "file_path": item.file_path.to_string_lossy(),
-                "percent": uploaded.saturating_mul(100) / size,
-                "uploaded_bytes": uploaded,
-                "total_bytes": size,
-                "bytes_per_second": uploaded.saturating_sub(uploaded_at_start) as f64
-                    / upload_started_at.elapsed().as_secs_f64().max(0.001),
-                "stage": if resumed { "正在断点续传" } else { "正在上传" }
-            }),
-        );
+        .buffer_unordered(effective_part_concurrency);
+    let mut checkpoint_dirty = false;
+    let mut checkpoint_saved_bytes = uploaded_at_start;
+    let mut checkpoint_saved_at = Instant::now();
+    let mut checkpoint_flush_interval =
+        tokio::time::interval(Duration::from_secs(OSS_CHECKPOINT_FLUSH_INTERVAL_SECS));
+    checkpoint_flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    checkpoint_flush_interval.tick().await;
+    loop {
+        tokio::select! {
+            result = part_uploads.next() => {
+                let Some(result) = result else { break };
+                let (part, etag, part_length) = match result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let uploaded = oss_checkpoint_uploaded_bytes(&checkpoint, size);
+                        if let Err(save_error) = checkpoint_writer
+                            .flush(item, Some(&checkpoint), uploaded)
+                            .await
+                        {
+                            return Err(format!("{error}；{save_error}"));
+                        }
+                        return Err(error);
+                    }
+                };
+                checkpoint.completed_parts.insert(part, etag);
+                checkpoint_dirty = true;
+                let uploaded = oss_checkpoint_uploaded_bytes(&checkpoint, size);
+                let speed = speed_tracker.observe(
+                    upload_started_at.elapsed(),
+                    uploaded.saturating_sub(uploaded_at_start),
+                );
+                emit(
+                    app,
+                    json!({
+                        "type": "progress",
+                        "file_path": item.file_path.to_string_lossy(),
+                        "percent": uploaded.saturating_mul(100) / size,
+                        "uploaded_bytes": uploaded,
+                        "total_bytes": size,
+                        "bytes_per_second": speed.bytes_per_second,
+                        "average_bytes_per_second": speed.average_bytes_per_second,
+                        "completed_part_bytes": part_length,
+                        "stage": if resumed { "正在断点续传" } else { "正在上传" }
+                    }),
+                );
+                if should_flush_upload_checkpoint(
+                    checkpoint_saved_bytes,
+                    uploaded,
+                    size,
+                    checkpoint_saved_at.elapsed(),
+                ) {
+                    checkpoint_writer.enqueue(item, &checkpoint, uploaded)?;
+                    checkpoint_dirty = false;
+                    checkpoint_saved_bytes = uploaded;
+                    checkpoint_saved_at = Instant::now();
+                }
+            }
+            _ = checkpoint_flush_interval.tick(), if checkpoint_dirty => {
+                let uploaded = oss_checkpoint_uploaded_bytes(&checkpoint, size);
+                checkpoint_writer.enqueue(item, &checkpoint, uploaded)?;
+                checkpoint_dirty = false;
+                checkpoint_saved_bytes = uploaded;
+                checkpoint_saved_at = Instant::now();
+            }
+        }
     }
+    let uploaded = oss_checkpoint_uploaded_bytes(&checkpoint, size);
+    checkpoint_writer
+        .flush(item, Some(&checkpoint), uploaded)
+        .await?;
 
     let parts_xml = checkpoint
         .completed_parts
@@ -5544,7 +5939,6 @@ async fn upload_oss(
         size,
     )
     .await?;
-    clear_upload_checkpoint(db_path, item)?;
     emit(
         app,
         json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 100, "uploaded_bytes": size, "total_bytes": size, "bytes_per_second": 0, "stage": "OSS 上传完成" }),
@@ -5584,6 +5978,7 @@ async fn calculate_file_gcid(
     app: &tauri::AppHandle,
     path: &Path,
     file_size: u64,
+    upload_priority: Option<&SharedState>,
 ) -> Result<String, String> {
     let mut file = tokio::fs::File::open(path)
         .await
@@ -5592,7 +5987,22 @@ async fn calculate_file_gcid(
     let mut buffer = vec![0_u8; chunk_size];
     let mut outer = Sha1::new();
     let mut hashed = 0_u64;
+    let progress_started_at = Instant::now();
+    let mut last_emit_elapsed = Duration::ZERO;
+    let mut last_percent = 0;
     loop {
+        if let Some(state) = upload_priority {
+            loop {
+                let can_run = state
+                    .lock()
+                    .map_err(|error| error.to_string())
+                    .map(|guard| background_gcid_may_run(guard.active_oss_uploads))?;
+                if can_run {
+                    break;
+                }
+                sleep(Duration::from_millis(GCID_PROGRESS_EMIT_INTERVAL_MS)).await;
+            }
+        }
         let read = file
             .read(&mut buffer)
             .await
@@ -5607,16 +6017,27 @@ async fn calculate_file_gcid(
         } else {
             hashed.saturating_mul(100) / file_size
         };
-        emit(
-            app,
-            json!({
-                "type": "progress",
-                "file_path": path.to_string_lossy(),
-                "percent": 0,
-                "bytes_per_second": 0,
-                "stage": format!("正在计算秒传指纹 {percent}%")
-            }),
-        );
+        let elapsed = progress_started_at.elapsed();
+        if should_emit_gcid_progress(
+            last_emit_elapsed,
+            last_percent,
+            elapsed,
+            percent,
+            hashed >= file_size,
+        ) {
+            emit(
+                app,
+                json!({
+                    "type": "progress",
+                    "file_path": path.to_string_lossy(),
+                    "percent": 0,
+                    "bytes_per_second": 0,
+                    "stage": format!("正在计算秒传指纹 {percent}%")
+                }),
+            );
+            last_emit_elapsed = elapsed;
+            last_percent = percent;
+        }
     }
     Ok(hex::encode_upper(outer.finalize()))
 }
@@ -5909,7 +6330,7 @@ async fn preflight_flash_upload(
             );
             Ok(gcid)
         } else {
-            let result = calculate_file_gcid(app, &item.file_path, item.size).await;
+            let result = calculate_file_gcid(app, &item.file_path, item.size, Some(state)).await;
             if let Ok(gcid) = &result {
                 let saved = {
                     let guard = state.lock().map_err(|error| error.to_string())?;
@@ -5972,7 +6393,6 @@ async fn preflight_flash_upload(
         return Ok(FlashPreflightOutcome::Miss(data));
     }
 
-    clear_upload_checkpoint(&db_path, item)?;
     emit(
         app,
         json!({
@@ -5991,6 +6411,13 @@ async fn preflight_flash_upload(
     };
     remember_pending_upload(state, item, &pending_outcome)
         .map_err(|message| format!("文件已秒传，但写入本地上传记录失败：{message}"))?;
+    if let Err(error) = clear_upload_checkpoint(&db_path, item) {
+        status(
+            app,
+            "warning",
+            format!("秒传记录已保存，但清理旧上传断点失败：{error}"),
+        );
+    }
     emit(
         app,
         json!({
@@ -6014,8 +6441,17 @@ async fn upload_item(
     app: &tauri::AppHandle,
     state: &SharedState,
     item: &UploadItem,
+    released_queue_slot: Option<&AtomicBool>,
 ) -> Result<UploadOutcome, String> {
-    let (token, device_id, multipart_part_size, db_path) = {
+    let (
+        token,
+        device_id,
+        multipart_part_size,
+        oss_part_concurrency,
+        oss_part_semaphore,
+        checkpoint_writer,
+        db_path,
+    ) = {
         let guard = state.lock().map_err(|e| e.to_string())?;
         (
             guard
@@ -6024,6 +6460,9 @@ async fn upload_item(
                 .ok_or_else(|| "尚未登录光鸭云盘".to_string())?,
             guard.device_id.clone(),
             guard.multipart_part_size.clone(),
+            guard.oss_part_concurrency,
+            guard.oss_part_semaphore.clone(),
+            guard.upload_checkpoint_writer.clone(),
             guard.db_path.clone(),
         )
     };
@@ -6209,7 +6648,7 @@ async fn upload_item(
             );
             Ok(gcid)
         } else {
-            let result = calculate_file_gcid(app, &item.file_path, item.size).await;
+            let result = calculate_file_gcid(app, &item.file_path, item.size, None).await;
             if let Ok(gcid) = &result {
                 let saved = {
                     let guard = state.lock().map_err(|error| error.to_string())?;
@@ -6281,9 +6720,22 @@ async fn upload_item(
             app,
             json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": if item.size == 0 { 0 } else { uploaded_bytes.saturating_mul(100) / item.size }, "uploaded_bytes": uploaded_bytes, "total_bytes": item.size, "stage": if resumed { "正在从断点继续上传" } else { "正在连接 OSS" } }),
         );
-        upload_oss(&data, item, app, &multipart_part_size, &db_path, persisted).await?;
+        let oss_upload_guard = ActiveOssUploadGuard::new(state)?;
+        let upload_result = upload_oss(
+            &data,
+            item,
+            app,
+            &multipart_part_size,
+            oss_part_concurrency,
+            oss_part_semaphore,
+            &checkpoint_writer,
+            persisted,
+        )
+        .await;
+        drop(oss_upload_guard);
+        drain_flash_preflight(app.clone(), state.clone());
+        upload_result?;
     } else {
-        clear_upload_checkpoint(&db_path, item)?;
         emit(
             app,
             json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 100, "uploaded_bytes": item.size, "total_bytes": item.size, "stage": "已命中秒传" }),
@@ -6295,6 +6747,13 @@ async fn upload_item(
     };
     remember_pending_upload(state, item, &pending_outcome)
         .map_err(|message| format!("文件已上传，但写入本地上传记录失败：{message}"))?;
+    if let Err(error) = clear_upload_checkpoint(&db_path, item) {
+        status(
+            app,
+            "warning",
+            format!("上传记录已保存，但清理旧上传断点失败：{error}"),
+        );
+    }
     emit(
         app,
         json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 100, "uploaded_bytes": item.size, "total_bytes": item.size, "stage": "已上传，正在等待云端入库" }),
@@ -6303,6 +6762,15 @@ async fn upload_item(
         app,
         json!({ "type": "file", "state": "processing", "file_path": item.file_path.to_string_lossy(), "mapping_id": item.mapping_id, "uploaded_bytes": item.size, "total_bytes": item.size, "stage": "已上传，正在等待云端入库" }),
     );
+    if let Some(released_queue_slot) = released_queue_slot {
+        {
+            let mut guard = state.lock().map_err(|error| error.to_string())?;
+            guard.active_uploads = guard.active_uploads.saturating_sub(1);
+        }
+        released_queue_slot.store(true, Ordering::Release);
+        emit_state(app, state);
+        drain_queue(app.clone(), state.clone());
+    }
     let task_data = wait_upload_task(app, &token, &device_id, &data.task_id, &item.file_path)
         .await
         .map_err(|error| {
@@ -6695,6 +7163,7 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
                 || guard.token.is_none()
                 || guard.active_uploads == 0
                 || guard.active_flash_preflights >= FLASH_PREFLIGHT_CONCURRENCY
+                || !background_gcid_may_run(guard.active_oss_uploads)
             {
                 None
             } else {
@@ -7019,12 +7488,15 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
         let state2 = state.clone();
         tauri::async_runtime::spawn(async move {
             let upload_key = item_key(&item);
+            let released_queue_slot = Arc::new(AtomicBool::new(false));
             let mut item = item;
             let result = match upload_source_root(&state2, &item) {
                 Ok(source_root) => match prepare_upload_item(&item, source_root.as_deref()).await {
                     Ok(Some(ready)) => {
                         item = ready;
-                        upload_item(&app2, &state2, &item).await.map(Some)
+                        upload_item(&app2, &state2, &item, Some(&released_queue_slot))
+                            .await
+                            .map(Some)
                     }
                     Ok(None) => Ok(None),
                     Err(message) => Err(message),
@@ -7036,19 +7508,22 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                 .as_ref()
                 .err()
                 .is_some_and(|message| message.contains("登录态已失效"));
+            let upload_slot_released = released_queue_slot.load(Ordering::Acquire);
             let outcome = result.as_ref().ok().and_then(|value| value.clone());
             let error_message = result.as_ref().err().cloned();
             let mut db_path = None;
             let mut cloud_pending = false;
             if let Ok(mut guard) = state2.lock() {
-                guard.active_uploads = guard.active_uploads.saturating_sub(1);
+                cloud_pending = guard.pending_cloud.contains_key(&upload_key);
+                if !upload_slot_released && !cloud_pending {
+                    guard.active_uploads = guard.active_uploads.saturating_sub(1);
+                }
                 guard.inflight.remove(&upload_key);
                 guard.inflight_items.remove(&upload_key);
                 db_path = Some(guard.db_path.clone());
                 if auth_expired {
                     guard.token = None;
                 }
-                cloud_pending = guard.pending_cloud.contains_key(&upload_key);
                 if waiting_for_file {
                     guard.waiting_files.insert(upload_key.clone(), item.clone());
                 }
@@ -7744,6 +8219,7 @@ fn get_state(state: tauri::State<'_, SharedState>) -> Snapshot {
             upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
             download_concurrency: DEFAULT_DOWNLOAD_CONCURRENCY,
             multipart_part_size: default_multipart_part_size(),
+            oss_part_concurrency: DEFAULT_OSS_PART_CONCURRENCY,
             mappings: vec![],
             saved_shares: vec![],
             hdhive: HdhivePublicConfig {
@@ -10489,6 +10965,7 @@ fn get_transfer_settings(state: tauri::State<'_, SharedState>) -> Result<Transfe
         upload_concurrency: guard.upload_concurrency,
         download_concurrency: guard.download_concurrency,
         multipart_part_size: guard.multipart_part_size.clone(),
+        oss_part_concurrency: guard.oss_part_concurrency,
     })
 }
 #[tauri::command]
@@ -10498,6 +10975,7 @@ fn update_transfer_settings(
     upload_concurrency: usize,
     download_concurrency: usize,
     multipart_part_size: Option<String>,
+    oss_part_concurrency: Option<usize>,
 ) -> Result<Snapshot, String> {
     if !(1..=MAX_TRANSFER_CONCURRENCY).contains(&upload_concurrency)
         || !(1..=MAX_TRANSFER_CONCURRENCY).contains(&download_concurrency)
@@ -10509,14 +10987,40 @@ fn update_transfer_settings(
     let multipart_part_size = multipart_part_size
         .map(|value| validate_multipart_part_size(&value))
         .transpose()?;
+    let oss_part_concurrency = oss_part_concurrency
+        .map(|value| {
+            if (1..=MAX_OSS_PART_CONCURRENCY).contains(&value) {
+                Ok(value)
+            } else {
+                Err(format!(
+                    "单文件 OSS 分片并发必须在 1–{MAX_OSS_PART_CONCURRENCY} 之间"
+                ))
+            }
+        })
+        .transpose()?;
     let next = {
         let mut guard = state.lock().map_err(|error| error.to_string())?;
+        let previous = (
+            guard.upload_concurrency,
+            guard.download_concurrency,
+            guard.multipart_part_size.clone(),
+            guard.oss_part_concurrency,
+        );
         guard.upload_concurrency = upload_concurrency;
         guard.download_concurrency = download_concurrency;
         if let Some(multipart_part_size) = multipart_part_size {
             guard.multipart_part_size = multipart_part_size;
         }
-        save_config(&guard);
+        if let Some(oss_part_concurrency) = oss_part_concurrency {
+            guard.oss_part_concurrency = oss_part_concurrency;
+        }
+        if let Err(error) = save_config_checked(&guard) {
+            guard.upload_concurrency = previous.0;
+            guard.download_concurrency = previous.1;
+            guard.multipart_part_size = previous.2;
+            guard.oss_part_concurrency = previous.3;
+            return Err(error);
+        }
         snapshot(&guard)
     };
     emit_state(&app, state.inner());
@@ -10610,6 +11114,7 @@ fn run() {
                 .to_path_buf();
             let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
             init_database(&db_path)?;
+            let upload_checkpoint_writer = UploadCheckpointWriter::new(db_path.clone());
             let auth_session = load_auth_session(&db_path)?;
             let upload_history = load_upload_history(&db_path)?;
             let pending_cloud = pending_upload_stamps(&db_path)?;
@@ -10686,6 +11191,7 @@ fn run() {
                 DEFAULT_DOWNLOAD_CONCURRENCY,
             );
             let multipart_part_size = normalize_multipart_part_size(&config.multipart_part_size);
+            let oss_part_concurrency = normalize_oss_part_concurrency(config.oss_part_concurrency);
             let mappings = config
                 .mappings
                 .into_iter()
@@ -10726,6 +11232,13 @@ fn run() {
                 upload_concurrency,
                 download_concurrency,
                 multipart_part_size,
+                oss_part_concurrency,
+                oss_part_semaphore: Arc::new(Semaphore::new(
+                    usize::try_from(MAX_TOTAL_OSS_BUFFER_BYTES / OSS_BUFFER_PERMIT_BYTES)
+                        .unwrap_or(usize::MAX),
+                )),
+                upload_checkpoint_writer,
+                active_oss_uploads: 0,
                 cache_enabled: cache_policy.enabled,
                 cache_max_entries: cache_policy.max_entries,
                 device_id,
@@ -11492,21 +12005,24 @@ mod tests {
                 .uploaded_bytes,
             2
         );
-        assert_eq!(load_resumable_uploads(&database).unwrap().len(), 2);
+        assert!(load_resumable_uploads(&database).unwrap().is_empty());
+        let remaining_checkpoints = open_database(&database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM upload_checkpoints", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(remaining_checkpoints, 0);
         fs::remove_dir_all(root).expect("remove destination scope fixture");
     }
 
     #[test]
     fn multipart_part_size_uses_safe_tiers_and_stays_below_the_oss_part_limit() {
-        assert_eq!(oss_part_size(100 * 1024 * 1024), 1024 * 1024);
-        assert_eq!(oss_part_size(100 * 1024 * 1024 + 1), 2 * 1024 * 1024);
-        assert_eq!(oss_part_size(1024 * 1024 * 1024), 2 * 1024 * 1024);
-        assert_eq!(oss_part_size(1024 * 1024 * 1024 + 1), 4 * 1024 * 1024);
-        assert_eq!(oss_part_size(10 * 1024 * 1024 * 1024), 4 * 1024 * 1024);
-        assert_eq!(
-            oss_part_size(10 * 1024 * 1024 * 1024 + 1),
-            OSS_LARGE_FILE_PART_SIZE
-        );
+        assert_eq!(oss_part_size(100 * OSS_MIB), 4 * OSS_MIB);
+        assert_eq!(oss_part_size(100 * OSS_MIB + 1), 8 * OSS_MIB);
+        assert_eq!(oss_part_size(1024 * OSS_MIB), 8 * OSS_MIB);
+        assert_eq!(oss_part_size(1024 * OSS_MIB + 1), OSS_LARGE_FILE_PART_SIZE);
+        assert_eq!(oss_part_size(10 * 1024 * OSS_MIB), OSS_LARGE_FILE_PART_SIZE);
 
         let failed_file_size = 96_220_456_048;
         let part_size = oss_part_size(failed_file_size);
@@ -11521,7 +12037,7 @@ mod tests {
             OSS_LARGE_FILE_PART_SIZE + OSS_MIB
         );
 
-        assert_eq!(configured_oss_part_size(100 * OSS_MIB, "auto"), OSS_MIB);
+        assert_eq!(configured_oss_part_size(100 * OSS_MIB, "auto"), 4 * OSS_MIB);
         assert_eq!(configured_oss_part_size(100 * OSS_MIB, "4m"), 4 * OSS_MIB);
         assert_eq!(configured_oss_part_size(100 * OSS_MIB, "8m"), 8 * OSS_MIB);
         assert_eq!(configured_oss_part_size(100 * OSS_MIB, "16m"), 16 * OSS_MIB);
@@ -11530,6 +12046,182 @@ mod tests {
             assert!(ceil_div_u64(u64::MAX / 2, configured) <= OSS_MULTIPART_TARGET_PARTS);
             assert!(ceil_div_u64(u64::MAX / 2, configured) <= 10_000);
         }
+    }
+
+    #[test]
+    fn multipart_concurrency_and_checkpoint_flush_bound_resource_use() {
+        assert_eq!(effective_oss_part_concurrency(4 * OSS_MIB, 8), 8);
+        assert_eq!(effective_oss_part_concurrency(16 * OSS_MIB, 8), 8);
+        assert_eq!(effective_oss_part_concurrency(64 * OSS_MIB, 8), 2);
+        assert_eq!(effective_oss_part_concurrency(256 * OSS_MIB, 8), 1);
+        assert_eq!(oss_buffer_permits(4 * OSS_MIB), 1);
+        assert_eq!(oss_buffer_permits(16 * OSS_MIB), 4);
+        assert_eq!(oss_buffer_permits(64 * OSS_MIB), 16);
+        assert_eq!(oss_buffer_permits(256 * OSS_MIB), 64);
+        assert_eq!(oss_buffer_permits(512 * OSS_MIB), 64);
+        assert_eq!(
+            normalize_oss_part_concurrency(0),
+            DEFAULT_OSS_PART_CONCURRENCY
+        );
+        assert_eq!(normalize_oss_part_concurrency(8), 8);
+
+        assert!(!should_flush_upload_checkpoint(
+            0,
+            OSS_CHECKPOINT_FLUSH_BYTES - 1,
+            10 * OSS_CHECKPOINT_FLUSH_BYTES,
+            Duration::from_millis(500),
+        ));
+        assert!(should_flush_upload_checkpoint(
+            0,
+            OSS_CHECKPOINT_FLUSH_BYTES,
+            10 * OSS_CHECKPOINT_FLUSH_BYTES,
+            Duration::from_millis(500),
+        ));
+        assert!(should_flush_upload_checkpoint(
+            0,
+            OSS_MIB,
+            10 * OSS_CHECKPOINT_FLUSH_BYTES,
+            Duration::from_secs(OSS_CHECKPOINT_FLUSH_INTERVAL_SECS),
+        ));
+        assert!(should_flush_upload_checkpoint(
+            0,
+            10 * OSS_MIB,
+            10 * OSS_MIB,
+            Duration::ZERO,
+        ));
+    }
+
+    #[test]
+    fn upload_speed_waits_for_real_samples_and_keeps_the_full_average() {
+        let mut tracker = UploadSpeedTracker::new(4);
+        let first = tracker.observe(Duration::from_secs(4), 4 * OSS_MIB);
+        assert_eq!(first.bytes_per_second, 0.0);
+        assert_eq!(first.average_bytes_per_second, OSS_MIB as f64);
+
+        let second = tracker.observe(Duration::from_secs(5), 8 * OSS_MIB);
+        assert_eq!(second.bytes_per_second, 0.0);
+        assert_eq!(second.average_bytes_per_second, 8.0 * OSS_MIB as f64 / 5.0);
+
+        let third = tracker.observe(Duration::from_secs(6), 12 * OSS_MIB);
+        assert_eq!(third.bytes_per_second, 0.0);
+        assert_eq!(third.average_bytes_per_second, 2.0 * OSS_MIB as f64);
+
+        let fourth = tracker.observe(Duration::from_secs(7), 16 * OSS_MIB);
+        assert!(fourth.bytes_per_second > 0.0);
+        assert_eq!(fourth.average_bytes_per_second, 16.0 * OSS_MIB as f64 / 7.0);
+
+        let later = tracker.observe(Duration::from_secs(12), 24 * OSS_MIB);
+        assert!(later.bytes_per_second.is_finite());
+        assert_eq!(later.average_bytes_per_second, 2.0 * OSS_MIB as f64);
+    }
+
+    #[test]
+    fn upload_speed_uses_the_actual_pending_part_count_for_small_files() {
+        let mut tracker = UploadSpeedTracker::new(1);
+        let first = tracker.observe(Duration::from_secs(2), 2 * OSS_MIB);
+        assert_eq!(first.bytes_per_second, OSS_MIB as f64);
+        assert_eq!(first.average_bytes_per_second, OSS_MIB as f64);
+    }
+
+    #[test]
+    fn gcid_progress_is_throttled_and_background_hashing_yields_to_oss() {
+        assert!(!should_emit_gcid_progress(
+            Duration::ZERO,
+            0,
+            Duration::from_millis(GCID_PROGRESS_EMIT_INTERVAL_MS - 1),
+            1,
+            false,
+        ));
+        assert!(should_emit_gcid_progress(
+            Duration::ZERO,
+            0,
+            Duration::from_millis(GCID_PROGRESS_EMIT_INTERVAL_MS),
+            1,
+            false,
+        ));
+        assert!(!should_emit_gcid_progress(
+            Duration::from_millis(GCID_PROGRESS_EMIT_INTERVAL_MS),
+            1,
+            Duration::from_millis(GCID_PROGRESS_EMIT_INTERVAL_MS * 2),
+            1,
+            false,
+        ));
+        assert!(should_emit_gcid_progress(
+            Duration::from_millis(GCID_PROGRESS_EMIT_INTERVAL_MS),
+            1,
+            Duration::from_millis(GCID_PROGRESS_EMIT_INTERVAL_MS + 1),
+            100,
+            true,
+        ));
+        assert!(background_gcid_may_run(0));
+        assert!(!background_gcid_may_run(1));
+    }
+
+    #[test]
+    fn checkpoint_writer_flushes_latest_snapshot_before_acknowledging() {
+        let root =
+            std::env::temp_dir().join(format!("guangya-checkpoint-writer-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create checkpoint writer fixture");
+        let database = root.join("state.sqlite3");
+        let file_path = root.join("video.mkv");
+        fs::write(&file_path, b"0123456789").expect("write checkpoint writer fixture");
+        let metadata = fs::metadata(&file_path).expect("read checkpoint writer metadata");
+        let item = UploadItem {
+            mapping_id: "__manual__".into(),
+            file_path,
+            remote_parent_id: "parent-1".into(),
+            remote_dir: String::new(),
+            relative_path: String::new(),
+            change_kind: "added".into(),
+            size: metadata.len(),
+            modified_ms: modified_ms(&metadata),
+        };
+        init_database(&database).expect("initialize checkpoint writer database");
+        let mut checkpoint = OssUploadCheckpoint {
+            task_id: "task-1".into(),
+            object_path: "objects/video.mkv".into(),
+            bucket_name: "bucket".into(),
+            end_point: "https://oss.example.com".into(),
+            provider: Some(json!("oss")),
+            upload_id: "upload-1".into(),
+            part_size: 5,
+            completed_parts: BTreeMap::from([(1, "etag-1".into())]),
+        };
+        tauri::async_runtime::block_on(async {
+            let writer = UploadCheckpointWriter::new(database.clone());
+            writer
+                .enqueue(&item, &checkpoint, 5)
+                .expect("enqueue first checkpoint");
+            checkpoint.completed_parts.insert(2, "etag-2".into());
+            writer
+                .enqueue(&item, &checkpoint, 10)
+                .expect("enqueue latest checkpoint");
+            writer
+                .flush(&item, Some(&checkpoint), 10)
+                .await
+                .expect("flush latest checkpoint");
+
+            let loaded = load_upload_checkpoint(&database, &item)
+                .expect("load flushed checkpoint")
+                .expect("flushed checkpoint should exist");
+            assert_eq!(loaded.uploaded_bytes, 10);
+            assert_eq!(loaded.checkpoint.completed_parts.len(), 2);
+            clear_upload_checkpoint(&database, &item).expect("clear flushed checkpoint");
+            sleep(Duration::from_millis(25)).await;
+            assert!(load_upload_checkpoint(&database, &item)
+                .expect("check for late checkpoint write")
+                .is_none());
+            drop(writer);
+        });
+        fs::remove_dir_all(root).expect("remove checkpoint writer fixture");
+    }
+
+    #[test]
+    fn retryable_oss_body_clones_share_the_same_allocation() {
+        let body = Bytes::from(vec![7_u8; 1024]);
+        let retry = body.clone();
+        assert_eq!(body.as_ptr(), retry.as_ptr());
+        assert_eq!(body, retry);
     }
 
     #[test]
@@ -11550,6 +12242,7 @@ mod tests {
         assert_eq!(config.upload_concurrency, DEFAULT_UPLOAD_CONCURRENCY);
         assert_eq!(config.download_concurrency, DEFAULT_DOWNLOAD_CONCURRENCY);
         assert_eq!(config.multipart_part_size, DEFAULT_MULTIPART_PART_SIZE);
+        assert_eq!(config.oss_part_concurrency, DEFAULT_OSS_PART_CONCURRENCY);
         assert!(parse_cache_enabled(None));
         assert!(!parse_cache_enabled(Some("false")));
         assert_eq!(parse_cache_max_entries(None), DEFAULT_CACHE_MAX_ENTRIES);

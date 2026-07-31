@@ -147,8 +147,8 @@ test('全盘搜索、上传并发、短信登录和 HDHive 总开关按真实上
       const state = await fetch(`${base}/api/state`).then((response) => response.json());
       return state.pending === 0 && state.active_uploads === 0;
     }, 12_000);
-    // 三个普通上传槽之外，允许一条独立的后台秒传预检通道。
-    assert.equal(maxActiveTaskChecks, 4);
+    // OSS 完成后上传槽立即释放；pending 确认允许有限并发，但不能无限放大轮询。
+    assert.ok(maxActiveTaskChecks >= 2 && maxActiveTaskChecks <= 4);
 
     const captchaRequired = await fetch(`${base}/api/auth/sms/send`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone_number: '13800000001' }),
