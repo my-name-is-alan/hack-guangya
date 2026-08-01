@@ -677,7 +677,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "const-random"
-version = "0.1.19"
+version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "87e00182fe74b066627d63b85fd550ac2998d4b0bd86bfed477a0ae4c7c71359"
 dependencies = [
@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "guangya-folder-sync"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "axum",
  "base64 0.22.1",
