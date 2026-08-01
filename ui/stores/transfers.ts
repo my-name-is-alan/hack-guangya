@@ -30,6 +30,8 @@ export interface DownloadTask {
   downloadedBytes: number
   totalBytes: number
   bytesPerSecond: number
+  segmented: boolean
+  connections: number
   filePath: string
   error: string
   createdAt: number
@@ -79,6 +81,8 @@ export const useTransfersStore = defineStore('transfers', () => {
         downloadedBytes: payload.downloaded_bytes == null ? undefined : Number(payload.downloaded_bytes),
         totalBytes: payload.total_bytes == null ? undefined : Number(payload.total_bytes),
         bytesPerSecond: payload.bytes_per_second == null ? undefined : Number(payload.bytes_per_second),
+        segmented: payload.segmented == null ? undefined : Boolean(payload.segmented),
+        connections: payload.connections == null ? undefined : Number(payload.connections),
         filePath: payload.file_path || undefined,
         error: payload.error || undefined,
       })
@@ -147,7 +151,8 @@ export const useTransfersStore = defineStore('transfers', () => {
     const task: DownloadTask = {
       id: newDownloadId(), fileName, destination, source: '我的文件', packaged,
       status: 'queued', progress: 0, downloadedBytes: 0, totalBytes: 0,
-      bytesPerSecond: 0, filePath: '', error: '', createdAt: now, updatedAt: now,
+      bytesPerSecond: 0, segmented: false, connections: 1,
+      filePath: '', error: '', createdAt: now, updatedAt: now,
     }
     enqueueLocalDownload('get_cloud_download', { file_ids: ids, packaged }, task)
     return true
@@ -179,7 +184,8 @@ export const useTransfersStore = defineStore('transfers', () => {
     const task: DownloadTask = {
       id: newDownloadId(), fileName, destination: selected, source: '接收分享', packaged,
       status: 'queued', progress: 0, downloadedBytes: 0, totalBytes: 0,
-      bytesPerSecond: 0, filePath: '', error: '', createdAt: now, updatedAt: now,
+      bytesPerSecond: 0, segmented: false, connections: 1,
+      filePath: '', error: '', createdAt: now, updatedAt: now,
     }
     enqueueLocalDownload('get_received_share_download', {
       access_token: accessToken,

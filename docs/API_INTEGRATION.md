@@ -231,7 +231,7 @@ UI 通过 bridge 的登录失效通知统一清空账号概览和文件状态。
 
 | UI 能力 | bridge | Tauri handler | Web route | 光鸭/数据通道 | 状态/备注 |
 |---|---|---|---|---|---|
-| 我的文件单文件下载 | `get_cloud_download` | `get_cloud_download` | `POST /api/files/download` | `POST /userres/v1/get_res_download_url` → 签名 CDN GET | L/R；实测字段 `signedURL`、TTL 21600 秒。桌面写入所选目录，Web 打开 URL。 |
+| 我的文件单文件下载 | `get_cloud_download` | `get_cloud_download` | `POST /api/files/download` | `POST /userres/v1/get_res_download_url` → 签名 CDN GET/Range | L/R；实测字段 `signedURL`、TTL 21600 秒。桌面端对不小于 16 MiB 且支持 `206 Content-Range` 的文件使用有界并发分片，分片失败自动回退单流；Web 打开 URL。 |
 | 我的文件夹/多选打包 | `get_cloud_download`，`packaged:true` | 同名 | 同上 | `POST /scheduler/v1/create_packaging_task` → 轮询 `/scheduler/v1/query_packaging_task` → CDN | S/R；当前最长等待 10 分钟。 |
 | 接收分享单文件下载 | `get_received_share_download` | `get_received_share_download` | `POST /api/received-share/download` | `POST /userres/v1/get_share_download_url` → CDN | S/R；body 含分享 `accessToken`。205/206/207 等限制应保留具体提示。 |
 | 接收分享打包下载 | 同上，`packaged:true` | 同名 | 同上 | scheduler create/query，额外带分享 `accessToken` | S/R。 |
@@ -300,7 +300,7 @@ HDHive 请求矩阵：
 |---|---|---|---|---|---|
 | 暂停/恢复队列 | `pause_queue` / `resume_queue` | 同名 | `POST /api/queue/pause` / `resume` | — | Local/R；控制本地调度，不撤销已发出的上游请求。 |
 | 读取传输设置 | `get_transfer_settings` | 同名 | `GET /api/settings` | — | Local/R。 |
-| 更新并发/分片设置 | `update_transfer_settings` | 同名 | `POST /api/settings/transfer` | — | Local/R；真正上传时影响 OSS 并发/part size。 |
+| 更新并发/分片设置 | `update_transfer_settings` | 同名 | `POST /api/settings/transfer` | — | Local/R；上传设置影响 OSS 并发/part size；下载并发表示同时文件任务数，桌面单文件分片会按总 HTTP 连接预算自动分配 1–4 路。 |
 | 读取/更新缓存策略 | `get_cache_settings` / `update_cache_settings` | 同名 | `GET/POST /api/settings/cache` | — | Local/R。 |
 | 缓存统计/清理 | `get_metadata_cache_stats` / `clear_metadata_cache` | 同名 | `GET /api/cache` / `POST /api/cache/clear` | — | Local/R；清本地目录/GCID 元数据缓存，不删除云端文件。 |
 | WebDAV 状态与凭据 | `get_mount_info` / `update_mount_credentials` | 同名 | `GET /api/mount` / `POST /api/mount/credentials` | — | Local/R；WebDAV 认证独立于 Web 管理访问码和光鸭登录。 |

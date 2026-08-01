@@ -87,7 +87,10 @@ watch(tab, value => void router.replace({ query: { ...route.query, tab: value } 
               <div class="transfer-name"><strong :title="item.fileName">{{ item.fileName }}</strong><span>{{ item.filePath || item.destination }}</span></div>
               <a-progress :percent="Math.round(item.progress || 0)" :status="item.status === 'failed' ? 'exception' : item.status === 'completed' ? 'success' : 'normal'" :show-info="false" size="small" />
             </div>
-            <span class="transfer-speed">{{ item.bytesPerSecond ? formatUploadSpeed(item.bytesPerSecond) : item.totalBytes ? `${formatSize(item.downloadedBytes)} / ${formatSize(item.totalBytes)}` : '' }}</span>
+            <span class="transfer-speed">
+              {{ item.bytesPerSecond ? formatUploadSpeed(item.bytesPerSecond) : item.totalBytes ? `${formatSize(item.downloadedBytes)} / ${formatSize(item.totalBytes)}` : '' }}
+              <template v-if="item.segmented && item.connections > 1"><br />{{ item.connections }} 路分片</template>
+            </span>
             <a-tag v-if="item.status === 'completed'" color="success"><CheckCircleOutlined /> 完成</a-tag>
             <a-tag v-else-if="item.status === 'failed'" color="error"><CloseCircleOutlined /> 失败</a-tag>
             <a-tag v-else color="processing"><LoadingOutlined spin /> {{ Math.round(item.progress || 0) }}%</a-tag>

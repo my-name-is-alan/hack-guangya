@@ -4,12 +4,14 @@ mod native_mount;
 mod webdav;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use futures_util::{stream, StreamExt};
+use futures_util::{stream, StreamExt, TryStreamExt};
 use hmac::{Hmac, Mac};
 use md5::Md5;
 use native_mount::{NativeMountInfo, NativeMountManager, NativeMountOptions};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, DATE, ETAG};
+use reqwest::header::{
+    HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_RANGE, CONTENT_TYPE, DATE, ETAG, RANGE,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -21,14 +23,17 @@ use std::{
     io::{self, SeekFrom},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
     },
 };
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    sync::{
+        mpsc::{self, UnboundedReceiver, UnboundedSender},
+        Semaphore,
+    },
     time::{sleep, Duration, Instant},
 };
 use uuid::Uuid;
@@ -59,6 +64,7 @@ const FILE_BUSY_RETRY_SECS: u64 = 3;
 const POLL_INTERVAL_SECS: u64 = 5;
 const API_CONNECT_TIMEOUT_SECS: u64 = 15;
 const API_REQUEST_TIMEOUT_SECS: u64 = 30;
+const FILE_LIST_REQUEST_TIMEOUT_SECS: u64 = 12;
 const OSS_REQUEST_TIMEOUT_SECS: u64 = 600;
 const OSS_MULTIPART_TARGET_PARTS: u64 = 9_000;
 const OSS_MIB: u64 = 1024 * 1024;
@@ -74,6 +80,14 @@ const DEFAULT_WEBDAV_USERNAME: &str = "guangya";
 const MAX_GCID_IMPORT_CONCURRENCY: usize = 16;
 const MAX_GCID_IMPORT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_GCID_IMPORT_ATTEMPTS: i64 = 5;
+const DOWNLOAD_PARALLEL_MIN_BYTES: u64 = 16 * 1024 * 1024;
+const DOWNLOAD_RANGE_MIN_BYTES: u64 = 8 * 1024 * 1024;
+const DOWNLOAD_RANGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const DOWNLOAD_MAX_HTTP_CONNECTIONS: usize = 8;
+const DOWNLOAD_MAX_CONNECTIONS_PER_FILE: usize = 4;
+const DOWNLOAD_PROBE_TIMEOUT_SECS: u64 = 12;
+const DOWNLOAD_READ_IDLE_TIMEOUT_SECS: u64 = 45;
+const DOWNLOAD_RANGE_ATTEMPTS: usize = 3;
 const DEFAULT_API_PAGE_SIZE: u64 = 100;
 const DEFAULT_RECENT_PAGE_SIZE: u64 = 20;
 const MAX_API_PAGE_SIZE: u64 = 100;
@@ -7331,14 +7345,18 @@ async fn list_files(
     folders_only: Option<bool>,
 ) -> Result<Value, String> {
     let (token, device_id) = auth_context(&state)?;
-    let response = api_post(
-        &token,
-        &device_id,
-        "/userres/v1/file/get_file_list",
-        file_list_request(&parent_id, page, folders_only.unwrap_or(false)),
-        &[],
+    let response = tokio::time::timeout(
+        Duration::from_secs(FILE_LIST_REQUEST_TIMEOUT_SECS),
+        api_post(
+            &token,
+            &device_id,
+            "/userres/v1/file/get_file_list",
+            file_list_request(&parent_id, page, folders_only.unwrap_or(false)),
+            &[],
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| "文件目录加载超过 12 秒，请重试".to_string())??;
     Ok(response
         .data
         .unwrap_or_else(|| json!({ "list": [], "total": 0 })))
@@ -7350,8 +7368,7 @@ fn file_list_request(parent_id: &str, page: u64, folders_only: bool) -> Value {
         "pageSize": 100,
         "parentId": parent_id,
         "orderBy": 0,
-        "sortType": 0,
-        "needSubFolderStat": true
+        "sortType": 0
     });
     if folders_only {
         request
@@ -8280,6 +8297,7 @@ async fn get_received_share_download(
     if !packaged && file_ids.len() != 1 {
         return Err("单文件下载只能选择一个文件".into());
     }
+    let download_task_concurrency = current_download_task_concurrency(state.inner())?;
     let (token, device_id) = auth_context(&state)?;
     if !packaged {
         let response = api_post(
@@ -8312,6 +8330,7 @@ async fn get_received_share_download(
             &file_name,
             &destination_dir,
             &download_id,
+            download_task_concurrency,
         )
         .await;
     }
@@ -8359,6 +8378,7 @@ async fn get_received_share_download(
                 &file_name,
                 &destination_dir,
                 &download_id,
+                download_task_concurrency,
             )
             .await;
         }
@@ -8382,6 +8402,7 @@ async fn get_cloud_download(
     if !packaged && file_ids.len() != 1 {
         return Err("单文件下载只能选择一个文件".into());
     }
+    let download_task_concurrency = current_download_task_concurrency(state.inner())?;
     let (token, device_id) = auth_context(&state)?;
     if !packaged {
         let response = api_post(
@@ -8406,6 +8427,7 @@ async fn get_cloud_download(
             &file_name,
             &destination_dir,
             &download_id,
+            download_task_concurrency,
         )
         .await;
     }
@@ -8453,6 +8475,7 @@ async fn get_cloud_download(
                 &file_name,
                 &destination_dir,
                 &download_id,
+                download_task_concurrency,
             )
             .await;
         }
@@ -8545,15 +8568,313 @@ fn available_download_path(directory: &Path, file_name: &str) -> PathBuf {
     directory.join(format!("{stem}-{}", Uuid::new_v4()))
 }
 
-fn response_total_bytes(response: &reqwest::Response) -> Option<u64> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DownloadByteRange {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ParsedContentRange {
+    start: u64,
+    end: u64,
+    total: u64,
+}
+
+fn parse_content_range(value: &str) -> Option<ParsedContentRange> {
+    let value = value.trim().strip_prefix("bytes ")?;
+    let (range, total) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let parsed = ParsedContentRange {
+        start: start.parse().ok()?,
+        end: end.parse().ok()?,
+        total: total.parse().ok()?,
+    };
+    (parsed.start <= parsed.end && parsed.end < parsed.total).then_some(parsed)
+}
+
+fn response_content_range(response: &reqwest::Response) -> Option<ParsedContentRange> {
     response
         .headers()
-        .get("content-range")
+        .get(CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.rsplit('/').next())
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
+        .and_then(parse_content_range)
+}
+
+fn response_total_bytes(response: &reqwest::Response) -> Option<u64> {
+    response_content_range(response)
+        .map(|value| value.total)
         .or_else(|| response.content_length().filter(|value| *value > 0))
+}
+
+fn configured_download_connections(download_task_concurrency: usize) -> usize {
+    let task_concurrency = download_task_concurrency.clamp(1, MAX_TRANSFER_CONCURRENCY);
+    (DOWNLOAD_MAX_HTTP_CONNECTIONS / task_concurrency).clamp(2, DOWNLOAD_MAX_CONNECTIONS_PER_FILE)
+}
+
+fn download_http_semaphore() -> Arc<Semaphore> {
+    static LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    LIMITER
+        .get_or_init(|| Arc::new(Semaphore::new(DOWNLOAD_MAX_HTTP_CONNECTIONS)))
+        .clone()
+}
+
+fn current_download_task_concurrency(state: &SharedState) -> Result<usize, String> {
+    state
+        .lock()
+        .map(|guard| guard.download_concurrency)
+        .map_err(|_| "读取下载并发设置失败".to_string())
+}
+
+fn download_byte_ranges(total_bytes: u64, connections: usize) -> Vec<DownloadByteRange> {
+    if total_bytes == 0 {
+        return Vec::new();
+    }
+    let target_chunks = connections.max(1).saturating_mul(4) as u64;
+    let balanced = total_bytes / target_chunks + u64::from(total_bytes % target_chunks != 0);
+    let chunk_size = balanced.clamp(DOWNLOAD_RANGE_MIN_BYTES, DOWNLOAD_RANGE_MAX_BYTES);
+    let mut ranges = Vec::new();
+    let mut start = 0_u64;
+    while start < total_bytes {
+        let end = start
+            .saturating_add(chunk_size.saturating_sub(1))
+            .min(total_bytes - 1);
+        ranges.push(DownloadByteRange { start, end });
+        start = end.saturating_add(1);
+    }
+    ranges
+}
+
+async fn probe_download(client: &reqwest::Client, download_url: &str) -> (Option<u64>, bool) {
+    let Ok(_permit) = download_http_semaphore().acquire_owned().await else {
+        return (None, false);
+    };
+    let response = match tokio::time::timeout(
+        Duration::from_secs(DOWNLOAD_PROBE_TIMEOUT_SECS),
+        client.get(download_url).header(RANGE, "bytes=0-0").send(),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        _ => return (None, false),
+    };
+    if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        if let Some(range) = response_content_range(&response) {
+            return (Some(range.total), range.start == 0 && range.end == 0);
+        }
+    }
+    (response_total_bytes(&response), false)
+}
+
+async fn download_range_to_file(
+    client: &reqwest::Client,
+    download_url: &str,
+    partial: &Path,
+    range: DownloadByteRange,
+    total_bytes: u64,
+    progress: &AtomicU64,
+) -> Result<(), String> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(partial)
+        .await
+        .map_err(|error| format!("打开分片临时文件失败：{error}"))?;
+    file.seek(SeekFrom::Start(range.start))
+        .await
+        .map_err(|error| format!("定位下载分片失败：{error}"))?;
+    let mut cursor = range.start;
+    let mut last_error = "分片数据提前结束".to_string();
+    for attempt in 1..=DOWNLOAD_RANGE_ATTEMPTS {
+        if cursor > range.end {
+            break;
+        }
+        let permit = download_http_semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|_| "下载连接调度器已关闭".to_string())?;
+        let requested_range = format!("bytes={cursor}-{}", range.end);
+        let mut response = match tokio::time::timeout(
+            Duration::from_secs(DOWNLOAD_READ_IDLE_TIMEOUT_SECS),
+            client
+                .get(download_url)
+                .header(RANGE, requested_range)
+                .send(),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                last_error = format!("连接分片服务器失败：{error}");
+                continue;
+            }
+            Err(_) => {
+                last_error = format!(
+                    "连接分片服务器超过 {} 秒无响应",
+                    DOWNLOAD_READ_IDLE_TIMEOUT_SECS
+                );
+                continue;
+            }
+        };
+        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(format!(
+                "下载服务器拒绝分片请求（HTTP {}）",
+                response.status()
+            ));
+        }
+        let content_range = response_content_range(&response)
+            .ok_or_else(|| "下载分片响应缺少有效 Content-Range".to_string())?;
+        if content_range.start != cursor
+            || content_range.end != range.end
+            || content_range.total != total_bytes
+        {
+            return Err(format!(
+                "下载分片范围不一致（期望 {cursor}-{} / {total_bytes}，实际 {}-{} / {}）",
+                range.end, content_range.start, content_range.end, content_range.total
+            ));
+        }
+        loop {
+            let next = tokio::time::timeout(
+                Duration::from_secs(DOWNLOAD_READ_IDLE_TIMEOUT_SECS),
+                response.chunk(),
+            )
+            .await;
+            let chunk = match next {
+                Ok(Ok(Some(chunk))) => chunk,
+                Ok(Ok(None)) => {
+                    last_error = "分片数据提前结束".to_string();
+                    break;
+                }
+                Ok(Err(error)) => {
+                    last_error = format!("读取下载分片失败：{error}");
+                    break;
+                }
+                Err(_) => {
+                    last_error = format!(
+                        "下载分片超过 {} 秒没有新数据",
+                        DOWNLOAD_READ_IDLE_TIMEOUT_SECS
+                    );
+                    break;
+                }
+            };
+            let remaining = range.end.saturating_sub(cursor).saturating_add(1);
+            if chunk.len() as u64 > remaining {
+                return Err("下载服务器返回了超出请求范围的数据".into());
+            }
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| format!("写入下载分片失败：{error}"))?;
+            cursor = cursor.saturating_add(chunk.len() as u64);
+            progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            if cursor > range.end {
+                break;
+            }
+        }
+        if cursor > range.end {
+            drop(permit);
+            break;
+        }
+        if attempt == DOWNLOAD_RANGE_ATTEMPTS {
+            return Err(format!(
+                "下载分片 {}-{} 重试 {} 次仍失败：{last_error}",
+                range.start, range.end, DOWNLOAD_RANGE_ATTEMPTS
+            ));
+        }
+        drop(permit);
+    }
+    if cursor <= range.end {
+        return Err(format!(
+            "下载分片 {}-{} 未完成：{last_error}",
+            range.start, range.end
+        ));
+    }
+    file.flush()
+        .await
+        .map_err(|error| format!("刷新下载分片失败：{error}"))?;
+    Ok(())
+}
+
+async fn download_parallel_ranges(
+    app: &tauri::AppHandle,
+    client: &reqwest::Client,
+    download_url: &str,
+    partial: &Path,
+    total_bytes: u64,
+    connections: usize,
+    download_id: &str,
+    actual_name: &str,
+) -> Result<u64, String> {
+    let file = tokio::fs::File::create(partial)
+        .await
+        .map_err(|error| format!("无法创建临时下载文件 {}：{error}", partial.display()))?;
+    file.set_len(total_bytes)
+        .await
+        .map_err(|error| format!("无法预分配下载文件空间：{error}"))?;
+    drop(file);
+
+    let progress = Arc::new(AtomicU64::new(0));
+    let ranges = download_byte_ranges(total_bytes, connections);
+    let tasks = stream::iter(ranges.into_iter().map(|range| {
+        let client = client.clone();
+        let download_url = download_url.to_string();
+        let partial = partial.to_path_buf();
+        let progress = progress.clone();
+        async move {
+            download_range_to_file(
+                &client,
+                &download_url,
+                &partial,
+                range,
+                total_bytes,
+                &progress,
+            )
+            .await
+        }
+    }))
+    .buffer_unordered(connections)
+    .try_collect::<Vec<()>>();
+    tokio::pin!(tasks);
+
+    let mut last_emit = Instant::now();
+    let mut last_emit_bytes = 0_u64;
+    let result = loop {
+        tokio::select! {
+            result = &mut tasks => break result.map(|_| ()),
+            _ = sleep(Duration::from_millis(400)) => {
+                let downloaded_bytes = progress.load(Ordering::Relaxed);
+                let elapsed = last_emit.elapsed().as_secs_f64();
+                let bytes_per_second = if elapsed > 0.0 {
+                    ((downloaded_bytes.saturating_sub(last_emit_bytes)) as f64 / elapsed) as u64
+                } else {
+                    0
+                };
+                emit(
+                    app,
+                    json!({
+                        "type": "download",
+                        "download_id": download_id,
+                        "state": "downloading",
+                        "file_name": actual_name,
+                        "downloaded_bytes": downloaded_bytes,
+                        "total_bytes": total_bytes,
+                        "percent": (downloaded_bytes.saturating_mul(100) / total_bytes).min(99),
+                        "bytes_per_second": bytes_per_second,
+                        "segmented": true,
+                        "connections": connections
+                    }),
+                );
+                last_emit = Instant::now();
+                last_emit_bytes = downloaded_bytes;
+            }
+        }
+    };
+    result?;
+    let downloaded_bytes = progress.load(Ordering::Relaxed);
+    if downloaded_bytes != total_bytes {
+        return Err(format!(
+            "并发分片下载不完整：应为 {total_bytes} 字节，实际 {downloaded_bytes} 字节"
+        ));
+    }
+    Ok(downloaded_bytes)
 }
 
 async fn download_to_local(
@@ -8562,6 +8883,7 @@ async fn download_to_local(
     requested_name: &str,
     destination_dir: &str,
     download_id: &str,
+    download_task_concurrency: usize,
 ) -> Result<Value, String> {
     if destination_dir.trim().is_empty() {
         return Err("请先选择下载保存目录".into());
@@ -8588,25 +8910,12 @@ async fn download_to_local(
         .connect_timeout(Duration::from_secs(API_CONNECT_TIMEOUT_SECS))
         .build()
         .map_err(|error| format!("创建下载客户端失败：{error}"))?;
-    let probed_total_bytes = match client.head(download_url).send().await {
-        Ok(response) if response.status().is_success() => response_total_bytes(&response),
-        _ => None,
-    };
-    let mut response = client
-        .get(download_url)
-        .send()
-        .await
-        .map_err(|error| format!("连接光鸭下载服务器失败：{error}"))?;
-    if !response.status().is_success() {
-        return Err(format!("光鸭文件下载失败（HTTP {}）", response.status()));
-    }
-    let total_bytes = response_total_bytes(&response).or(probed_total_bytes);
-    let mut file = tokio::fs::File::create(&partial)
-        .await
-        .map_err(|error| format!("无法创建临时下载文件 {}：{error}", partial.display()))?;
-    let mut downloaded_bytes = 0_u64;
-    let mut last_emit = Instant::now();
-    let mut last_emit_bytes = 0_u64;
+    let (probed_total_bytes, supports_ranges) = probe_download(&client, download_url).await;
+    let configured_connections = configured_download_connections(download_task_concurrency);
+    let segmented = supports_ranges
+        && configured_connections > 1
+        && probed_total_bytes.is_some_and(|total| total >= DOWNLOAD_PARALLEL_MIN_BYTES);
+    let connections = if segmented { configured_connections } else { 1 };
     emit(
         app,
         json!({
@@ -8615,17 +8924,88 @@ async fn download_to_local(
             "state": "downloading",
             "file_name": actual_name,
             "downloaded_bytes": 0,
-            "total_bytes": total_bytes,
-            "percent": total_bytes.map(|_| 0),
-            "bytes_per_second": 0
+            "total_bytes": probed_total_bytes,
+            "percent": probed_total_bytes.map(|_| 0),
+            "bytes_per_second": 0,
+            "segmented": segmented,
+            "connections": connections
         }),
     );
-    let result: Result<(), String> = async {
-        while let Some(chunk) = response
-            .chunk()
+    let result: Result<(u64, Option<u64>, bool, usize), String> = async {
+        if segmented {
+            let total_bytes = probed_total_bytes.expect("segmented downloads require a known size");
+            match download_parallel_ranges(
+                app,
+                &client,
+                download_url,
+                &partial,
+                total_bytes,
+                connections,
+                download_id,
+                &actual_name,
+            )
             .await
-            .map_err(|error| format!("读取光鸭下载数据失败：{error}"))?
-        {
+            {
+                Ok(downloaded_bytes) => {
+                    return Ok((downloaded_bytes, Some(total_bytes), true, connections));
+                }
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(&partial).await;
+                    emit(
+                        app,
+                        json!({
+                            "type": "download",
+                            "download_id": download_id,
+                            "state": "downloading",
+                            "file_name": actual_name,
+                            "downloaded_bytes": 0,
+                            "total_bytes": total_bytes,
+                            "percent": 0,
+                            "bytes_per_second": 0,
+                            "segmented": false,
+                            "connections": 1,
+                            "fallback_reason": error
+                        }),
+                    );
+                }
+            }
+        }
+
+        let permit = download_http_semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|_| "下载连接调度器已关闭".to_string())?;
+        let mut response = tokio::time::timeout(
+            Duration::from_secs(DOWNLOAD_READ_IDLE_TIMEOUT_SECS),
+            client.get(download_url).send(),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "连接光鸭下载服务器超过 {} 秒无响应",
+                DOWNLOAD_READ_IDLE_TIMEOUT_SECS
+            )
+        })?
+        .map_err(|error| format!("连接光鸭下载服务器失败：{error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("光鸭文件下载失败（HTTP {}）", response.status()));
+        }
+        let total_bytes = response_total_bytes(&response).or(probed_total_bytes);
+        let mut file = tokio::fs::File::create(&partial)
+            .await
+            .map_err(|error| format!("无法创建临时下载文件 {}：{error}", partial.display()))?;
+        let mut downloaded_bytes = 0_u64;
+        let mut last_emit = Instant::now();
+        let mut last_emit_bytes = 0_u64;
+        loop {
+            let chunk = tokio::time::timeout(
+                Duration::from_secs(DOWNLOAD_READ_IDLE_TIMEOUT_SECS),
+                response.chunk(),
+            )
+            .await
+            .map_err(|_| format!("下载超过 {} 秒没有新数据", DOWNLOAD_READ_IDLE_TIMEOUT_SECS))?
+            .map_err(|error| format!("读取光鸭下载数据失败：{error}"))?;
+            let Some(chunk) = chunk else { break };
             file.write_all(&chunk)
                 .await
                 .map_err(|error| format!("写入下载文件失败：{error}"))?;
@@ -8650,7 +9030,9 @@ async fn download_to_local(
                         "downloaded_bytes": downloaded_bytes,
                         "total_bytes": total_bytes,
                         "percent": percent,
-                        "bytes_per_second": bytes_per_second
+                        "bytes_per_second": bytes_per_second,
+                        "segmented": false,
+                        "connections": 1
                     }),
                 );
                 last_emit = Instant::now();
@@ -8660,18 +9042,29 @@ async fn download_to_local(
         file.flush()
             .await
             .map_err(|error| format!("刷新下载文件失败：{error}"))?;
-        Ok(())
+        drop(file);
+        drop(permit);
+        if let Some(total_bytes) = total_bytes {
+            if downloaded_bytes != total_bytes {
+                return Err(format!(
+                    "下载数据不完整：应为 {total_bytes} 字节，实际 {downloaded_bytes} 字节"
+                ));
+            }
+        }
+        Ok((downloaded_bytes, total_bytes, false, 1))
     }
     .await;
-    drop(file);
-    if let Err(error) = result {
-        let _ = tokio::fs::remove_file(&partial).await;
-        emit(
-            app,
-            json!({ "type": "download", "download_id": download_id, "state": "error", "error": error }),
-        );
-        return Err(error);
-    }
+    let (downloaded_bytes, total_bytes, completed_segmented, completed_connections) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&partial).await;
+            emit(
+                app,
+                json!({ "type": "download", "download_id": download_id, "state": "error", "error": error }),
+            );
+            return Err(error);
+        }
+    };
     if let Err(error) = tokio::fs::rename(&partial, &target).await {
         let _ = tokio::fs::remove_file(&partial).await;
         return Err(format!("完成下载文件失败：{error}"));
@@ -8688,7 +9081,9 @@ async fn download_to_local(
             "downloaded_bytes": downloaded_bytes,
             "total_bytes": total_bytes,
             "percent": 100,
-            "bytes_per_second": 0
+            "bytes_per_second": 0,
+            "segmented": completed_segmented,
+            "connections": completed_connections
         }),
     );
     Ok(json!({
@@ -12012,6 +12407,7 @@ mod tests {
         assert_eq!(regular.get("parentId"), Some(&json!("folder-1")));
         assert_eq!(regular.get("page"), Some(&json!(3)));
         assert!(regular.get("resType").is_none());
+        assert!(regular.get("needSubFolderStat").is_none());
 
         let folders = file_list_request("folder-1", 3, true);
         assert_eq!(folders.get("resType"), Some(&json!(2)));
@@ -12294,6 +12690,46 @@ mod tests {
             root.join("episode (1).mkv")
         );
         fs::remove_dir_all(root).expect("download test directory should be removable");
+    }
+
+    #[test]
+    fn parallel_download_ranges_are_contiguous_bounded_and_complete() {
+        let total_bytes = 200 * 1024 * 1024 + 17;
+        let ranges = download_byte_ranges(total_bytes, 4);
+        assert!(ranges.len() > 4);
+        assert_eq!(ranges.first().map(|range| range.start), Some(0));
+        assert_eq!(ranges.last().map(|range| range.end), Some(total_bytes - 1));
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].end + 1, pair[1].start);
+        }
+        assert!(ranges.iter().all(|range| {
+            let length = range.end - range.start + 1;
+            length <= DOWNLOAD_RANGE_MAX_BYTES
+        }));
+    }
+
+    #[test]
+    fn download_connection_budget_balances_files_and_segments() {
+        assert_eq!(configured_download_connections(1), 4);
+        assert_eq!(configured_download_connections(2), 4);
+        assert_eq!(configured_download_connections(4), 2);
+        assert_eq!(configured_download_connections(8), 2);
+        assert_eq!(configured_download_connections(99), 2);
+    }
+
+    #[test]
+    fn content_range_parser_rejects_incomplete_or_invalid_ranges() {
+        assert_eq!(
+            parse_content_range("bytes 8388608-16777215/33554432"),
+            Some(ParsedContentRange {
+                start: 8_388_608,
+                end: 16_777_215,
+                total: 33_554_432,
+            })
+        );
+        assert!(parse_content_range("bytes */33554432").is_none());
+        assert!(parse_content_range("bytes 10-9/20").is_none());
+        assert!(parse_content_range("bytes 0-20/20").is_none());
     }
 
     #[test]

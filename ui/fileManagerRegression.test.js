@@ -8,6 +8,7 @@ const gcidImportStatusSource = readFile(new URL('./components/files/GcidImportSt
 const renameRulesSource = readFile(new URL('./renameRules.js', import.meta.url), 'utf8');
 const stylesSource = readFile(new URL('./styles.css', import.meta.url), 'utf8');
 const transfersSource = readFile(new URL('./stores/transfers.ts', import.meta.url), 'utf8');
+const transfersViewSource = readFile(new URL('./views/TransfersView.vue', import.meta.url), 'utf8');
 
 function sourceBetween(source, startMarker, endMarker) {
   const start = source.indexOf(startMarker);
@@ -86,6 +87,14 @@ test('cancelled desktop folder selection does not report a queued download', asy
   assert.match(transferStoreSource, /typeof selected !== ['"]string['"] \|\| !selected\) return false/);
   assert.match(downloadSource, /const queued = await transfers\.downloadRecords\(targets\)/);
   assert.match(downloadSource, /if \(isTauri && queued\) message\.success\(['"]已加入下载队列['"]\)/);
+});
+
+test('desktop download progress exposes concurrent range mode', async () => {
+  const [transferStoreSource, transferViewSource] = await Promise.all([transfersSource, transfersViewSource]);
+  assert.match(transferStoreSource, /segmented:\s*payload\.segmented == null \? undefined : Boolean\(payload\.segmented\)/);
+  assert.match(transferStoreSource, /connections:\s*payload\.connections == null \? undefined : Number\(payload\.connections\)/);
+  assert.match(transferViewSource, /item\.segmented && item\.connections > 1/);
+  assert.match(transferViewSource, /\{\{ item\.connections \}\} 路分片/);
 });
 
 test('rename request keeps file identifiers and names in camelCase', async () => {

@@ -551,7 +551,6 @@ test('Web 扫码登录保存刷新令牌并在重启后自动续期', async () =
       parentId: 'folder-1',
       orderBy: 0,
       sortType: 0,
-      needSubFolderStat: true,
       resType: 2,
     });
     assert.equal(refreshCount, 2);

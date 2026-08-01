@@ -53,14 +53,14 @@ onMounted(loadSettings)
   <section class="setting-section">
     <div class="section-lead">
       <strong>并发与分片</strong>
-      <span>分片默认自动；手动档位仅提供 OSS 安全值。</span>
+      <span>下载并发控制同时文件数；桌面大文件会按总连接预算自动分配 1–4 路 Range 分片。</span>
     </div>
     <a-form class="settings-form" layout="vertical">
       <div class="two-columns">
         <a-form-item label="上传并发">
           <a-input-number v-model:value="form.upload_concurrency" :min="1" :max="8" />
         </a-form-item>
-        <a-form-item label="下载并发">
+        <a-form-item label="下载任务并发" extra="数值越大可同时下载更多文件；单个大文件的分片路数由应用自动平衡。">
           <a-input-number v-model:value="form.download_concurrency" :min="1" :max="8" />
         </a-form-item>
       </div>

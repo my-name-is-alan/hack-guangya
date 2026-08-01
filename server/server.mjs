@@ -92,6 +92,7 @@ const tokenRefreshIntervalMs = envInteger('GUANGYA_TOKEN_REFRESH_MS', 20 * 60_00
 const maxJsonBodyBytes = envInteger('GUANGYA_MAX_JSON_BODY_BYTES', 64 * 1024, 4 * 1024, 1024 * 1024);
 const maxShareTrafficBytes = 1024 * 1024 ** 4;
 const requestTimeoutMs = envInteger('GUANGYA_REQUEST_TIMEOUT_MS', 30_000, 5_000, 120_000);
+const fileListRequestTimeoutMs = Math.min(requestTimeoutMs, 12_000);
 const hdhiveAllowedHosts = new Set(String(process.env.HDHIVE_ALLOWED_HOSTS || '')
   .split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
 function normalizeHdhiveBaseUrl(value) {
@@ -902,10 +903,10 @@ async function parseResponse(response, endpoint) {
   if (!raw.trim() && response.ok) return { code: 0, data: {} };
   try { return JSON.parse(raw.replace(/^\uFEFF/, '')); } catch (error) { throw httpError(502, `光鸭接口 ${endpoint} 返回了非 JSON 响应（HTTP ${response.status}）：${raw.slice(0, 240)}（${error.message}）`); }
 }
-async function apiPost(endpoint, body, allowed = [], allowRefresh = true) {
+async function apiPost(endpoint, body, allowed = [], allowRefresh = true, timeoutMs = requestTimeoutMs) {
   let response;
   try {
-    response = await fetch(`${apiBase}${endpoint}`, { method: 'POST', headers: headers(), body: JSON.stringify(body || {}), signal: AbortSignal.timeout(requestTimeoutMs) });
+    response = await fetch(`${apiBase}${endpoint}`, { method: 'POST', headers: headers(), body: JSON.stringify(body || {}), signal: AbortSignal.timeout(timeoutMs) });
   } catch (cause) {
     const timedOut = ['AbortError', 'TimeoutError'].includes(cause?.name);
     const error = httpError(timedOut ? 504 : 502, timedOut ? `光鸭接口 ${endpoint} 请求超时` : `无法连接光鸭接口 ${endpoint}：${cause.message}`);
@@ -919,7 +920,7 @@ async function apiPost(endpoint, body, allowed = [], allowRefresh = true) {
   if (response.status === 401 || isAuthExpiredBusinessCode(code)) {
     if (allowRefresh && refreshToken) {
       await refreshSavedSession();
-      return apiPost(endpoint, body, allowed, false);
+      return apiPost(endpoint, body, allowed, false, timeoutMs);
     }
     invalidateAuthSession();
     throw httpError(401, '登录态已失效，且自动续期失败，请重新扫码登录');
@@ -2981,10 +2982,9 @@ async function routeApiV2(request, response, url) {
       parentId: url.searchParams.get('parentId') || '',
       orderBy: 0,
       sortType: 0,
-      needSubFolderStat: true,
     };
     if (url.searchParams.get('resType') === '2') body.resType = 2;
-    return json(response, 200, await apiPost('/userres/v1/file/get_file_list', body));
+    return json(response, 200, await apiPost('/userres/v1/file/get_file_list', body, [], true, fileListRequestTimeoutMs));
   }
   if (request.method === 'GET' && url.pathname === '/api/files/detail') {
     const fileId = validateIdentifier(url.searchParams.get('fileId'), '文件 ID');
