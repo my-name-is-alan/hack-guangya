@@ -8,6 +8,8 @@ import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { startTestServer, stopTestServer, waitUntil } from './test-helpers.mjs';
 
+const WINDOWS_CLIENT_ID = 'aMe_SVSlkrbQXpUT';
+
 async function listen(server) {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -51,6 +53,8 @@ test('全盘搜索、上传并发、短信登录和 HDHive 总开关按真实上
     const body = await jsonBody(request);
     apiRequests.push({ url: request.url, body, headers: request.headers });
     if (request.url === '/userres/v1/file/search_files') return sendJson(response, { code: 0, data: { list: searchItems, total: searchItems.length } });
+    if (request.url === '/cloudcollection/v1/create_task') return sendJson(response, { code: 0, data: { taskId: 'offline-task-1' } });
+    if (request.url === '/cloudcollection/v1/list_task') return sendJson(response, { code: 0, data: { list: [], total: 250 } });
     if (request.url === '/userres/v1/file/get_file_list') {
       const list = searchItems.filter((item) => item.resType === body.resType
         && (!Array.isArray(body.fileTypes) || body.fileTypes.includes(item.fileType)));
@@ -104,13 +108,45 @@ test('全盘搜索、上传并发、短信登录和 HDHive 总开关按真实上
     });
     const base = `http://127.0.0.1:${instance.port}`;
 
-    const videoSearch = await fetch(`${base}/api/search?query=holiday&type=video&page=2`).then((response) => response.json());
+    const videoSearch = await fetch(`${base}/api/search?query=holiday&type=video&page=0`).then((response) => response.json());
     assert.deepEqual(videoSearch.data.list.map((item) => item.fileId), ['video-1']);
     assert.equal(videoSearch.data.total, 1);
     assert.equal(videoSearch.data.remote_total, 6);
     const searchRequest = apiRequests.find((entry) => entry.url === '/userres/v1/file/search_files');
-    assert.deepEqual(searchRequest.body, { name: 'holiday', pageSize: 100, page: 2 });
+    assert.deepEqual(searchRequest.body, { name: 'holiday', pageSize: 100, page: 0 });
     assert.equal(searchRequest.headers.authorization, 'Bearer initial-cloud-token');
+    assert.equal(searchRequest.headers.dt, '5');
+    assert.equal(searchRequest.headers.av, '1.0.2');
+    assert.equal(searchRequest.headers.vc, '1002');
+    assert.equal(searchRequest.headers['x-client-id'], WINDOWS_CLIENT_ID);
+    assert.match(searchRequest.headers['x-device-id'], /^[a-f0-9]{32}$/);
+    assert.equal(searchRequest.headers['user-agent'], 'GuangyapanPC/1.0.2');
+
+    const offline = await fetch(`${base}/api/offline`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'magnet:?xt=urn:btih:example', parent_id: 'folder-1', new_name: '示例' }),
+    });
+    assert.equal(offline.status, 200, await offline.clone().text());
+    const offlineRequest = apiRequests.find((entry) => entry.url === '/cloudcollection/v1/create_task');
+    assert.deepEqual(offlineRequest.body, {
+      url: 'magnet:?xt=urn:btih:example',
+      parentId: 'folder-1',
+      newName: '示例',
+    });
+    await fetch(`${base}/api/offline`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'ed2k://|file|example.iso|1|ABC|/', parent_id: '' }),
+    });
+    assert.deepEqual(apiRequests.filter((entry) => entry.url === '/cloudcollection/v1/create_task').at(-1).body, {
+      url: 'ed2k://|file|example.iso|1|ABC|/',
+      parentId: '',
+    });
+    const offlineList = await fetch(`${base}/api/offline?cursor=cursor-2&pageSize=100`).then((response) => response.json());
+    assert.equal(offlineList.data.total, 250);
+    const offlineListRequest = apiRequests.find((entry) => entry.url === '/cloudcollection/v1/list_task');
+    assert.deepEqual(offlineListRequest.body, { cursor: 'cursor-2', pageSize: 100 });
 
     const extensionSearch = await fetch(`${base}/api/search?query=holiday&extension=.pdf`).then((response) => response.json());
     assert.deepEqual(extensionSearch.data.list.map((item) => item.fileId), ['document-1']);
@@ -163,7 +199,13 @@ test('全盘搜索、上传并发、短信登录和 HDHive 总开关按真实上
     assert.deepEqual(sent, { verification_id: 'verification-0000', request_id: 'verification-0000', is_user: true, phone_number: '+86 13800000000', captcha_required: false });
     const verificationRequest = accountRequests.find((entry) => entry.url === '/v1/auth/verification' && entry.body.phone_number.endsWith('0000'));
     assert.equal(verificationRequest.headers['x-captcha-token'], 'automatic-captcha-token');
-    assert.deepEqual(verificationRequest.body, { phone_number: '+86 13800000000', target: 'ANY', client_id: 'aMe-8VSlkrbQXpUR' });
+    assert.deepEqual(verificationRequest.body, {
+      phone_number: '+86 13800000000',
+      target: 'ANY',
+      client_id: WINDOWS_CLIENT_ID,
+      usage: 'SIGN_IN',
+      selected_channel: 'VERIFICATION_PHONE',
+    });
 
     const loggedIn = await fetch(`${base}/api/auth/sms/login`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ verification_id: sent.verification_id, verification_code: '123456' }),
@@ -174,7 +216,7 @@ test('全盘搜索、上传并发、短信登录和 HDHive 总开关按真实上
       username: '+86 13800000000',
       verification_code: '123456',
       verification_token: 'verified-verification-0000',
-      client_id: 'aMe-8VSlkrbQXpUR',
+      client_id: WINDOWS_CLIENT_ID,
     });
 
     const newUserSent = await fetch(`${base}/api/auth/sms/send`, {
@@ -191,7 +233,7 @@ test('全盘搜索、上传并发、短信登录和 HDHive 总开关按真实上
       phone_number: '+86 13800000002',
       verification_code: '654321',
       verification_token: 'verified-verification-0002',
-      client_id: 'aMe-8VSlkrbQXpUR',
+      client_id: WINDOWS_CLIENT_ID,
       name: '光鸭用户0002',
     });
     const database = new DatabaseSync(path.join(instance.dataDir, 'state.sqlite3'));
@@ -221,6 +263,48 @@ test('全盘搜索、上传并发、短信登录和 HDHive 总开关按真实上
   } finally {
     await stopTestServer(instance);
     await Promise.all([close(apiServer), close(accountServer), close(hdhiveServer)]);
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('带本地文件类型过滤的搜索会跨远端页收集并返回可继续分页的总数', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-search-page-test-'));
+  const requestedPages = [];
+  const remotePages = [
+    [
+      ...Array.from({ length: 60 }, (_, index) => ({ fileId: `p0-pdf-${index}`, fileName: `needle-${index}.pdf`, resType: 1 })),
+      ...Array.from({ length: 40 }, (_, index) => ({ fileId: `p0-jpg-${index}`, fileName: `needle-${index}.jpg`, resType: 1 })),
+    ],
+    [
+      ...Array.from({ length: 60 }, (_, index) => ({ fileId: `p1-pdf-${index}`, fileName: `needle-${index}.pdf`, resType: 1 })),
+      ...Array.from({ length: 40 }, (_, index) => ({ fileId: `p1-jpg-${index}`, fileName: `needle-${index}.jpg`, resType: 1 })),
+    ],
+    [{ fileId: 'p2-jpg-0', fileName: 'needle-tail.jpg', resType: 1 }],
+  ];
+  const apiServer = http.createServer(async (request, response) => {
+    const body = await jsonBody(request);
+    if (request.url !== '/userres/v1/file/search_files') return sendJson(response, { code: 404, msg: 'not found' }, 404);
+    requestedPages.push(body.page);
+    return sendJson(response, { code: 0, msg: 'success', data: { list: remotePages[body.page] || [], total: 201 } });
+  });
+  let instance;
+  try {
+    const apiBase = await listen(apiServer);
+    instance = await startTestServer(root, {
+      GUANGYA_API_BASE: apiBase,
+      GUANGYA_TOKEN: 'search-page-token',
+    });
+    const base = `http://127.0.0.1:${instance.port}`;
+    const response = await fetch(`${base}/api/search?query=needle&extension=pdf&page=1`).then((value) => value.json());
+    assert.equal(response.data.list.length, 20);
+    assert.deepEqual(response.data.list.map((item) => item.fileId), Array.from({ length: 20 }, (_, index) => `p1-pdf-${index + 40}`));
+    assert.equal(response.data.total, 120);
+    assert.equal(response.data.remote_total, 201);
+    assert.equal(response.data.remote_count, 201);
+    assert.deepEqual(requestedPages, [0, 1, 2]);
+  } finally {
+    await stopTestServer(instance);
+    await close(apiServer);
     await fsp.rm(root, { recursive: true, force: true });
   }
 });

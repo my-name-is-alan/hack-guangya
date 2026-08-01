@@ -40,7 +40,8 @@ export const useTransfersStore = defineStore('transfers', () => {
   const uploads = ref<Record<string, UploadTask>>({})
   const downloads = ref<DownloadTask[]>([])
   const downloadConcurrency = ref(2)
-  const queue = createConcurrencyQueue(() => downloadConcurrency.value)
+  const downloadPaused = ref(false)
+  const queue = createConcurrencyQueue(() => downloadConcurrency.value, () => downloadPaused.value)
 
   const orderedUploads = computed(() => orderUploadProgress(Object.values(uploads.value)) as UploadTask[])
   const activeUploads = computed(() => orderedUploads.value.filter(item => !['done', 'error'].includes(item.state)))
@@ -197,10 +198,16 @@ export const useTransfersStore = defineStore('transfers', () => {
     }
   }
 
+  function setPaused(paused: boolean) {
+    downloadPaused.value = Boolean(paused)
+    if (!downloadPaused.value) queue.pump()
+  }
+
   return {
     uploads,
     downloads,
     downloadConcurrency,
+    downloadPaused,
     orderedUploads,
     activeUploads,
     uploadSpeed,
@@ -210,6 +217,7 @@ export const useTransfersStore = defineStore('transfers', () => {
     downloadRecords,
     downloadReceivedShare,
     updateDownload,
+    setPaused,
     clearFinished,
   }
 })

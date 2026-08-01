@@ -1,6 +1,6 @@
 # Docker Web 部署配置
 
-本文档适用于 Docker Hub 镜像 `94xhzy/guangya-sync:0.1.15`。容器提供光鸭云盘 Web 管理界面、服务器目录监控、断点续传、自动分享与 HDHive 投稿。
+本文档适用于 Docker Hub 镜像 `94xhzy/guangya-sync:0.1.17`。容器提供光鸭云盘 Web 管理界面、服务器目录监控、断点续传、自动分享与 HDHive 投稿。
 
 ## 1. 准备目录和配置
 
@@ -23,7 +23,7 @@ openssl rand -hex 24
 把结果写入 `.env`：
 
 ```dotenv
-GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.15
+GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.17
 GUANGYA_HTTP_PORT=8080
 GUANGYA_ADMIN_USERNAME=admin
 GUANGYA_ADMIN_PASSWORD=替换为上面生成的强随机密码
@@ -213,13 +213,14 @@ docker compose logs --tail=100 guangya-sync
 生产环境建议固定版本标签或不可变摘要：
 
 ```dotenv
-GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.15
+GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.17
 ```
 
-当前 `0.1.15`/`latest` 发布摘要：
+确认当前 `0.1.17` 与 `latest` 的远端摘要：
 
-```dotenv
-GUANGYA_IMAGE=94xhzy/guangya-sync@sha256:aa5e855d3c2800095335a73bad03dcdb07c32cc355b1a192852da228131d741a
+```bash
+docker buildx imagetools inspect 94xhzy/guangya-sync:0.1.17
+docker buildx imagetools inspect 94xhzy/guangya-sync:latest
 ```
 
 回滚时把 `GUANGYA_IMAGE` 改回已验证的旧标签或摘要，再执行：
@@ -276,5 +277,5 @@ docker compose logs -f guangya-sync
 docker compose restart guangya-sync
 docker compose down
 docker compose pull
-docker image inspect 94xhzy/guangya-sync:0.1.15
+docker image inspect 94xhzy/guangya-sync:0.1.17
 ```

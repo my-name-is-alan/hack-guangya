@@ -36,11 +36,12 @@ const captcha = reactive({
   height: 520,
 })
 
-let pollTimer: ReturnType<typeof setInterval> | null = null
+let pollTimer: ReturnType<typeof setTimeout> | null = null
 let expiryTimer: ReturnType<typeof setInterval> | null = null
 let smsTimer: ReturnType<typeof setInterval> | null = null
+let pollIntervalSeconds = 3
 
-const phoneValid = computed(() => /^1\d{10}$/.test(sms.phone.trim()))
+const phoneValid = computed(() => /^1[3-9]\d{9}$/.test(sms.phone.trim()))
 
 function isTrustedCaptchaHostname(hostname: string) {
   const normalizedHostname = hostname.toLowerCase()
@@ -65,7 +66,7 @@ function createCaptchaState() {
 }
 
 function clearQrTimers() {
-  if (pollTimer) clearInterval(pollTimer)
+  if (pollTimer) clearTimeout(pollTimer)
   if (expiryTimer) clearInterval(expiryTimer)
   pollTimer = null
   expiryTimer = null
@@ -162,6 +163,7 @@ async function refreshQr() {
     const data = unwrapData(await bridge.login())
     const deviceCode = String(pick(data, ['device_code', 'deviceCode'], ''))
     const value = String(pick(data, [
+      'short_uri_complete', 'shortUriComplete',
       'verification_uri_complete', 'verificationUriComplete', 'verification_url',
       'verificationUrl', 'verification_uri', 'verificationUri',
     ], ''))
@@ -173,17 +175,28 @@ async function refreshQr() {
       message: '使用光鸭 App 扫码确认',
       remaining: Number(data.expires_in || 120),
     })
-    pollTimer = setInterval(async () => {
-      try {
-        const result = unwrapData(await bridge.invoke('poll_device_login', { device_code: deviceCode }))
-        if (result.authenticated) await finishLogin()
-        else if (result.message) qr.message = String(result.message)
-      }
-      catch (reason) {
-        clearQrTimers()
-        qr.message = errorText(reason)
-      }
-    }, Math.max(2, Number(data.interval || 3)) * 1000)
+    const suppliedInterval = Number(data.interval || 3)
+    pollIntervalSeconds = Number.isFinite(suppliedInterval) ? Math.max(2, suppliedInterval) : 3
+    const schedulePoll = () => {
+      pollTimer = setTimeout(async () => {
+        pollTimer = null
+        try {
+          const result = unwrapData(await bridge.invoke('poll_device_login', { device_code: deviceCode }))
+          if (result.authenticated) {
+            await finishLogin()
+            return
+          }
+          if (result.slow_down) pollIntervalSeconds = Math.min(60, pollIntervalSeconds * 2)
+          if (result.message) qr.message = String(result.message)
+          schedulePoll()
+        }
+        catch (reason) {
+          clearQrTimers()
+          qr.message = errorText(reason)
+        }
+      }, pollIntervalSeconds * 1000)
+    }
+    schedulePoll()
     expiryTimer = setInterval(() => {
       qr.remaining -= 1
       if (qr.remaining <= 0) void refreshQr()

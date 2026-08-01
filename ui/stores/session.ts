@@ -83,6 +83,7 @@ export const useSessionStore = defineStore('session', () => {
 
     const transfers = useTransfersStore()
     transfers.downloadConcurrency = Number(state.download_concurrency || 2)
+    transfers.setPaused(Boolean(state.paused))
     if (!state.logged_in) {
       Object.assign(overview, { profile: {}, assets: {} })
       useFilesStore().reset()

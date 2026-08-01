@@ -61,12 +61,12 @@ test('普通上传槽被占用时，后续文件仍会后台预检并直接秒�
     if (request.url === '/userres/v1/file/get_info_by_task_id') {
       if (body.taskId === 'task-first' && !allowFirstConfirm) {
         events.push('poll:task-first');
-        response.end(JSON.stringify({ code: 999, msg: '文件上传中' }));
+        response.end(JSON.stringify({ code: 147, msg: '文件上传中' }));
         return;
       }
       if (body.taskId === 'task-second' && !allowSecondConfirm) {
         events.push('poll:task-second');
-        response.end(JSON.stringify({ code: 999, msg: '文件上传中' }));
+        response.end(JSON.stringify({ code: 147, msg: '文件上传中' }));
         return;
       }
       events.push(`confirmed:${body.taskId}`);

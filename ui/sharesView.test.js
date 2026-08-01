@@ -43,12 +43,12 @@ test('SharesView uses the shared display-name resolver in the list', async () =>
 
   assert.match(source, /import \{ shareDisplayName \} from ['"]\.\.\/shareRecord\.js['"]/);
   assert.match(source, /\{\{\s*shareDisplayName\(record\)\s*\}\}/);
-  assert.match(source, /确定取消「\$\{shareDisplayName\(record\)\}」吗？/);
+  assert.match(source, /确定取消「\$\{shareDisplayName\(targets\[0\]\)\}」吗？/);
 });
 
 test('SharesView copies the URL together with direct or URL-derived extraction codes', async () => {
   const source = await sharesViewSource;
-  const copySource = sourceBetween(source, 'async function copyCloudShare(record)', 'async function deleteShare(record)');
+  const copySource = sourceBetween(source, 'async function copyCloudShare(record)', 'async function deleteShareRecords(records)');
 
   assert.match(source, /import \{ parseGuangyaShareLink \} from ['"]\.\.\/shareLink\.js['"]/);
   assert.match(source, /import \{[^}]*\bcopyText\b[^}]*\} from ['"]\.\.\/formatters\.js['"]/);
@@ -61,13 +61,13 @@ test('SharesView copies the URL together with direct or URL-derived extraction c
 
 test('SharesView provides searchable pagination and deletes by the backend ids contract', async () => {
   const source = await sharesViewSource;
-  const deleteSource = sourceBetween(source, 'async function deleteShare(record)', 'function handleCloudShareTableChange');
+  const deleteSource = sourceBetween(source, 'async function deleteShareRecords(records)', 'function confirmDeleteShares(records)');
 
   assert.match(source, /const filteredCloudShares = computed/);
   assert.match(source, /v-model:value="cloudShareQuery"/);
   assert.match(source, /:pagination="cloudSharePagination"/);
   assert.match(source, /showSizeChanger:\s*true/);
-  assert.match(deleteSource, /record\.id \?\? record\.shareId \?\? record\.share_id/);
-  assert.match(deleteSource, /bridge\.invoke\(['"]delete_shares['"],\s*\{\s*ids:\s*\[id\]\s*\}\)/);
+  assert.match(deleteSource, /records\.map\(shareRecordId\)/);
+  assert.match(deleteSource, /bridge\.invoke\(['"]delete_shares['"],\s*\{\s*ids\s*\}\)/);
   assert.doesNotMatch(deleteSource, /share_ids/);
 });

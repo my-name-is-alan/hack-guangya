@@ -43,7 +43,7 @@ const OFFLINE_STATUS_MAP = {
   2: ['已完成', 'success'],
   3: ['下载失败', 'error'],
   4: ['已取消', 'warning'],
-  5: ['资源违规', 'error'],
+  5: ['部分完成', 'warning'],
 };
 export function offlineStatus(record) {
   const raw = pick(record, ['status', 'taskStatus', 'state'], null);

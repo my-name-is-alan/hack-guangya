@@ -35,7 +35,13 @@ use uuid::Uuid;
 
 const API_BASE: &str = "https://api.guangyapan.com";
 const ACCOUNT_BASE: &str = "https://account.guangyapan.com";
-const OAUTH_CLIENT_ID: &str = "aMe-8VSlkrbQXpUR";
+// Kept in sync with api_map's live Windows PC profile.
+const OAUTH_CLIENT_ID: &str = "aMe_SVSlkrbQXpUT";
+const OAUTH_CLIENT_SECRET: &str = "FNAfp5IFEfCn5MYsIUTewg";
+const API_DEVICE_TYPE: &str = "5";
+const API_APP_VERSION: &str = "1.0.2";
+const API_VERSION_CODE: &str = "1002";
+const API_USER_AGENT: &str = "GuangyapanPC/1.0.2";
 const AUTH_URL: &str = "https://www.guangyapan.com/#/";
 const DEFAULT_UPLOAD_CONCURRENCY: usize = 2;
 const DEFAULT_DOWNLOAD_CONCURRENCY: usize = 2;
@@ -52,7 +58,7 @@ const FILE_STABILITY_WAIT_MS: u64 = 1_200;
 const FILE_BUSY_RETRY_SECS: u64 = 3;
 const POLL_INTERVAL_SECS: u64 = 5;
 const API_CONNECT_TIMEOUT_SECS: u64 = 15;
-const API_REQUEST_TIMEOUT_SECS: u64 = 120;
+const API_REQUEST_TIMEOUT_SECS: u64 = 30;
 const OSS_REQUEST_TIMEOUT_SECS: u64 = 600;
 const OSS_MULTIPART_TARGET_PARTS: u64 = 9_000;
 const OSS_MIB: u64 = 1024 * 1024;
@@ -68,6 +74,16 @@ const DEFAULT_WEBDAV_USERNAME: &str = "guangya";
 const MAX_GCID_IMPORT_CONCURRENCY: usize = 16;
 const MAX_GCID_IMPORT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_GCID_IMPORT_ATTEMPTS: i64 = 5;
+const DEFAULT_API_PAGE_SIZE: u64 = 100;
+const DEFAULT_RECENT_PAGE_SIZE: u64 = 20;
+const MAX_API_PAGE_SIZE: u64 = 100;
+const MAX_API_ID_LENGTH: usize = 256;
+const MAX_API_ID_BATCH: usize = 1_000;
+const MAX_API_CURSOR_LENGTH: usize = 256;
+const MAX_REMOTE_NAME_LENGTH: usize = 255;
+const MAX_OFFLINE_URL_LENGTH: usize = 8_192;
+const MAX_OFFLINE_FILE_INDEXES: usize = 1_000;
+const MAX_SHARE_TRAFFIC_BYTES: u64 = 1_125_899_906_842_624;
 const DEFAULT_MEDIA_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "heic", "heif", "avif", "tif", "tiff",
     "raw", "cr2", "nef", "arw", "dng", "mp4", "mov", "mkv", "avi", "wmv", "flv", "webm", "m4v",
@@ -306,6 +322,7 @@ struct AutoShareReceipt {
     share_url: Option<String>,
     status: String,
     action: Option<String>,
+    error_code: Option<String>,
     message: Option<String>,
     resource_url: Option<String>,
     notification_status: Option<String>,
@@ -341,6 +358,21 @@ struct ApiResponse {
     msg: String,
     data: Option<Value>,
 }
+
+#[derive(Debug)]
+enum BusinessRequestError {
+    Request(String),
+    InvalidResponse { http_status: u16, message: String },
+}
+
+impl BusinessRequestError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Request(message) | Self::InvalidResponse { message, .. } => message,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct UploadCredentials {
     #[serde(rename = "accessKeyID")]
@@ -357,6 +389,7 @@ struct UploadToken {
     object_path: Option<String>,
     bucket_name: Option<String>,
     end_point: Option<String>,
+    full_end_point: Option<String>,
     creds: Option<UploadCredentials>,
     #[serde(default)]
     provider: Option<Value>,
@@ -1008,6 +1041,27 @@ fn cloud_search_request(
     }
     ("/userres/v1/file/get_file_list", request)
 }
+
+fn paginate_filtered_search_results(
+    matches: Vec<Value>,
+    page: u64,
+    page_size: usize,
+    remote_exhausted: bool,
+) -> (Vec<Value>, u64) {
+    let offset = usize::try_from(page)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(page_size);
+    let visible_total = if remote_exhausted {
+        matches.len()
+    } else {
+        matches
+            .len()
+            .min(offset.saturating_add(page_size).saturating_add(1))
+    };
+    let list = matches.into_iter().skip(offset).take(page_size).collect();
+    (list, u64::try_from(visible_total).unwrap_or(u64::MAX))
+}
+
 fn should_sync(path: &Path, sync_types: &[String]) -> bool {
     let extension = file_extension(path);
     !extension.is_empty()
@@ -1168,6 +1222,7 @@ fn init_database(path: &Path) -> Result<(), String> {
                share_url TEXT,
                status TEXT NOT NULL,
                action TEXT,
+               error_code TEXT,
                message TEXT,
                resource_url TEXT,
                notification_status TEXT,
@@ -1241,6 +1296,10 @@ fn init_database(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("初始化 GCID 导入状态失败：{e}"))?;
     let _ = connection.execute(
         "ALTER TABLE auto_share_events ADD COLUMN notification_status TEXT",
+        [],
+    );
+    let _ = connection.execute(
+        "ALTER TABLE auto_share_events ADD COLUMN error_code TEXT",
         [],
     );
     for migration in [
@@ -1505,6 +1564,26 @@ fn save_auth_session(
             params![access_token, refresh_token, unix_timestamp()],
         )
         .map_err(|e| format!("保存登录状态失败：{e}"))?;
+    Ok(())
+}
+
+fn replace_auth_session(
+    path: &Path,
+    access_token: Option<&str>,
+    refresh_token: Option<&str>,
+) -> Result<(), String> {
+    let connection = open_database(path)?;
+    connection
+        .execute(
+            "INSERT INTO auth_session (id, access_token, refresh_token, updated_at)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+               access_token = excluded.access_token,
+               refresh_token = excluded.refresh_token,
+               updated_at = excluded.updated_at",
+            params![access_token, refresh_token, unix_timestamp()],
+        )
+        .map_err(|e| format!("替换登录状态失败：{e}"))?;
     Ok(())
 }
 
@@ -1966,10 +2045,11 @@ fn load_or_create_device_id(path: &Path) -> Result<String, String> {
         )
         .optional()
         .map_err(|e| format!("读取设备 ID 失败：{e}"))?;
-    if let Some(value) = current.filter(|value| !value.trim().is_empty()) {
-        return Ok(value);
-    }
-    let value = Uuid::new_v4().to_string();
+    let value = current
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase().replace('-', ""))
+        .filter(|value| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
     connection
         .execute(
             "INSERT INTO app_state (key, value, updated_at) VALUES ('device_id', ?1, ?2)
@@ -2006,7 +2086,7 @@ fn load_auto_share_receipts(path: &Path) -> Result<Vec<AutoShareReceipt>, String
     let connection = open_database(path)?;
     let mut statement = connection
         .prepare(
-            "SELECT event_id, mapping_id, target_key, share_url, status, action, message, resource_url, notification_status, updated_at
+            "SELECT event_id, mapping_id, target_key, share_url, status, action, error_code, message, resource_url, notification_status, updated_at
              FROM auto_share_events ORDER BY updated_at DESC LIMIT 50",
         )
         .map_err(|error| format!("读取自动分享回执失败：{error}"))?;
@@ -2019,10 +2099,11 @@ fn load_auto_share_receipts(path: &Path) -> Result<Vec<AutoShareReceipt>, String
                 share_url: row.get(3)?,
                 status: row.get(4)?,
                 action: row.get(5)?,
-                message: row.get(6)?,
-                resource_url: row.get(7)?,
-                notification_status: row.get(8)?,
-                updated_at: row.get(9)?,
+                error_code: row.get(6)?,
+                message: row.get(7)?,
+                resource_url: row.get(8)?,
+                notification_status: row.get(9)?,
+                updated_at: row.get(10)?,
             })
         })
         .map_err(|error| format!("读取自动分享回执失败：{error}"))?
@@ -2148,7 +2229,7 @@ fn save_auto_share_event(
                (event_id, mapping_id, target_key, share_url, status, action, message, resource_url, payload, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(event_id) DO UPDATE SET share_url=excluded.share_url, status=excluded.status,
-               action=excluded.action, message=excluded.message, resource_url=excluded.resource_url,
+               action=excluded.action, error_code=NULL, message=excluded.message, resource_url=excluded.resource_url,
                payload=excluded.payload, updated_at=excluded.updated_at",
             params![
                 event_id,
@@ -2219,6 +2300,75 @@ fn auth_hook_script() -> &'static str {
     })();"#
 }
 
+fn business_api_headers(token: &str, device_id: &str) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert("accept", HeaderValue::from_static("application/json"));
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).map_err(|error| error.to_string())?,
+    );
+    headers.insert("dt", HeaderValue::from_static(API_DEVICE_TYPE));
+    headers.insert("av", HeaderValue::from_static(API_APP_VERSION));
+    headers.insert("vc", HeaderValue::from_static(API_VERSION_CODE));
+    headers.insert("x-client-id", HeaderValue::from_static(OAUTH_CLIENT_ID));
+    headers.insert(
+        "x-device-id",
+        HeaderValue::from_str(device_id).map_err(|error| error.to_string())?,
+    );
+    headers.insert("user-agent", HeaderValue::from_static(API_USER_AGENT));
+    // Retain the legacy alias alongside the canonical x-device-id header.
+    headers.insert(
+        "did",
+        HeaderValue::from_str(device_id).map_err(|error| error.to_string())?,
+    );
+    let trace_id = Uuid::new_v4().simple().to_string();
+    let span_id = Uuid::new_v4().simple().to_string()[..16].to_string();
+    headers.insert(
+        "traceparent",
+        HeaderValue::from_str(&format!("00-{trace_id}-{span_id}-01"))
+            .map_err(|error| error.to_string())?,
+    );
+    Ok(headers)
+}
+
+fn business_auth_expired(http_status: u16, code: i64) -> bool {
+    http_status == 401 || matches!(code, 110 | 117 | 118)
+}
+
+async fn api_post_response(
+    token: &str,
+    device_id: &str,
+    endpoint: &str,
+    body: Value,
+) -> Result<(u16, ApiResponse), BusinessRequestError> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(API_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(API_REQUEST_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| BusinessRequestError::Request(format!("创建网络客户端失败：{e}")))?;
+    let headers = business_api_headers(token, device_id).map_err(BusinessRequestError::Request)?;
+    let response = client
+        .post(format!("{API_BASE}{endpoint}"))
+        .headers(headers)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| BusinessRequestError::Request(e.to_string()))?;
+    let http_status = response.status().as_u16();
+    let raw = response
+        .text()
+        .await
+        .map_err(|e| BusinessRequestError::Request(e.to_string()))?;
+    let payload = parse_api_response(&raw, http_status, endpoint).map_err(|message| {
+        BusinessRequestError::InvalidResponse {
+            http_status,
+            message,
+        }
+    })?;
+    Ok((http_status, payload))
+}
+
 async fn api_post(
     token: &str,
     device_id: &str,
@@ -2226,50 +2376,29 @@ async fn api_post(
     body: Value,
     allowed: &[i64],
 ) -> Result<ApiResponse, String> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(API_CONNECT_TIMEOUT_SECS))
-        .timeout(Duration::from_secs(API_REQUEST_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("创建网络客户端失败：{e}"))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| e.to_string())?,
-    );
-    headers.insert("dt", HeaderValue::from_static("4"));
-    headers.insert(
-        "did",
-        HeaderValue::from_str(device_id).map_err(|e| e.to_string())?,
-    );
-    let trace_id = Uuid::new_v4().simple().to_string();
-    let span_id = Uuid::new_v4().simple().to_string()[..16].to_string();
-    headers.insert(
-        "traceparent",
-        HeaderValue::from_str(&format!("00-{trace_id}-{span_id}-01")).map_err(|e| e.to_string())?,
-    );
-    let response = client
-        .post(format!("{API_BASE}{endpoint}"))
-        .headers(headers)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let http_status = response.status();
-    let raw = response.text().await.map_err(|e| e.to_string())?;
-    let payload = parse_api_response(&raw, http_status.as_u16(), endpoint)?;
-    if http_status.as_u16() == 401 || payload.code == 117 {
+    let request_preview = if endpoint == "/userres/v1/share_file" {
+        Some(serde_json::to_string(&body).unwrap_or_else(|_| "<无法序列化分享参数>".to_string()))
+    } else {
+        None
+    };
+    let (http_status, payload) = match api_post_response(token, device_id, endpoint, body).await {
+        Ok(response) => response,
+        Err(BusinessRequestError::InvalidResponse {
+            http_status: 401, ..
+        }) => return Err("登录态已失效，请重新打开官方登录页".into()),
+        Err(error) => return Err(error.into_message()),
+    };
+    if business_auth_expired(http_status, payload.code) {
         return Err("登录态已失效，请重新打开官方登录页".into());
     }
-    if !http_status.is_success() || (payload.code != 0 && !allowed.contains(&payload.code)) {
+    if !(200..300).contains(&http_status) || (payload.code != 0 && !allowed.contains(&payload.code))
+    {
         let message = if payload.msg.is_empty() {
             format!("光鸭接口失败：HTTP {http_status}/{}", payload.code)
         } else {
             payload.msg.clone()
         };
-        if endpoint == "/userres/v1/share_file" {
-            let request_preview =
-                serde_json::to_string(&body).unwrap_or_else(|_| "<无法序列化分享参数>".to_string());
+        if let Some(request_preview) = request_preview {
             return Err(format!(
                 "{message}（HTTP {http_status}，业务码 {}；请求参数：{request_preview}）",
                 payload.code
@@ -2282,26 +2411,32 @@ async fn api_post(
 
 fn parse_api_response(raw: &str, status: u16, endpoint: &str) -> Result<ApiResponse, String> {
     let trimmed = raw.trim().trim_start_matches('\u{feff}');
-    if trimmed.is_empty() && (200..300).contains(&status) {
-        return Ok(ApiResponse {
-            code: 0,
-            msg: String::new(),
-            data: Some(json!({})),
-        });
-    }
     let value: Value = serde_json::from_str(trimmed).map_err(|error| {
         let preview = trimmed.chars().take(240).collect::<String>();
         format!("光鸭接口 {endpoint} 返回了非 JSON 响应（HTTP {status}）：{preview}（{error}）")
     })?;
-    let code = value
-        .get("code")
-        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
-        .unwrap_or(0);
     let msg = value
         .get("msg")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let has_code = value.get("code").is_some_and(|value| !value.is_null());
+    let code = match value.get("code").filter(|value| !value.is_null()) {
+        Some(value) => value
+            .as_i64()
+            .or_else(|| value.as_str()?.parse().ok())
+            .ok_or_else(|| format!("光鸭接口 {endpoint} 返回了无效业务码"))?,
+        None => 0,
+    };
+    let normalized_msg = msg.trim().to_ascii_lowercase();
+    if code == 0
+        && ((!normalized_msg.is_empty() && !matches!(normalized_msg.as_str(), "success" | "ok"))
+            || (!has_code && normalized_msg.is_empty() && value.get("data").is_none()))
+    {
+        return Err(format!(
+            "光鸭接口 {endpoint} 返回了未标明成功状态的响应（HTTP {status}）"
+        ));
+    }
     Ok(ApiResponse {
         code,
         msg,
@@ -2345,11 +2480,42 @@ fn parse_guangya_share_link(value: &str) -> Result<(String, String), String> {
     Ok((share_id.to_string(), code))
 }
 
-async fn account_post(endpoint: &str, body: Value) -> Result<(u16, Value), String> {
-    account_post_with_captcha(endpoint, body, None).await
+fn account_api_headers(device_id: &str, token: Option<&str>) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert("accept", HeaderValue::from_static("application/json"));
+    headers.insert("x-client-id", HeaderValue::from_static(OAUTH_CLIENT_ID));
+    headers.insert(
+        "x-device-id",
+        HeaderValue::from_str(device_id).map_err(|error| error.to_string())?,
+    );
+    headers.insert(
+        "x-client-version",
+        HeaderValue::from_static(API_APP_VERSION),
+    );
+    headers.insert("x-sdk-version", HeaderValue::from_static("9.0.2"));
+    headers.insert("x-protocol-version", HeaderValue::from_static("301"));
+    headers.insert("accept-language", HeaderValue::from_static("zh-CN"));
+    headers.insert("user-agent", HeaderValue::from_static(API_USER_AGENT));
+    if let Some(token) = token {
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(headers)
+}
+
+async fn account_post(
+    device_id: &str,
+    endpoint: &str,
+    body: Value,
+) -> Result<(u16, Value), String> {
+    account_post_with_captcha(device_id, endpoint, body, None).await
 }
 
 async fn account_post_with_captcha(
+    device_id: &str,
     endpoint: &str,
     body: Value,
     captcha_token: Option<&str>,
@@ -2359,13 +2525,10 @@ async fn account_post_with_captcha(
         .timeout(Duration::from_secs(API_REQUEST_TIMEOUT_SECS))
         .build()
         .map_err(|error| format!("创建账号请求客户端失败：{error}"))?;
+    let headers = account_api_headers(device_id, None)?;
     let mut request = client
         .post(format!("{ACCOUNT_BASE}{endpoint}"))
-        .header(CONTENT_TYPE, "application/json")
-        .header("x-client-id", OAUTH_CLIENT_ID)
-        .header("x-sdk-version", "9.0.2")
-        .header("x-protocol-version", "301")
-        .header("accept-language", "zh-CN")
+        .headers(headers)
         .json(&body);
     if let Some(captcha_token) = captcha_token.filter(|value| !value.trim().is_empty()) {
         request = request.header("x-captcha-token", captcha_token.trim());
@@ -2468,25 +2631,39 @@ fn captcha_challenge_response(payload: &Value, force: bool) -> Option<Value> {
 
 fn normalize_china_phone(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
-    if trimmed.is_empty()
-        || trimmed
-            .chars()
-            .any(|character| !character.is_ascii_digit() && !"+ -()".contains(character))
-    {
+    if trimmed.is_empty() {
         return Err("请输入有效的中国大陆手机号".to_string());
     }
-    let digits = trimmed
+
+    let mut plus_count = 0_u8;
+    let mut parentheses_depth = 0_u8;
+    for (index, character) in trimmed.char_indices() {
+        match character {
+            '0'..='9' | ' ' | '-' => {}
+            '+' if index == 0 && plus_count == 0 => plus_count += 1,
+            '(' if parentheses_depth == 0 => parentheses_depth = 1,
+            ')' if parentheses_depth == 1 => parentheses_depth = 0,
+            _ => return Err("请输入有效的中国大陆手机号".to_string()),
+        }
+    }
+    if parentheses_depth != 0 {
+        return Err("请输入有效的中国大陆手机号".to_string());
+    }
+
+    let compact = trimmed
         .chars()
-        .filter(|character| character.is_ascii_digit())
+        .filter(|character| character.is_ascii_digit() || *character == '+')
         .collect::<String>();
-    let local = if digits.len() == 13 && digits.starts_with("86") {
-        &digits[2..]
-    } else if digits.len() == 11 {
-        digits.as_str()
-    } else {
+    let local = compact
+        .strip_prefix("+86")
+        .or_else(|| compact.strip_prefix("0086"))
+        .or_else(|| (compact.len() == 13 && compact.starts_with("86")).then_some(&compact[2..]))
+        .unwrap_or(compact.as_str());
+    if local.len() != 11 || !local.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err("请输入 11 位中国大陆手机号".to_string());
-    };
-    if !local.starts_with('1') {
+    }
+    let digits = local.as_bytes();
+    if digits[0] != b'1' || !(b'3'..=b'9').contains(&digits[1]) {
         return Err("请输入有效的中国大陆手机号".to_string());
     }
     Ok(format!("+86 {local}"))
@@ -2504,11 +2681,11 @@ fn masked_phone_name(phone_number: &str) -> String {
     }
 }
 
-async fn account_get(token: &str, endpoint: &str) -> Result<Value, String> {
+async fn account_get(token: &str, device_id: &str, endpoint: &str) -> Result<Value, String> {
+    let headers = account_api_headers(device_id, Some(token))?;
     let response = reqwest::Client::new()
         .get(format!("{ACCOUNT_BASE}{endpoint}"))
-        .header(CONTENT_TYPE, "application/json")
-        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .headers(headers)
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -2689,7 +2866,7 @@ fn parse_gcid_export(raw: &[u8]) -> Result<(Vec<GcidImportFile>, u128, String), 
         }
         let size = parse_gcid_file_size(&item.size)
             .map_err(|error| format!("第 {} 条记录：{error}", index + 1))?;
-        let gcid = item.gcid.to_ascii_lowercase();
+        let gcid = item.gcid.to_ascii_uppercase();
         if gcid.len() != 40 || !gcid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(format!("第 {} 条记录的 GCID 无效", index + 1));
         }
@@ -3202,10 +3379,10 @@ async fn process_gcid_import_file(
             "res": { "fileSize": record.size },
             "parentId": parent_id
         }),
-        &[156, 159],
+        &[156, 160],
     )
     .await?;
-    if response.code == 159 {
+    if response.code == 160 {
         return match find_remote_file(&token, &device_id, &parent_id, &record.name).await? {
             Some((file_id, file_size, 1)) if file_size == record.size => {
                 Ok(GcidImportOutcome::Existing { file_id })
@@ -3233,9 +3410,12 @@ async fn process_gcid_import_file(
             &device_id,
             "/userres/v1/check_can_flash_upload",
             json!({ "taskId": task_id, "gcid": record.gcid }),
-            &[],
+            &[112],
         )
         .await?;
+        if flash.code == 112 {
+            return Ok(GcidImportOutcome::Missed { task_id });
+        }
         let data = flash.data.unwrap_or_default();
         instant = data
             .get("canFlashUpload")
@@ -3919,9 +4099,10 @@ async fn poll_hdhive_receipt(
                 let _ = open_database(&db_path).and_then(|connection| {
                     connection
                         .execute(
-                            "UPDATE auto_share_events SET notification_status=?1, updated_at=?2 WHERE event_id=?3",
+                            "UPDATE auto_share_events SET notification_status=?1, error_code=?2, updated_at=?3 WHERE event_id=?4",
                             params![
                                 notification_status,
+                                result.get("error_code").and_then(Value::as_str),
                                 unix_timestamp(),
                                 pending.event_id
                             ],
@@ -4252,38 +4433,50 @@ async fn auto_share_loop(app: tauri::AppHandle, state: SharedState) {
     }
 }
 
-fn is_cloud_index_pending_message(message: &str) -> bool {
-    [
-        "文件上传中",
-        "上传处理中",
-        "正在上传",
-        "正在处理",
-        "正在入库",
-        "任务处理中",
-        "任务未完成",
-        "稍后再试",
-    ]
-    .iter()
-    .any(|pending| message.contains(pending))
-}
+fn classify_upload_task_response(
+    http_status: u16,
+    result: ApiResponse,
+) -> Result<CloudTaskCheck, CloudConfirmError> {
+    let ApiResponse { code, msg, data } = result;
+    if business_auth_expired(http_status, code) {
+        return Err(CloudConfirmError::Retryable(
+            "登录态已失效，请重新打开官方登录页".to_string(),
+        ));
+    }
 
-fn is_cloud_index_permanent_message(message: &str) -> bool {
-    [
-        "文件违规",
-        "违规文件",
-        "禁止上传",
-        "不允许上传",
-        "上传失败",
-        "入库失败",
-        "任务失败",
-        "任务不存在",
-        "文件不存在",
-        "任务已取消",
-        "任务被取消",
-        "任务已过期",
-    ]
-    .iter()
-    .any(|permanent| message.contains(permanent))
+    let error_message = || {
+        let detail = if msg.trim().is_empty() {
+            format!("业务码 {code}")
+        } else {
+            format!("{msg}（业务码 {code}）")
+        };
+        format!("云端入库查询失败：HTTP {http_status}，{detail}")
+    };
+    if !(200..300).contains(&http_status) {
+        let message = error_message();
+        return if http_status >= 500 || matches!(http_status, 408 | 429) {
+            Err(CloudConfirmError::Retryable(message))
+        } else {
+            Err(CloudConfirmError::Permanent(message))
+        };
+    }
+
+    match code {
+        147 => Ok(CloudTaskCheck::Pending),
+        0 => data
+            .filter(|data| {
+                data.get("fileId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|file_id| !file_id.trim().is_empty())
+            })
+            .map(CloudTaskCheck::Confirmed)
+            .ok_or_else(|| {
+                CloudConfirmError::Permanent(
+                    "云端入库成功响应缺少有效的 fileId，已停止轮询".to_string(),
+                )
+            }),
+        _ => Err(CloudConfirmError::Permanent(error_message())),
+    }
 }
 
 async fn check_upload_task(
@@ -4291,32 +4484,30 @@ async fn check_upload_task(
     device_id: &str,
     task_id: &str,
 ) -> Result<CloudTaskCheck, CloudConfirmError> {
-    match api_post(
+    match api_post_response(
         token,
         device_id,
         "/userres/v1/file/get_info_by_task_id",
         json!({ "taskId": task_id }),
-        &[145, 146, 155, 163],
     )
     .await
     {
-        Ok(result) if is_cloud_index_permanent_message(&result.msg) => {
-            Err(CloudConfirmError::Permanent(result.msg))
+        Ok((http_status, result)) => classify_upload_task_response(http_status, result),
+        Err(BusinessRequestError::InvalidResponse {
+            http_status: 401, ..
+        }) => Err(CloudConfirmError::Retryable(
+            "登录态已失效，请重新打开官方登录页".to_string(),
+        )),
+        Err(BusinessRequestError::InvalidResponse {
+            http_status,
+            message,
+        }) if http_status >= 500 || matches!(http_status, 408 | 429) => {
+            Err(CloudConfirmError::Retryable(message))
         }
-        Ok(result) => Ok(result
-            .data
-            .filter(|data| {
-                data.get("fileId")
-                    .and_then(Value::as_str)
-                    .is_some_and(|file_id| !file_id.is_empty())
-            })
-            .map(CloudTaskCheck::Confirmed)
-            .unwrap_or(CloudTaskCheck::Pending)),
-        Err(message) if is_cloud_index_pending_message(&message) => Ok(CloudTaskCheck::Pending),
-        Err(message) if is_cloud_index_permanent_message(&message) => {
+        Err(BusinessRequestError::InvalidResponse { message, .. }) => {
             Err(CloudConfirmError::Permanent(message))
         }
-        Err(message) => Err(CloudConfirmError::Retryable(message)),
+        Err(BusinessRequestError::Request(message)) => Err(CloudConfirmError::Retryable(message)),
     }
 }
 
@@ -4541,6 +4732,20 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn preferred_oss_endpoint(token_data: &UploadToken) -> Option<String> {
+    token_data
+        .full_end_point
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            token_data
+                .end_point
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .map(str::to_owned)
+}
+
 async fn upload_oss(
     token_data: &UploadToken,
     item: &UploadItem,
@@ -4576,9 +4781,7 @@ async fn upload_oss(
                 .bucket_name
                 .clone()
                 .ok_or_else(|| "光鸭没有返回 OSS 存储桶".to_string())?,
-            end_point: token_data
-                .end_point
-                .clone()
+            end_point: preferred_oss_endpoint(token_data)
                 .ok_or_else(|| "光鸭没有返回 OSS 端点".to_string())?,
             provider: token_data.provider.clone(),
             upload_id: String::new(),
@@ -5311,7 +5514,10 @@ async fn upload_item(
                     .unwrap_or_default()
                     .is_empty()
                 {
-                    token_data.end_point = Some(saved.checkpoint.end_point.clone());
+                    token_data.end_point = token_data
+                        .full_end_point
+                        .clone()
+                        .or_else(|| Some(saved.checkpoint.end_point.clone()));
                 }
                 if token_data.provider.is_none() {
                     token_data.provider = saved.checkpoint.provider.clone();
@@ -5741,24 +5947,31 @@ fn apply_source_policy(state: &SharedState, item: &UploadItem) -> Result<Option<
     Ok(Some(format!("已移动到归档目录：{}", destination.display())))
 }
 
-fn resubmit_source_if_changed(state: &SharedState, item: &UploadItem) {
-    if item.mapping_id == "__manual__" {
-        return;
-    }
-    let changed = fs::metadata(&item.file_path)
+fn source_changed_since_upload(item: &UploadItem) -> bool {
+    fs::metadata(&item.file_path)
         .ok()
         .filter(|metadata| metadata.is_file())
         .is_some_and(|metadata| {
             metadata.len() != item.size || modified_ms(&metadata) != item.modified_ms
-        });
-    if changed {
+        })
+}
+
+fn resubmit_source_if_changed(state: &SharedState, item: &UploadItem) -> bool {
+    if item.mapping_id == "__manual__" {
+        return false;
+    }
+    if source_changed_since_upload(item) {
         if let Ok(guard) = state.lock() {
-            let _ = guard.event_tx.send(FsEvent {
-                mapping_id: item.mapping_id.clone(),
-                path: item.file_path.clone(),
-            });
+            return guard
+                .event_tx
+                .send(FsEvent {
+                    mapping_id: item.mapping_id.clone(),
+                    path: item.file_path.clone(),
+                })
+                .is_ok();
         }
     }
+    false
 }
 
 async fn finalize_successful_upload(
@@ -5767,6 +5980,21 @@ async fn finalize_successful_upload(
     item: &UploadItem,
     outcome: &UploadOutcome,
 ) {
+    if resubmit_source_if_changed(state, item) {
+        emit(
+            app,
+            json!({
+                "type": "file",
+                "state": "waiting-file",
+                "file_path": item.file_path.to_string_lossy(),
+                "mapping_id": item.mapping_id,
+                "uploaded_bytes": 0,
+                "total_bytes": fs::metadata(&item.file_path).map(|metadata| metadata.len()).unwrap_or(item.size),
+                "stage": "检测到源文件仍在写入，等待完整后重新上传"
+            }),
+        );
+        return;
+    }
     let db_path = state.lock().ok().map(|guard| guard.db_path.clone());
     if let Some(path) = db_path.as_deref() {
         if let Err(message) = clear_auto_share_failure(path, item) {
@@ -5815,10 +6043,12 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
             {
                 None
             } else {
-                let position = guard
-                    .queue
-                    .iter()
-                    .position(|candidate| !flash_preflight_cached(&guard, candidate));
+                let position = guard.queue.iter().position(|candidate| {
+                    !guard
+                        .inflight
+                        .contains_key(&item_key(&candidate.mapping_id, &candidate.file_path))
+                        && !flash_preflight_cached(&guard, candidate)
+                });
                 position.and_then(|position| {
                     let item = guard.queue.remove(position)?;
                     let key = item_key(&item.mapping_id, &item.file_path);
@@ -6105,7 +6335,12 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
             {
                 None
             } else {
-                let item = guard.queue.pop_front();
+                let position = guard.queue.iter().position(|candidate| {
+                    !guard
+                        .inflight
+                        .contains_key(&item_key(&candidate.mapping_id, &candidate.file_path))
+                });
+                let item = position.and_then(|position| guard.queue.remove(position));
                 if let Some(item) = &item {
                     guard.active_uploads += 1;
                     guard.inflight.insert(
@@ -6648,37 +6883,7 @@ async fn recover_pending_upload(app: tauri::AppHandle, state: SharedState, pendi
             };
             match remember_confirmed_upload(&state, &item, &outcome) {
                 Ok(()) => {
-                    if let Err(message) = clear_auto_share_failure(&db_path, &item) {
-                        status(&app, "error", message);
-                    }
-                    if let Err(message) = schedule_auto_share(&state, &item, &outcome).await {
-                        status(
-                            &app,
-                            "error",
-                            format!("云端已确认，但自动分享排队失败：{message}"),
-                        );
-                    }
-                    match apply_source_policy(&state, &item) {
-                        Ok(Some(message)) => status(&app, "success", message),
-                        Ok(None) => status(
-                            &app,
-                            "success",
-                            format!("已恢复并确认云端入库：{}", item.file_path.display()),
-                        ),
-                        Err(message) => {
-                            status(&app, "error", message);
-                            resubmit_source_if_changed(&state, &item);
-                        }
-                    }
-                    emit(
-                        &app,
-                        json!({
-                            "type": "file",
-                            "state": "done",
-                            "file_path": item.file_path.to_string_lossy(),
-                            "mapping_id": item.mapping_id
-                        }),
-                    );
+                    finalize_successful_upload(&app, &state, &item, &outcome).await;
                 }
                 Err(message) => status(&app, "warning", message),
             }
@@ -6929,21 +7134,193 @@ fn auth_context(state: &tauri::State<'_, SharedState>) -> Result<(String, String
 async fn get_overview(state: tauri::State<'_, SharedState>) -> Result<Value, String> {
     let (token, device_id) = auth_context(&state)?;
     let assets = api_post(&token, &device_id, "/assets/v1/get_assets", json!({}), &[]).await?;
-    let profile = match account_get(&token, "/v1/user/me").await {
-        Ok(value) => value,
-        Err(_) => api_post(
-            &token,
-            &device_id,
-            "/activity/v1/get_user_data",
-            json!({}),
-            &[],
-        )
+    let profile = account_get(&token, &device_id, "/v1/user/me")
         .await
-        .ok()
-        .and_then(|response| response.data)
-        .unwrap_or_else(|| json!({})),
-    };
+        .unwrap_or_else(|_| json!({}));
     Ok(json!({ "assets": assets.data.unwrap_or_else(|| json!({})), "profile": profile }))
+}
+
+#[tauri::command]
+async fn get_assets(state: tauri::State<'_, SharedState>) -> Result<Value, String> {
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(&token, &device_id, "/assets/v1/get_assets", json!({}), &[]).await?;
+    Ok(response.data.unwrap_or_else(|| json!({})))
+}
+
+#[tauri::command]
+async fn get_global_config(state: tauri::State<'_, SharedState>) -> Result<Value, String> {
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/misc/v1/get_global_config",
+        json!({}),
+        &[],
+    )
+    .await?;
+    Ok(response.data.unwrap_or_else(|| json!({})))
+}
+
+fn recycle_file_list_request(page: Option<u64>) -> Value {
+    json!({
+        "page": page.unwrap_or(0),
+        "pageSize": DEFAULT_API_PAGE_SIZE,
+        "parentId": "",
+        "dirType": 4,
+        "orderBy": 12,
+        "sortType": 1
+    })
+}
+
+fn clear_recycle_bin_request() -> (&'static str, Value) {
+    ("/userres/v1/file/clear_recycle_bin", json!({}))
+}
+
+fn create_folder_request(
+    parent_id: &str,
+    dir_name: &str,
+    fail_if_name_exist: Option<bool>,
+) -> Result<Value, String> {
+    let parent_id = normalize_parent_id(parent_id)?;
+    let dir_name = normalize_remote_name(dir_name)?;
+    let mut request = json!({ "parentId": parent_id, "dirName": dir_name });
+    if let Some(fail_if_name_exist) = fail_if_name_exist {
+        request
+            .as_object_mut()
+            .expect("create folder request must be an object")
+            .insert("failIfNameExist".to_string(), json!(fail_if_name_exist));
+    }
+    Ok(request)
+}
+
+fn file_detail_request(file_id: &str) -> Result<Value, String> {
+    Ok(json!({ "fileId": normalize_api_id(file_id, "文件 ID")? }))
+}
+
+fn normalize_file_type_filter(values: Option<&[i64]>) -> Result<Option<Vec<i64>>, String> {
+    let Some(values) = values else {
+        return Ok(None);
+    };
+    if values.len() > 12 || values.iter().any(|value| !(0..=11).contains(value)) {
+        return Err("文件类型只能包含 0–11".into());
+    }
+    let mut seen = HashSet::new();
+    let values = values
+        .iter()
+        .copied()
+        .filter(|value| seen.insert(*value))
+        .collect::<Vec<_>>();
+    Ok((!values.is_empty()).then_some(values))
+}
+
+fn recent_actions_request(
+    cursor: Option<&str>,
+    page_size: Option<u64>,
+    file_types: Option<&[i64]>,
+    exclude_file_types: Option<&[i64]>,
+) -> Result<Value, String> {
+    let mut request = json!({
+        "cursor": normalize_api_cursor(cursor)?.unwrap_or_default(),
+        "pageSize": normalize_api_page_size(page_size, DEFAULT_RECENT_PAGE_SIZE)?
+    });
+    if let Some(file_types) = normalize_file_type_filter(file_types)? {
+        request
+            .as_object_mut()
+            .expect("recent actions request must be an object")
+            .insert("fileTypes".to_string(), json!(file_types));
+    }
+    if let Some(file_types) = normalize_file_type_filter(exclude_file_types)? {
+        request
+            .as_object_mut()
+            .expect("recent actions request must be an object")
+            .insert("excludeFileTypes".to_string(), json!(file_types));
+    }
+    Ok(request)
+}
+
+#[tauri::command]
+async fn list_recycle_files(
+    state: tauri::State<'_, SharedState>,
+    page: Option<u64>,
+) -> Result<Value, String> {
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/userres/v1/file/get_file_list",
+        recycle_file_list_request(page),
+        &[],
+    )
+    .await?;
+    Ok(response
+        .data
+        .unwrap_or_else(|| json!({ "list": [], "total": 0 })))
+}
+
+#[tauri::command]
+async fn create_folder(
+    state: tauri::State<'_, SharedState>,
+    parent_id: String,
+    dir_name: String,
+    fail_if_name_exist: Option<bool>,
+) -> Result<Value, String> {
+    let request = create_folder_request(&parent_id, &dir_name, fail_if_name_exist)?;
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/userres/v1/file/create_dir",
+        request,
+        &[],
+    )
+    .await?;
+    Ok(response.data.unwrap_or_else(|| json!({})))
+}
+
+#[tauri::command]
+async fn get_file_detail(
+    state: tauri::State<'_, SharedState>,
+    file_id: String,
+) -> Result<Value, String> {
+    let request = file_detail_request(&file_id)?;
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/userres/v1/file/get_file_detail",
+        request,
+        &[],
+    )
+    .await?;
+    response
+        .data
+        .ok_or_else(|| "光鸭没有返回文件详情".to_string())
+}
+
+#[tauri::command]
+async fn list_recent_actions(
+    state: tauri::State<'_, SharedState>,
+    cursor: Option<String>,
+    page_size: Option<u64>,
+    file_types: Option<Vec<i64>>,
+    exclude_file_types: Option<Vec<i64>>,
+) -> Result<Value, String> {
+    let request = recent_actions_request(
+        cursor.as_deref(),
+        page_size,
+        file_types.as_deref(),
+        exclude_file_types.as_deref(),
+    )?;
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/userres/v1/get_user_action",
+        request,
+        &[],
+    )
+    .await?;
+    Ok(response.data.unwrap_or_else(|| json!({ "list": [] })))
 }
 
 #[tauri::command]
@@ -6951,19 +7328,38 @@ async fn list_files(
     state: tauri::State<'_, SharedState>,
     parent_id: String,
     page: u64,
+    folders_only: Option<bool>,
 ) -> Result<Value, String> {
     let (token, device_id) = auth_context(&state)?;
     let response = api_post(
         &token,
         &device_id,
         "/userres/v1/file/get_file_list",
-        json!({ "page": page, "pageSize": 100, "parentId": parent_id, "orderBy": 0, "sortType": 0, "needSubFolderStat": true }),
+        file_list_request(&parent_id, page, folders_only.unwrap_or(false)),
         &[],
     )
     .await?;
     Ok(response
         .data
         .unwrap_or_else(|| json!({ "list": [], "total": 0 })))
+}
+
+fn file_list_request(parent_id: &str, page: u64, folders_only: bool) -> Value {
+    let mut request = json!({
+        "page": page,
+        "pageSize": 100,
+        "parentId": parent_id,
+        "orderBy": 0,
+        "sortType": 0,
+        "needSubFolderStat": true
+    });
+    if folders_only {
+        request
+            .as_object_mut()
+            .expect("file list request must be an object")
+            .insert("resType".to_string(), json!(2));
+    }
+    request
 }
 
 #[tauri::command]
@@ -6978,37 +7374,78 @@ async fn search_files(
     let extension = normalize_search_extension(extension.as_deref());
     let (token, device_id) = auth_context(&state)?;
     let page = page.unwrap_or(0);
-    let (endpoint, request) =
-        cloud_search_request(&query, file_type.as_deref(), extension.as_deref(), page);
-    let response = api_post(&token, &device_id, endpoint, request, &[]).await?;
-    let data = response
-        .data
-        .unwrap_or_else(|| json!({ "list": [], "total": 0 }));
-    let source_total = data.get("total").and_then(Value::as_u64).unwrap_or(0);
-    let source_list = data
-        .get("list")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let remote_count = source_list.len() as u64;
-    let list = source_list
-        .into_iter()
-        .filter(|item| {
+    const PAGE_SIZE: usize = 100;
+    let has_local_filter = file_type.is_some() || extension.is_some();
+    if !has_local_filter {
+        let (endpoint, request) = cloud_search_request(&query, None, None, page);
+        let response = api_post(&token, &device_id, endpoint, request, &[]).await?;
+        let data = response
+            .data
+            .unwrap_or_else(|| json!({ "list": [], "total": 0 }));
+        let total = data.get("total").and_then(Value::as_u64).unwrap_or(0);
+        let list = data
+            .get("list")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        return Ok(json!({
+            "remote_count": list.len(),
+            "remote_total": total,
+            "list": list,
+            "total": total,
+            "page": page,
+            "page_size": PAGE_SIZE,
+        }));
+    }
+
+    let required_matches = usize::try_from(page)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(PAGE_SIZE)
+        .saturating_add(PAGE_SIZE)
+        .saturating_add(1);
+    let mut remote_page = 0_u64;
+    let mut remote_total = 0_u64;
+    let mut remote_count = 0_u64;
+    let mut matches = Vec::new();
+    let remote_exhausted = loop {
+        let (endpoint, request) = cloud_search_request(
+            &query,
+            file_type.as_deref(),
+            extension.as_deref(),
+            remote_page,
+        );
+        let response = api_post(&token, &device_id, endpoint, request, &[]).await?;
+        let data = response
+            .data
+            .unwrap_or_else(|| json!({ "list": [], "total": 0 }));
+        let source_total = data.get("total").and_then(Value::as_u64).unwrap_or(0);
+        remote_total = remote_total.max(source_total);
+        let source_list = data
+            .get("list")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let source_count = source_list.len();
+        remote_count = remote_count.saturating_add(source_count as u64);
+        matches.extend(source_list.into_iter().filter(|item| {
             cloud_item_matches_search_filters(item, file_type.as_deref(), extension.as_deref())
-        })
-        .collect::<Vec<_>>();
-    let total = if file_type.is_some() || extension.is_some() {
-        list.len() as u64
-    } else {
-        source_total
+        }));
+        let exhausted =
+            source_count < PAGE_SIZE || (remote_total > 0 && remote_count >= remote_total);
+        if matches.len() >= required_matches || exhausted {
+            break exhausted;
+        }
+        remote_page = remote_page.saturating_add(1);
     };
+    let (list, total) =
+        paginate_filtered_search_results(matches, page, PAGE_SIZE, remote_exhausted);
     Ok(json!({
         "list": list,
         "total": total,
-        "remote_total": source_total,
+        "remote_total": remote_total,
         "remote_count": remote_count,
         "page": page,
-        "page_size": 100
+        "page_size": PAGE_SIZE
     }))
 }
 
@@ -7314,12 +7751,99 @@ async fn rename_remote(
     Ok(())
 }
 
-fn validate_file_ids(file_ids: &[String]) -> Result<(), String> {
-    if file_ids.is_empty() {
-        Err("请至少选择一个文件或文件夹".into())
-    } else {
-        Ok(())
+fn normalize_api_id(value: &str, label: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{label}不能为空"));
     }
+    if value.chars().count() > MAX_API_ID_LENGTH || value.chars().any(char::is_control) {
+        return Err(format!("{label}格式无效"));
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_parent_id(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.chars().count() > MAX_API_ID_LENGTH || value.chars().any(char::is_control) {
+        return Err("父目录 ID 格式无效".into());
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_id_list(values: &[String], label: &str) -> Result<Vec<String>, String> {
+    if values.is_empty() {
+        return Err(format!("请至少选择一个{label}"));
+    }
+    if values.len() > MAX_API_ID_BATCH {
+        return Err(format!("单次最多操作 {MAX_API_ID_BATCH} 个{label}"));
+    }
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values {
+        let value = normalize_api_id(value, &format!("{label} ID"))?;
+        if seen.insert(value.clone()) {
+            normalized.push(value);
+        }
+    }
+    if normalized.is_empty() {
+        return Err(format!("请至少选择一个{label}"));
+    }
+    Ok(normalized)
+}
+
+fn normalize_api_cursor(cursor: Option<&str>) -> Result<Option<String>, String> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    if cursor.chars().count() > MAX_API_CURSOR_LENGTH || cursor.chars().any(char::is_control) {
+        return Err("分页游标格式无效".into());
+    }
+    Ok(Some(cursor.to_string()))
+}
+
+fn normalize_api_page_size(page_size: Option<u64>, default: u64) -> Result<u64, String> {
+    let page_size = page_size.unwrap_or(default);
+    if !(1..=MAX_API_PAGE_SIZE).contains(&page_size) {
+        return Err(format!("每页数量必须在 1–{MAX_API_PAGE_SIZE} 之间"));
+    }
+    Ok(page_size)
+}
+
+fn normalize_remote_name(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("文件夹名称不能为空".into());
+    }
+    if value.chars().count() > MAX_REMOTE_NAME_LENGTH
+        || matches!(value, "." | "..")
+        || value
+            .chars()
+            .any(|character| character.is_control() || "\\/:*?\"<>|".contains(character))
+    {
+        return Err("文件夹名称格式无效".into());
+    }
+    Ok(value.to_string())
+}
+
+fn operation_task_id(data: &Value) -> Option<String> {
+    let value = data
+        .get("taskId")
+        .or_else(|| data.get("taskID"))
+        .unwrap_or(data);
+    let task_id = value_as_id(Some(value));
+    (!task_id.trim().is_empty()).then(|| task_id.trim().to_string())
+}
+
+async fn finish_operation_response(
+    token: &str,
+    device_id: &str,
+    response: ApiResponse,
+) -> Result<Value, String> {
+    let data = response.data.unwrap_or_else(|| json!({}));
+    if let Some(task_id) = operation_task_id(&data) {
+        wait_operation_task(token, device_id, &task_id).await?;
+    }
+    Ok(data)
 }
 
 async fn fetch_received_share_files(
@@ -7501,6 +8025,73 @@ async fn find_existing_share_for_files(
     Ok(None)
 }
 
+fn normalize_share_traffic_limit(value: &Value) -> Result<String, String> {
+    match value {
+        Value::String(value) => {
+            let value = value.trim();
+            if value.is_empty()
+                || value.len() > 32
+                || !value.chars().all(|value| value.is_ascii_digit())
+            {
+                return Err("分享流量限制必须是非负整数".into());
+            }
+            let value = value
+                .parse::<u64>()
+                .map_err(|_| "分享流量限制必须是非负整数".to_string())?;
+            if value > MAX_SHARE_TRAFFIC_BYTES {
+                return Err("分享流量限制最大为 1024 TB".into());
+            }
+            Ok(value.to_string())
+        }
+        Value::Number(value) => {
+            let value = value
+                .as_u64()
+                .ok_or_else(|| "分享流量限制必须是非负整数".to_string())?;
+            if value > MAX_SHARE_TRAFFIC_BYTES {
+                return Err("分享流量限制最大为 1024 TB".into());
+            }
+            Ok(value.to_string())
+        }
+        _ => Err("分享流量限制必须是数字或十进制字符串".into()),
+    }
+}
+
+fn update_share_request(
+    id: &str,
+    validate_duration: i64,
+    download_type: i64,
+    traffic_limit: &Value,
+) -> Result<Value, String> {
+    let id = normalize_api_id(id, "分享 ID")?;
+    if !matches!(validate_duration, 0 | 86_400 | 604_800 | 2_592_000) {
+        return Err("分享有效期必须是永久、1 天、7 天或 30 天".into());
+    }
+    if !matches!(download_type, 0 | 1) {
+        return Err("分享下载类型必须是 0 或 1".into());
+    }
+    Ok(json!({
+        "id": id,
+        "validateDuration": validate_duration,
+        "downloadType": download_type,
+        "trafficLimit": normalize_share_traffic_limit(traffic_limit)?
+    }))
+}
+
+fn direct_link_file_request(file_id: &str) -> Result<Value, String> {
+    Ok(json!({ "fileId": normalize_api_id(file_id, "文件 ID")? }))
+}
+
+fn get_direct_link_request(file_id: &str, short_link: bool) -> Result<Value, String> {
+    Ok(json!({
+        "fileId": normalize_api_id(file_id, "文件 ID")?,
+        "shortLink": short_link
+    }))
+}
+
+fn delete_shares_request(ids: &[String]) -> Result<Value, String> {
+    Ok(json!({ "ids": normalize_id_list(ids, "分享")? }))
+}
+
 #[tauri::command]
 async fn list_shares(state: tauri::State<'_, SharedState>) -> Result<Value, String> {
     let (token, device_id) = auth_context(&state)?;
@@ -7510,17 +8101,91 @@ async fn list_shares(state: tauri::State<'_, SharedState>) -> Result<Value, Stri
 #[tauri::command]
 async fn delete_shares(
     state: tauri::State<'_, SharedState>,
-    ids: Vec<Value>,
+    ids: Vec<String>,
 ) -> Result<Value, String> {
-    if ids.is_empty() {
-        return Err("请至少选择一个分享".into());
-    }
+    let request = delete_shares_request(&ids)?;
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(&token, &device_id, "/userres/v1/delete_share", request, &[]).await?;
+    Ok(response.data.unwrap_or_else(|| json!({})))
+}
+
+#[tauri::command]
+async fn update_share(
+    state: tauri::State<'_, SharedState>,
+    id: String,
+    validate_duration: i64,
+    download_type: i64,
+    traffic_limit: Value,
+) -> Result<Value, String> {
+    let request = update_share_request(&id, validate_duration, download_type, &traffic_limit)?;
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(&token, &device_id, "/userres/v1/update_share", request, &[]).await?;
+    Ok(response.data.unwrap_or_else(|| json!({})))
+}
+
+#[tauri::command]
+async fn delete_invalid_shares(state: tauri::State<'_, SharedState>) -> Result<Value, String> {
     let (token, device_id) = auth_context(&state)?;
     let response = api_post(
         &token,
         &device_id,
-        "/userres/v1/delete_share",
-        json!({ "ids": ids }),
+        "/userres/v1/delete_invalid_share",
+        json!({}),
+        &[],
+    )
+    .await?;
+    Ok(response.data.unwrap_or_else(|| json!({})))
+}
+
+#[tauri::command]
+async fn set_direct_link(
+    state: tauri::State<'_, SharedState>,
+    file_id: String,
+) -> Result<Value, String> {
+    let request = direct_link_file_request(&file_id)?;
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/userres/v1/set_direct_link",
+        request,
+        &[],
+    )
+    .await?;
+    Ok(response.data.unwrap_or_else(|| json!({})))
+}
+
+#[tauri::command]
+async fn unset_direct_link(
+    state: tauri::State<'_, SharedState>,
+    file_id: String,
+) -> Result<Value, String> {
+    let request = direct_link_file_request(&file_id)?;
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/userres/v1/unset_direct_link",
+        request,
+        &[],
+    )
+    .await?;
+    Ok(response.data.unwrap_or_else(|| json!({})))
+}
+
+#[tauri::command]
+async fn get_direct_link(
+    state: tauri::State<'_, SharedState>,
+    file_id: String,
+    short_link: Option<bool>,
+) -> Result<Value, String> {
+    let request = get_direct_link_request(&file_id, short_link.unwrap_or(false))?;
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/userres/v1/get_direct_link",
+        request,
         &[],
     )
     .await?;
@@ -7576,7 +8241,8 @@ async fn restore_received_share(
     file_ids: Vec<String>,
     parent_id: String,
 ) -> Result<Value, String> {
-    validate_file_ids(&file_ids)?;
+    let file_ids = normalize_id_list(&file_ids, "文件或文件夹")?;
+    let parent_id = normalize_parent_id(&parent_id)?;
     if access_token.trim().is_empty() {
         return Err("分享访问令牌为空，请重新打开分享链接".into());
     }
@@ -7607,7 +8273,7 @@ async fn get_received_share_download(
     destination_dir: String,
     download_id: String,
 ) -> Result<Value, String> {
-    validate_file_ids(&file_ids)?;
+    let file_ids = normalize_id_list(&file_ids, "文件或文件夹")?;
     if access_token.trim().is_empty() {
         return Err("分享访问令牌为空，请重新打开分享链接".into());
     }
@@ -7634,6 +8300,8 @@ async fn get_received_share_download(
         let download_url = data
             .get("downloadUrl")
             .or_else(|| data.get("downloadURL"))
+            .or_else(|| data.get("signedURL"))
+            .or_else(|| data.get("signedUrl"))
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| "光鸭没有返回文件下载地址".to_string())?
@@ -7694,6 +8362,7 @@ async fn get_received_share_download(
             )
             .await;
         }
+        ensure_packaging_task_active(&data)?;
         sleep(Duration::from_secs(1)).await;
     }
     Err("光鸭打包超过 10 分钟仍未完成，请稍后重试".into())
@@ -7709,7 +8378,7 @@ async fn get_cloud_download(
     destination_dir: String,
     download_id: String,
 ) -> Result<Value, String> {
-    validate_file_ids(&file_ids)?;
+    let file_ids = normalize_id_list(&file_ids, "文件或文件夹")?;
     if !packaged && file_ids.len() != 1 {
         return Err("单文件下载只能选择一个文件".into());
     }
@@ -7787,9 +8456,43 @@ async fn get_cloud_download(
             )
             .await;
         }
+        ensure_packaging_task_active(&data)?;
         sleep(Duration::from_secs(1)).await;
     }
     Err("光鸭打包超过 10 分钟仍未完成，请稍后重试".into())
+}
+
+fn ensure_packaging_task_active(data: &Value) -> Result<(), String> {
+    let status = data
+        .get("status")
+        .or_else(|| data.get("state"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let failed = matches!(
+        status.as_str(),
+        "failed" | "failure" | "error" | "cancelled" | "canceled" | "expired"
+    );
+    let error_code = data
+        .get("errorCode")
+        .or_else(|| data.get("error_code"))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
+        .unwrap_or(0);
+    if !failed && error_code == 0 {
+        return Ok(());
+    }
+    Err(data
+        .get("message")
+        .or_else(|| data.get("msg"))
+        .or_else(|| data.get("error"))
+        .and_then(Value::as_str)
+        .unwrap_or("光鸭文件打包失败")
+        .to_string())
 }
 
 fn safe_download_name(value: &str) -> String {
@@ -8001,7 +8704,8 @@ async fn copy_files(
     file_ids: Vec<String>,
     parent_id: String,
 ) -> Result<Value, String> {
-    validate_file_ids(&file_ids)?;
+    let file_ids = normalize_id_list(&file_ids, "文件或文件夹")?;
+    let parent_id = normalize_parent_id(&parent_id)?;
     let (token, device_id) = auth_context(&state)?;
     let response = api_post(
         &token,
@@ -8011,15 +8715,7 @@ async fn copy_files(
         &[],
     )
     .await?;
-    if let Some(task_id) = response
-        .data
-        .as_ref()
-        .and_then(|data| data.get("taskId"))
-        .and_then(Value::as_str)
-    {
-        wait_operation_task(&token, &device_id, task_id).await?;
-    }
-    Ok(response.data.unwrap_or_else(|| json!({})))
+    finish_operation_response(&token, &device_id, response).await
 }
 
 #[tauri::command]
@@ -8028,7 +8724,8 @@ async fn move_files(
     file_ids: Vec<String>,
     parent_id: String,
 ) -> Result<Value, String> {
-    validate_file_ids(&file_ids)?;
+    let file_ids = normalize_id_list(&file_ids, "文件或文件夹")?;
+    let parent_id = normalize_parent_id(&parent_id)?;
     let (token, device_id) = auth_context(&state)?;
     let response = api_post(
         &token,
@@ -8038,15 +8735,7 @@ async fn move_files(
         &[],
     )
     .await?;
-    if let Some(task_id) = response
-        .data
-        .as_ref()
-        .and_then(|data| data.get("taskId"))
-        .and_then(Value::as_str)
-    {
-        wait_operation_task(&token, &device_id, task_id).await?;
-    }
-    Ok(response.data.unwrap_or_else(|| json!({})))
+    finish_operation_response(&token, &device_id, response).await
 }
 
 #[tauri::command]
@@ -8054,7 +8743,7 @@ async fn delete_files(
     state: tauri::State<'_, SharedState>,
     file_ids: Vec<String>,
 ) -> Result<Value, String> {
-    validate_file_ids(&file_ids)?;
+    let file_ids = normalize_id_list(&file_ids, "文件或文件夹")?;
     let (token, device_id) = auth_context(&state)?;
     let response = api_post(
         &token,
@@ -8064,15 +8753,51 @@ async fn delete_files(
         &[],
     )
     .await?;
-    if let Some(task_id) = response
-        .data
-        .as_ref()
-        .and_then(|data| data.get("taskId"))
-        .and_then(Value::as_str)
-    {
-        wait_operation_task(&token, &device_id, task_id).await?;
-    }
-    Ok(response.data.unwrap_or_else(|| json!({})))
+    finish_operation_response(&token, &device_id, response).await
+}
+
+#[tauri::command]
+async fn restore_files(
+    state: tauri::State<'_, SharedState>,
+    file_ids: Vec<String>,
+) -> Result<Value, String> {
+    let file_ids = normalize_id_list(&file_ids, "文件或文件夹")?;
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/userres/v1/file/recycle_file",
+        json!({ "fileIds": file_ids }),
+        &[],
+    )
+    .await?;
+    finish_operation_response(&token, &device_id, response).await
+}
+
+#[tauri::command]
+async fn permanently_delete_files(
+    state: tauri::State<'_, SharedState>,
+    file_ids: Vec<String>,
+) -> Result<Value, String> {
+    let file_ids = normalize_id_list(&file_ids, "文件或文件夹")?;
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/userres/v1/file/delete_file",
+        json!({ "fileIds": file_ids }),
+        &[],
+    )
+    .await?;
+    finish_operation_response(&token, &device_id, response).await
+}
+
+#[tauri::command]
+async fn clear_recycle_bin(state: tauri::State<'_, SharedState>) -> Result<Value, String> {
+    let (endpoint, request) = clear_recycle_bin_request();
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(&token, &device_id, endpoint, request, &[]).await?;
+    finish_operation_response(&token, &device_id, response).await
 }
 
 #[tauri::command]
@@ -8161,9 +8886,7 @@ async fn create_share(
     code: Option<String>,
     auto_fill_code: Option<bool>,
 ) -> Result<Value, String> {
-    if file_ids.is_empty() {
-        return Err("请至少选择一个文件或文件夹".into());
-    }
+    let file_ids = normalize_id_list(&file_ids, "文件或文件夹")?;
     let title = title.trim();
     let title = if title.is_empty() {
         "云盘分享".to_string()
@@ -8330,23 +9053,154 @@ async fn create_share(
     Ok(data)
 }
 
+fn normalize_offline_url(url: &str) -> Result<String, String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("请输入离线下载地址".into());
+    }
+    if url.len() > MAX_OFFLINE_URL_LENGTH || url.chars().any(char::is_control) {
+        return Err("离线下载地址格式无效".into());
+    }
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        let parsed = reqwest::Url::parse(url).map_err(|_| "离线下载地址格式无效")?;
+        if parsed.host_str().is_none() {
+            return Err("离线下载地址缺少主机名".into());
+        }
+    } else if lower.starts_with("magnet:") {
+        if url.len() <= "magnet:".len() {
+            return Err("磁力链接格式无效".into());
+        }
+    } else if lower.starts_with("ed2k://") {
+        if url.len() <= "ed2k://".len() {
+            return Err("电驴链接格式无效".into());
+        }
+    } else {
+        return Err("仅支持 HTTP、HTTPS、磁力或 ED2K 离线地址".into());
+    }
+    Ok(url.to_string())
+}
+
+fn normalize_offline_file_indexes(
+    file_indexes: Option<&[u64]>,
+) -> Result<Option<Vec<u64>>, String> {
+    let Some(file_indexes) = file_indexes else {
+        return Ok(None);
+    };
+    if file_indexes.is_empty() {
+        return Err("已提供 fileIndexes 时请至少选择一个资源文件".into());
+    }
+    if file_indexes.len() > MAX_OFFLINE_FILE_INDEXES {
+        return Err(format!(
+            "单次最多选择 {MAX_OFFLINE_FILE_INDEXES} 个资源文件"
+        ));
+    }
+    let mut seen = HashSet::new();
+    Ok(Some(
+        file_indexes
+            .iter()
+            .copied()
+            .filter(|index| seen.insert(*index))
+            .collect(),
+    ))
+}
+
+fn offline_resolve_request(url: &str) -> Result<Value, String> {
+    Ok(json!({ "url": normalize_offline_url(url)? }))
+}
+
+fn offline_task_request(
+    url: &str,
+    parent_id: &str,
+    new_name: &str,
+    file_indexes: Option<&[u64]>,
+) -> Result<Value, String> {
+    let url = normalize_offline_url(url)?;
+    let parent_id = normalize_parent_id(parent_id)?;
+    let mut request = json!({ "url": url, "parentId": parent_id });
+    if let Some(name) = (!new_name.trim().is_empty()).then(|| new_name.trim()) {
+        if name.chars().count() > MAX_REMOTE_NAME_LENGTH
+            || name
+                .chars()
+                .any(|character| character.is_control() || "\\/:*?\"<>|".contains(character))
+        {
+            return Err("离线任务名称格式无效".into());
+        }
+        request
+            .as_object_mut()
+            .expect("offline task request must be an object")
+            .insert("newName".to_string(), json!(name));
+    }
+    if let Some(file_indexes) = normalize_offline_file_indexes(file_indexes)? {
+        if !url.to_ascii_lowercase().starts_with("magnet:") {
+            return Err("只有磁力任务支持 fileIndexes".into());
+        }
+        request
+            .as_object_mut()
+            .expect("offline task request must be an object")
+            .insert("fileIndexes".to_string(), json!(file_indexes));
+    }
+    Ok(request)
+}
+
+fn offline_task_list_request(
+    page: Option<u64>,
+    cursor: Option<&str>,
+    page_size: Option<u64>,
+    status: Option<&[i64]>,
+) -> Result<Value, String> {
+    let cursor = normalize_api_cursor(cursor)?;
+    if cursor.as_deref().unwrap_or_default().is_empty() && page.is_some_and(|page| page > 0) {
+        return Err("离线任务列表使用 cursor 翻页，不支持 page > 0".into());
+    }
+    let mut request = json!({
+        "cursor": cursor.unwrap_or_default(),
+        "pageSize": normalize_api_page_size(page_size, DEFAULT_API_PAGE_SIZE)?
+    });
+    let object = request
+        .as_object_mut()
+        .expect("offline task list request must be an object");
+    if let Some(statuses) = status {
+        if statuses.len() > 6 || statuses.iter().any(|status| !(0..=5).contains(status)) {
+            return Err("离线任务状态只能包含 0–5".into());
+        }
+        let mut seen = HashSet::new();
+        let statuses = statuses
+            .iter()
+            .copied()
+            .filter(|status| seen.insert(*status))
+            .collect::<Vec<_>>();
+        object.insert("status".to_string(), json!(statuses));
+    }
+    Ok(request)
+}
+
+fn offline_task_ids_request(task_ids: &[String]) -> Result<Value, String> {
+    Ok(json!({
+        "taskIds": normalize_id_list(task_ids, "离线任务")?
+    }))
+}
+
 #[tauri::command]
 async fn create_offline_task(
     state: tauri::State<'_, SharedState>,
     url: String,
     parent_id: String,
-    new_name: String,
+    new_name: Option<String>,
+    file_indexes: Option<Vec<u64>>,
 ) -> Result<Value, String> {
-    let url = url.trim();
-    if url.is_empty() {
-        return Err("请输入离线下载地址".into());
-    }
+    let request = offline_task_request(
+        &url,
+        &parent_id,
+        new_name.as_deref().unwrap_or_default(),
+        file_indexes.as_deref(),
+    )?;
     let (token, device_id) = auth_context(&state)?;
     let response = api_post(
         &token,
         &device_id,
         "/cloudcollection/v1/create_task",
-        json!({ "url": url, "parentId": parent_id, "newName": new_name.trim() }),
+        request,
         &[],
     )
     .await?;
@@ -8354,17 +9208,111 @@ async fn create_offline_task(
 }
 
 #[tauri::command]
-async fn list_offline_tasks(state: tauri::State<'_, SharedState>) -> Result<Value, String> {
+async fn list_offline_tasks(
+    state: tauri::State<'_, SharedState>,
+    page: Option<u64>,
+    cursor: Option<String>,
+    page_size: Option<u64>,
+    status: Option<Vec<i64>>,
+) -> Result<Value, String> {
+    let request = offline_task_list_request(page, cursor.as_deref(), page_size, status.as_deref())?;
     let (token, device_id) = auth_context(&state)?;
     let response = api_post(
         &token,
         &device_id,
         "/cloudcollection/v1/list_task",
-        json!({ "page": 0, "pageSize": 100 }),
+        request,
         &[],
     )
     .await?;
     Ok(response.data.unwrap_or_else(|| json!({ "list": [] })))
+}
+
+#[tauri::command]
+async fn resolve_offline_resource(
+    state: tauri::State<'_, SharedState>,
+    url: String,
+) -> Result<Value, String> {
+    let request = offline_resolve_request(&url)?;
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/cloudcollection/v1/resolve_res",
+        request,
+        &[],
+    )
+    .await?;
+    response
+        .data
+        .ok_or_else(|| "光鸭没有返回离线资源解析结果".to_string())
+}
+
+async fn delete_offline_task_records(
+    state: &tauri::State<'_, SharedState>,
+    task_ids: &[String],
+) -> Result<Value, String> {
+    let request = offline_task_ids_request(task_ids)?;
+    let (token, device_id) = auth_context(state)?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/cloudcollection/v2/delete_task",
+        request,
+        &[],
+    )
+    .await?;
+    Ok(response.data.unwrap_or_else(|| json!({})))
+}
+
+#[tauri::command]
+async fn delete_offline_tasks(
+    state: tauri::State<'_, SharedState>,
+    task_ids: Vec<String>,
+) -> Result<Value, String> {
+    delete_offline_task_records(&state, &task_ids).await
+}
+
+#[tauri::command]
+async fn cancel_offline_tasks(
+    state: tauri::State<'_, SharedState>,
+    task_ids: Vec<String>,
+) -> Result<Value, String> {
+    // The official PC client uses v2/delete_task for both cancelling active
+    // tasks and removing completed task records.
+    delete_offline_task_records(&state, &task_ids).await
+}
+
+#[tauri::command]
+async fn retry_offline_tasks(
+    state: tauri::State<'_, SharedState>,
+    task_ids: Vec<String>,
+) -> Result<Value, String> {
+    let request = offline_task_ids_request(&task_ids)?;
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/cloudcollection/v2/retry_task",
+        request,
+        &[],
+    )
+    .await?;
+    Ok(response.data.unwrap_or_else(|| json!({})))
+}
+
+#[tauri::command]
+async fn get_offline_statistics(state: tauri::State<'_, SharedState>) -> Result<Value, String> {
+    let (token, device_id) = auth_context(&state)?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/nd.bizcloudcollection.s/v1/get_task_statistics",
+        json!({}),
+        &[],
+    )
+    .await?;
+    Ok(response.data.unwrap_or_else(|| json!({})))
 }
 
 #[tauri::command]
@@ -8415,17 +9363,22 @@ fn remove_share_link(
 }
 
 async fn refresh_saved_session(app: tauri::AppHandle, state: SharedState) -> Result<bool, String> {
-    let refresh_token = state
-        .lock()
-        .map_err(|e| e.to_string())?
-        .refresh_token
-        .clone();
+    let (refresh_token, device_id) = {
+        let guard = state.lock().map_err(|e| e.to_string())?;
+        (guard.refresh_token.clone(), guard.device_id.clone())
+    };
     let Some(refresh_token) = refresh_token else {
         return Ok(false);
     };
     let (status_code, payload) = account_post(
+        &device_id,
         "/v1/auth/token",
-        json!({ "grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": OAUTH_CLIENT_ID }),
+        json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": OAUTH_CLIENT_ID,
+            "client_secret": OAUTH_CLIENT_SECRET,
+        }),
     )
     .await?;
     if status_code >= 400 {
@@ -8477,6 +9430,18 @@ async fn refresh_saved_session(app: tauri::AppHandle, state: SharedState) -> Res
     Ok(true)
 }
 
+#[tauri::command]
+async fn refresh_session(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> Result<Value, String> {
+    if refresh_saved_session(app, state.inner().clone()).await? {
+        Ok(json!({ "authenticated": true }))
+    } else {
+        Err("登录态已失效，且没有可用的刷新令牌，请重新登录".to_string())
+    }
+}
+
 async fn token_refresh_loop(app: tauri::AppHandle, state: SharedState) {
     loop {
         sleep(Duration::from_secs(TOKEN_REFRESH_INTERVAL_SECS)).await;
@@ -8505,16 +9470,17 @@ async fn request_sms_code(
     captcha_token: Option<String>,
 ) -> Result<Value, String> {
     let phone_number = normalize_china_phone(&phone)?;
+    let device_id = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .device_id
+        .clone();
     let supplied_captcha_token = captcha_token.filter(|value| !value.trim().is_empty());
     let resolved_captcha_token = if let Some(token) = supplied_captcha_token {
         Some(token.trim().to_string())
     } else {
-        let device_id = state
-            .lock()
-            .map_err(|error| error.to_string())?
-            .device_id
-            .clone();
         let (status_code, payload) = account_post_with_captcha(
+            &device_id,
             "/v1/shield/captcha/init",
             json!({
                 "client_id": OAUTH_CLIENT_ID,
@@ -8545,11 +9511,14 @@ async fn request_sms_code(
     };
 
     let (status_code, payload) = account_post_with_captcha(
+        &device_id,
         "/v1/auth/verification",
         json!({
             "phone_number": phone_number,
             "target": "ANY",
-            "client_id": OAUTH_CLIENT_ID
+            "client_id": OAUTH_CLIENT_ID,
+            "usage": "SIGN_IN",
+            "selected_channel": "VERIFICATION_PHONE",
         }),
         resolved_captcha_token.as_deref(),
     )
@@ -8611,13 +9580,15 @@ async fn login_with_sms(
     if verification_id.is_empty() {
         return Err("请先获取短信验证码".to_string());
     }
-    let verification = state
-        .lock()
-        .map_err(|error| error.to_string())?
-        .sms_verifications
-        .get(verification_id)
-        .cloned()
-        .ok_or_else(|| "短信验证码请求已失效，请重新获取".to_string())?;
+    let (verification, device_id) = {
+        let guard = state.lock().map_err(|error| error.to_string())?;
+        let verification = guard
+            .sms_verifications
+            .get(verification_id)
+            .cloned()
+            .ok_or_else(|| "短信验证码请求已失效，请重新获取".to_string())?;
+        (verification, guard.device_id.clone())
+    };
     if verification.phone_number != phone_number {
         return Err("手机号与验证码请求不一致，请重新获取".to_string());
     }
@@ -8626,6 +9597,7 @@ async fn login_with_sms(
         .map(|value| value.trim().to_string())
         .or(verification.captcha_token.clone());
     let (verify_status, verify_payload) = account_post_with_captcha(
+        &device_id,
         "/v1/auth/verification/verify",
         json!({
             "verification_id": verification_id,
@@ -8670,8 +9642,13 @@ async fn login_with_sms(
             }),
         )
     };
-    let (login_status, login_payload) =
-        account_post_with_captcha(endpoint, body, resolved_captcha_token.as_deref()).await?;
+    let (login_status, login_payload) = account_post_with_captcha(
+        &device_id,
+        endpoint,
+        body,
+        resolved_captcha_token.as_deref(),
+    )
+    .await?;
     if !(200..300).contains(&login_status) {
         if let Some(challenge) =
             captcha_challenge_response(&login_payload, payload_mentions_captcha(&login_payload))
@@ -8691,7 +9668,7 @@ async fn login_with_sms(
         .map_err(|error| error.to_string())?
         .db_path
         .clone();
-    save_auth_session(&db_path, Some(&access_token), refresh_token.as_deref())?;
+    replace_auth_session(&db_path, Some(&access_token), refresh_token.as_deref())?;
     {
         let mut guard = state.lock().map_err(|error| error.to_string())?;
         guard.token = Some(access_token);
@@ -8718,10 +9695,20 @@ fn clear_expired_session(
 }
 
 #[tauri::command]
-async fn start_device_login() -> Result<Value, String> {
+async fn start_device_login(state: tauri::State<'_, SharedState>) -> Result<Value, String> {
+    let device_id = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .device_id
+        .clone();
     let (status, payload) = account_post(
+        &device_id,
         "/v1/auth/device/code",
-        json!({ "scope": "user", "client_id": OAUTH_CLIENT_ID }),
+        json!({
+            "scope": "user",
+            "client_id": OAUTH_CLIENT_ID,
+            "meta": { "scene": "pc_login" },
+        }),
     )
     .await?;
     if status >= 400 {
@@ -8735,15 +9722,54 @@ async fn start_device_login() -> Result<Value, String> {
     Ok(payload.get("data").cloned().unwrap_or(payload))
 }
 
+fn device_login_wait_response(status_code: u16, payload: &Value) -> Result<Option<Value>, String> {
+    if let Some(error) = account_payload_string(payload, &["error"]) {
+        return match error.trim().to_ascii_lowercase().as_str() {
+            "authorization_pending" => Ok(Some(json!({
+                "pending": true,
+                "message": "等待扫码确认",
+            }))),
+            "slow_down" => Ok(Some(json!({
+                "pending": true,
+                "slow_down": true,
+                "interval_increment": 5,
+                "message": "请求过于频繁，已延长扫码查询间隔",
+            }))),
+            _ => Err(account_error_message(payload, "扫码登录失败")),
+        };
+    }
+    if matches!(status_code, 202 | 428) {
+        return Ok(Some(json!({
+            "pending": true,
+            "message": "等待扫码确认",
+        })));
+    }
+    if status_code >= 400 {
+        return Err(account_error_message(payload, "扫码登录失败"));
+    }
+    Ok(None)
+}
+
 #[tauri::command]
 async fn poll_device_login(
     app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
     device_code: String,
 ) -> Result<Value, String> {
+    let device_id = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .device_id
+        .clone();
     let (status_code, payload) = account_post(
+        &device_id,
         "/v1/auth/token",
-        json!({ "grant_type": "urn:ietf:params:oauth:grant-type:device_code", "device_code": device_code, "client_id": OAUTH_CLIENT_ID }),
+        json!({
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": device_code,
+            "client_id": OAUTH_CLIENT_ID,
+            "client_secret": OAUTH_CLIENT_SECRET,
+        }),
     )
     .await?;
     let token = payload
@@ -8770,13 +9796,12 @@ async fn poll_device_login(
         let db_path = {
             let mut guard = state.lock().map_err(|e| e.to_string())?;
             guard.token = Some(token.clone());
-            if refresh_token.is_some() {
-                guard.refresh_token = refresh_token.clone();
-            }
+            guard.refresh_token = refresh_token.clone();
             reset_remote_cache(&mut guard.remote_cache);
             guard.db_path.clone()
         };
-        if let Err(message) = save_auth_session(&db_path, Some(&token), refresh_token.as_deref()) {
+        if let Err(message) = replace_auth_session(&db_path, Some(&token), refresh_token.as_deref())
+        {
             status(&app, "error", message);
         }
         status(&app, "success", "扫码登录成功，可以开始使用云盘和备份任务");
@@ -8784,26 +9809,10 @@ async fn poll_device_login(
         drain_queue(app, state.inner().clone());
         return Ok(json!({ "authenticated": true }));
     }
-    if status_code == 400 || status_code == 202 || status_code == 428 {
-        let pending_message =
-            if payload.get("error").and_then(Value::as_str) == Some("authorization_pending") {
-                "等待扫码确认"
-            } else {
-                payload
-                    .get("error_description")
-                    .or_else(|| payload.get("msg"))
-                    .and_then(Value::as_str)
-                    .filter(|message| *message != "Precondition Required")
-                    .unwrap_or("等待扫码确认")
-            };
-        return Ok(json!({ "pending": true, "message": pending_message }));
+    if let Some(waiting) = device_login_wait_response(status_code, &payload)? {
+        return Ok(waiting);
     }
-    Err(payload
-        .get("error_description")
-        .or_else(|| payload.get("msg"))
-        .and_then(Value::as_str)
-        .unwrap_or("扫码登录失败")
-        .to_string())
+    Err(account_error_message(&payload, "扫码登录失败"))
 }
 
 #[tauri::command]
@@ -8840,14 +9849,15 @@ async fn capture_token(
     }
     let db_path = {
         let mut guard = state.lock().map_err(|e| e.to_string())?;
-        if guard.token.as_deref() == Some(token.as_str()) {
+        if guard.token.as_deref() == Some(token.as_str()) && guard.refresh_token.is_none() {
             return Ok(());
         }
         guard.token = Some(token.clone());
+        guard.refresh_token = None;
         reset_remote_cache(&mut guard.remote_cache);
         guard.db_path.clone()
     };
-    if let Err(message) = save_auth_session(&db_path, Some(&token), None) {
+    if let Err(message) = replace_auth_session(&db_path, Some(&token), None) {
         status(&app, "error", message);
     }
     status(&app, "success", "已捕获官方登录态，可以开始监控上传");
@@ -9702,13 +10712,20 @@ fn run() {
             select_native_mount_target,
             select_rclone_binary,
             clear_expired_session,
+            refresh_session,
             start_device_login,
             request_sms_code,
             login_with_sms,
             poll_device_login,
             get_overview,
+            get_assets,
+            get_global_config,
             list_files,
+            list_recycle_files,
             search_files,
+            create_folder,
+            get_file_detail,
+            list_recent_actions,
             select_gcid_import_file,
             stage_gcid_import_text,
             prepare_gcid_import,
@@ -9720,17 +10737,30 @@ fn run() {
             copy_files,
             move_files,
             delete_files,
+            restore_files,
+            permanently_delete_files,
+            clear_recycle_bin,
             batch_rename_files,
             create_share,
             list_shares,
             delete_shares,
+            update_share,
+            delete_invalid_shares,
+            set_direct_link,
+            unset_direct_link,
+            get_direct_link,
             open_received_share,
             list_received_share_files,
             restore_received_share,
             get_received_share_download,
             get_cloud_download,
+            resolve_offline_resource,
             create_offline_task,
             list_offline_tasks,
+            delete_offline_tasks,
+            cancel_offline_tasks,
+            retry_offline_tasks,
+            get_offline_statistics,
             save_share_link,
             remove_share_link,
             open_login,
@@ -9769,6 +10799,266 @@ fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn business_headers_follow_the_live_windows_api_profile() {
+        let headers = business_api_headers("access-token", "0123456789abcdef0123456789abcdef")
+            .expect("headers should be valid");
+        assert_eq!(headers.get("dt").unwrap(), "5");
+        assert_eq!(headers.get("av").unwrap(), "1.0.2");
+        assert_eq!(headers.get("vc").unwrap(), "1002");
+        assert_eq!(headers.get("x-client-id").unwrap(), OAUTH_CLIENT_ID);
+        assert_eq!(
+            headers.get("x-device-id").unwrap(),
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(headers.get("user-agent").unwrap(), API_USER_AGENT);
+        assert!(business_auth_expired(200, 110));
+        assert!(business_auth_expired(200, 117));
+        assert!(business_auth_expired(200, 118));
+        assert!(business_auth_expired(401, 0));
+        assert!(!business_auth_expired(200, 112));
+    }
+
+    #[test]
+    fn account_headers_follow_the_same_pc_device_profile() {
+        let device_id = "0123456789abcdef0123456789abcdef";
+        let headers = account_api_headers(device_id, Some("account-access-token"))
+            .expect("account headers should be valid");
+        assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/json");
+        assert_eq!(headers.get("accept").unwrap(), "application/json");
+        assert_eq!(headers.get("x-client-id").unwrap(), OAUTH_CLIENT_ID);
+        assert_eq!(headers.get("x-device-id").unwrap(), device_id);
+        assert_eq!(headers.get("x-client-version").unwrap(), API_APP_VERSION);
+        assert_eq!(headers.get("x-sdk-version").unwrap(), "9.0.2");
+        assert_eq!(headers.get("x-protocol-version").unwrap(), "301");
+        assert_eq!(headers.get("accept-language").unwrap(), "zh-CN");
+        assert_eq!(headers.get("user-agent").unwrap(), API_USER_AGENT);
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap(),
+            "Bearer account-access-token"
+        );
+        assert!(account_api_headers(device_id, None)
+            .expect("anonymous account headers should be valid")
+            .get(AUTHORIZATION)
+            .is_none());
+    }
+
+    #[test]
+    fn business_response_rejects_contradictory_failure_messages() {
+        assert_eq!(
+            parse_api_response(r#"{"msg":"success","data":{}}"#, 200, "/test")
+                .expect("success message should be accepted")
+                .code,
+            0
+        );
+        assert_eq!(
+            parse_api_response(r#"{"code":0,"msg":"OK","data":{}}"#, 200, "/test")
+                .expect("code zero with an explicit success message should be accepted")
+                .code,
+            0
+        );
+        assert_eq!(
+            parse_api_response(r#"{"data":{}}"#, 200, "/test")
+                .expect("legacy data-only responses stay compatible")
+                .code,
+            0
+        );
+        assert_eq!(
+            parse_api_response(r#"{"code":0,"data":{}}"#, 200, "/test")
+                .expect("an explicit zero code is a success signal")
+                .code,
+            0
+        );
+        assert!(parse_api_response(r#"{"code":0,"msg":"参数错误"}"#, 200, "/test").is_err());
+        assert!(parse_api_response(r#"{"msg":"参数错误"}"#, 200, "/test").is_err());
+        assert_eq!(
+            parse_api_response(r#"{"code":112,"msg":"参数错误"}"#, 200, "/test")
+                .expect("non-zero business responses must remain inspectable")
+                .code,
+            112
+        );
+        assert!(parse_api_response("", 200, "/test").is_err());
+    }
+
+    #[test]
+    fn file_management_payloads_match_the_official_pc_contract() {
+        assert_eq!(
+            recycle_file_list_request(Some(3)),
+            json!({
+                "page": 3,
+                "pageSize": 100,
+                "parentId": "",
+                "dirType": 4,
+                "orderBy": 12,
+                "sortType": 1
+            })
+        );
+        assert_eq!(
+            clear_recycle_bin_request(),
+            ("/userres/v1/file/clear_recycle_bin", json!({}))
+        );
+        assert_eq!(
+            create_folder_request(" root-id ", " 新建目录 ", None).unwrap(),
+            json!({ "parentId": "root-id", "dirName": "新建目录" })
+        );
+        assert_eq!(
+            create_folder_request("", "目录", Some(true)).unwrap(),
+            json!({ "parentId": "", "dirName": "目录", "failIfNameExist": true })
+        );
+        assert!(create_folder_request("", "../坏目录", None).is_err());
+        assert_eq!(
+            file_detail_request(" file-1 ").unwrap(),
+            json!({ "fileId": "file-1" })
+        );
+        assert_eq!(
+            recent_actions_request(None, None, None, None).unwrap(),
+            json!({ "cursor": "", "pageSize": 20 })
+        );
+        assert_eq!(
+            recent_actions_request(
+                Some(" opaque-cursor "),
+                Some(50),
+                Some(&[1, 2, 1]),
+                Some(&[4, 5, 4])
+            )
+            .unwrap(),
+            json!({
+                "cursor": " opaque-cursor ",
+                "pageSize": 50,
+                "fileTypes": [1, 2],
+                "excludeFileTypes": [4, 5]
+            })
+        );
+        assert!(recent_actions_request(Some("bad\ncursor"), None, None, None).is_err());
+        assert!(recent_actions_request(None, Some(0), None, None).is_err());
+        assert!(recent_actions_request(None, None, Some(&[12]), None).is_err());
+    }
+
+    #[test]
+    fn api_id_lists_are_trimmed_deduplicated_and_bounded() {
+        assert_eq!(
+            normalize_id_list(
+                &[
+                    " file-1 ".to_string(),
+                    "file-2".to_string(),
+                    "file-1".to_string()
+                ],
+                "文件"
+            )
+            .unwrap(),
+            vec!["file-1".to_string(), "file-2".to_string()]
+        );
+        assert!(normalize_id_list(&[], "文件").is_err());
+        assert!(normalize_id_list(&["   ".to_string()], "文件").is_err());
+        assert!(normalize_id_list(&["bad\nid".to_string()], "文件").is_err());
+        assert_eq!(
+            operation_task_id(&json!({ "taskId": 12345 })).as_deref(),
+            Some("12345")
+        );
+        assert_eq!(
+            operation_task_id(&json!("task-1")).as_deref(),
+            Some("task-1")
+        );
+        assert!(operation_task_id(&json!({})).is_none());
+    }
+
+    #[test]
+    fn share_update_and_direct_link_payloads_match_the_official_pc_contract() {
+        assert_eq!(
+            update_share_request(" share-1 ", 604_800, 1, &json!(2048)).unwrap(),
+            json!({
+                "id": "share-1",
+                "validateDuration": 604800,
+                "downloadType": 1,
+                "trafficLimit": "2048"
+            })
+        );
+        assert_eq!(
+            update_share_request("share-1", 0, 0, &json!(" 0 ")).unwrap()["trafficLimit"],
+            json!("0")
+        );
+        assert!(update_share_request("share-1", -1, 1, &json!(0)).is_err());
+        assert!(update_share_request("share-1", 86_400, 2, &json!(0)).is_err());
+        assert!(update_share_request("share-1", 86_400, 1, &json!(1.5)).is_err());
+        assert!(
+            update_share_request("share-1", 0, 0, &json!(MAX_SHARE_TRAFFIC_BYTES + 1)).is_err()
+        );
+        assert_eq!(
+            direct_link_file_request(" file-1 ").unwrap(),
+            json!({ "fileId": "file-1" })
+        );
+        assert_eq!(
+            get_direct_link_request("file-1", true).unwrap(),
+            json!({ "fileId": "file-1", "shortLink": true })
+        );
+        assert_eq!(
+            delete_shares_request(&[
+                " share-1 ".to_string(),
+                "share-2".to_string(),
+                "share-1".to_string()
+            ])
+            .unwrap(),
+            json!({ "ids": ["share-1", "share-2"] })
+        );
+    }
+
+    #[test]
+    fn registered_tauri_commands_and_acl_stay_in_sync() {
+        use std::collections::BTreeSet;
+
+        let source = include_str!("main.rs");
+        let marker = ".invoke_handler(tauri::generate_handler![";
+        let registry = source
+            .split_once(marker)
+            .expect("invoke handler registry must exist")
+            .1
+            .split_once("])")
+            .expect("invoke handler registry must terminate")
+            .0;
+        let registered = registry
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        let permissions = include_str!("../permissions/app.toml");
+        let mut allowed = Vec::new();
+        let mut remaining = permissions;
+        while let Some((_, after_key)) = remaining.split_once("commands.allow") {
+            let (_, after_open) = after_key
+                .split_once('[')
+                .expect("commands.allow must be an array");
+            let (array, after_close) = after_open
+                .split_once(']')
+                .expect("commands.allow array must terminate");
+            let mut quoted = array.split('"');
+            while quoted.next().is_some() {
+                let Some(command) = quoted.next() else {
+                    break;
+                };
+                if !command.trim().is_empty() {
+                    allowed.push(command.to_string());
+                }
+            }
+            remaining = after_close;
+        }
+
+        let registered_set = registered.iter().cloned().collect::<BTreeSet<_>>();
+        let allowed_set = allowed.iter().cloned().collect::<BTreeSet<_>>();
+        assert_eq!(
+            registered.len(),
+            registered_set.len(),
+            "duplicate command registration"
+        );
+        assert_eq!(
+            allowed.len(),
+            allowed_set.len(),
+            "duplicate command ACL entry"
+        );
+        assert_eq!(registered_set, allowed_set);
+    }
 
     #[test]
     fn webdav_credentials_require_safe_explicit_values() {
@@ -10107,6 +11397,32 @@ mod tests {
         assert!(!file_available_for_upload(&path).expect("probe locked file"));
         drop(held);
         assert!(file_available_for_upload(&path).expect("probe released file"));
+        fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn detects_source_growth_after_the_upload_snapshot() {
+        let path =
+            std::env::temp_dir().join(format!("guangya-growing-source-{}.tmp", Uuid::new_v4()));
+        fs::write(&path, b"partial").expect("write fixture");
+        let metadata = fs::metadata(&path).expect("read fixture metadata");
+        let item = UploadItem {
+            mapping_id: "mapping".into(),
+            file_path: path.clone(),
+            remote_parent_id: String::new(),
+            remote_dir: String::new(),
+            relative_path: "growing.tmp".into(),
+            change_kind: "added".into(),
+            size: metadata.len(),
+            modified_ms: modified_ms(&metadata),
+        };
+        assert!(!source_changed_since_upload(&item));
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, b" remainder"))
+            .expect("grow fixture");
+        assert!(source_changed_since_upload(&item));
         fs::remove_file(path).expect("remove fixture");
     }
 
@@ -10691,6 +12007,35 @@ mod tests {
     }
 
     #[test]
+    fn folder_picker_file_list_request_filters_before_remote_pagination() {
+        let regular = file_list_request("folder-1", 3, false);
+        assert_eq!(regular.get("parentId"), Some(&json!("folder-1")));
+        assert_eq!(regular.get("page"), Some(&json!(3)));
+        assert!(regular.get("resType").is_none());
+
+        let folders = file_list_request("folder-1", 3, true);
+        assert_eq!(folders.get("resType"), Some(&json!(2)));
+    }
+
+    #[test]
+    fn filtered_search_pagination_uses_a_one_item_lookahead_until_remote_exhaustion() {
+        let matches = (0..250)
+            .map(|index| json!({ "index": index }))
+            .collect::<Vec<_>>();
+        let (middle_page, lower_bound_total) =
+            paginate_filtered_search_results(matches.clone(), 1, 100, false);
+        assert_eq!(middle_page.len(), 100);
+        assert_eq!(middle_page[0].get("index"), Some(&json!(100)));
+        assert_eq!(middle_page[99].get("index"), Some(&json!(199)));
+        assert_eq!(lower_bound_total, 201);
+
+        let (last_page, exact_total) = paginate_filtered_search_results(matches, 2, 100, true);
+        assert_eq!(last_page.len(), 50);
+        assert_eq!(last_page[0].get("index"), Some(&json!(200)));
+        assert_eq!(exact_total, 250);
+    }
+
+    #[test]
     fn sms_phone_normalization_and_masked_signup_name_are_stable() {
         assert_eq!(
             normalize_china_phone("13800138000").unwrap(),
@@ -10704,18 +12049,174 @@ mod tests {
             normalize_china_phone("86-138-0013-8000").unwrap(),
             "+86 13800138000"
         );
+        assert_eq!(
+            normalize_china_phone("0086 138 0013 8000").unwrap(),
+            "+86 13800138000"
+        );
         assert!(normalize_china_phone("23800138000").is_err());
+        assert!(normalize_china_phone("12800138000").is_err());
         assert!(normalize_china_phone("1380013800").is_err());
+        assert!(normalize_china_phone("+1 13800138000").is_err());
+        assert!(normalize_china_phone("+86+13800138000").is_err());
+        assert!(normalize_china_phone("+86 (13800138000").is_err());
         assert_eq!(masked_phone_name("+86 13800138000"), "用户138****8000");
     }
 
     #[test]
-    fn cloud_index_processing_messages_are_retried() {
-        assert!(is_cloud_index_pending_message("文件上传中"));
-        assert!(is_cloud_index_pending_message("任务处理中，请稍后再试"));
-        assert!(!is_cloud_index_pending_message("文件违规，无法入库"));
-        assert!(is_cloud_index_permanent_message("文件违规，无法入库"));
-        assert!(!is_cloud_index_permanent_message("operation timed out"));
+    fn cloud_index_polling_only_treats_business_code_147_as_pending() {
+        assert!(matches!(
+            classify_upload_task_response(
+                200,
+                ApiResponse {
+                    code: 147,
+                    msg: "任务处理中".to_string(),
+                    data: None,
+                },
+            ),
+            Ok(CloudTaskCheck::Pending)
+        ));
+        let confirmed = classify_upload_task_response(
+            200,
+            ApiResponse {
+                code: 0,
+                msg: "success".to_string(),
+                data: Some(json!({ "fileId": "file-1" })),
+            },
+        )
+        .expect("code zero with fileId should confirm the upload");
+        assert!(matches!(confirmed, CloudTaskCheck::Confirmed(_)));
+        assert!(matches!(
+            classify_upload_task_response(
+                200,
+                ApiResponse {
+                    code: 145,
+                    msg: "任务不存在".to_string(),
+                    data: None,
+                },
+            ),
+            Err(CloudConfirmError::Permanent(_))
+        ));
+        assert!(matches!(
+            classify_upload_task_response(
+                200,
+                ApiResponse {
+                    code: 0,
+                    msg: "success".to_string(),
+                    data: Some(json!({})),
+                },
+            ),
+            Err(CloudConfirmError::Permanent(_))
+        ));
+        assert!(matches!(
+            classify_upload_task_response(
+                200,
+                ApiResponse {
+                    code: 110,
+                    msg: "token expired".to_string(),
+                    data: None,
+                },
+            ),
+            Err(CloudConfirmError::Retryable(_))
+        ));
+    }
+
+    #[test]
+    fn oauth_device_polling_distinguishes_pending_slow_down_and_fatal_errors() {
+        let pending = device_login_wait_response(
+            400,
+            &json!({ "error": "authorization_pending", "error_description": "pending" }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(pending.get("pending"), Some(&json!(true)));
+        assert!(pending.get("slow_down").is_none());
+
+        let slow_down = device_login_wait_response(400, &json!({ "error": "slow_down" }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(slow_down.get("slow_down"), Some(&json!(true)));
+        assert_eq!(slow_down.get("interval_increment"), Some(&json!(5)));
+
+        assert!(device_login_wait_response(
+            400,
+            &json!({ "error": "expired_token", "error_description": "二维码已过期" }),
+        )
+        .is_err());
+        assert!(device_login_wait_response(400, &json!({ "msg": "参数错误" })).is_err());
+    }
+
+    #[test]
+    fn offline_requests_omit_blank_names_and_oss_prefers_full_endpoint() {
+        let unnamed =
+            offline_task_request("magnet:?xt=urn:btih:test", "root", "   ", None).unwrap();
+        assert_eq!(
+            unnamed,
+            json!({ "url": "magnet:?xt=urn:btih:test", "parentId": "root" })
+        );
+        assert!(!unnamed.as_object().unwrap().contains_key("newName"));
+        let named = offline_task_request("ed2k://fixture", "root", "  电影  ", None).unwrap();
+        assert_eq!(named.get("newName"), Some(&json!("电影")));
+        assert!(!named.as_object().unwrap().contains_key("resType"));
+        assert_eq!(
+            offline_task_request("magnet:?xt=urn:btih:test", "root", "", Some(&[2, 1, 2])).unwrap(),
+            json!({
+                "url": "magnet:?xt=urn:btih:test",
+                "parentId": "root",
+                "fileIndexes": [2, 1]
+            })
+        );
+        assert!(offline_task_request("https://example.com/a", "", "", Some(&[0])).is_err());
+        assert_eq!(
+            offline_resolve_request(" https://example.com/a ").unwrap(),
+            json!({ "url": "https://example.com/a" })
+        );
+        assert!(offline_resolve_request("file:///tmp/a.torrent").is_err());
+        assert_eq!(
+            offline_task_list_request(None, None, None, None).unwrap(),
+            json!({ "cursor": "", "pageSize": 100 })
+        );
+        assert!(offline_task_list_request(Some(3), None, None, None).is_err());
+        assert_eq!(
+            offline_task_list_request(Some(0), Some("next"), Some(20), None).unwrap(),
+            json!({ "cursor": "next", "pageSize": 20 })
+        );
+        assert!(offline_task_list_request(Some(3), Some(""), Some(20), None).is_err());
+        assert_eq!(
+            offline_task_list_request(None, Some(""), Some(20), Some(&[1, 3])).unwrap(),
+            json!({ "cursor": "", "pageSize": 20, "status": [1, 3] })
+        );
+        assert_eq!(
+            offline_task_list_request(
+                None,
+                Some(" opaque-next-cursor "),
+                Some(50),
+                Some(&[5, 2, 5])
+            )
+            .unwrap(),
+            json!({ "cursor": " opaque-next-cursor ", "pageSize": 50, "status": [5, 2] })
+        );
+        assert!(offline_task_list_request(None, None, Some(101), None).is_err());
+        assert!(offline_task_list_request(None, None, None, Some(&[6])).is_err());
+        assert_eq!(
+            offline_task_ids_request(&[
+                " task-1 ".to_string(),
+                "task-2".to_string(),
+                "task-1".to_string()
+            ])
+            .unwrap(),
+            json!({ "taskIds": ["task-1", "task-2"] })
+        );
+
+        let token: UploadToken = serde_json::from_value(json!({
+            "taskId": "task",
+            "endPoint": "oss-cn.example.com",
+            "fullEndPoint": "https://bucket.oss-cn.example.com",
+        }))
+        .unwrap();
+        assert_eq!(
+            preferred_oss_endpoint(&token).as_deref(),
+            Some("https://bucket.oss-cn.example.com")
+        );
     }
 
     #[test]
@@ -10796,6 +12297,18 @@ mod tests {
     }
 
     #[test]
+    fn packaging_failure_states_stop_polling_immediately() {
+        assert!(ensure_packaging_task_active(&json!({ "status": "processing" })).is_ok());
+        assert!(ensure_packaging_task_active(
+            &json!({ "status": "failed", "message": "压缩失败" })
+        )
+        .is_err());
+        assert!(
+            ensure_packaging_task_active(&json!({ "errorCode": "42", "msg": "任务失效" })).is_err()
+        );
+    }
+
+    #[test]
     fn sqlite_persists_auth_device_and_uploaded_file_history() {
         let root = std::env::temp_dir().join(format!("guangya-sqlite-test-{}", Uuid::new_v4()));
         let database = root.join("state.sqlite3");
@@ -10805,11 +12318,32 @@ mod tests {
         let auth = load_auth_session(&database).expect("auth should load");
         assert_eq!(auth.access_token.as_deref(), Some("access-token"));
         assert_eq!(auth.refresh_token.as_deref(), Some("refresh-token"));
+        save_auth_session(&database, Some("refreshed-access-token"), None)
+            .expect("refresh should retain a non-rotated refresh token");
+        let refreshed_auth = load_auth_session(&database).expect("refreshed auth should load");
+        assert_eq!(
+            refreshed_auth.access_token.as_deref(),
+            Some("refreshed-access-token")
+        );
+        assert_eq!(
+            refreshed_auth.refresh_token.as_deref(),
+            Some("refresh-token")
+        );
+        replace_auth_session(&database, Some("new-login-access-token"), None)
+            .expect("a fresh login should replace the complete session");
+        let replaced_auth = load_auth_session(&database).expect("replacement auth should load");
+        assert_eq!(
+            replaced_auth.access_token.as_deref(),
+            Some("new-login-access-token")
+        );
+        assert!(replaced_auth.refresh_token.is_none());
         clear_persisted_auth_session(&database).expect("expired auth should clear");
         let cleared_auth = load_auth_session(&database).expect("cleared auth should load");
         assert!(cleared_auth.access_token.is_none());
         assert!(cleared_auth.refresh_token.is_none());
         let device_id = load_or_create_device_id(&database).expect("device id should persist");
+        assert_eq!(device_id.len(), 32);
+        assert!(device_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(
             load_or_create_device_id(&database).expect("device id should reload"),
             device_id
@@ -10982,7 +12516,7 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].folder_path, "Movies");
         assert_eq!(files[0].name, "Film.mkv");
-        assert_eq!(files[0].gcid, "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(files[0].gcid, "0123456789ABCDEF0123456789ABCDEF01234567");
         assert_eq!(files[1].path, "Shows/Episode.mkv");
         assert_eq!(total_size, 30);
         assert_eq!(common_path, "H:/Media");

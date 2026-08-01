@@ -11,6 +11,13 @@ import OSS from 'ali-oss';
 import { autoShareTargetFor, shareFilePayload, signHdhiveRequest } from './auto-share.mjs';
 import { createAccessControl } from './access-control.mjs';
 import { createDirectoryCache } from './directory-cache.mjs';
+import {
+  buildAccountHeaders,
+  buildBusinessHeaders,
+  businessResponseCode,
+  isAuthExpiredBusinessCode,
+  resolveGuangyaProfile,
+} from './guangya-protocol.mjs';
 import { createNativeMountManager, normalizeNativeMountOptions } from './native-mount.mjs';
 import { uploadPartSize } from './upload-parts.mjs';
 import { createWebDavHandler, normalizeWebDavEntry, WebDavError } from './webdav.mjs';
@@ -61,8 +68,14 @@ const databaseFile = path.join(dataDir, 'state.sqlite3');
 const manualUploadRoot = path.join(dataDir, 'manual-uploads');
 const apiBase = process.env.GUANGYA_API_BASE || 'https://api.guangyapan.com';
 const accountBase = process.env.GUANGYA_ACCOUNT_BASE || 'https://account.guangyapan.com';
-const oauthClientId = 'aMe-8VSlkrbQXpUR';
+const guangyaProfile = resolveGuangyaProfile();
+const oauthClientId = guangyaProfile.clientId;
+const oauthClientSecret = guangyaProfile.clientSecret;
 function envInteger(name, fallback, minimum, maximum) { const parsed = Number(process.env[name]); return Number.isFinite(parsed) ? Math.max(minimum, Math.min(maximum, Math.round(parsed))) : fallback; }
+function normalizeDeviceId(value) {
+  const compact = String(value || '').trim().toLowerCase().replaceAll('-', '');
+  return /^[a-f0-9]{32}$/.test(compact) ? compact : crypto.randomBytes(16).toString('hex');
+}
 const ossTimeoutMs = envInteger('GUANGYA_OSS_TIMEOUT_MS', 600_000, 120_000, 3_600_000);
 const ossRetryMax = envInteger('GUANGYA_OSS_RETRY_MAX', 3, 0, 10);
 const ossParallel = envInteger('GUANGYA_OSS_PARALLEL', 3, 1, 8);
@@ -77,6 +90,7 @@ const cloudConfirmPollMs = envInteger('GUANGYA_CLOUD_CONFIRM_POLL_MS', 1_000, 10
 const autoShareQuietMs = envInteger('GUANGYA_AUTO_SHARE_QUIET_MS', 30_000, 1_000, 600_000);
 const tokenRefreshIntervalMs = envInteger('GUANGYA_TOKEN_REFRESH_MS', 20 * 60_000, 60_000, 60 * 60_000);
 const maxJsonBodyBytes = envInteger('GUANGYA_MAX_JSON_BODY_BYTES', 64 * 1024, 4 * 1024, 1024 * 1024);
+const maxShareTrafficBytes = 1024 * 1024 ** 4;
 const requestTimeoutMs = envInteger('GUANGYA_REQUEST_TIMEOUT_MS', 30_000, 5_000, 120_000);
 const hdhiveAllowedHosts = new Set(String(process.env.HDHIVE_ALLOWED_HOSTS || '')
   .split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
@@ -170,6 +184,7 @@ database.exec(`
     share_url TEXT,
     status TEXT NOT NULL,
     action TEXT,
+    error_code TEXT,
     message TEXT,
     resource_url TEXT,
     notification_status TEXT,
@@ -201,6 +216,7 @@ database.exec(`
 `);
 if (!database.prepare("PRAGMA table_info(auth_session)").all().some((column) => column.name === 'refresh_token')) database.exec('ALTER TABLE auth_session ADD COLUMN refresh_token TEXT');
 if (!database.prepare("PRAGMA table_info(auto_share_events)").all().some((column) => column.name === 'notification_status')) database.exec('ALTER TABLE auto_share_events ADD COLUMN notification_status TEXT');
+if (!database.prepare("PRAGMA table_info(auto_share_events)").all().some((column) => column.name === 'error_code')) database.exec('ALTER TABLE auto_share_events ADD COLUMN error_code TEXT');
 if (!database.prepare("PRAGMA table_info(uploaded_files)").all().some((column) => column.name === 'status')) {
   database.exec("ALTER TABLE uploaded_files ADD COLUMN status TEXT");
 }
@@ -290,7 +306,7 @@ saveAppStateValue('cache_enabled', cacheEnabled);
 saveAppStateValue('cache_max_entries', cacheMaxEntries);
 saveAppStateValue('hdhive_enabled', hdhiveEnabled);
 const storedDevice = database.prepare("SELECT value FROM app_state WHERE key = 'device_id'").get();
-const deviceId = storedDevice?.value || crypto.randomUUID();
+const deviceId = normalizeDeviceId(storedDevice?.value);
 database.prepare("INSERT INTO app_state (key, value, updated_at) VALUES ('device_id', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at").run(deviceId, Math.floor(Date.now() / 1000));
 const clients = new Set();
 const watchers = new Map();
@@ -317,7 +333,7 @@ let active = 0;
 let activeFlashPreflights = 0;
 const flashPreflightConcurrency = 1;
 const flashPreflightTokenMaxAgeMs = 10 * 60 * 1000;
-const fileStabilityMs = Math.max(200, Number(process.env.GUANGYA_FILE_STABILITY_MS || 1200));
+const fileStabilityMs = Math.max(200, Number(process.env.GUANGYA_FILE_STABILITY_MS || 5000));
 const fileBusyRetryMs = Math.max(500, Number(process.env.GUANGYA_FILE_BUSY_RETRY_MS || 3000));
 const storedInstance = database.prepare("SELECT value FROM app_state WHERE key = 'hdhive_instance_id'").get();
 const hdhiveInstanceId = String(process.env.HDHIVE_GUANGYA_SYNC_INSTANCE_ID || storedInstance?.value || crypto.randomUUID());
@@ -384,7 +400,7 @@ function prependQueuedItem(key, item) {
   queue.set(key, item);
   for (const [queuedKey, queuedItem] of queued) queue.set(queuedKey, queuedItem);
 }
-function autoShareReceipts() { return database.prepare('SELECT event_id, mapping_id, target_key, share_url, status, action, message, resource_url, notification_status, updated_at FROM auto_share_events ORDER BY updated_at DESC LIMIT 50').all(); }
+function autoShareReceipts() { return database.prepare('SELECT event_id, mapping_id, target_key, share_url, status, action, error_code, message, resource_url, notification_status, updated_at FROM auto_share_events ORDER BY updated_at DESC LIMIT 50').all(); }
 function transferSettings() {
   return {
     upload_concurrency: uploadConcurrency,
@@ -551,10 +567,11 @@ async function readBody(request, { maxBytes = maxJsonBodyBytes } = {}) {
 async function saveConfig() { await fsp.mkdir(dataDir, { recursive: true }); await fsp.writeFile(configFile, JSON.stringify({ mappings, saved_shares: savedShares }, null, 2)); }
 function saveAuthSession(accessToken, nextRefreshToken = null) { database.prepare('INSERT INTO auth_session (id, access_token, refresh_token, updated_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET access_token = excluded.access_token, refresh_token = COALESCE(excluded.refresh_token, auth_session.refresh_token), updated_at = excluded.updated_at').run(accessToken || null, nextRefreshToken || null, Math.floor(Date.now() / 1000)); }
 function replaceAuthSession(accessToken, nextRefreshToken = null) { database.prepare('INSERT INTO auth_session (id, access_token, refresh_token, updated_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET access_token = excluded.access_token, refresh_token = excluded.refresh_token, updated_at = excluded.updated_at').run(accessToken || null, nextRefreshToken || null, Math.floor(Date.now() / 1000)); }
-function saveAuthToken(value) { saveAuthSession(value, null); }
 function invalidateAuthSession() {
   token = null;
   refreshToken = null;
+  remoteCache.clear();
+  remoteCache.set('', '');
   replaceAuthSession(null, null);
   publishState();
 }
@@ -595,6 +612,7 @@ function saveUploadCheckpoint(item, params, checkpoint, uploadedBytes) {
     provider: params?.provider,
     bucketName: params?.bucketName,
     endPoint: params?.endPoint,
+    fullEndPoint: params?.fullEndPoint,
     region: params?.region,
   };
   const serializableCheckpoint = { ...(checkpoint || {}) };
@@ -632,7 +650,12 @@ async function resumeUploadParams(params, fileSize) {
     taskId: params.taskId,
     object: { objectPath: params.objectPath, provider: params.provider },
   }, [156]);
-  return { response, params: response.data || {} };
+  return {
+    response,
+    // Some resume responses omit static endpoint fields. Retain only the
+    // non-sensitive location metadata from the original checkpoint.
+    params: { ...params, ...(response.data || {}) },
+  };
 }
 function restoreUploadCheckpoints() {
   const rows = database.prepare('SELECT mapping_id, file_path, size, modified_ms, item_json FROM upload_checkpoints ORDER BY updated_at').all();
@@ -865,29 +888,50 @@ async function queueServerUploads(values, parentId) {
   return { queued, skipped, total: files.length };
 }
 function ignore(file) { const base = path.basename(file).toLowerCase(); return base.startsWith('~$') || ['.tmp', '.part', '.crdownload', '.download', '.swp', '.ds_store'].some((suffix) => base.endsWith(suffix)); }
-function headers() { if (!token) throw new Error('尚未设置光鸭会话令牌'); const trace = `${crypto.randomBytes(16).toString('hex')}-${crypto.randomBytes(8).toString('hex')}`; return { 'content-type': 'application/json', authorization: `Bearer ${token}`, dt: '4', did: deviceId, traceparent: `00-${trace}-01` }; }
+function headers() {
+  const trace = `${crypto.randomBytes(16).toString('hex')}-${crypto.randomBytes(8).toString('hex')}`;
+  return buildBusinessHeaders({
+    token,
+    deviceId,
+    profile: guangyaProfile,
+    traceparent: `00-${trace}-01`,
+  });
+}
 async function parseResponse(response, endpoint) {
   const raw = await response.text();
   if (!raw.trim() && response.ok) return { code: 0, data: {} };
-  try { return JSON.parse(raw.replace(/^\uFEFF/, '')); } catch (error) { throw new Error(`光鸭接口 ${endpoint} 返回了非 JSON 响应（HTTP ${response.status}）：${raw.slice(0, 240)}（${error.message}）`); }
+  try { return JSON.parse(raw.replace(/^\uFEFF/, '')); } catch (error) { throw httpError(502, `光鸭接口 ${endpoint} 返回了非 JSON 响应（HTTP ${response.status}）：${raw.slice(0, 240)}（${error.message}）`); }
 }
 async function apiPost(endpoint, body, allowed = [], allowRefresh = true) {
-  const response = await fetch(`${apiBase}${endpoint}`, { method: 'POST', headers: headers(), body: JSON.stringify(body || {}), signal: AbortSignal.timeout(120000) });
+  let response;
+  try {
+    response = await fetch(`${apiBase}${endpoint}`, { method: 'POST', headers: headers(), body: JSON.stringify(body || {}), signal: AbortSignal.timeout(requestTimeoutMs) });
+  } catch (cause) {
+    const timedOut = ['AbortError', 'TimeoutError'].includes(cause?.name);
+    const error = httpError(timedOut ? 504 : 502, timedOut ? `光鸭接口 ${endpoint} 请求超时` : `无法连接光鸭接口 ${endpoint}：${cause.message}`);
+    error.httpStatus = error.statusCode;
+    error.retryable = true;
+    error.cause = cause;
+    throw error;
+  }
   const payload = await parseResponse(response, endpoint);
-  const code = Number(payload.code || 0);
-  if (response.status === 401 || code === 117) {
+  const code = businessResponseCode(payload);
+  if (response.status === 401 || isAuthExpiredBusinessCode(code)) {
     if (allowRefresh && refreshToken) {
       await refreshSavedSession();
       return apiPost(endpoint, body, allowed, false);
     }
     invalidateAuthSession();
-    throw new Error('登录态已失效，且自动续期失败，请重新扫码登录');
+    throw httpError(401, '登录态已失效，且自动续期失败，请重新扫码登录');
   }
-  if (!response.ok || (code !== 0 && !allowed.includes(code))) {
-    const error = new Error(payload.msg || `光鸭接口失败 ${response.status}/${code}`);
+  if (!response.ok || code === null || (code !== 0 && !allowed.includes(code))) {
+    const error = new Error(payload.msg || (code === null
+      ? `光鸭接口 ${endpoint} 返回了未标明成功状态的响应`
+      : `光鸭接口失败 ${response.status}/${code}`));
     error.httpStatus = response.status;
+    error.statusCode = response.status === 429 ? 429 : response.status >= 500 ? 502 : response.status >= 400 ? response.status : 400;
     error.apiCode = code;
-    error.retryable = response.status >= 500 || response.status === 429;
+    error.retryable = response.status >= 500 || response.status === 429 || [100, 101, 102, 103].includes(code);
     throw error;
   }
   return payload;
@@ -969,6 +1013,15 @@ async function restoreReceivedShare(body) {
   return response.data || {};
 }
 
+function assertPackagingTaskActive(data) {
+  const status = String(data?.status || data?.state || '').trim().toLowerCase();
+  const errorCode = Number(data?.errorCode ?? data?.error_code ?? 0);
+  if (['failed', 'failure', 'error', 'cancelled', 'canceled', 'expired'].includes(status)
+    || (Number.isFinite(errorCode) && errorCode !== 0)) {
+    throw new Error(String(data?.message || data?.msg || data?.error || '光鸭文件打包失败'));
+  }
+}
+
 async function getReceivedShareDownload(body) {
   const accessToken = String(body.access_token || '').trim();
   const fileIds = validateFileIds(body.file_ids);
@@ -978,7 +1031,8 @@ async function getReceivedShareDownload(body) {
   if (!packaged) {
     const response = await apiPost('/userres/v1/get_share_download_url', { fileId: fileIds[0], accessToken }, [205, 206, 207, 504]);
     if (Number(response.code || 0) !== 0) throw new Error(`当前分享下载受限，请到光鸭官方页面处理（业务码 ${response.code}：${response.msg || ''}）`);
-    const downloadUrl = String(response.data?.downloadUrl || response.data?.downloadURL || '');
+    const downloadUrl = String(response.data?.signedURL || response.data?.signedUrl
+      || response.data?.downloadUrl || response.data?.downloadURL || response.data?.url || '');
     if (!downloadUrl) throw new Error('光鸭没有返回文件下载地址');
     return { download_url: downloadUrl, mode: 'single' };
   }
@@ -990,6 +1044,7 @@ async function getReceivedShareDownload(body) {
     const result = await apiPost('/scheduler/v1/query_packaging_task', { taskId, accessToken });
     const downloadUrl = String(result.data?.signedURL || result.data?.signedUrl || '');
     if (downloadUrl) return { download_url: downloadUrl, mode: 'packaged' };
+    assertPackagingTaskActive(result.data);
     await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
   throw new Error('光鸭打包超过 10 分钟仍未完成，请稍后重试');
@@ -1013,6 +1068,7 @@ async function getCloudDownload(body) {
     const result = await apiPost('/scheduler/v1/query_packaging_task', { taskId });
     const downloadUrl = String(result.data?.signedURL || result.data?.signedUrl || '');
     if (downloadUrl) return { download_url: downloadUrl, mode: 'packaged' };
+    assertPackagingTaskActive(result.data);
     await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
   throw new Error('光鸭打包超过 10 分钟仍未完成，请稍后重试');
@@ -1063,7 +1119,7 @@ function clearAutoShareFailure(item) {
 function saveAutoShareEvent(eventId, mappingId, targetKey, shareUrl, statusValue, action, messageText, resourceUrl, payload) {
   database.prepare(`INSERT INTO auto_share_events (event_id, mapping_id, target_key, share_url, status, action, message, resource_url, payload, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(event_id) DO UPDATE SET share_url=excluded.share_url, status=excluded.status, action=excluded.action, message=excluded.message, resource_url=excluded.resource_url, payload=excluded.payload, updated_at=excluded.updated_at`)
+    ON CONFLICT(event_id) DO UPDATE SET share_url=excluded.share_url, status=excluded.status, action=excluded.action, error_code=NULL, message=excluded.message, resource_url=excluded.resource_url, payload=excluded.payload, updated_at=excluded.updated_at`)
     .run(eventId, mappingId, targetKey, shareUrl || null, statusValue, action || null, messageText || null, resourceUrl || null, JSON.stringify(payload || {}), Math.floor(Date.now() / 1000));
   publishState();
 }
@@ -1103,7 +1159,7 @@ async function pollHdhiveReceipt(eventId, mappingId, targetKey, shareUrl, payloa
     try {
       const result = await hdhiveRequest('GET', pathname);
       saveAutoShareEvent(eventId, mappingId, targetKey, shareUrl, result.status || 'processing', result.action, hdhiveReceiptMessage(result), result.resource_url, payload);
-      database.prepare('UPDATE auto_share_events SET notification_status = ?, updated_at = ? WHERE event_id = ?').run(result.notification_status || null, Math.floor(Date.now() / 1000), eventId);
+      database.prepare('UPDATE auto_share_events SET notification_status = ?, error_code = ?, updated_at = ? WHERE event_id = ?').run(result.notification_status || null, result.error_code || null, Math.floor(Date.now() / 1000), eventId);
       publishState();
       if (['completed', 'needs_review', 'failed'].includes(result.status)) return;
     } catch (error) {
@@ -1318,9 +1374,20 @@ async function retryAutoShareEvent(eventId, overrides) {
   void pollHdhiveReceipt(eventId, row.mapping_id, row.target_key, row.share_url, payload);
   return result;
 }
+function accountRequestHeaders(extraHeaders = {}) {
+  return {
+    ...buildAccountHeaders({ deviceId, profile: guangyaProfile }),
+    ...extraHeaders,
+  };
+}
 async function accountGet(endpoint, allowRefresh = true) {
   if (!token) throw new Error('尚未设置光鸭会话令牌');
-  const response = await fetch(`${accountBase}${endpoint}`, { headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, signal: AbortSignal.timeout(120000) });
+  let response;
+  try {
+    response = await fetch(`${accountBase}${endpoint}`, { headers: accountRequestHeaders({ authorization: `Bearer ${token}` }), signal: AbortSignal.timeout(requestTimeoutMs) });
+  } catch (cause) {
+    throw httpError(['AbortError', 'TimeoutError'].includes(cause?.name) ? 504 : 502, `无法连接光鸭账号接口 ${endpoint}：${cause.message}`);
+  }
   const payload = await parseResponse(response, endpoint);
   if (response.status === 401) {
     if (allowRefresh && refreshToken) {
@@ -1330,10 +1397,18 @@ async function accountGet(endpoint, allowRefresh = true) {
     invalidateAuthSession();
     throw new Error('登录态已失效，且自动续期失败，请重新扫码登录');
   }
-  if (!response.ok) throw new Error(payload.msg || `账号接口失败 ${response.status}`);
+  if (!response.ok) throw httpError(response.status >= 500 ? 502 : response.status, payload.msg || `账号接口失败 ${response.status}`);
   return payload;
 }
-async function accountPost(endpoint, body, extraHeaders = {}) { const response = await fetch(`${accountBase}${endpoint}`, { method: 'POST', headers: { 'content-type': 'application/json', ...extraHeaders }, body: JSON.stringify(body || {}), signal: AbortSignal.timeout(120000) }); return { status: response.status, payload: await parseResponse(response, endpoint) }; }
+async function accountPost(endpoint, body, extraHeaders = {}) {
+  let response;
+  try {
+    response = await fetch(`${accountBase}${endpoint}`, { method: 'POST', headers: accountRequestHeaders(extraHeaders), body: JSON.stringify(body || {}), signal: AbortSignal.timeout(requestTimeoutMs) });
+  } catch (cause) {
+    throw httpError(['AbortError', 'TimeoutError'].includes(cause?.name) ? 504 : 502, `无法连接光鸭账号接口 ${endpoint}：${cause.message}`);
+  }
+  return { status: response.status, payload: await parseResponse(response, endpoint) };
+}
 function authValue(payload, key) { return payload?.[key] ?? payload?.data?.[key] ?? null; }
 function accountError(payload, fallback) { return payload?.error_description || payload?.description || payload?.msg || payload?.message || payload?.error || fallback; }
 function normalizeChinesePhone(value) {
@@ -1345,10 +1420,6 @@ function normalizeChinesePhone(value) {
 }
 function smsSdkHeaders(captchaToken = '') {
   return {
-    'x-client-id': oauthClientId,
-    'x-sdk-version': '9.0.2',
-    'x-protocol-version': '301',
-    'accept-language': 'zh-CN',
     ...(captchaToken ? { 'x-captcha-token': captchaToken } : {}),
   };
 }
@@ -1391,6 +1462,8 @@ async function sendSmsLogin(body) {
       phone_number: phoneNumber,
       target: 'ANY',
       client_id: oauthClientId,
+      usage: 'SIGN_IN',
+      selected_channel: 'VERIFICATION_PHONE',
     }, smsSdkHeaders(captchaToken));
     const url = captchaUrl(verification.payload);
     if (url) return captchaRequiredPayload(url, phoneNumber);
@@ -1482,37 +1555,61 @@ async function completeSmsLogin(body) {
   return { authenticated: true, is_user: isUser };
 }
 async function startDeviceLogin() {
-  const { status: statusCode, payload } = await accountPost('/v1/auth/device/code', { scope: 'user', client_id: oauthClientId });
+  const { status: statusCode, payload } = await accountPost('/v1/auth/device/code', {
+    scope: 'user',
+    client_id: oauthClientId,
+    meta: { scene: 'pc_login' },
+  });
   if (statusCode >= 400) throw new Error(payload.error_description || payload.msg || '无法创建扫码登录任务');
   return payload.data || payload;
 }
 async function pollDeviceLogin(deviceCode) {
   if (!String(deviceCode || '').trim()) throw new Error('缺少扫码登录任务');
-  const { status: statusCode, payload } = await accountPost('/v1/auth/token', { grant_type: 'urn:ietf:params:oauth:grant-type:device_code', device_code: deviceCode, client_id: oauthClientId });
+  const { status: statusCode, payload } = await accountPost('/v1/auth/token', {
+    grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+    device_code: deviceCode,
+    client_id: oauthClientId,
+    client_secret: oauthClientSecret,
+  });
   const accessToken = authValue(payload, 'access_token');
   const nextRefreshToken = authValue(payload, 'refresh_token');
   if (accessToken) {
     token = String(accessToken);
-    if (nextRefreshToken) refreshToken = String(nextRefreshToken);
+    refreshToken = nextRefreshToken ? String(nextRefreshToken) : null;
     remoteCache.clear();
     remoteCache.set('', '');
-    saveAuthSession(token, refreshToken);
+    replaceAuthSession(token, refreshToken);
     status('success', '扫码登录成功，可以开始使用云盘和备份任务');
     publishState();
     pump();
     schedulePendingUploadRecovery(0);
     return { authenticated: true };
   }
-  if ([400, 202, 428].includes(statusCode)) {
-    const message = payload.error === 'authorization_pending' ? '等待扫码确认' : (payload.error_description === 'Precondition Required' ? '等待扫码确认' : payload.error_description || payload.msg || '等待扫码确认');
-    return { pending: true, message };
+  const oauthError = String(authValue(payload, 'error') || '').trim().toLowerCase();
+  const description = String(authValue(payload, 'error_description') || authValue(payload, 'msg') || '').trim();
+  const isPending = oauthError === 'authorization_pending'
+    || oauthError === 'slow_down'
+    || statusCode === 202
+    || statusCode === 428
+    || description === 'Precondition Required';
+  if (isPending) {
+    return {
+      pending: true,
+      slow_down: oauthError === 'slow_down',
+      message: oauthError === 'slow_down' ? '请求过快，正在降低扫码轮询频率' : '等待扫码确认',
+    };
   }
-  throw new Error(payload.error_description || payload.msg || '扫码登录失败');
+  throw new Error(description || oauthError || '扫码登录失败');
 }
 async function refreshSavedSession() {
   if (!refreshToken) return false;
   if (!refreshPromise) refreshPromise = (async () => {
-    const { status: statusCode, payload } = await accountPost('/v1/auth/token', { grant_type: 'refresh_token', refresh_token: refreshToken, client_id: oauthClientId });
+    const { status: statusCode, payload } = await accountPost('/v1/auth/token', {
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: oauthClientId,
+      client_secret: oauthClientSecret,
+    });
     if (statusCode >= 400) {
       const message = payload.error_description || payload.msg || '刷新登录状态失败';
       if ([400, 401, 403].includes(statusCode)) {
@@ -1559,25 +1656,41 @@ async function ensureRemote(baseParentId, remotePath) {
   }
   return parentId;
 }
-function isCloudIndexPendingMessage(message) { return /文件上传中|上传处理中|正在上传|正在处理|正在入库|任务处理中|任务未完成|稍后再试/.test(String(message || '')); }
+const CLOUD_TASK_PENDING_CODES = new Set([147]);
+const CLOUD_TASK_INVALID_CODES = new Set([145, 146, 152, 155, 163]);
 function isExplicitPermanentCloudTaskFailure(error) {
-  return error?.retryable === false && (Number.isFinite(error?.apiCode) || Number.isFinite(error?.httpStatus));
+  const code = Number(error?.apiCode);
+  return CLOUD_TASK_INVALID_CODES.has(code)
+    || (error?.retryable === false && (Number.isFinite(code) || Number.isFinite(error?.httpStatus)));
 }
 async function waitTask(taskId, eventPath) {
   const deadline = Date.now() + cloudConfirmTimeoutMs;
   let attempt = 0;
   while (Date.now() < deadline) {
+    let transientFailure = false;
     try {
-      const response = await apiPost('/userres/v1/file/get_info_by_task_id', { taskId }, [145, 146, 155, 163]);
+      const response = await apiPost('/userres/v1/file/get_info_by_task_id', { taskId }, [...CLOUD_TASK_PENDING_CODES]);
       if (response.data?.fileId) return response.data;
-    } catch (error) {
-      if (!isCloudIndexPendingMessage(error.message)) {
-        if (isExplicitPermanentCloudTaskFailure(error)) error.permanentCloudTaskFailure = true;
+      if (Number(response.code || 0) !== 147) {
+        const error = new Error('云端入库成功响应缺少有效的 fileId，已停止轮询');
+        error.apiCode = Number(response.code || 0);
+        error.httpStatus = 200;
+        error.retryable = false;
         throw error;
       }
+    } catch (error) {
+      if (isExplicitPermanentCloudTaskFailure(error)) error.permanentCloudTaskFailure = true;
+      if (error?.retryable !== true) throw error;
+      transientFailure = true;
     }
     attempt += 1;
-    publish({ type: 'progress', file_path: eventPath, percent: 100, bytes_per_second: 0, stage: '文件已上传，云端正在入库' });
+    publish({
+      type: 'progress',
+      file_path: eventPath,
+      percent: 100,
+      bytes_per_second: 0,
+      stage: transientFailure ? '云端确认暂时不可用，正在重试' : '文件已上传，云端正在入库',
+    });
     const delayMs = Math.min(cloudConfirmPollMs * Math.max(1, Math.ceil(attempt / 5)), 5_000, Math.max(0, deadline - Date.now()));
     if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
@@ -1819,7 +1932,8 @@ async function upload(item) {
         accessKeySecret: currentParams.creds.secretAccessKey || currentParams.creds.accessKeySecret,
         stsToken: currentParams.creds.sessionToken,
         bucket: currentParams.bucketName,
-        endpoint: currentParams.endPoint,
+        endpoint: currentParams.fullEndPoint || currentParams.endPoint,
+        cname: Boolean(currentParams.fullEndPoint),
         secure: true,
         timeout: ossTimeoutMs,
         retryMax: ossRetryMax,
@@ -1975,6 +2089,32 @@ function rebuildPendingItem(row) {
 }
 async function finalizeConfirmedUpload(key, item, taskData, recovered = false) {
   if (!confirmPendingUploadRecord(key, taskData.taskId, taskData.remoteFileId)) return false;
+  const mapping = mappings.find((entry) => entry.id === item.mapping_id && entry.enabled);
+  if (mapping) {
+    try {
+      const current = await fsp.stat(item.file_path);
+      const sourceChanged = current.isFile() && (
+        current.size !== item.size
+        || current.mtimeMs !== item.mtime
+        || (item.source_dev != null && Number(current.dev) !== Number(item.source_dev))
+        || (item.source_ino != null && Number(current.ino) !== Number(item.source_ino))
+      );
+      if (sourceChanged) {
+        publish({
+          type: 'file',
+          state: 'waiting-file',
+          file_path: uploadEventPath(item),
+          uploaded_bytes: 0,
+          total_bytes: current.size,
+          stage: '检测到源文件仍在写入，等待完整后重新上传',
+        });
+        await enqueue(mapping, item.file_path);
+        return true;
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') status('warning', `核对上传源文件失败：${uploadEventPath(item)}：${error.message}`);
+    }
+  }
   clearAutoShareFailure(item);
   try { await scheduleAutoShare(item, taskData); }
   catch (error) { status('error', `文件已确认入库，但自动分享排队失败：${error.message}`); }
@@ -1986,13 +2126,6 @@ async function finalizeConfirmedUpload(key, item, taskData, recovered = false) {
   }
   if (recovered && item.cleanup_path && isWithinRoot(manualUploadRoot, item.cleanup_path)) await fsp.rm(item.cleanup_path, { recursive: true, force: true });
   publish({ type: 'file', state: 'done', file_path: uploadEventPath(item), uploaded_bytes: item.size, total_bytes: item.size });
-  const mapping = mappings.find((entry) => entry.id === item.mapping_id && entry.enabled);
-  if (mapping) {
-    try {
-      const current = await fsp.stat(item.file_path);
-      if (current.isFile() && (current.size !== item.size || current.mtimeMs !== item.mtime)) await enqueue(mapping, item.file_path);
-    } catch {}
-  }
   return true;
 }
 function scheduleCloudUploadRetry(key, item, reason) {
@@ -2018,6 +2151,13 @@ function scheduleCloudUploadRetry(key, item, reason) {
       pump();
     }
   }, fileBusyRetryMs);
+}
+function isTransientUploadError(error) {
+  if (error?.retryable === true) return true;
+  if (['AbortError', 'TimeoutError'].includes(error?.name)) return true;
+  if (error instanceof TypeError) return true;
+  const code = String(error?.code || error?.cause?.code || '');
+  return /^(?:ECONNRESET|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|UND_ERR_)/.test(code);
 }
 let pendingRecoveryPromise = null;
 let pendingRecoveryTimer = null;
@@ -2084,7 +2224,7 @@ async function cleanupUnreferencedManualUploads() {
 }
 function pumpFlashPreflight() {
   if (paused || !token || active === 0 || activeFlashPreflights >= flashPreflightConcurrency) return;
-  const candidate = [...queue.entries()].find(([key, item]) => !flashPreflightCached(key, item));
+  const candidate = [...queue.entries()].find(([key, item]) => !inflight.has(key) && !flashPreflightCached(key, item));
   if (!candidate) return;
   const [key, item] = candidate;
   queue.delete(key);
@@ -2148,7 +2288,9 @@ function pumpFlashPreflight() {
 function pump() {
   if (paused || !token) { publishState(); return; }
   while (active < uploadConcurrency && queue.size) {
-    const [key, item] = queue.entries().next().value;
+    const candidate = [...queue.entries()].find(([key]) => !inflight.has(key));
+    if (!candidate) break;
+    const [key, item] = candidate;
     queue.delete(key);
     inflight.set(key, `${item.size}:${item.mtime}`);
     inflightItems.set(key, item);
@@ -2172,9 +2314,10 @@ function pump() {
         scheduleBusyUploadRetry(key, item);
         return;
       }
-      if (error.requeueUpload) {
+      if (error.requeueUpload || isTransientUploadError(error)) {
         preserveSource = true;
         scheduleCloudUploadRetry(key, item, error.message);
+        return;
       }
       recordAutoShareFailure(item, error);
       console.error(`上传失败：${item.file_path}：${error.stack || error.message}`);
@@ -2256,7 +2399,7 @@ async function startWatcher(mapping) {
     usePolling: polling,
     interval: polling ? 5000 : 100,
     binaryInterval: polling ? 5000 : 300,
-    awaitWriteFinish: { stabilityThreshold: 1200, pollInterval: polling ? 1000 : 200 },
+    awaitWriteFinish: { stabilityThreshold: fileStabilityMs, pollInterval: polling ? 1000 : 200 },
   });
   watcher.on('add', (file) => { void enqueue(mapping, file); });
   watcher.on('change', (file) => { void enqueue(mapping, file); });
@@ -2273,8 +2416,7 @@ async function startWatcher(mapping) {
   }
 }
 async function restartWatchers() { for (const watcher of watchers.values()) await watcher.close(); watchers.clear(); for (const mapping of mappings) { if (!mapping.enabled) continue; try { await startWatcher(mapping); } catch (error) { mapping.enabled = false; mapping.watch_error = error.message; console.error(`备份任务监控启动失败：${mapping.local_path}：${error.message}`); } } await saveConfig(); }
-async function routeApi(request, response, url) { if (request.method === 'GET' && url.pathname === '/api/state') return json(response, 200, state()); if (request.method === 'GET' && url.pathname === '/api/events') { response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' }); response.write(`data: ${JSON.stringify({ type: 'state', state: state() })}\n\n`); clients.add(response); request.on('close', () => clients.delete(response)); return; } if (request.method === 'POST' && url.pathname === '/api/auth') { const body = await readBody(request); token = String(body.token || '').trim().replace(/^Bearer\s+/i, '') || null; saveAuthToken(token); publishState(); pump(); return json(response, 200, state()); } if (request.method === 'POST' && url.pathname === '/api/mappings') { const body = await readBody(request); const mapping = { id: crypto.randomUUID(), local_path: allowedPath(body.local_path), remote_path: normalizeRemote(body.remote_path), enabled: true }; const stat = await fsp.stat(mapping.local_path); if (!stat.isDirectory()) throw new Error('监控路径不是目录'); mappings.push(mapping); await saveConfig(); await startWatcher(mapping); publishState(); return json(response, 200, mapping); } if (request.method === 'DELETE' && url.pathname.startsWith('/api/mappings/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); await watchers.get(id)?.close(); watchers.delete(id); mappings = mappings.filter((item) => item.id !== id); deleteMappingTransientUploads(id); await saveConfig(); publishState(); return json(response, 200, {}); } if (request.method === 'PATCH' && url.pathname.startsWith('/api/mappings/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); const body = await readBody(request); const mapping = mappings.find((item) => item.id === id); if (!mapping) return json(response, 404, { error: '监控目录不存在' }); mapping.enabled = Boolean(body.enabled); await saveConfig(); await startWatcher(mapping); publishState(); return json(response, 200, mapping); } if (request.method === 'POST' && url.pathname === '/api/queue/pause') { paused = true; publishState(); return json(response, 200, state()); } if (request.method === 'POST' && url.pathname === '/api/queue/resume') { paused = false; pump(); return json(response, 200, state()); } json(response, 404, { error: 'not found' }); }
-async function apiOverview() { const assets = await apiPost('/assets/v1/get_assets', {}); let profile = {}; try { profile = await accountGet('/v1/user/me'); } catch { try { profile = (await apiPost('/activity/v1/get_user_data', {})).data || {}; } catch {} } return { assets: assets.data || {}, profile: profile?.data || profile || {} }; }
+async function apiOverview() { const assets = await apiPost('/assets/v1/get_assets', {}); let profile = {}; try { profile = await accountGet('/v1/user/me'); } catch {} return { assets: assets.data || {}, profile: profile?.data || profile || {} }; }
 function cloudFileExtension(record) {
   const supplied = String(record?.ext || '').trim().replace(/^\./, '').toLowerCase();
   if (supplied) return supplied;
@@ -2299,26 +2441,68 @@ async function searchCloudFiles(url) {
   const requestedExtension = String(url.searchParams.get('extension') || '').trim().replace(/^\./, '').toLowerCase();
   if (requestedType && !SEARCH_TYPES.has(requestedType)) throw new Error('文件类型必须是 image、video、audio、document、archive 或 folder');
   if (requestedExtension && !/^[a-z0-9]{1,16}$/.test(requestedExtension)) throw new Error('文件后缀格式无效');
-  let result;
-  if (!query && (requestedType || requestedExtension)) {
-    const folder = requestedType === 'folder';
-    const fileType = !folder && (SEARCH_FILE_TYPES[requestedType] || fileTypeForExtension(requestedExtension));
-    const body = { parentId: '*', pageSize: 100, page, resType: folder ? 2 : 1, orderBy: 3, sortType: 1 };
-    if (fileType) body.fileTypes = [fileType];
-    result = await apiPost('/userres/v1/file/get_file_list', body);
-  } else {
-    result = await apiPost('/userres/v1/file/search_files', { name: query, pageSize: 100, page });
+  async function fetchRemotePage(remotePage) {
+    if (!query && (requestedType || requestedExtension)) {
+      const folder = requestedType === 'folder';
+      const fileType = !folder && (SEARCH_FILE_TYPES[requestedType] || fileTypeForExtension(requestedExtension));
+      const body = { parentId: '*', pageSize: 100, page: remotePage, resType: folder ? 2 : 1, orderBy: 3, sortType: 1 };
+      if (fileType) body.fileTypes = [fileType];
+      return apiPost('/userres/v1/file/get_file_list', body);
+    }
+    return apiPost('/userres/v1/file/search_files', { name: query, pageSize: 100, page: remotePage });
   }
+
+  const requiresLocalPagination = Boolean(requestedExtension || (query && requestedType));
+  if (requiresLocalPagination) {
+    const start = page * 100;
+    const end = start + 100;
+    const filtered = [];
+    let result = null;
+    let remoteCount = 0;
+    let remoteTotal = 0;
+    let exhausted = false;
+    for (let remotePage = 0; remotePage < 1000; remotePage += 1) {
+      const current = await fetchRemotePage(remotePage);
+      result ||= current;
+      const data = current.data || {};
+      const remoteList = Array.isArray(data.list) ? data.list : [];
+      remoteCount += remoteList.length;
+      const reportedTotal = Number(data.total);
+      if (Number.isFinite(reportedTotal)) remoteTotal = Math.max(remoteTotal, reportedTotal);
+      filtered.push(...remoteList.filter((record) => matchesSearchType(record, requestedType)
+        && (!requestedExtension || (Number(record?.resType) !== 2 && cloudFileExtension(record) === requestedExtension))));
+      if (!remoteList.length || (Number.isFinite(reportedTotal) && remoteCount >= reportedTotal)) {
+        exhausted = true;
+        break;
+      }
+      if (filtered.length > end) break;
+    }
+    const list = filtered.slice(start, end);
+    return {
+      ...(result || { code: 0, msg: 'success' }),
+      data: {
+        ...(result?.data || {}),
+        list,
+        total: exhausted ? filtered.length : Math.max(end + 1, filtered.length),
+        remote_total: remoteTotal || remoteCount,
+        remote_count: remoteCount,
+        page,
+        pageSize: 100,
+        page_size: 100,
+      },
+    };
+  }
+
+  const result = await fetchRemotePage(page);
   const data = result.data || {};
   const remoteList = Array.isArray(data.list) ? data.list : [];
-  const list = remoteList.filter((record) => matchesSearchType(record, requestedType)
-    && (!requestedExtension || (Number(record?.resType) !== 2 && cloudFileExtension(record) === requestedExtension)));
+  const list = remoteList.filter((record) => matchesSearchType(record, requestedType));
   return {
     ...result,
     data: {
       ...data,
       list,
-      total: requestedType || requestedExtension ? list.length : Number(data.total ?? list.length),
+      total: Number(data.total ?? list.length),
       remote_total: Number(data.total ?? remoteList.length),
       remote_count: remoteList.length,
       page,
@@ -2328,7 +2512,92 @@ async function searchCloudFiles(url) {
   };
 }
 
-function validateFileIds(fileIds) { if (!Array.isArray(fileIds) || !fileIds.length) throw new Error('请至少选择一个文件或文件夹'); return fileIds.map(String); }
+function validateIdentifiers(values, label) {
+  if (!Array.isArray(values) || !values.length) throw new Error(`请至少提供一个${label}`);
+  const unique = [];
+  const seen = new Set();
+  for (const value of values) {
+    if (!['string', 'number', 'bigint'].includes(typeof value)) throw new Error(`${label}无效，请刷新后重试`);
+    if (typeof value === 'number' && (!Number.isSafeInteger(value) || value < 0)) throw new Error(`${label}无效，请刷新后重试`);
+    const normalized = String(value).trim();
+    if (!normalized || normalized.length > 256 || !/^[A-Za-z0-9._:-]+$/.test(normalized)) {
+      throw new Error(`${label}无效，请刷新后重试`);
+    }
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    unique.push(normalized);
+  }
+  return unique;
+}
+function validateFileIds(fileIds) { return validateIdentifiers(fileIds, '文件 ID'); }
+function validateTaskIds(taskIds) { return validateIdentifiers(taskIds, '离线任务 ID'); }
+function validateShareIds(shareIds) { return validateIdentifiers(shareIds, '分享记录 ID'); }
+function validateIdentifier(value, label) { return validateIdentifiers([value], label)[0]; }
+function validateOptionalIdentifier(value, label) {
+  if (value == null || String(value).trim() === '') return '';
+  return validateIdentifier(value, label);
+}
+function validateInteger(value, label, { minimum = 0, maximum = Number.MAX_SAFE_INTEGER } = {}) {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(`${label}必须是 ${minimum} 到 ${maximum} 之间的整数`);
+  }
+  return parsed;
+}
+function queryInteger(url, name, fallback, options) {
+  const value = url.searchParams.get(name);
+  return value == null || value === '' ? fallback : validateInteger(value, name, options);
+}
+function queryIntegerList(url, camelName, snakeName, { maximum = 255 } = {}) {
+  const values = [...url.searchParams.getAll(camelName), ...url.searchParams.getAll(snakeName)]
+    .flatMap((value) => String(value).split(','))
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (!values.length) return [];
+  return [...new Set(values.map((value) => validateInteger(value, camelName, { minimum: 0, maximum })))];
+}
+function validateCloudName(value, label) {
+  const name = String(value || '').trim();
+  if (!name || name === '.' || name === '..' || name.length > 255 || /[\\/:*?"<>|\u0000-\u001f\u007f]/.test(name)) {
+    throw new Error(`${label}无效`);
+  }
+  return name;
+}
+function validateOfflineUrl(value) {
+  const raw = String(value ?? '');
+  if (!raw || raw.length > 8192 || /[\u0000-\u001f\u007f]/.test(raw)) throw new Error('离线资源地址无效');
+  const source = raw.trim();
+  if (!source || !/^(?:https?|magnet|ed2k):/i.test(source)) throw new Error('离线资源地址只支持 HTTP、HTTPS、Magnet 或 ED2K');
+  if (/^https?:/i.test(source)) {
+    let parsed;
+    try { parsed = new URL(source); } catch { throw new Error('HTTP 离线资源地址无效'); }
+    if (!parsed.hostname || !['http:', 'https:'].includes(parsed.protocol)) throw new Error('HTTP 离线资源地址无效');
+  } else if (/^magnet:/i.test(source) && !/^magnet:\?/i.test(source)) {
+    throw new Error('Magnet 离线资源地址无效');
+  } else if (/^ed2k:/i.test(source) && !/^ed2k:\/\//i.test(source)) {
+    throw new Error('ED2K 离线资源地址无效');
+  }
+  return source;
+}
+function validateOfflineFileIndexes(value, source) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) throw new Error('file_indexes 必须是非负整数数组');
+  const fileIndexes = [...new Set(value.map((item) => {
+    if (typeof item !== 'number' || !Number.isSafeInteger(item) || item < 0) throw new Error('file_indexes 必须是非负整数数组');
+    return item;
+  }))];
+  if (fileIndexes.length > 1000) throw new Error('单次最多选择 1000 个资源文件');
+  if (fileIndexes.length && !/^magnet:/i.test(source)) throw new Error('只有 Magnet 资源支持选择文件序号');
+  return fileIndexes;
+}
+async function executeFileTask(endpoint, payload) {
+  const result = await apiPost(endpoint, payload);
+  await waitOperation(result.data?.taskId);
+  remoteCache.clear();
+  remoteCache.set('', '');
+  webDavDirectoryCache.clear();
+  return result.data || {};
+}
 async function renameRemote(fileId, newName) { await apiPost('/userres/v1/file/rename', { fileId, newName }); }
 async function batchRename(renames) {
   const work = (Array.isArray(renames) ? renames : []).map((item) => ({ fileId: String(item.fileId || ''), currentName: String(item.currentName || ''), newName: String(item.newName || '') })).filter((item) => item.currentName !== item.newName);
@@ -2388,18 +2657,38 @@ async function deleteWebDavEntry({ entry }) {
   if (entry.isDirectory) webDavDirectoryCache.invalidateSubtree(entry.id);
 }
 async function moveWebDavEntry({ entry, parentId, name }) {
-  if (String(entry.parentId || '') !== String(parentId || '')) {
+  const sourceParentId = String(entry.parentId || '');
+  const destinationParentId = String(parentId || '');
+  const moved = sourceParentId !== destinationParentId;
+  if (moved) {
     const result = await apiPost('/userres/v1/file/move_file', {
       fileIds: [entry.id],
-      parentId: String(parentId || ''),
+      parentId: destinationParentId,
     });
     await waitOperation(result.data?.taskId);
-    webDavDirectoryCache.invalidate(entry.parentId);
-    webDavDirectoryCache.invalidate(parentId);
+    webDavDirectoryCache.invalidate(sourceParentId);
+    webDavDirectoryCache.invalidate(destinationParentId);
   }
   if (entry.name !== name) {
-    await renameRemote(entry.id, name);
-    webDavDirectoryCache.invalidate(parentId);
+    try {
+      await renameRemote(entry.id, name);
+      webDavDirectoryCache.invalidate(destinationParentId);
+    } catch (error) {
+      if (moved) {
+        try {
+          const rollback = await apiPost('/userres/v1/file/move_file', {
+            fileIds: [entry.id],
+            parentId: sourceParentId,
+          });
+          await waitOperation(rollback.data?.taskId);
+          webDavDirectoryCache.invalidate(sourceParentId);
+          webDavDirectoryCache.invalidate(destinationParentId);
+        } catch (rollbackError) {
+          throw new WebDavError(500, `${error.message}；恢复资源原目录也失败：${rollbackError.message}`);
+        }
+      }
+      throw error;
+    }
   }
 }
 async function copyWebDavEntry({ entry, parentId, name }) {
@@ -2418,7 +2707,12 @@ async function copyWebDavEntry({ entry, parentId, name }) {
   const after = (await listWebDavChildren(parentId)).map(normalizeWebDavEntry);
   const copied = after.find((item) => item.name === entry.name && !beforeIds.has(item.id));
   if (!copied?.id) throw new WebDavError(409, '云端复制已完成，但无法定位副本进行重命名');
-  await renameRemote(copied.id, name);
+  try {
+    await renameRemote(copied.id, name);
+  } catch (error) {
+    try { await deleteWebDavEntry({ entry: copied }); } catch {}
+    throw error;
+  }
   webDavDirectoryCache.invalidate(parentId);
 }
 async function putWebDavFile({ request, parentId, name, existing }) {
@@ -2444,33 +2738,93 @@ async function putWebDavFile({ request, parentId, name, existing }) {
     if (!uploaded.remoteFileId) {
       throw new WebDavError(503, uploaded.pendingError || '文件已上传，但云端暂未确认入库');
     }
-    if (existing) await deleteWebDavEntry({ entry: existing });
-    if (temporaryName !== name) await renameRemote(String(uploaded.remoteFileId), name);
+    const uploadedEntry = {
+      id: String(uploaded.remoteFileId),
+      parentId: String(parentId || ''),
+      name: temporaryName,
+      isDirectory: false,
+    };
+    let backup = null;
+    if (existing) {
+      backup = {
+        ...existing,
+        parentId: String(parentId || ''),
+        name: `.__gy_dav_backup_${crypto.randomUUID().replaceAll('-', '')}`,
+      };
+      try {
+        await moveWebDavEntry({ entry: existing, parentId, name: backup.name });
+      } catch (error) {
+        try { await deleteWebDavEntry({ entry: uploadedEntry }); } catch {}
+        throw error;
+      }
+    }
+    try {
+      if (temporaryName !== name) await renameRemote(uploadedEntry.id, name);
+    } catch (error) {
+      let rollbackError = null;
+      if (backup) {
+        try { await moveWebDavEntry({ entry: backup, parentId, name }); }
+        catch (reason) { rollbackError = reason; }
+      }
+      try { await deleteWebDavEntry({ entry: uploadedEntry }); } catch {}
+      if (rollbackError) throw new WebDavError(500, `${error.message}；恢复被覆盖文件也失败：${rollbackError.message}`);
+      throw error;
+    }
+    if (backup) await deleteWebDavEntry({ entry: backup });
     webDavDirectoryCache.invalidate(parentId);
     return { id: String(uploaded.remoteFileId) };
   } finally {
     await fsp.rm(temporaryRoot, { recursive: true, force: true });
   }
 }
+function webDavEtagMatches(value, etag) {
+  const expected = String(etag || '').replace(/^W\//i, '');
+  return String(value || '').split(',').map((item) => item.trim()).some((item) => item === '*' || item.replace(/^W\//i, '') === expected);
+}
+function finishWebDavConditional(response, statusCode, entry) {
+  response.writeHead(statusCode, {
+    etag: entry.etag,
+    'last-modified': new Date(entry.modifiedAt).toUTCString(),
+  });
+  response.end();
+}
 async function readWebDavFile({ request, response, entry, headOnly }) {
+  const ifMatch = request.headers['if-match'];
+  if (ifMatch && !webDavEtagMatches(ifMatch, entry.etag)) {
+    finishWebDavConditional(response, 412, entry);
+    return;
+  }
+  const ifUnmodifiedSince = Date.parse(String(request.headers['if-unmodified-since'] || ''));
+  if (!ifMatch && Number.isFinite(ifUnmodifiedSince) && entry.modifiedAt > ifUnmodifiedSince + 999) {
+    finishWebDavConditional(response, 412, entry);
+    return;
+  }
+  const ifNoneMatch = request.headers['if-none-match'];
+  if (ifNoneMatch && webDavEtagMatches(ifNoneMatch, entry.etag)) {
+    finishWebDavConditional(response, 304, entry);
+    return;
+  }
+  const ifModifiedSince = Date.parse(String(request.headers['if-modified-since'] || ''));
+  if (!ifNoneMatch && Number.isFinite(ifModifiedSince) && entry.modifiedAt <= ifModifiedSince + 999) {
+    finishWebDavConditional(response, 304, entry);
+    return;
+  }
   const download = await getCloudDownload({ file_ids: [entry.id], packaged: false });
   const headers = {};
-  for (const name of ['range', 'if-match', 'if-none-match', 'if-modified-since', 'if-unmodified-since']) {
-    if (request.headers[name]) headers[name] = request.headers[name];
-  }
+  if (request.headers.range) headers.range = request.headers.range;
   const upstream = await fetch(download.download_url, {
     method: 'GET',
     headers,
     signal: AbortSignal.timeout(ossTimeoutMs),
   });
-  if (!upstream.ok && upstream.status !== 206 && upstream.status !== 304) {
+  if (!upstream.ok && upstream.status !== 206 && upstream.status !== 304 && upstream.status !== 416) {
     throw new WebDavError(upstream.status === 404 ? 404 : 502, `云端文件读取失败（HTTP ${upstream.status}）`);
   }
   const responseHeaders = {
     'accept-ranges': upstream.headers.get('accept-ranges') || 'bytes',
     'content-type': upstream.headers.get('content-type') || 'application/octet-stream',
-    etag: upstream.headers.get('etag') || entry.etag,
-    'last-modified': upstream.headers.get('last-modified') || new Date(entry.modifiedAt).toUTCString(),
+    etag: entry.etag,
+    'last-modified': new Date(entry.modifiedAt).toUTCString(),
   };
   for (const name of ['content-length', 'content-range', 'content-disposition']) {
     const value = upstream.headers.get(name);
@@ -2616,9 +2970,47 @@ async function routeApiV2(request, response, url) {
   if (request.method === 'POST' && url.pathname === '/api/auth/device/poll') { const body = await readBody(request); return json(response, 200, await pollDeviceLogin(body.device_code)); }
   if (request.method === 'POST' && url.pathname === '/api/auth/sms/send') { const body = await readBody(request); return json(response, 200, await sendSmsLogin(body)); }
   if (request.method === 'POST' && url.pathname === '/api/auth/sms/login') { const body = await readBody(request); return json(response, 200, await completeSmsLogin(body)); }
-  if (request.method === 'POST' && url.pathname === '/api/auth') { const body = await readBody(request); token = String(body.token || '').trim().replace(/^Bearer\s+/i, '') || null; refreshToken = null; replaceAuthSession(token, null); publishState(); pump(); schedulePendingUploadRecovery(0); return json(response, 200, state()); }
+  if (request.method === 'POST' && url.pathname === '/api/auth') { const body = await readBody(request); token = String(body.token || '').trim().replace(/^Bearer\s+/i, '') || null; refreshToken = null; remoteCache.clear(); remoteCache.set('', ''); replaceAuthSession(token, null); publishState(); pump(); schedulePendingUploadRecovery(0); return json(response, 200, state()); }
+  if (request.method === 'GET' && url.pathname === '/api/assets') return json(response, 200, await apiPost('/assets/v1/get_assets', {}));
+  if (request.method === 'GET' && url.pathname === '/api/global-config') return json(response, 200, await apiPost('/misc/v1/get_global_config', {}));
   if (request.method === 'GET' && url.pathname === '/api/overview') return json(response, 200, await apiOverview());
-  if (request.method === 'GET' && url.pathname === '/api/files') return json(response, 200, await apiPost('/userres/v1/file/get_file_list', { page: Number(url.searchParams.get('page') || 0), pageSize: 100, parentId: url.searchParams.get('parentId') || '', orderBy: 0, sortType: 0, needSubFolderStat: true }));
+  if (request.method === 'GET' && url.pathname === '/api/files') {
+    const body = {
+      page: Math.max(0, Math.floor(Number(url.searchParams.get('page') || 0) || 0)),
+      pageSize: 100,
+      parentId: url.searchParams.get('parentId') || '',
+      orderBy: 0,
+      sortType: 0,
+      needSubFolderStat: true,
+    };
+    if (url.searchParams.get('resType') === '2') body.resType = 2;
+    return json(response, 200, await apiPost('/userres/v1/file/get_file_list', body));
+  }
+  if (request.method === 'GET' && url.pathname === '/api/files/detail') {
+    const fileId = validateIdentifier(url.searchParams.get('fileId'), '文件 ID');
+    return json(response, 200, await apiPost('/userres/v1/file/get_file_detail', { fileId }));
+  }
+  if (request.method === 'GET' && url.pathname === '/api/recent') {
+    const body = {
+      cursor: String(url.searchParams.get('cursor') || ''),
+      pageSize: queryInteger(url, 'pageSize', 50, { minimum: 1, maximum: 1000 }),
+    };
+    const fileTypes = queryIntegerList(url, 'fileTypes', 'file_types', { maximum: 11 });
+    const excludeFileTypes = queryIntegerList(url, 'excludeFileTypes', 'exclude_file_types', { maximum: 11 });
+    if (fileTypes.length) body.fileTypes = fileTypes;
+    if (excludeFileTypes.length) body.excludeFileTypes = excludeFileTypes;
+    return json(response, 200, await apiPost('/userres/v1/get_user_action', body));
+  }
+  if (request.method === 'GET' && url.pathname === '/api/recycle') {
+    return json(response, 200, await apiPost('/userres/v1/file/get_file_list', {
+      page: queryInteger(url, 'page', 0, { minimum: 0 }),
+      pageSize: queryInteger(url, 'pageSize', 100, { minimum: 1, maximum: 1000 }),
+      parentId: '',
+      dirType: 4,
+      orderBy: 12,
+      sortType: 1,
+    }));
+  }
   if (request.method === 'GET' && url.pathname === '/api/search') return json(response, 200, await searchCloudFiles(url));
   if (request.method === 'POST' && url.pathname === '/api/upload') return handleWebUpload(request, response, url);
   if (request.method === 'GET' && url.pathname === '/api/server-files') {
@@ -2630,20 +3022,138 @@ async function routeApiV2(request, response, url) {
     const body = await readBody(request, { maxBytes: 1024 * 1024 });
     return json(response, 200, await queueServerUploads(body.paths, body.parent_id));
   }
-  if (request.method === 'POST' && url.pathname === '/api/files/copy') { const body = await readBody(request); const result = await apiPost('/userres/v1/file/copy_file', { fileIds: validateFileIds(body.file_ids), parentId: String(body.parent_id || '') }); await waitOperation(result.data?.taskId); return json(response, 200, result.data || {}); }
-  if (request.method === 'POST' && url.pathname === '/api/files/move') { const body = await readBody(request); const result = await apiPost('/userres/v1/file/move_file', { fileIds: validateFileIds(body.file_ids), parentId: String(body.parent_id || '') }); await waitOperation(result.data?.taskId); return json(response, 200, result.data || {}); }
-  if (request.method === 'POST' && url.pathname === '/api/files/delete') { const body = await readBody(request); const result = await apiPost('/userres/v1/file/delete_file', { fileIds: validateFileIds(body.file_ids) }); await waitOperation(result.data?.taskId); return json(response, 200, result.data || {}); }
+  if (request.method === 'POST' && url.pathname === '/api/files/create-folder') {
+    const body = await readBody(request);
+    const payload = {
+      parentId: validateOptionalIdentifier(body.parent_id ?? body.parentId, '父目录 ID'),
+      dirName: validateCloudName(body.dir_name ?? body.dirName, '文件夹名称'),
+    };
+    const failIfNameExist = body.fail_if_name_exist ?? body.failIfNameExist;
+    if (failIfNameExist != null) {
+      if (typeof failIfNameExist !== 'boolean') throw new Error('fail_if_name_exist 必须是布尔值');
+      payload.failIfNameExist = failIfNameExist;
+    }
+    return json(response, 200, await executeFileTask('/userres/v1/file/create_dir', payload));
+  }
+  if (request.method === 'POST' && url.pathname === '/api/files/copy') {
+    const body = await readBody(request);
+    return json(response, 200, await executeFileTask('/userres/v1/file/copy_file', {
+      fileIds: validateFileIds(body.file_ids),
+      parentId: validateOptionalIdentifier(body.parent_id, '父目录 ID'),
+    }));
+  }
+  if (request.method === 'POST' && url.pathname === '/api/files/move') {
+    const body = await readBody(request);
+    return json(response, 200, await executeFileTask('/userres/v1/file/move_file', {
+      fileIds: validateFileIds(body.file_ids),
+      parentId: validateOptionalIdentifier(body.parent_id, '父目录 ID'),
+    }));
+  }
+  if (request.method === 'POST' && url.pathname === '/api/files/delete') {
+    const body = await readBody(request);
+    return json(response, 200, await executeFileTask('/userres/v1/file/delete_file', { fileIds: validateFileIds(body.file_ids) }));
+  }
+  if (request.method === 'POST' && url.pathname === '/api/recycle/restore') {
+    const body = await readBody(request);
+    return json(response, 200, await executeFileTask('/userres/v1/file/recycle_file', { fileIds: validateFileIds(body.file_ids) }));
+  }
+  if (request.method === 'POST' && url.pathname === '/api/recycle/delete') {
+    const body = await readBody(request);
+    return json(response, 200, await executeFileTask('/userres/v1/file/delete_file', { fileIds: validateFileIds(body.file_ids) }));
+  }
+  if (request.method === 'POST' && url.pathname === '/api/recycle/clear') {
+    await readBody(request);
+    return json(response, 200, await executeFileTask('/userres/v1/file/clear_recycle_bin', {}));
+  }
   if (request.method === 'POST' && url.pathname === '/api/files/rename-batch') { const body = await readBody(request); return json(response, 200, await batchRename(body.renames)); }
   if (request.method === 'POST' && url.pathname === '/api/files/download') { const body = await readBody(request); return json(response, 200, await getCloudDownload(body)); }
   if (request.method === 'POST' && url.pathname === '/api/share') { const body = await readBody(request); return json(response, 200, await createManualShare(body)); }
   if (request.method === 'GET' && url.pathname === '/api/shares') return json(response, 200, await listAllShares());
-  if (request.method === 'POST' && url.pathname === '/api/shares/delete') { const body = await readBody(request); const ids = Array.isArray(body.ids) ? body.ids : Array.isArray(body.share_ids) ? body.share_ids : []; if (!ids.length || ids.some((id) => id == null || id === '')) throw new Error('分享记录 ID 无效，请刷新后重试'); const result = await apiPost('/userres/v1/delete_share', { ids }); return json(response, 200, result.data || {}); }
+  if (request.method === 'POST' && url.pathname === '/api/shares/delete') {
+    const body = await readBody(request);
+    const ids = validateShareIds(Array.isArray(body.ids) ? body.ids : body.share_ids);
+    const result = await apiPost('/userres/v1/delete_share', { ids });
+    return json(response, 200, result.data || {});
+  }
+  if (request.method === 'POST' && url.pathname === '/api/shares/update') {
+    const body = await readBody(request);
+    const validateDuration = validateInteger(body.validate_duration ?? body.validateDuration, '分享有效期', { minimum: 0 });
+    if (![0, 86_400, 604_800, 2_592_000].includes(validateDuration)) throw new Error('分享有效期必须是 0、86400、604800 或 2592000');
+    const result = await apiPost('/userres/v1/update_share', {
+      id: validateIdentifier(body.id, '分享记录 ID'),
+      validateDuration,
+      downloadType: validateInteger(body.download_type ?? body.downloadType, '下载类型', { minimum: 0, maximum: 1 }),
+      trafficLimit: String(validateInteger(body.traffic_limit ?? body.trafficLimit, '流量限制', { minimum: 0, maximum: maxShareTrafficBytes })),
+    });
+    return json(response, 200, result.data || {});
+  }
+  if (request.method === 'POST' && url.pathname === '/api/shares/delete-invalid') {
+    await readBody(request);
+    const result = await apiPost('/userres/v1/delete_invalid_share', {});
+    return json(response, 200, result.data || {});
+  }
+  if (request.method === 'POST' && ['/api/direct-link/set', '/api/direct-link/unset'].includes(url.pathname)) {
+    const body = await readBody(request);
+    const endpoint = url.pathname.endsWith('/set') ? '/userres/v1/set_direct_link' : '/userres/v1/unset_direct_link';
+    const result = await apiPost(endpoint, { fileId: validateIdentifier(body.file_id ?? body.fileId, '文件 ID') });
+    return json(response, 200, result.data || {});
+  }
+  if (request.method === 'POST' && url.pathname === '/api/direct-link/get') {
+    const body = await readBody(request);
+    const shortLink = body.short_link ?? body.shortLink ?? false;
+    if (typeof shortLink !== 'boolean') throw new Error('short_link 必须是布尔值');
+    const result = await apiPost('/userres/v1/get_direct_link', {
+      fileId: validateIdentifier(body.file_id ?? body.fileId, '文件 ID'),
+      shortLink,
+    });
+    return json(response, 200, result.data || {});
+  }
   if (request.method === 'POST' && url.pathname === '/api/received-share/open') { const body = await readBody(request); return json(response, 200, await openReceivedShare(body.url)); }
   if (request.method === 'POST' && url.pathname === '/api/received-share/files') { const body = await readBody(request); return json(response, 200, await listReceivedShareFiles(body.access_token, body.parent_id)); }
   if (request.method === 'POST' && url.pathname === '/api/received-share/restore') { const body = await readBody(request); return json(response, 200, await restoreReceivedShare(body)); }
   if (request.method === 'POST' && url.pathname === '/api/received-share/download') { const body = await readBody(request); return json(response, 200, await getReceivedShareDownload(body)); }
-  if (request.method === 'GET' && url.pathname === '/api/offline') return json(response, 200, await apiPost('/cloudcollection/v1/list_task', { page: 0, pageSize: 100 }));
-  if (request.method === 'POST' && url.pathname === '/api/offline') { const body = await readBody(request); return json(response, 200, await apiPost('/cloudcollection/v1/create_task', { url: body.url, parentId: body.parent_id || '', newName: body.new_name || '' })); }
+  if (request.method === 'GET' && url.pathname === '/api/offline') {
+    const pageSize = queryInteger(url, 'pageSize', 100, { minimum: 1, maximum: 1000 });
+    const page = queryInteger(url, 'page', 0, { minimum: 0 });
+    const cursor = String(url.searchParams.get('cursor') || '');
+    if (!cursor && page > 0) throw new Error('离线任务列表使用 cursor 翻页，不支持 page > 0');
+    const body = { cursor, pageSize };
+    const status = queryIntegerList(url, 'status', 'statuses', { maximum: 5 });
+    if (status.length) body.status = status;
+    return json(response, 200, await apiPost('/cloudcollection/v1/list_task', body));
+  }
+  if (request.method === 'POST' && url.pathname === '/api/offline/resolve') {
+    const body = await readBody(request);
+    const source = validateOfflineUrl(body.url);
+    const result = await apiPost('/cloudcollection/v1/resolve_res', { url: source });
+    return json(response, 200, result.data || {});
+  }
+  if (request.method === 'POST' && url.pathname === '/api/offline') {
+    const body = await readBody(request);
+    const source = validateOfflineUrl(body.url);
+    const fileIndexes = validateOfflineFileIndexes(body.file_indexes ?? body.fileIndexes, source);
+    const payload = {
+      url: source,
+      parentId: validateOptionalIdentifier(body.parent_id ?? body.parentId, '父目录 ID'),
+    };
+    if (fileIndexes.length) payload.fileIndexes = fileIndexes;
+    const rawNewName = body.new_name ?? body.newName;
+    if (rawNewName != null && String(rawNewName).trim()) payload.newName = validateCloudName(rawNewName, '离线任务名称');
+    return json(response, 200, await apiPost('/cloudcollection/v1/create_task', payload));
+  }
+  if (request.method === 'POST' && ['/api/offline/cancel', '/api/offline/delete'].includes(url.pathname)) {
+    const body = await readBody(request);
+    const result = await apiPost('/cloudcollection/v2/delete_task', { taskIds: validateTaskIds(body.task_ids ?? body.taskIds) });
+    return json(response, 200, result.data || {});
+  }
+  if (request.method === 'POST' && url.pathname === '/api/offline/retry') {
+    const body = await readBody(request);
+    const result = await apiPost('/cloudcollection/v2/retry_task', { taskIds: validateTaskIds(body.task_ids ?? body.taskIds) });
+    return json(response, 200, result.data || {});
+  }
+  if (request.method === 'GET' && url.pathname === '/api/offline/statistics') {
+    return json(response, 200, await apiPost('/nd.bizcloudcollection.s/v1/get_task_statistics', {}));
+  }
   if (request.method === 'GET' && url.pathname === '/api/hdhive/config') return json(response, 200, state().hdhive);
   if (request.method === 'POST' && url.pathname === '/api/hdhive/config') {
     const body = await readBody(request);

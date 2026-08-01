@@ -4,6 +4,7 @@ import { formatSize, formatTime, pick } from './formatters.js';
 import { useFilesStore } from './stores/files.ts';
 import { useSessionStore } from './stores/session.ts';
 import { useTransfersStore } from './stores/transfers.ts';
+import { classifyVipStatus } from './vipStatus.js';
 
 export { formatSize, formatTime };
 
@@ -34,8 +35,9 @@ export const usedSpace = sessionRefs.usedSpace;
 export const totalSpace = sessionRefs.totalSpace;
 export const quotaPercent = sessionRefs.quotaPercent;
 export const vipExpireTime = computed(() => Number(pick(overview.assets, ['vipExpireTime', 'vip_expire_time'], 0)));
-export const isVip = computed(() => [1, 2].includes(Number(pick(overview.assets, ['isVip', 'vipStatus', 'svipStatus'], 0))));
-export const vipExpired = computed(() => Number(pick(overview.assets, ['vipStatus', 'svipStatus'], 0)) === 3);
+const vipState = computed(() => classifyVipStatus(pick(overview.assets, ['vipStatus', 'svipStatus', 'isVip'], 1)));
+export const isVip = computed(() => vipState.value.active);
+export const vipExpired = computed(() => vipState.value.expired);
 export const vipLabel = computed(() => isVip.value ? 'VIP会员' : vipExpired.value ? 'VIP已过期' : '普通用户');
 export const vipExpireLabel = computed(() => vipExpireTime.value ? formatTime(vipExpireTime.value) : isVip.value ? '未返回到期时间' : '未开通 VIP');
 

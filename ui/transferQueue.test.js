@@ -42,3 +42,22 @@ test('download queue never starts more jobs than the configured concurrency', as
   assert.equal(queue.active, 0);
   assert.equal(queue.pending, 0);
 });
+
+test('download queue does not start queued work while paused and resumes on pump', async () => {
+  let paused = true;
+  const started = [];
+  const queue = createConcurrencyQueue(() => 2, () => paused);
+
+  queue.enqueue(async () => { started.push('first'); });
+  queue.enqueue(async () => { started.push('second'); });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, []);
+  assert.equal(queue.pending, 2);
+
+  paused = false;
+  queue.pump();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, ['first', 'second']);
+  assert.equal(queue.active, 0);
+  assert.equal(queue.pending, 0);
+});

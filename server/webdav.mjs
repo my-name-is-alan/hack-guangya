@@ -43,7 +43,7 @@ export function decodeWebDavPath(pathname, prefix = '/dav') {
 
 function entryTimestamp(raw) {
   const value = raw.updatedAt ?? raw.updateTime ?? raw.modifiedAt ?? raw.modifyTime
-    ?? raw.createdAt ?? raw.createTime ?? 0;
+    ?? raw.utime ?? raw.createdAt ?? raw.createTime ?? raw.ctime ?? 0;
   if (typeof value === 'string' && !/^\d+$/.test(value)) {
     const parsed = Date.parse(value);
     if (Number.isFinite(parsed)) return parsed;
@@ -209,21 +209,6 @@ function destinationSegments(request, prefix) {
   return decodeWebDavPath(pathname, prefix);
 }
 
-function lockBody(token) {
-  return `<?xml version="1.0" encoding="utf-8"?>
-<D:prop xmlns:D="DAV:">
-  <D:lockdiscovery>
-    <D:activelock>
-      <D:locktype><D:write/></D:locktype>
-      <D:lockscope><D:exclusive/></D:lockscope>
-      <D:depth>infinity</D:depth>
-      <D:timeout>Second-3600</D:timeout>
-      <D:locktoken><D:href>${xmlEscape(token)}</D:href></D:locktoken>
-    </D:activelock>
-  </D:lockdiscovery>
-</D:prop>`;
-}
-
 export function createWebDavHandler({
   prefix = '/dav',
   listChildren,
@@ -244,8 +229,8 @@ export function createWebDavHandler({
 
     if (method === 'OPTIONS') {
       return send(response, 204, '', {
-        allow: 'OPTIONS, PROPFIND, PROPPATCH, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY, LOCK, UNLOCK',
-        dav: '1, 2',
+        allow: 'OPTIONS, PROPFIND, PROPPATCH, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY',
+        dav: '1',
         ms_author_via: 'DAV',
       });
     }
@@ -262,13 +247,13 @@ export function createWebDavHandler({
         for (const child of children) responses.push(propertyResponse(prefix, [...segments, child.name], child));
       }
       const body = `<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">${responses.join('')}</D:multistatus>`;
-      return send(response, 207, body, { 'content-type': 'application/xml; charset=utf-8', dav: '1, 2' });
+      return send(response, 207, body, { 'content-type': 'application/xml; charset=utf-8', dav: '1' });
     }
 
     if (method === 'PROPPATCH') {
       const { entry } = await resolveEntry(listChildren, segments);
       const body = `<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">${propertyResponse(prefix, segments, entry)}</D:multistatus>`;
-      return send(response, 207, body, { 'content-type': 'application/xml; charset=utf-8', dav: '1, 2' });
+      return send(response, 207, body, { 'content-type': 'application/xml; charset=utf-8', dav: '1' });
     }
 
     if (method === 'GET' || method === 'HEAD') {
@@ -312,28 +297,43 @@ export function createWebDavHandler({
       if (!entry.id) throw new WebDavError(403, '不能移动或复制 WebDAV 根目录');
       const destination = await resolveParent(listChildren, destinationSegments(request, prefix));
       const overwrite = String(request.headers.overwrite || 'T').toUpperCase() !== 'F';
-      if (destination.existing?.id === entry.id && method === 'MOVE') return send(response, 204);
-      if (destination.existing && !overwrite) throw new WebDavError(412, '目标已经存在');
-      if (destination.existing) await deleteEntry({ entry: destination.existing });
-      if (method === 'MOVE') {
-        await moveEntry({ entry, parentId: destination.parentId, name: destination.name });
-      } else {
-        await copyEntry({ entry, parentId: destination.parentId, name: destination.name });
+      if (destination.existing?.id === entry.id) {
+        if (method === 'MOVE') return send(response, 204);
+        throw new WebDavError(403, '不能把资源复制到自身');
       }
-      return send(response, destination.existing ? 204 : 201);
+      if (destination.existing && !overwrite) throw new WebDavError(412, '目标已经存在');
+      const replaced = destination.existing;
+      let backup = null;
+      if (replaced) {
+        backup = {
+          ...replaced,
+          parentId: destination.parentId,
+          name: `.__gy_dav_backup_${crypto.randomUUID().replaceAll('-', '')}`,
+        };
+        await moveEntry({ entry: replaced, parentId: destination.parentId, name: backup.name });
+      }
+      try {
+        if (method === 'MOVE') {
+          await moveEntry({ entry, parentId: destination.parentId, name: destination.name });
+        } else {
+          await copyEntry({ entry, parentId: destination.parentId, name: destination.name });
+        }
+      } catch (error) {
+        if (backup) {
+          try {
+            await moveEntry({ entry: backup, parentId: destination.parentId, name: destination.name });
+          } catch (rollbackError) {
+            throw new WebDavError(500, `${error.message}；恢复被覆盖目标也失败：${rollbackError.message}`);
+          }
+        }
+        throw error;
+      }
+      if (backup) await deleteEntry({ entry: backup });
+      return send(response, replaced ? 204 : 201);
     }
 
-    if (method === 'LOCK') {
-      const token = `opaquelocktoken:${crypto.randomUUID()}`;
-      return send(response, 200, lockBody(token), {
-        'content-type': 'application/xml; charset=utf-8',
-        'lock-token': `<${token}>`,
-      });
-    }
-
-    if (method === 'UNLOCK') return send(response, 204);
     throw new WebDavError(405, `不支持 WebDAV 方法：${method}`, {
-      allow: 'OPTIONS, PROPFIND, PROPPATCH, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY, LOCK, UNLOCK',
+      allow: 'OPTIONS, PROPFIND, PROPPATCH, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY',
     });
   };
 }

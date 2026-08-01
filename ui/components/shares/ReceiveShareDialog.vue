@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, reactive } from 'vue'
-import { ArrowLeftOutlined, CloudDownloadOutlined, FileOutlined, FolderOutlined, InboxOutlined } from '@antdv-next/icons'
+import { ArrowLeftOutlined, CloudDownloadOutlined, FileOutlined, FolderOpenOutlined, FolderOutlined, InboxOutlined } from '@antdv-next/icons'
 import { message } from 'antdv-next'
 import { bridge, isTauri } from '../../bridge.js'
 import { errorText, fileId, formatSize, formatTime, isFolder, unwrapData } from '../../formatters.js'
 import { parseGuangyaShareLink } from '../../shareLink.js'
 import { useTransfersStore } from '../../stores/transfers'
+import CloudFolderPicker from '../cloud/CloudFolderPicker.vue'
 
 const transfers = useTransfersStore()
 const state = reactive({
@@ -19,6 +20,9 @@ const state = reactive({
   files: [] as any[],
   selectedKeys: [] as string[],
   path: [] as Array<{ id: string, name: string }>,
+  targetId: '',
+  targetLabel: '全部文件',
+  targetPickerOpen: false,
   error: '',
 })
 
@@ -42,7 +46,20 @@ const rowSelection = computed(() => ({
 }))
 
 function open() {
-  Object.assign(state, { open: true, loading: false, url: '', password: '', info: null, files: [], selectedKeys: [], path: [], error: '' })
+  Object.assign(state, {
+    open: true,
+    loading: false,
+    url: '',
+    password: '',
+    info: null,
+    files: [],
+    selectedKeys: [],
+    path: [],
+    targetId: '',
+    targetLabel: '全部文件',
+    targetPickerOpen: false,
+    error: '',
+  })
 }
 
 function requestUrl() {
@@ -128,10 +145,10 @@ async function restore() {
     await bridge.invoke('restore_received_share', {
       access_token: state.info.access_token || '',
       file_ids: selectedRecords().map(fileId),
-      parent_id: '',
+      parent_id: state.targetId,
     })
     state.open = false
-    message.success(`已将 ${selectedCount.value} 项转存到云盘根目录`)
+    message.success(`已将 ${selectedCount.value} 项转存到 ${state.targetLabel}`)
   }
   catch (reason) {
     message.error(errorText(reason))
@@ -139,6 +156,11 @@ async function restore() {
   finally {
     state.restoring = false
   }
+}
+
+function selectTarget(target: { id: string, label: string }) {
+  state.targetId = target.id
+  state.targetLabel = target.label
 }
 
 async function download() {
@@ -195,7 +217,10 @@ async function download() {
           </template>
         </a-table>
         <a-flex justify="space-between" align="center" wrap="wrap" gap="small">
-          <span class="modal-hint">已选 {{ selectedCount }} 项 · 转存到云盘根目录</span>
+          <a-flex align="center" gap="small">
+            <span class="modal-hint">已选 {{ selectedCount }} 项 · 转存到 {{ state.targetLabel }}</span>
+            <a-button size="small" @click="state.targetPickerOpen = true"><template #icon><FolderOpenOutlined /></template>选择目录</a-button>
+          </a-flex>
           <a-space>
             <a-button :loading="state.downloading" :disabled="!selectedCount" @click="download"><template #icon><CloudDownloadOutlined /></template>下载所选</a-button>
             <a-button type="primary" :loading="state.restoring" :disabled="!selectedCount" @click="restore"><template #icon><InboxOutlined /></template>转存所选</a-button>
@@ -204,6 +229,7 @@ async function download() {
       </template>
     </a-space>
   </a-modal>
+  <CloudFolderPicker v-model:open="state.targetPickerOpen" title="选择转存目录" @select="selectTarget" />
 </template>
 
 <style scoped>

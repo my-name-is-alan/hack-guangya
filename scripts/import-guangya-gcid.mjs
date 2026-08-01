@@ -6,16 +6,24 @@ import process from 'node:process';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
+import {
+  buildAccountHeaders,
+  buildBusinessHeaders,
+  businessResponseCode,
+  isAuthExpiredBusinessCode,
+  resolveGuangyaProfile,
+} from '../server/guangya-protocol.mjs';
 
-const API_BASE = 'https://api.guangyapan.com';
-const ACCOUNT_BASE = 'https://account.guangyapan.com';
-const OAUTH_CLIENT_ID = 'aMe-8VSlkrbQXpUR';
+const API_BASE = process.env.GUANGYA_API_BASE || 'https://api.guangyapan.com';
+const ACCOUNT_BASE = process.env.GUANGYA_ACCOUNT_BASE || 'https://account.guangyapan.com';
+const guangyaProfile = resolveGuangyaProfile();
 const DEFAULT_APP_DATA = path.join(
   process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'),
   'com.hackguangya.folder-sync',
 );
 const DEFAULT_AUTH_DB = path.join(DEFAULT_APP_DATA, 'state.sqlite3');
-const TRANSIENT_TASK_CODES = new Set([145, 146, 155, 163]);
+const CLOUD_TASK_PENDING_CODES = new Set([147]);
+const CLOUD_TASK_INVALID_CODES = new Set([145, 146, 152, 155, 163]);
 
 class ApiError extends Error {
   constructor(message, { apiCode = null, httpStatus = null, retryable = false } = {}) {
@@ -64,8 +72,8 @@ export function validateExport(payload) {
     if (!Number.isSafeInteger(size) || size <= 0) {
       throw new Error(`第 ${index + 1} 条记录的文件大小超出安全范围`);
     }
-    const gcid = String(item?.gcid || '').toLowerCase();
-    if (!/^[0-9a-f]{40}$/.test(gcid)) {
+    const gcid = String(item?.gcid || '').toUpperCase();
+    if (!/^[0-9A-F]{40}$/.test(gcid)) {
       throw new Error(`第 ${index + 1} 条记录的 GCID 无效`);
     }
     const parts = relativePath.split('/');
@@ -265,6 +273,9 @@ class AuthProvider {
     this.accessToken = String(auth.access_token);
     this.refreshToken = String(auth.refresh_token || '');
     this.deviceId = String(device.value);
+    if (!/^[a-f0-9]{32}$/i.test(this.deviceId)) {
+      throw new Error('登录状态中的光鸭设备 ID 格式无效');
+    }
     this.lastReadAt = Date.now();
   }
 
@@ -276,21 +287,23 @@ class AuthProvider {
     return this.accessToken;
   }
 
-  async refresh() {
+  async refresh({ force = false } = {}) {
     if (this.refreshPromise) return this.refreshPromise;
     this.refreshPromise = (async () => {
       this.reload();
       const expiresAt = jwtExpiry(this.accessToken);
-      if (!expiresAt || expiresAt - unixTime() > 120) return;
+      if (!force && (!expiresAt || expiresAt - unixTime() > 120)) return;
       if (!this.refreshToken) throw new Error('光鸭登录态即将过期，但没有 refresh_token');
       const response = await fetch(`${ACCOUNT_BASE}/v1/auth/token`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: buildAccountHeaders({ deviceId: this.deviceId, profile: guangyaProfile }),
         body: JSON.stringify({
           grant_type: 'refresh_token',
           refresh_token: this.refreshToken,
-          client_id: OAUTH_CLIENT_ID,
+          client_id: guangyaProfile.clientId,
+          client_secret: guangyaProfile.clientSecret,
         }),
+        signal: AbortSignal.timeout(30_000),
       });
       const raw = await response.text();
       let payload;
@@ -299,7 +312,7 @@ class AuthProvider {
       } catch {
         throw new Error(`刷新光鸭登录态返回了非 JSON 内容（HTTP ${response.status}）`);
       }
-      if (!response.ok) {
+      if (!response.ok || payload.error) {
         throw new Error(payload.error_description || payload.msg || `刷新光鸭登录态失败（HTTP ${response.status}）`);
       }
       const data = payload.data && typeof payload.data === 'object' ? payload.data : payload;
@@ -336,22 +349,22 @@ class GuangyaApi {
 
   async post(endpoint, body, { allowedCodes = [], maxRetries = 6 } = {}) {
     let lastError;
+    let refreshedAfterAuthFailure = false;
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
       try {
-        const token = await this.auth.token({ forceReload: attempt > 0 && lastError?.apiCode === 117 });
+        const token = await this.auth.token();
         const traceId = crypto.randomUUID().replaceAll('-', '');
         const spanId = crypto.randomUUID().replaceAll('-', '').slice(0, 16);
         const response = await fetch(`${API_BASE}${endpoint}`, {
           method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            authorization: `Bearer ${token}`,
-            dt: '4',
-            did: this.auth.deviceId,
+          headers: buildBusinessHeaders({
+            token,
+            deviceId: this.auth.deviceId,
+            profile: guangyaProfile,
             traceparent: `00-${traceId}-${spanId}-01`,
-          },
+          }),
           body: JSON.stringify(body),
-          signal: AbortSignal.timeout(60_000),
+          signal: AbortSignal.timeout(30_000),
         });
         const raw = await response.text();
         let payload;
@@ -363,11 +376,35 @@ class GuangyaApi {
             { httpStatus: response.status, retryable: response.status >= 500 },
           );
         }
-        const code = Number(payload.code || 0);
-        if (response.ok && (code === 0 || allowedCodes.includes(code))) return payload;
-        const retryable = response.status === 429 || response.status >= 500 || code === 117;
+        const code = businessResponseCode(payload);
+        if (response.status === 401 || isAuthExpiredBusinessCode(code)) {
+          if (refreshedAfterAuthFailure || !this.auth.refreshToken) {
+            throw new ApiError('光鸭登录态已失效，请先在主 App 重新登录', {
+              apiCode: code,
+              httpStatus: response.status,
+            });
+          }
+          try {
+            await this.auth.refresh({ force: true });
+          } catch (cause) {
+            throw new ApiError(`刷新光鸭登录态失败：${cause.message || cause}`, {
+              apiCode: code,
+              httpStatus: response.status,
+            });
+          }
+          refreshedAfterAuthFailure = true;
+          continue;
+        }
+        if (response.ok && code !== null && (code === 0 || allowedCodes.includes(code))) {
+          return payload;
+        }
+        const retryable = response.status === 429
+          || response.status >= 500
+          || [100, 101, 102, 103].includes(code);
         throw new ApiError(
-          payload.msg || `光鸭接口失败：HTTP ${response.status}/业务码 ${code}`,
+          payload.msg || (code === null
+            ? `${endpoint} 返回了未标明成功状态的响应（HTTP ${response.status}）`
+            : `光鸭接口失败：HTTP ${response.status}/业务码 ${code}`),
           { apiCode: code, httpStatus: response.status, retryable },
         );
       } catch (error) {
@@ -539,10 +576,20 @@ class ImportRunner {
       const response = await this.api.post(
         '/userres/v1/file/get_info_by_task_id',
         { taskId },
-        { allowedCodes: [...TRANSIENT_TASK_CODES] },
+        { allowedCodes: [...CLOUD_TASK_PENDING_CODES, ...CLOUD_TASK_INVALID_CODES] },
       );
       if (response.data?.fileId) return String(response.data.fileId);
-      if (!TRANSIENT_TASK_CODES.has(Number(response.code || 0)) && Number(response.code || 0) !== 0) {
+      const code = Number(response.code || 0);
+      if (code === 0) {
+        throw new Error(`云端入库成功响应缺少有效的 fileId：${row.path}`);
+      }
+      if (CLOUD_TASK_INVALID_CODES.has(code)) {
+        throw new ApiError(response.msg || `秒传任务已失效：${taskId}`, {
+          apiCode: code,
+          retryable: true,
+        });
+      }
+      if (code !== 0 && !CLOUD_TASK_PENDING_CODES.has(code)) {
         throw new Error(response.msg || `秒传任务失败：${taskId}`);
       }
       attempt += 1;
@@ -600,10 +647,19 @@ class ImportRunner {
     if (!taskId) throw new Error('光鸭没有返回上传任务 ID');
     let instant = Number(tokenResponse.code || 0) === 156;
     if (!instant) {
-      const flash = await this.api.post('/userres/v1/check_can_flash_upload', {
-        taskId,
-        gcid: row.gcid,
-      });
+      let flash;
+      try {
+        flash = await this.api.post('/userres/v1/check_can_flash_upload', {
+          taskId,
+          gcid: row.gcid,
+        });
+      } catch (error) {
+        if (error.apiCode === 112) {
+          this.finish(row, 'missed', { taskId, error: '光鸭未接受该 GCID 秒传，且本地没有源文件可普通上传' });
+          return;
+        }
+        throw error;
+      }
       instant = flash.data?.canFlashUpload === true;
       if (flash.data?.taskId) taskId = String(flash.data.taskId);
     }

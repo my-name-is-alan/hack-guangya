@@ -8,11 +8,12 @@ export function normalizeTransferConcurrency(value, fallback = DEFAULT_TRANSFER_
     : fallback;
 }
 
-export function createConcurrencyQueue(getLimit) {
+export function createConcurrencyQueue(getLimit, getPaused = () => false) {
   const pending = [];
   let active = 0;
 
   function pump() {
+    if (getPaused()) return;
     const limit = normalizeTransferConcurrency(getLimit());
     while (active < limit && pending.length) {
       const run = pending.shift();

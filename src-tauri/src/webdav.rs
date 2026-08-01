@@ -278,8 +278,10 @@ fn raw_timestamp_ms(value: &Value) -> u64 {
         "updateTime",
         "modifiedAt",
         "modifyTime",
+        "utime",
         "createdAt",
         "createTime",
+        "ctime",
     ] {
         let Some(candidate) = value.get(key) else {
             continue;
@@ -801,38 +803,65 @@ async fn rename_entry(context: &WebDavContext, entry_id: &str, new_name: &str) -
     Ok(())
 }
 
+async fn move_entry_to_parent(
+    context: &WebDavContext,
+    entry_id: &str,
+    source_parent_id: &str,
+    parent_id: &str,
+) -> DavResult<()> {
+    if source_parent_id == parent_id {
+        return Ok(());
+    }
+    let (token, device_id) = auth_context(&context.state)?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/userres/v1/file/move_file",
+        json!({ "fileIds": [entry_id], "parentId": parent_id }),
+        &[],
+    )
+    .await
+    .map_err(DavError::from)?;
+    if let Some(task_id) = response
+        .data
+        .as_ref()
+        .and_then(|data| data.get("taskId"))
+        .and_then(Value::as_str)
+    {
+        wait_operation_task(&token, &device_id, task_id)
+            .await
+            .map_err(DavError::from)?;
+    }
+    context.directory_cache.invalidate(source_parent_id);
+    context.directory_cache.invalidate(parent_id);
+    Ok(())
+}
+
 async fn move_entry(
     context: &WebDavContext,
     entry: &RemoteEntry,
     parent_id: &str,
     name: &str,
 ) -> DavResult<()> {
-    if entry.parent_id != parent_id {
-        let (token, device_id) = auth_context(&context.state)?;
-        let response = api_post(
-            &token,
-            &device_id,
-            "/userres/v1/file/move_file",
-            json!({ "fileIds": [entry.id.clone()], "parentId": parent_id }),
-            &[],
-        )
-        .await
-        .map_err(DavError::from)?;
-        if let Some(task_id) = response
-            .data
-            .as_ref()
-            .and_then(|data| data.get("taskId"))
-            .and_then(Value::as_str)
-        {
-            wait_operation_task(&token, &device_id, task_id)
-                .await
-                .map_err(DavError::from)?;
-        }
-        context.directory_cache.invalidate(&entry.parent_id);
-        context.directory_cache.invalidate(parent_id);
-    }
+    let moved = entry.parent_id != parent_id;
+    move_entry_to_parent(context, &entry.id, &entry.parent_id, parent_id).await?;
     if entry.name != name {
-        rename_entry(context, &entry.id, name).await?;
+        if let Err(error) = rename_entry(context, &entry.id, name).await {
+            if moved {
+                if let Err(rollback_error) =
+                    move_entry_to_parent(context, &entry.id, parent_id, &entry.parent_id).await
+                {
+                    return Err(DavError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "{}；恢复资源原目录也失败：{}",
+                            error.message, rollback_error.message
+                        ),
+                    ));
+                }
+            }
+            return Err(error);
+        }
         context.directory_cache.invalidate(parent_id);
     }
     Ok(())
@@ -889,7 +918,10 @@ async fn copy_entry(
                 "云端复制已完成，但无法定位副本进行重命名",
             )
         })?;
-    rename_entry(context, &copied.id, name).await?;
+    if let Err(error) = rename_entry(context, &copied.id, name).await {
+        let _ = delete_entry(context, &copied).await;
+        return Err(error);
+    }
     context.directory_cache.invalidate(parent_id);
     Ok(())
 }
@@ -995,11 +1027,50 @@ async fn put_file(
                 "文件已上传，但云端暂未确认入库",
             )
         })?;
-        if let Some(existing) = existing {
-            delete_entry(context, existing).await?;
-        }
+        let uploaded_entry = RemoteEntry {
+            id: remote_id.clone(),
+            parent_id: parent_id.to_string(),
+            name: temporary_name.clone(),
+            is_directory: false,
+            size: metadata.len(),
+            modified_ms: modified_ms as u64,
+        };
+        let backup = if let Some(existing) = existing {
+            let backup = RemoteEntry {
+                name: format!(".__gy_dav_backup_{}", Uuid::new_v4().simple()),
+                parent_id: parent_id.to_string(),
+                ..existing.clone()
+            };
+            if let Err(error) = move_entry(context, existing, parent_id, &backup.name).await {
+                let _ = delete_entry(context, &uploaded_entry).await;
+                return Err(error);
+            }
+            Some(backup)
+        } else {
+            None
+        };
         if temporary_name != name {
-            rename_entry(context, &remote_id, name).await?;
+            if let Err(error) = rename_entry(context, &remote_id, name).await {
+                let rollback_error = if let Some(backup) = backup.as_ref() {
+                    move_entry(context, backup, parent_id, name).await.err()
+                } else {
+                    None
+                };
+                let _ = delete_entry(context, &uploaded_entry).await;
+                if let Some(rollback_error) = rollback_error {
+                    return Err(DavError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "{}；恢复被覆盖文件也失败：{}",
+                            error.message, rollback_error.message
+                        ),
+                    ));
+                }
+                return Err(error);
+            }
+        }
+        if let Some(backup) = backup.as_ref() {
+            delete_entry(context, backup).await?;
         }
         context.directory_cache.invalidate(parent_id);
         Ok(RemoteEntry {
@@ -1016,12 +1087,62 @@ async fn put_file(
     result
 }
 
+fn webdav_etag_matches(value: &str, etag: &str) -> bool {
+    let expected = etag.strip_prefix("W/").unwrap_or(etag);
+    value.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == expected
+    })
+}
+
+fn webdav_condition_response(status: StatusCode, entry: &RemoteEntry) -> DavResult<Response<Body>> {
+    Response::builder()
+        .status(status)
+        .header(ETAG, entry.etag())
+        .header(LAST_MODIFIED, http_date(entry.modified_ms))
+        .body(Body::empty())
+        .map_err(|error| DavError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
+fn request_http_date(headers: &HeaderMap, name: &axum::http::HeaderName) -> Option<u64> {
+    let value = headers.get(name)?.to_str().ok()?;
+    httpdate::parse_http_date(value)
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
+}
+
 async fn read_file(
     context: &WebDavContext,
     request_headers: &HeaderMap,
     entry: &RemoteEntry,
     head_only: bool,
 ) -> DavResult<Response<Body>> {
+    let etag = entry.etag();
+    if let Some(value) = request_headers
+        .get(IF_MATCH)
+        .and_then(|value| value.to_str().ok())
+    {
+        if !webdav_etag_matches(value, &etag) {
+            return webdav_condition_response(StatusCode::PRECONDITION_FAILED, entry);
+        }
+    } else if request_http_date(request_headers, &IF_UNMODIFIED_SINCE)
+        .is_some_and(|value| entry.modified_ms > value.saturating_add(999))
+    {
+        return webdav_condition_response(StatusCode::PRECONDITION_FAILED, entry);
+    }
+    if let Some(value) = request_headers
+        .get(IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+    {
+        if webdav_etag_matches(value, &etag) {
+            return webdav_condition_response(StatusCode::NOT_MODIFIED, entry);
+        }
+    } else if request_http_date(request_headers, &IF_MODIFIED_SINCE)
+        .is_some_and(|value| entry.modified_ms <= value.saturating_add(999))
+    {
+        return webdav_condition_response(StatusCode::NOT_MODIFIED, entry);
+    }
     let (token, device_id) = auth_context(&context.state)?;
     let response = api_post(
         &token,
@@ -1041,16 +1162,8 @@ async fn read_file(
         .ok_or_else(|| DavError::new(StatusCode::BAD_GATEWAY, "光鸭没有返回文件下载地址"))?;
     let client = reqwest::Client::new();
     let mut upstream_request = client.get(download_url);
-    for header in [
-        RANGE,
-        IF_MATCH,
-        IF_NONE_MATCH,
-        IF_MODIFIED_SINCE,
-        IF_UNMODIFIED_SINCE,
-    ] {
-        if let Some(value) = request_headers.get(&header) {
-            upstream_request = upstream_request.header(header.as_str(), value.as_bytes());
-        }
+    if let Some(value) = request_headers.get(RANGE) {
+        upstream_request = upstream_request.header(RANGE.as_str(), value.as_bytes());
     }
     let upstream = upstream_request
         .send()
@@ -1058,7 +1171,10 @@ async fn read_file(
         .map_err(|error| DavError::new(StatusCode::BAD_GATEWAY, error.to_string()))?;
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    if !upstream.status().is_success() && upstream.status().as_u16() != 304 {
+    if !upstream.status().is_success()
+        && upstream.status().as_u16() != 304
+        && upstream.status().as_u16() != 416
+    {
         return Err(DavError::new(
             if upstream.status().as_u16() == 404 {
                 StatusCode::NOT_FOUND
@@ -1075,8 +1191,6 @@ async fn read_file(
         CONTENT_LENGTH,
         CONTENT_RANGE,
         CONTENT_DISPOSITION,
-        ETAG,
-        LAST_MODIFIED,
     ] {
         if let Some(value) = upstream.headers().get(header.as_str()) {
             builder = builder.header(header, value.as_bytes());
@@ -1085,12 +1199,8 @@ async fn read_file(
     if upstream.headers().get(ACCEPT_RANGES.as_str()).is_none() {
         builder = builder.header(ACCEPT_RANGES, "bytes");
     }
-    if upstream.headers().get(ETAG.as_str()).is_none() {
-        builder = builder.header(ETAG, entry.etag());
-    }
-    if upstream.headers().get(LAST_MODIFIED.as_str()).is_none() {
-        builder = builder.header(LAST_MODIFIED, http_date(entry.modified_ms));
-    }
+    builder = builder.header(ETAG, etag);
+    builder = builder.header(LAST_MODIFIED, http_date(entry.modified_ms));
     let body = if head_only {
         Body::empty()
     } else {
@@ -1099,25 +1209,6 @@ async fn read_file(
     builder
         .body(body)
         .map_err(|error| DavError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
-}
-
-fn lock_response() -> Response<Body> {
-    let token = format!("opaquelocktoken:{}", Uuid::new_v4());
-    let body = format!(
-        r#"<?xml version="1.0" encoding="utf-8"?>
-<D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock>
-<D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope>
-<D:depth>infinity</D:depth><D:timeout>Second-3600</D:timeout>
-<D:locktoken><D:href>{}</D:href></D:locktoken>
-</D:activelock></D:lockdiscovery></D:prop>"#,
-        xml_escape(&token)
-    );
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/xml; charset=utf-8")
-        .header("lock-token", format!("<{token}>"))
-        .body(Body::from(body))
-        .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
 async fn handle_request(
@@ -1152,9 +1243,9 @@ async fn handle_authenticated(
             .status(StatusCode::NO_CONTENT)
             .header(
                 ALLOW,
-                "OPTIONS, PROPFIND, PROPPATCH, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY, LOCK, UNLOCK",
+                "OPTIONS, PROPFIND, PROPPATCH, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY",
             )
-            .header("dav", "1, 2")
+            .header("dav", "1")
             .header("ms-author-via", "DAV")
             .body(Body::empty())
             .unwrap_or_else(|_| Response::new(Body::empty())));
@@ -1184,7 +1275,7 @@ async fn handle_authenticated(
         return Response::builder()
             .status(StatusCode::MULTI_STATUS)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
-            .header("dav", "1, 2")
+            .header("dav", "1")
             .body(Body::from(body))
             .map_err(|error| DavError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
     }
@@ -1197,7 +1288,7 @@ async fn handle_authenticated(
         return Response::builder()
             .status(StatusCode::MULTI_STATUS)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
-            .header("dav", "1, 2")
+            .header("dav", "1")
             .body(Body::from(body))
             .map_err(|error| DavError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
     }
@@ -1282,8 +1373,11 @@ async fn handle_authenticated(
             .unwrap_or("T")
             .to_uppercase()
             != "F";
-        if method.as_str() == "MOVE" && existing.as_ref().is_some_and(|item| item.id == entry.id) {
-            return Ok(empty_response(StatusCode::NO_CONTENT));
+        if existing.as_ref().is_some_and(|item| item.id == entry.id) {
+            if method.as_str() == "MOVE" {
+                return Ok(empty_response(StatusCode::NO_CONTENT));
+            }
+            return Err(DavError::new(StatusCode::FORBIDDEN, "不能把资源复制到自身"));
         }
         if existing.is_some() && !overwrite {
             return Err(DavError::new(
@@ -1292,25 +1386,44 @@ async fn handle_authenticated(
             ));
         }
         let replaced = existing.is_some();
-        if let Some(existing) = existing {
-            delete_entry(context, &existing).await?;
-        }
-        if method.as_str() == "MOVE" {
-            move_entry(context, &entry, &parent_id, &name).await?;
+        let backup = if let Some(existing) = existing {
+            let backup = RemoteEntry {
+                parent_id: parent_id.clone(),
+                name: format!(".__gy_dav_backup_{}", Uuid::new_v4().simple()),
+                ..existing.clone()
+            };
+            move_entry(context, &existing, &parent_id, &backup.name).await?;
+            Some(backup)
         } else {
-            copy_entry(context, &entry, &parent_id, &name).await?;
+            None
+        };
+        let operation = if method.as_str() == "MOVE" {
+            move_entry(context, &entry, &parent_id, &name).await
+        } else {
+            copy_entry(context, &entry, &parent_id, &name).await
+        };
+        if let Err(error) = operation {
+            if let Some(backup) = backup.as_ref() {
+                if let Err(rollback) = move_entry(context, backup, &parent_id, &name).await {
+                    return Err(DavError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "{}；恢复被覆盖目标也失败：{}",
+                            error.message, rollback.message
+                        ),
+                    ));
+                }
+            }
+            return Err(error);
+        }
+        if let Some(backup) = backup {
+            delete_entry(context, &backup).await?;
         }
         return Ok(empty_response(if replaced {
             StatusCode::NO_CONTENT
         } else {
             StatusCode::CREATED
         }));
-    }
-    if method.as_str() == "LOCK" {
-        return Ok(lock_response());
-    }
-    if method.as_str() == "UNLOCK" {
-        return Ok(empty_response(StatusCode::NO_CONTENT));
     }
     Err(DavError::new(
         StatusCode::METHOD_NOT_ALLOWED,
@@ -1398,6 +1511,17 @@ mod tests {
         assert!(file_xml.contains("<D:getcontentlength>12</D:getcontentlength>"));
         assert!(file_xml.contains("text/plain"));
         assert!(file_xml.contains("/%E8%B5%84%E6%96%99/readme%2Etxt"));
+    }
+
+    #[test]
+    fn webdav_conditional_etags_accept_weak_lists_and_wildcards() {
+        let etag = r#""gy-file-12-1700000000000""#;
+        assert!(webdav_etag_matches("*", etag));
+        assert!(webdav_etag_matches(
+            r#""other", W/"gy-file-12-1700000000000""#,
+            etag
+        ));
+        assert!(!webdav_etag_matches(r#""other""#, etag));
     }
 
     #[test]

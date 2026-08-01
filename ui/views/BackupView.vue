@@ -1,5 +1,5 @@
 <script setup>
-import { computed, reactive, ref } from 'vue';
+import { computed, reactive, ref, watchEffect } from 'vue';
 import { message, Modal } from 'antdv-next';
 import {
   ArrowLeftOutlined,
@@ -13,6 +13,7 @@ import {
   SendOutlined,
 } from '@antdv-next/icons';
 import { bridge, isTauri } from '../bridge.js';
+import { needsTmdbReview } from '../receiptReview.js';
 import { appState, refreshState } from '../store.js';
 import {
   defaultSyncExtensions,
@@ -64,16 +65,45 @@ const cloudFolderColumns = [
 ];
 const syncTypesEditor = reactive({ open: false, saving: false, mapping: null, selected: [] });
 const autoShareHistory = reactive({ open: false, mapping: null });
+const receiptReview = reactive({});
+const autoShareBusy = reactive({});
+const receiptMediaOptions = [
+  { label: '电视剧', value: 'tv' },
+  { label: '电影', value: 'movie' },
+];
+
+const allAutoShareEvents = computed(() => Array.isArray(appState.auto_share_events)
+  ? appState.auto_share_events
+  : []);
+
+function receiptEventId(event) {
+  return String(event?.event_id || '');
+}
+
+function receiptTargetLabel(event) {
+  return String(event?.target_key || '未命名分享');
+}
+
+function ensureReceiptReview(event) {
+  const eventId = receiptEventId(event);
+  if (eventId && !receiptReview[eventId]) {
+    receiptReview[eventId] = { tmdb_id: '', media_type: 'tv' };
+  }
+}
+
+watchEffect(() => {
+  allAutoShareEvents.value.forEach(ensureReceiptReview);
+});
 
 const autoShareHistoryEvents = computed(() => {
   const mappingId = autoShareHistory.mapping?.id;
   if (!mappingId) return [];
-  return appState.auto_share_events.filter((event) => event.mapping_id === mappingId);
+  return allAutoShareEvents.value.filter((event) => event.mapping_id === mappingId);
 });
 const recentActivity = computed(() => [
-  ...appState.auto_share_events.map((event) => ({
+  ...allAutoShareEvents.value.map((event) => ({
     kind: 'event',
-    id: `event:${event.id || event.event_id}`,
+    id: `event:${event.event_id}`,
     timestamp: activityTimestamp(event.updated_at || event.created_at),
     value: event,
   })),
@@ -277,12 +307,32 @@ async function backfillAutoShares(item) {
   }
 }
 async function retryAutoShareEvent(event) {
+  const eventId = receiptEventId(event);
+  if (!eventId) {
+    message.error('当前回执缺少事件 ID，请刷新后重试');
+    return;
+  }
+  if (autoShareBusy[eventId]) return;
+  ensureReceiptReview(event);
+  const review = receiptReview[eventId];
+  const tmdbId = String(review.tmdb_id || '').trim();
+  if (needsTmdbReview(event) && !tmdbId) {
+    message.warning('请输入 TMDB ID 后再重试');
+    return;
+  }
+  autoShareBusy[eventId] = true;
   try {
-    await bridge.invoke('retry_auto_share_event', { event_id: event.id, tmdb_id: event.tmdb_id, media_type: event.media_type });
+    await bridge.invoke('retry_auto_share_event', {
+      event_id: eventId,
+      tmdb_id: tmdbId || null,
+      media_type: tmdbId ? review.media_type : null,
+    });
     await refreshState();
     message.success('已重新投递');
   } catch (error) {
     message.error(errorText(error));
+  } finally {
+    autoShareBusy[eventId] = false;
   }
 }
 </script>
@@ -350,6 +400,37 @@ async function retryAutoShareEvent(event) {
               <time>{{ item.value.time }}</time>
             </template>
           </div>
+        </div>
+      </a-tab-pane>
+
+      <a-tab-pane key="receipts" :tab="`分享回执${allAutoShareEvents.length ? ` (${allAutoShareEvents.length})` : ''}`">
+        <a-empty v-if="!allAutoShareEvents.length" class="section-empty" description="暂无分享与 HDHive 回执" />
+        <div v-else class="receipt-list global-receipt-list">
+          <a-card v-for="event in allAutoShareEvents" :key="event.event_id" class="receipt-card" :bordered="false" size="small">
+            <a-flex class="receipt-heading" align="center" gap="small" wrap="wrap">
+              <a-tag :color="receiptColor(event.status)">{{ receiptStatusLabel(event) }}</a-tag>
+              <a-tag>{{ event.mapping_id === '__manual__' ? '手动分享' : '备份自动分享' }}</a-tag>
+              <strong class="receipt-name" :title="receiptTargetLabel(event)">{{ receiptTargetLabel(event) }}</strong>
+              <span class="receipt-time">{{ formatTime(event.updated_at || event.created_at) }}</span>
+            </a-flex>
+            <a-alert :type="receiptAlertType(event.status)" :message="receiptDisplayMessage(event)" show-icon class="receipt-alert" />
+            <a-flex class="receipt-actions" gap="small" align="center" wrap="wrap">
+              <a-tag v-if="event.action">{{ receiptActionLabel(event.action) }}</a-tag>
+              <a-tag v-if="event.notification_status">通知：{{ event.notification_status }}</a-tag>
+              <a v-if="event.share_url" :href="event.share_url" target="_blank" rel="noopener noreferrer">查看分享</a>
+              <a v-if="event.resource_url" :href="event.resource_url" target="_blank" rel="noopener noreferrer">查看 HDHive 资源</a>
+              <template v-if="needsTmdbReview(event)">
+                <a-input v-model:value="receiptReview[receiptEventId(event)].tmdb_id" size="small" placeholder="TMDB ID" class="receipt-tmdb" />
+                <a-select v-model:value="receiptReview[receiptEventId(event)].media_type" size="small" :options="receiptMediaOptions" class="receipt-media" />
+              </template>
+              <a-button
+                v-if="['needs_review', 'failed', 'delivery_failed'].includes(event.status)"
+                size="small"
+                :loading="autoShareBusy[receiptEventId(event)]"
+                @click="retryAutoShareEvent(event)"
+              ><template #icon><SendOutlined /></template>重试</a-button>
+            </a-flex>
+          </a-card>
         </div>
       </a-tab-pane>
     </a-tabs>
@@ -446,17 +527,27 @@ async function retryAutoShareEvent(event) {
     <a-drawer v-model:open="autoShareHistory.open" :title="`自动分享记录 · ${autoShareHistory.mapping?.local_path || ''}`" width="560">
       <a-empty v-if="!autoShareHistoryEvents.length" description="暂无自动分享记录" />
       <div v-else class="receipt-list">
-        <a-card v-for="event in autoShareHistoryEvents" :key="event.id" class="receipt-card" :bordered="false" size="small">
-          <a-flex align="center" gap="small">
+        <a-card v-for="event in autoShareHistoryEvents" :key="event.event_id" class="receipt-card" :bordered="false" size="small">
+          <a-flex class="receipt-heading" align="center" gap="small" wrap="wrap">
             <a-tag :color="receiptColor(event.status)">{{ receiptStatusLabel(event) }}</a-tag>
-            <strong class="receipt-name" :title="event.file_name">{{ event.file_name }}</strong>
+            <strong class="receipt-name" :title="receiptTargetLabel(event)">{{ receiptTargetLabel(event) }}</strong>
             <span class="receipt-time">{{ formatTime(event.updated_at || event.created_at) }}</span>
           </a-flex>
-          <a-alert :type="receiptAlertType(event.status)" :message="receiptDisplayMessage(event)" show-icon style="margin-top:8px" />
-          <a-flex gap="small" wrap="wrap" style="margin-top:8px">
+          <a-alert :type="receiptAlertType(event.status)" :message="receiptDisplayMessage(event)" show-icon class="receipt-alert" />
+          <a-flex class="receipt-actions" gap="small" align="center" wrap="wrap">
             <a-tag v-if="event.action">{{ receiptActionLabel(event.action) }}</a-tag>
-            <a v-if="event.share_url" :href="event.share_url" target="_blank">查看分享</a>
-            <a-button v-if="['failed', 'delivery_failed'].includes(event.status)" size="small" @click="retryAutoShareEvent(event)"><template #icon><SendOutlined /></template>重试</a-button>
+            <a v-if="event.share_url" :href="event.share_url" target="_blank" rel="noopener noreferrer">查看分享</a>
+            <a v-if="event.resource_url" :href="event.resource_url" target="_blank" rel="noopener noreferrer">查看 HDHive 资源</a>
+            <template v-if="needsTmdbReview(event)">
+              <a-input v-model:value="receiptReview[receiptEventId(event)].tmdb_id" size="small" placeholder="TMDB ID" class="receipt-tmdb" />
+              <a-select v-model:value="receiptReview[receiptEventId(event)].media_type" size="small" :options="receiptMediaOptions" class="receipt-media" />
+            </template>
+            <a-button
+              v-if="['needs_review', 'failed', 'delivery_failed'].includes(event.status)"
+              size="small"
+              :loading="autoShareBusy[receiptEventId(event)]"
+              @click="retryAutoShareEvent(event)"
+            ><template #icon><SendOutlined /></template>重试</a-button>
           </a-flex>
         </a-card>
       </div>
@@ -470,4 +561,14 @@ async function retryAutoShareEvent(event) {
 .activity-row { display: grid; grid-template-columns:100px minmax(180px,.8fr) minmax(240px,1.2fr) 160px; align-items: center; gap: 12px; min-height: 48px; border-bottom: 1px solid var(--line, #e7e8eb); }
 .activity-row strong, .activity-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .activity-row span, .activity-row time { color: var(--text-3, #98a2b3); font-size: 12px; }
+.receipt-list { display: grid; gap: 10px; }
+.global-receipt-list { max-width: 960px; }
+.receipt-card { background: var(--surface, #fff); }
+.receipt-heading { min-width: 0; }
+.receipt-name { min-width: 160px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.receipt-time { margin-left: auto; color: var(--text-3, #98a2b3); font-size: 12px; }
+.receipt-alert { margin-top: 8px; }
+.receipt-actions { margin-top: 8px; }
+.receipt-tmdb { width: 120px; }
+.receipt-media { width: 100px; }
 </style>

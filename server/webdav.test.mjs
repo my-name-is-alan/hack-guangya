@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { once } from 'node:events';
-import { createWebDavHandler, WebDavError } from './webdav.mjs';
+import { createWebDavHandler, normalizeWebDavEntry, WebDavError } from './webdav.mjs';
 import { startTestServer, stopTestServer } from './test-helpers.mjs';
 
 function inMemoryBackend() {
@@ -64,6 +64,48 @@ function inMemoryBackend() {
   };
 }
 
+async function startProtocolServer(handler, t) {
+  const server = http.createServer(async (request, response) => {
+    try {
+      await handler(request, response, new URL(request.url, 'http://127.0.0.1'));
+    } catch (error) {
+      response.writeHead(error.statusCode || 500, error.headers || {});
+      response.end(error.message);
+    }
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => server.close());
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+test('WebDAV 使用光鸭 utime/ctime 生成稳定的修改时间和 ETag', () => {
+  const fromUtime = normalizeWebDavEntry({
+    fileId: 'utime-file',
+    fileName: 'utime.txt',
+    resType: 1,
+    fileSize: 12,
+    utime: '1722500000',
+  });
+  const repeated = normalizeWebDavEntry({
+    fileId: 'utime-file',
+    fileName: 'utime.txt',
+    resType: 1,
+    fileSize: 12,
+    utime: 1722500000,
+  });
+  const fromCtime = normalizeWebDavEntry({
+    fileId: 'ctime-file',
+    fileName: 'ctime.txt',
+    resType: 1,
+    ctime: '2026-08-01T08:00:00.000Z',
+  });
+
+  assert.equal(fromUtime.modifiedAt, 1_722_500_000_000);
+  assert.equal(fromUtime.etag, repeated.etag);
+  assert.equal(fromCtime.modifiedAt, Date.parse('2026-08-01T08:00:00.000Z'));
+});
+
 test('WebDAV 协议层支持目录与文件完整 CRUD', async (t) => {
   const backend = inMemoryBackend();
   const handler = createWebDavHandler({ prefix: '/dav', ...backend });
@@ -85,7 +127,11 @@ test('WebDAV 协议层支持目录与文件完整 CRUD', async (t) => {
   const options = await fetch(`${base}/dav/`, { method: 'OPTIONS' });
   assert.equal(options.status, 204);
   assert.match(options.headers.get('allow'), /PROPFIND/);
-  assert.equal(options.headers.get('dav'), '1, 2');
+  assert.equal(options.headers.get('dav'), '1');
+  assert.doesNotMatch(options.headers.get('allow'), /LOCK|UNLOCK/);
+  const unsupportedLock = await fetch(`${base}/dav/`, { method: 'LOCK' });
+  assert.equal(unsupportedLock.status, 405);
+  assert.doesNotMatch(unsupportedLock.headers.get('allow'), /LOCK|UNLOCK/);
 
   const root = await fetch(`${base}/dav/`, { method: 'PROPFIND', headers: { depth: '1' } });
   assert.equal(root.status, 207);
@@ -157,6 +203,70 @@ test('WebDAV MOVE 遵守 Overwrite: F', async (t) => {
     headers: { destination: `${base}/dav/b.txt`, overwrite: 'F' },
   });
   assert.equal(response.status, 412);
+});
+
+test('WebDAV COPY 到自身会拒绝且不删除源文件', async (t) => {
+  const backend = inMemoryBackend();
+  backend.entries.set('source', {
+    id: 'source',
+    parentId: '',
+    name: 'same.txt',
+    isDirectory: false,
+    content: Buffer.from('source-content'),
+    modifiedAt: Date.now(),
+  });
+  const handler = createWebDavHandler({ prefix: '/dav', ...backend });
+  const base = await startProtocolServer(handler, t);
+
+  const response = await fetch(`${base}/dav/same.txt`, {
+    method: 'COPY',
+    headers: { destination: `${base}/dav/same.txt` },
+  });
+
+  assert.equal(response.status, 403);
+  assert.equal(backend.entries.get('source')?.name, 'same.txt');
+  assert.equal(backend.entries.get('source')?.content.toString(), 'source-content');
+  assert.equal(backend.entries.size, 1);
+});
+
+test('WebDAV 覆盖 COPY 失败时会恢复原目标文件', async (t) => {
+  const backend = inMemoryBackend();
+  backend.entries.set('source', {
+    id: 'source',
+    parentId: '',
+    name: 'source.txt',
+    isDirectory: false,
+    content: Buffer.from('source-content'),
+    modifiedAt: Date.now(),
+  });
+  backend.entries.set('target', {
+    id: 'target',
+    parentId: '',
+    name: 'target.txt',
+    isDirectory: false,
+    content: Buffer.from('target-content'),
+    modifiedAt: Date.now(),
+  });
+  const handler = createWebDavHandler({
+    prefix: '/dav',
+    ...backend,
+    async copyEntry() {
+      throw new Error('模拟云端复制失败');
+    },
+  });
+  const base = await startProtocolServer(handler, t);
+
+  const response = await fetch(`${base}/dav/source.txt`, {
+    method: 'COPY',
+    headers: { destination: `${base}/dav/target.txt` },
+  });
+
+  assert.equal(response.status, 500);
+  assert.equal(backend.entries.get('source')?.name, 'source.txt');
+  assert.equal(backend.entries.get('source')?.content.toString(), 'source-content');
+  assert.equal(backend.entries.get('target')?.name, 'target.txt');
+  assert.equal(backend.entries.get('target')?.content.toString(), 'target-content');
+  assert.equal([...backend.entries.values()].some((entry) => entry.name.startsWith('.__gy_dav_backup_')), false);
 });
 
 test('Docker WebDAV 与管理端口和管理员凭据隔离', async (t) => {

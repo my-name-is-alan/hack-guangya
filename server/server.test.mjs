@@ -430,14 +430,18 @@ test('Web 扫码登录保存刷新令牌并在重启后自动续期', async () =
   const dataDir = path.join(root, 'data');
   await Promise.all([fsp.mkdir(watchRoot, { recursive: true }), fsp.mkdir(archiveRoot, { recursive: true })]);
 
+  const deviceRequests = [];
   const tokenRequests = [];
+  const accountHeadersSeen = [];
   let refreshCount = 0;
   const accountServer = http.createServer(async (request, response) => {
+    accountHeadersSeen.push(request.headers);
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
     response.writeHead(200, { 'content-type': 'application/json' });
     if (request.url === '/v1/auth/device/code') {
+      deviceRequests.push(body);
       response.end(JSON.stringify({ data: { device_code: 'device-1', user_code: 'ABCD', verification_uri_complete: 'https://example.test/authorize', expires_in: 120, interval: 1 } }));
       return;
     }
@@ -457,11 +461,15 @@ test('Web 扫码登录保存刷新令牌并在重启后自动续期', async () =
   await once(accountServer, 'listening');
   const accountPort = accountServer.address().port;
 
-  const apiServer = http.createServer((request, response) => {
+  const fileListRequests = [];
+  const apiServer = http.createServer(async (request, response) => {
     response.setHeader('content-type', 'application/json');
     if (request.url === '/userres/v1/file/get_file_list') {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      fileListRequests.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
       if (request.headers.authorization === 'Bearer refreshed-access-token-1') {
-        response.end(JSON.stringify({ code: 117, msg: 'token expired' }));
+        response.end(JSON.stringify({ code: 110, msg: 'token expired' }));
       } else {
         response.end(JSON.stringify({ code: 0, data: { list: [], total: 0 } }));
       }
@@ -499,6 +507,18 @@ test('Web 扫码登录保存刷新令牌并在重启后自动续期', async () =
     const deviceLogin = await fetch(`http://127.0.0.1:${firstPort}/api/auth/device/start`, { method: 'POST' }).then((value) => value.json());
     assert.equal(deviceLogin.device_code, 'device-1');
     assert.equal(deviceLogin.verification_uri_complete, 'https://example.test/authorize');
+    assert.deepEqual(deviceRequests, [{
+      scope: 'user',
+      client_id: 'aMe_SVSlkrbQXpUT',
+      meta: { scene: 'pc_login' },
+    }]);
+    assert.equal(accountHeadersSeen[0]['x-client-id'], 'aMe_SVSlkrbQXpUT');
+    assert.match(accountHeadersSeen[0]['x-device-id'], /^[a-f0-9]{32}$/);
+    assert.equal(accountHeadersSeen[0]['x-client-version'], '1.0.2');
+    assert.equal(accountHeadersSeen[0]['x-sdk-version'], '9.0.2');
+    assert.equal(accountHeadersSeen[0]['x-protocol-version'], '301');
+    assert.equal(accountHeadersSeen[0]['accept-language'], 'zh-CN');
+    assert.equal(accountHeadersSeen[0]['user-agent'], 'GuangyapanPC/1.0.2');
 
     const pollResponse = await fetch(`http://127.0.0.1:${firstPort}/api/auth/device/poll`, {
       method: 'POST',
@@ -508,6 +528,9 @@ test('Web 扫码登录保存刷新令牌并在重启后自动续期', async () =
     const pollPayload = await pollResponse.json();
     assert.equal(pollResponse.status, 200, JSON.stringify(pollPayload));
     assert.deepEqual(pollPayload, { authenticated: true });
+    const deviceTokenRequest = tokenRequests.find((request) => request.grant_type === 'urn:ietf:params:oauth:grant-type:device_code');
+    assert.equal(deviceTokenRequest.client_id, 'aMe_SVSlkrbQXpUT');
+    assert.ok(deviceTokenRequest.client_secret);
     assert.equal((await fetch(`http://127.0.0.1:${firstPort}/api/state`).then((value) => value.json())).logged_in, true);
     await stopServer(child);
     child = null;
@@ -517,8 +540,20 @@ test('Web 扫码登录保存刷新令牌并在重启后自动续期', async () =
     await waitUntil(() => tokenRequests.some((request) => request.grant_type === 'refresh_token'));
     assert.equal((await fetch(`http://127.0.0.1:${secondPort}/api/state`).then((value) => value.json())).logged_in, true);
     assert.equal(tokenRequests.some((request) => request.refresh_token === 'refresh-token-1'), true);
+    assert.ok(tokenRequests.filter((request) => request.grant_type === 'refresh_token').every((request) => request.client_secret));
     const filesResponse = await fetch(`http://127.0.0.1:${secondPort}/api/files`);
     assert.equal(filesResponse.status, 200, await filesResponse.text());
+    const foldersResponse = await fetch(`http://127.0.0.1:${secondPort}/api/files?page=3&parentId=folder-1&resType=2`);
+    assert.equal(foldersResponse.status, 200, await foldersResponse.text());
+    assert.deepEqual(fileListRequests.at(-1), {
+      page: 3,
+      pageSize: 100,
+      parentId: 'folder-1',
+      orderBy: 0,
+      sortType: 0,
+      needSubFolderStat: true,
+      resType: 2,
+    });
     assert.equal(refreshCount, 2);
   } finally {
     if (child) await stopServer(child);
@@ -526,6 +561,187 @@ test('Web 扫码登录保存刷新令牌并在重启后自动续期', async () =
       new Promise((resolve) => accountServer.close(resolve)),
       new Promise((resolve) => apiServer.close(resolve)),
     ]);
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Web 扫码轮询区分 authorization_pending、slow_down 和终止错误', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-device-poll-errors-test-'));
+  const watchRoot = path.join(root, 'watch');
+  const archiveRoot = path.join(root, 'archive');
+  const dataDir = path.join(root, 'data');
+  await Promise.all([fsp.mkdir(watchRoot), fsp.mkdir(archiveRoot)]);
+
+  let pollCount = 0;
+  const accountServer = http.createServer(async (request, response) => {
+    for await (const _ of request) {}
+    response.writeHead(400, { 'content-type': 'application/json' });
+    const payloads = [
+      { error: 'authorization_pending', error_description: 'authorization is pending' },
+      { error: 'slow_down', error_description: 'polling too quickly' },
+      { error: 'access_denied', error_description: 'the user denied access' },
+    ];
+    response.end(JSON.stringify(payloads[Math.min(pollCount, payloads.length - 1)]));
+    pollCount += 1;
+  });
+  accountServer.listen(0, '127.0.0.1');
+  await once(accountServer, 'listening');
+
+  const port = await freePort();
+  const child = spawn(process.execPath, [path.join(here, 'server.mjs')], {
+    cwd: path.resolve(here, '..'),
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DATA_DIR: dataDir,
+      GUANGYA_WATCH_ROOT: watchRoot,
+      GUANGYA_ARCHIVE_ROOT: archiveRoot,
+      GUANGYA_ACCOUNT_BASE: `http://127.0.0.1:${accountServer.address().port}`,
+      GUANGYA_TOKEN: '',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+
+  const poll = () => fetch(`http://127.0.0.1:${port}/api/auth/device/poll`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ device_code: 'device-errors' }),
+  });
+
+  try {
+    await waitUntil(() => output.includes('Guangya Web listening'));
+    const pendingResponse = await poll();
+    assert.equal(pendingResponse.status, 200);
+    assert.deepEqual(await pendingResponse.json(), {
+      pending: true,
+      slow_down: false,
+      message: '等待扫码确认',
+    });
+
+    const slowDownResponse = await poll();
+    assert.equal(slowDownResponse.status, 200);
+    assert.deepEqual(await slowDownResponse.json(), {
+      pending: true,
+      slow_down: true,
+      message: '请求过快，正在降低扫码轮询频率',
+    });
+
+    const deniedResponse = await poll();
+    assert.equal(deniedResponse.status, 400);
+    assert.deepEqual(await deniedResponse.json(), { error: 'the user denied access' });
+  } finally {
+    child.kill();
+    await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 2_000))]);
+    await new Promise((resolve) => accountServer.close(resolve));
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Web 普通删除与 WebDAV DELETE 都使用官方永久删除接口', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-delete-contract-test-'));
+  const watchRoot = path.join(root, 'watch');
+  const archiveRoot = path.join(root, 'archive');
+  const dataDir = path.join(root, 'data');
+  await Promise.all([fsp.mkdir(watchRoot), fsp.mkdir(archiveRoot)]);
+
+  const upstreamRequests = [];
+  let rejectFirstList = true;
+  const apiServer = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
+    upstreamRequests.push({ url: request.url, body });
+    response.setHeader('content-type', 'application/json');
+    if (request.url === '/userres/v1/file/get_file_list') {
+      if (rejectFirstList) {
+        rejectFirstList = false;
+        response.end(JSON.stringify({ msg: '参数错误', data: { list: [], total: 0 } }));
+      } else {
+        response.end(JSON.stringify({
+          code: 0,
+          data: {
+            list: [{ fileId: 'dav-file', fileName: 'dav.txt', resType: 1, fileSize: 3, utime: 1_722_500_000 }],
+            total: 1,
+          },
+        }));
+      }
+      return;
+    }
+    if (request.url === '/userres/v1/file/recycle_file') {
+      response.end(JSON.stringify({ code: 0, data: { taskId: 'recycle-task' } }));
+      return;
+    }
+    if (request.url === '/userres/v1/file/delete_file') {
+      response.end(JSON.stringify({ code: 0, data: { taskId: 'delete-task' } }));
+      return;
+    }
+    if (request.url === '/userres/v1/get_task_status') {
+      response.end(JSON.stringify({ code: 0, data: { status: 2, detail: { code: 0 } } }));
+      return;
+    }
+    response.statusCode = 404;
+    response.end(JSON.stringify({ code: 404, msg: 'not found' }));
+  });
+  apiServer.listen(0, '127.0.0.1');
+  await once(apiServer, 'listening');
+
+  const port = await freePort();
+  const webdavPort = await freePort();
+  const webdavPassword = 'webdav-password-long';
+  const child = spawn(process.execPath, [path.join(here, 'server.mjs')], {
+    cwd: path.resolve(here, '..'),
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DATA_DIR: dataDir,
+      GUANGYA_WATCH_ROOT: watchRoot,
+      GUANGYA_ARCHIVE_ROOT: archiveRoot,
+      GUANGYA_FILE_ROOTS: root,
+      GUANGYA_API_BASE: `http://127.0.0.1:${apiServer.address().port}`,
+      GUANGYA_TOKEN: 'test-token',
+      GUANGYA_ADMIN_PASSWORD: '',
+      GUANGYA_WEBDAV_PORT: String(webdavPort),
+      GUANGYA_WEBDAV_USERNAME: 'storage-user',
+      GUANGYA_WEBDAV_PASSWORD: webdavPassword,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+
+  try {
+    await waitUntil(() => output.includes('Guangya Web listening'));
+
+    const failedList = await fetch(`http://127.0.0.1:${port}/api/files`);
+    assert.equal(failedList.status, 400);
+    assert.deepEqual(await failedList.json(), { error: '参数错误' });
+
+    const deleteResponse = await fetch(`http://127.0.0.1:${port}/api/files/delete`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ file_ids: ['web-file'] }),
+    });
+    assert.equal(deleteResponse.status, 200, await deleteResponse.clone().text());
+
+    const authorization = `Basic ${Buffer.from(`storage-user:${webdavPassword}`).toString('base64')}`;
+    const webdavDelete = await fetch(`http://127.0.0.1:${webdavPort}/dav/dav.txt`, {
+      method: 'DELETE',
+      headers: { authorization },
+    });
+    assert.equal(webdavDelete.status, 204, await webdavDelete.clone().text());
+
+    const recycleCalls = upstreamRequests.filter((entry) => entry.url === '/userres/v1/file/recycle_file');
+    const deleteCalls = upstreamRequests.filter((entry) => entry.url === '/userres/v1/file/delete_file');
+    assert.deepEqual(recycleCalls.map((entry) => entry.body), []);
+    assert.deepEqual(deleteCalls.map((entry) => entry.body), [{ fileIds: ['web-file'] }, { fileIds: ['dav-file'] }]);
+  } finally {
+    child.kill();
+    await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 2_000))]);
+    await new Promise((resolve) => apiServer.close(resolve));
     await fsp.rm(root, { recursive: true, force: true });
   }
 });
@@ -555,7 +771,7 @@ test('浏览器文件落盘后立即返回并由后台队列完成云端上传',
     if (url.pathname === '/userres/v1/file/get_info_by_task_id') {
       taskRequested = true;
       taskRequestCount += 1;
-      if (taskRequestCount <= 2) response.end(JSON.stringify({ code: 999, msg: '文件上传中' }));
+      if (taskRequestCount <= 2) response.end(JSON.stringify({ code: 147, msg: '文件上传中' }));
       else response.end(JSON.stringify({ code: 0, data: { fileId: 'remote-1' } }));
       return;
     }
@@ -645,7 +861,7 @@ test('同一电视剧多季复用顶层文件夹分享并按静默窗口聚合�
     }
     if (request.url === '/userres/v1/file/get_info_by_task_id') {
       if (input.taskId === 'task-s02.mkv' && !confirmSecondEpisode) {
-        response.end(JSON.stringify({ code: 145, data: {} }));
+        response.end(JSON.stringify({ code: 147, msg: '文件上传中' }));
         return;
       }
       response.end(JSON.stringify({ code: 0, data: { fileId: `remote-${input.taskId}` } }));
@@ -861,7 +1077,7 @@ test('Web 接收分享可读取目录并转存到指定云盘目录', async () =
     }
     if (request.url === '/userres/v1/get_share_download_url') {
       assert.deepEqual(body, { fileId: 'file-1', accessToken: 'received-share-token' });
-      response.end(JSON.stringify({ data: { downloadUrl: 'https://download.example.test/file-1.mkv' } }));
+      response.end(JSON.stringify({ data: { signedURL: 'https://download.example.test/file-1.mkv' } }));
       return;
     }
     if (request.url === '/userres/v1/get_res_download_url') {
@@ -1138,7 +1354,7 @@ test('Web 重启后先恢复未确认任务，再重新上传期间变化的源�
     } else if (request.url === '/userres/v1/file/get_info_by_task_id') {
       assert.match(body.taskId, /^pending-task-\d+$/);
       confirmRequests += 1;
-      response.end(JSON.stringify(cloudConfirmed ? { code: 0, data: { fileId: `confirmed-${body.taskId}` } } : { code: 999, msg: '文件上传中' }));
+      response.end(JSON.stringify(cloudConfirmed ? { code: 0, data: { fileId: `confirmed-${body.taskId}` } } : { code: 147, msg: '文件上传中' }));
     } else { response.statusCode = 404; response.end(JSON.stringify({ code: 404, msg: 'not found' })); }
   });
   apiServer.listen(0, '127.0.0.1');
@@ -1197,6 +1413,102 @@ test('Web 重启后先恢复未确认任务，再重新上传期间变化的源�
     confirmedDb.close();
   } finally {
     if (running) await stopServer(running.child);
+    await new Promise((resolve) => apiServer.close(resolve));
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Web 源文件在云端确认前继续增长时不会提前完成，而是重新上传最新版本', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-growing-upload-test-'));
+  const watchRoot = path.join(root, 'watch');
+  const archiveRoot = path.join(root, 'archive');
+  const dataDir = path.join(root, 'data');
+  await Promise.all([fsp.mkdir(watchRoot), fsp.mkdir(archiveRoot)]);
+  const sourceFile = path.join(watchRoot, 'growing.txt');
+  await fsp.writeFile(sourceFile, 'partial');
+  let uploadTokenRequests = 0;
+  let firstConfirmRequests = 0;
+  let releaseFirstConfirmation;
+  const firstConfirmation = new Promise((resolve) => { releaseFirstConfirmation = resolve; });
+  const apiServer = http.createServer(async (request, response) => {
+    const body = JSON.parse(await new Promise((resolve) => {
+      let value = '';
+      request.on('data', (chunk) => { value += chunk; });
+      request.on('end', () => resolve(value || '{}'));
+    }));
+    response.setHeader('content-type', 'application/json');
+    if (request.url === '/userres/v1/get_res_center_token') {
+      uploadTokenRequests += 1;
+      response.end(JSON.stringify({ code: 156, data: { taskId: `growing-task-${uploadTokenRequests}` } }));
+    } else if (request.url === '/userres/v1/file/get_info_by_task_id') {
+      if (body.taskId === 'growing-task-1') {
+        firstConfirmRequests += 1;
+        await firstConfirmation;
+      }
+      response.end(JSON.stringify({ code: 0, data: { fileId: `confirmed-${body.taskId}` } }));
+    } else {
+      response.statusCode = 404;
+      response.end(JSON.stringify({ code: 404, msg: 'not found' }));
+    }
+  });
+  apiServer.listen(0, '127.0.0.1');
+  await once(apiServer, 'listening');
+  const port = await freePort();
+  const child = spawn(process.execPath, [path.join(here, 'server.mjs')], {
+    cwd: path.resolve(here, '..'),
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DATA_DIR: dataDir,
+      GUANGYA_WATCH_ROOT: watchRoot,
+      GUANGYA_ARCHIVE_ROOT: archiveRoot,
+      GUANGYA_FILE_ROOTS: root,
+      GUANGYA_API_BASE: `http://127.0.0.1:${apiServer.address().port}`,
+      GUANGYA_TOKEN: 'test-token',
+      GUANGYA_FILE_STABILITY_MS: '200',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+  try {
+    await waitUntil(() => output.includes('Guangya Web listening'));
+    const mappingResponse = await fetch(`http://127.0.0.1:${port}/api/mappings`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        local_path: watchRoot,
+        remote_path: '',
+        source_policy: 'keep',
+        scan_existing: true,
+        sync_types: ['txt'],
+      }),
+    });
+    assert.equal(mappingResponse.status, 200, await mappingResponse.text());
+    await waitUntil(() => uploadTokenRequests === 1 && firstConfirmRequests === 1, 10_000)
+      .catch((error) => { throw new Error(`${error.message}\n${output}`); });
+    await fsp.appendFile(sourceFile, ' file remainder');
+    releaseFirstConfirmation();
+    await waitUntil(async () => {
+      const current = await fetch(`http://127.0.0.1:${port}/api/state`).then((response) => response.json());
+      return uploadTokenRequests >= 2 && current.pending === 0 && current.active_uploads === 0;
+    }, 10_000).catch(async (error) => {
+      const current = await fetch(`http://127.0.0.1:${port}/api/state`).then((response) => response.json());
+      throw new Error(`${error.message}; uploadTokenRequests=${uploadTokenRequests}; state=${JSON.stringify(current)}\n${output}`);
+    });
+    const sourceStat = await fsp.stat(sourceFile);
+    const database = new DatabaseSync(path.join(dataDir, 'state.sqlite3'));
+    const uploaded = database.prepare('SELECT size, status, remote_file_id FROM uploaded_files').get();
+    database.close();
+    assert.equal(uploadTokenRequests, 2);
+    assert.equal(uploaded.size, sourceStat.size);
+    assert.equal(uploaded.status, 'cloud_confirmed');
+    assert.equal(uploaded.remote_file_id, 'confirmed-growing-task-2');
+  } finally {
+    releaseFirstConfirmation();
+    child.kill();
+    await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 2_000))]);
     await new Promise((resolve) => apiServer.close(resolve));
     await fsp.rm(root, { recursive: true, force: true });
   }

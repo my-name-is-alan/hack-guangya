@@ -24,8 +24,10 @@ import {
   FileTextOutlined,
   FileWordOutlined,
   FileZipOutlined,
+  FolderAddOutlined,
   FolderOpenOutlined,
   FolderOutlined,
+  InfoCircleOutlined,
   ReloadOutlined,
   ScissorOutlined,
   ShareAltOutlined,
@@ -34,6 +36,7 @@ import {
   VideoCameraOutlined,
 } from '@antdv-next/icons';
 import CompactFileBreadcrumb from '../components/files/CompactFileBreadcrumb.vue';
+import FileDetailsDrawer from '../components/files/FileDetailsDrawer.vue';
 import FileSelectionBar from '../components/files/FileSelectionBar.vue';
 import GcidImportStatus from '../components/files/GcidImportStatus.vue';
 import ShareResultDialog from '../components/shares/ShareResultDialog.vue';
@@ -82,6 +85,10 @@ const folderInput = ref(null);
 const focusedRowId = ref('');
 const fileClipboard = reactive({ mode: '', items: [] });
 const fileContextMenu = reactive({ open: false, x: 0, y: 0, record: null, keyboard: false });
+const newFolderInput = ref(null);
+const newFolderModal = reactive({ open: false, saving: false, name: '', error: '' });
+const detailsOpen = ref(false);
+const detailsRecord = ref(null);
 let selectionAnchorId = '';
 let gcidImportPollTimer = null;
 const uploadMenuItems = computed(() => [
@@ -92,6 +99,8 @@ const uploadMenuItems = computed(() => [
 const fileContextMenuItems = computed(() => {
   const record = fileContextMenu.record;
   if (!record) return [
+    { key: 'newFolder', icon: () => h(FolderAddOutlined), label: '新建文件夹' },
+    { type: 'divider' },
     {
       key: 'paste',
       icon: () => h(CheckOutlined),
@@ -113,6 +122,7 @@ const fileContextMenuItems = computed(() => {
     { key: 'copyTo', icon: () => h(CopyOutlined), label: '复制到…' },
     { key: 'moveTo', icon: () => h(SwapOutlined), label: '移动到…' },
     { type: 'divider' },
+    { key: 'details', icon: () => h(InfoCircleOutlined), label: '查看详情' },
     { key: 'rename', icon: () => h(EditOutlined), label: '重命名 (F2)' },
     { key: 'download', icon: () => h(DownloadOutlined), label: '下载' },
     { key: 'share', icon: () => h(ShareAltOutlined), label: '创建分享' },
@@ -349,6 +359,9 @@ function fileRowProps(record, rowIndex) {
       if (event.key === 'Enter' && isFolder(record)) {
         event.preventDefault();
         enterFolder(record);
+      } else if (event.key === 'Enter') {
+        event.preventDefault();
+        openFileDetails(record);
       }
       if (event.key === ' ') {
         event.preventDefault();
@@ -499,6 +512,7 @@ async function handleFileContextMenuClick({ key }) {
   const record = fileContextMenu.record;
   const targets = record ? contextTargetRecords() : [];
   closeFileContextMenu(false);
+  if (key === 'newFolder') return openNewFolderModal();
   if (key === 'paste') return pasteFileClipboard();
   if (key === 'refresh') return loadCloudFiles();
   if (!record) return;
@@ -506,6 +520,7 @@ async function handleFileContextMenuClick({ key }) {
   if (key === 'copy') return setFileClipboard('copy', targets);
   if (key === 'cut') return setFileClipboard('move', targets);
   if (key === 'download') return downloadCloudFiles(targets);
+  if (key === 'details') return openFileDetails(record);
   if (key === 'rename') return openRenameModal(targets);
   if (key === 'copyTo') return openFolderPicker('copy', targets);
   if (key === 'moveTo') return openFolderPicker('move', targets);
@@ -726,6 +741,72 @@ async function createCloudShare(records) {
   shareAccess.open = true;
 }
 
+function validateFolderName(value) {
+  const name = String(value || '').trim();
+  if (!name) return '请输入文件夹名称';
+  if (name === '.' || name === '..') return '文件夹名称不能是 . 或 ..';
+  if (name.length > 255) return '文件夹名称不能超过 255 个字符';
+  if (/[\\/:*?"<>|\u0000-\u001f]/.test(name)) return '名称不能包含 \\ / : * ? " < > | 或控制字符';
+  return '';
+}
+
+function openNewFolderModal() {
+  if (!appState.logged_in) return;
+  newFolderModal.name = '';
+  newFolderModal.error = '';
+  newFolderModal.open = true;
+}
+
+function focusNewFolderInput(open) {
+  if (!open) return;
+  void nextTick(() => newFolderInput.value?.focus?.({ cursor: 'all' }));
+}
+
+async function submitNewFolder() {
+  if (newFolderModal.saving) return;
+  newFolderModal.error = validateFolderName(newFolderModal.name);
+  if (newFolderModal.error) {
+    void nextTick(() => newFolderInput.value?.focus?.());
+    return;
+  }
+  const name = newFolderModal.name.trim();
+  newFolderModal.saving = true;
+  try {
+    const data = unwrapData(await bridge.invoke('create_folder', {
+      parent_id: currentFolderId.value,
+      dir_name: name,
+      fail_if_name_exist: true,
+    }));
+    newFolderModal.open = false;
+    await loadCloudFiles(0);
+    const createdId = pick(data, ['fileId', 'file_id', 'id'], '')
+      || fileId(files.value.find((item) => isFolder(item) && item.fileName === name));
+    if (createdId) {
+      selectedKeys.value = [createdId];
+      focusedRowId.value = String(createdId);
+      await restoreFocusedFileRow(createdId);
+    }
+    message.success(`文件夹「${name}」已创建`);
+  } catch (error) {
+    newFolderModal.error = errorText(error);
+    message.error(newFolderModal.error);
+    void nextTick(() => newFolderInput.value?.focus?.());
+  } finally {
+    newFolderModal.saving = false;
+  }
+}
+
+function openFileDetails(record) {
+  if (!record || !fileId(record)) return;
+  detailsRecord.value = record;
+  focusedRowId.value = String(fileId(record));
+  detailsOpen.value = true;
+}
+
+function handleDetailsClosed() {
+  void restoreFocusedFileRow(focusedRowId.value);
+}
+
 async function confirmCloudShare() {
   const targets = shareAccess.records;
   if (!targets.length || shareResult.creating) return;
@@ -828,7 +909,7 @@ async function deleteCloudFiles(records) {
         await bridge.invoke('delete_files', { file_ids: ids });
         selectedKeys.value = [];
         await loadCloudFiles();
-        message.success('已删除');
+        message.success('已移入回收站');
       } catch (error) {
         message.error(errorText(error));
       }
@@ -1370,6 +1451,7 @@ onBeforeUnmount(() => {
           <a-flex align="center" gap="small" class="file-primary-actions">
             <GcidImportStatus v-if="gcidImportRunning" v-model:open="gcidImport.detailsOpen" :status="gcidImport.status" :percent="gcidImportProgress" />
             <a-button v-if="isTauri && !gcidImportRunning" :disabled="!appState.logged_in" @click="openGcidImport"><template #icon><FileAddOutlined /></template>JSON 秒传</a-button>
+            <a-button :disabled="!appState.logged_in" @click="openNewFolderModal"><template #icon><FolderAddOutlined /></template>新建文件夹</a-button>
             <a-dropdown :menu="{ items: uploadMenuItems, onClick: handleUploadMenuClick }" :trigger="['click']">
               <a-button type="primary" :loading="uploading" :disabled="!appState.logged_in"><template #icon><UploadOutlined /></template>上传</a-button>
             </a-dropdown>
@@ -1412,6 +1494,34 @@ onBeforeUnmount(() => {
         <span class="file-context-anchor" :style="{ left: `${fileContextMenu.x}px`, top: `${fileContextMenu.y}px` }" />
       </a-dropdown>
     </teleport>
+
+    <FileDetailsDrawer v-model:open="detailsOpen" :record="detailsRecord" @closed="handleDetailsClosed" />
+
+    <a-modal
+      v-model:open="newFolderModal.open"
+      title="新建文件夹"
+      ok-text="创建"
+      cancel-text="取消"
+      :confirm-loading="newFolderModal.saving"
+      :ok-button-props="{ disabled: Boolean(newFolderModal.error) && !newFolderModal.name.trim() }"
+      @after-open-change="focusNewFolderInput"
+      @ok="submitNewFolder"
+    >
+      <a-form layout="vertical" @submit.prevent="submitNewFolder">
+        <a-form-item label="文件夹名称" :validate-status="newFolderModal.error ? 'error' : undefined" :help="newFolderModal.error || undefined">
+          <a-input
+            ref="newFolderInput"
+            v-model:value="newFolderModal.name"
+            aria-label="文件夹名称"
+            :maxlength="255"
+            show-count
+            placeholder="请输入文件夹名称"
+            @input="newFolderModal.error = validateFolderName(newFolderModal.name)"
+            @press-enter="submitNewFolder"
+          />
+        </a-form-item>
+      </a-form>
+    </a-modal>
 
     <a-modal
       v-model:open="shareAccess.open"
