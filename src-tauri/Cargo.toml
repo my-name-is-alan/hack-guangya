@@ -1,6 +1,6 @@
 [package]
 name = "guangya-folder-sync"
-version = "0.1.18"
+version = "0.1.19"
 description = "光鸭云盘文件夹同步 Tauri 客户端"
 authors = ["hack-guangya"]
 edition = "2021"
