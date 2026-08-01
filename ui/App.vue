@@ -95,6 +95,9 @@ const bridge = isTauri ? {
     if (command === 'list_received_share_files') return webRequest('/api/received-share/files', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'restore_received_share') return webRequest('/api/received-share/restore', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'get_received_share_download') return webRequest('/api/received-share/download', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'pause_download') throw new Error('Docker Web 下载由浏览器接管，请在浏览器下载面板中暂停');
+    if (command === 'resume_download') throw new Error('Docker Web 下载由浏览器接管，请在浏览器下载面板中继续');
+    if (command === 'cancel_download') throw new Error('Docker Web 下载由浏览器接管，请在浏览器下载面板中取消');
     if (command === 'create_offline_task') return webRequest('/api/offline', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'list_offline_tasks') return webRequest('/api/offline');
     if (command === 'save_share_link') return webRequest('/api/share-links', { method: 'POST', body: JSON.stringify(args) });
@@ -236,6 +239,7 @@ let unsubscribeDrag = null;
 let ruleId = 0;
 let refreshTimer = null;
 const localDownloadQueue = createConcurrencyQueue(() => appState.download_concurrency);
+const localDownloadJobs = new Map();
 
 const pageTitle = computed(() => pageMeta[activeView.value][0]);
 const pageSubtitle = computed(() => pageMeta[activeView.value][1]);
@@ -291,7 +295,8 @@ const cloudSharePagination = computed(() => ({
 }));
 const activeDownloadCount = computed(() => downloadTasks.value.filter((task) => ['preparing', 'downloading'].includes(task.status)).length);
 const queuedDownloadCount = computed(() => downloadTasks.value.filter((task) => task.status === 'queued').length);
-const finishedDownloadCount = computed(() => downloadTasks.value.filter((task) => ['completed', 'failed'].includes(task.status)).length);
+const pausedDownloadCount = computed(() => downloadTasks.value.filter((task) => task.status === 'paused').length);
+const finishedDownloadCount = computed(() => downloadTasks.value.filter((task) => ['completed', 'failed', 'cancelled'].includes(task.status)).length);
 const gcidImportRunning = computed(() => ['preparing', 'running'].includes(gcidImport.status?.status));
 const gcidImportProgress = computed(() => gcidImportPercent(gcidImport.status));
 const currentFolderPath = computed(() => currentPath.value.length ? `根目录 / ${currentPath.value.map((item) => item.name).join(' / ')}` : '根目录');
@@ -790,12 +795,14 @@ function updateDownloadTask(id, changes) {
 function downloadStatus(task) {
   if (task.status === 'completed') return ['已完成', 'success'];
   if (task.status === 'failed') return ['下载失败', 'error'];
+  if (task.status === 'cancelled') return ['已取消', 'default'];
+  if (task.status === 'paused') return ['已暂停', 'warning'];
   if (task.status === 'downloading') return ['下载中', 'processing'];
   if (task.status === 'queued') return ['等待下载', 'default'];
   return [task.packaged ? '云端打包中' : '准备下载', 'warning'];
 }
 function clearFinishedDownloads() {
-  downloadTasks.value = downloadTasks.value.filter((task) => !['completed', 'failed'].includes(task.status));
+  downloadTasks.value = downloadTasks.value.filter((task) => !['completed', 'failed', 'cancelled'].includes(task.status));
 }
 function clearFinishedUploads() {
   uploadProgress.value = Object.fromEntries(
@@ -814,22 +821,75 @@ async function chooseDownloadDirectory() {
   return bridge.selectFolder();
 }
 function queueLocalDownload(command, args, task) {
-  downloadTasks.value = [{ ...task, status: 'queued' }, ...downloadTasks.value];
+  downloadTasks.value = [{ ...task, status: 'queued', started: false }, ...downloadTasks.value];
   activeView.value = 'downloads';
-  localDownloadQueue.enqueue(async () => {
-    updateDownloadTask(task.id, { status: 'preparing' });
+  const run = async () => {
+    const current = downloadTasks.value.find((item) => item.id === task.id);
+    if (!current || current.status === 'cancelled') return;
+    updateDownloadTask(task.id, { status: 'preparing', started: true });
     try {
       const payload = await bridge.invoke(command, { ...args, destination_dir: task.destination, download_id: task.id });
       const data = unwrapData(payload);
       if (!data.file_path) throw new Error('客户端下载完成，但没有返回本地文件位置');
+      if (downloadTasks.value.find((item) => item.id === task.id)?.status === 'cancelled') return;
       updateDownloadTask(task.id, { status: 'completed', progress: 100, filePath: data.file_path, downloadedBytes: data.bytes || task.downloadedBytes });
       message.success(`下载完成：${data.file_path}`, 8);
     } catch (error) {
       const text = errorText(error);
-      updateDownloadTask(task.id, { status: 'failed', error: text });
-      message.error(text);
+      const current = downloadTasks.value.find((item) => item.id === task.id);
+      if (current?.status === 'cancelled' || text.includes('下载已取消')) {
+        updateDownloadTask(task.id, { status: 'cancelled', error: '', bytesPerSecond: 0 });
+      } else {
+        updateDownloadTask(task.id, { status: 'failed', error: text, bytesPerSecond: 0 });
+        message.error(text);
+      }
+    } finally {
+      const current = downloadTasks.value.find((item) => item.id === task.id);
+      if (!current || ['completed', 'failed', 'cancelled'].includes(current.status)) localDownloadJobs.delete(task.id);
     }
-  });
+  };
+  localDownloadJobs.set(task.id, run);
+  localDownloadQueue.enqueue(task.id, run);
+}
+
+async function pauseLocalDownload(task) {
+  if (!['queued', 'preparing', 'downloading'].includes(task.status)) return;
+  if (task.status === 'queued' && localDownloadQueue.cancel(task.id)) {
+    updateDownloadTask(task.id, { status: 'paused', started: false, bytesPerSecond: 0 });
+    return;
+  }
+  try {
+    await bridge.invoke('pause_download', { task_id: task.id });
+    updateDownloadTask(task.id, { status: 'paused', bytesPerSecond: 0 });
+  } catch (error) { message.error(errorText(error)); }
+}
+
+async function resumeLocalDownload(task) {
+  if (task.status !== 'paused') return;
+  if (!task.started) {
+    const run = localDownloadJobs.get(task.id);
+    if (!run) { message.error('下载任务已经失效，请重新添加'); return; }
+    updateDownloadTask(task.id, { status: 'queued', error: '' });
+    localDownloadQueue.enqueue(task.id, run);
+    return;
+  }
+  try {
+    await bridge.invoke('resume_download', { task_id: task.id });
+    updateDownloadTask(task.id, { status: 'downloading', error: '' });
+  } catch (error) { message.error(errorText(error)); }
+}
+
+async function cancelLocalDownload(task) {
+  if (['completed', 'failed', 'cancelled'].includes(task.status)) return;
+  if ((task.status === 'queued' && localDownloadQueue.cancel(task.id)) || (task.status === 'paused' && !task.started)) {
+    localDownloadJobs.delete(task.id);
+    updateDownloadTask(task.id, { status: 'cancelled', error: '', bytesPerSecond: 0 });
+    return;
+  }
+  try {
+    await bridge.invoke('cancel_download', { task_id: task.id });
+    updateDownloadTask(task.id, { status: 'cancelled', error: '', bytesPerSecond: 0 });
+  } catch (error) { message.error(errorText(error)); }
 }
 async function downloadCloudFiles(items = selectedFiles.value) {
   const targets = [...items];
@@ -840,7 +900,7 @@ async function downloadCloudFiles(items = selectedFiles.value) {
     const destination = await chooseDownloadDirectory();
     if (!destination) return;
     const fileName = localDownloadName(targets, packaged);
-    const task = { id: newDownloadId(), fileName, destination, source: '我的文件', packaged, status: 'preparing', progress: 0, downloadedBytes: 0, totalBytes: 0, bytesPerSecond: 0, filePath: '', error: '', createdAt: Date.now(), updatedAt: Date.now() };
+    const task = { id: newDownloadId(), fileName, destination, source: '我的文件', packaged, status: 'preparing', progress: 0, downloadedBytes: 0, totalBytes: 0, bytesPerSecond: 0, segmented: false, connections: 1, filePath: '', error: '', createdAt: Date.now(), updatedAt: Date.now() };
     queueLocalDownload('get_cloud_download', { file_ids: targets.map(fileId), packaged, file_name: fileName }, task);
     message.success('已加入下载管理');
   } catch (error) { message.error(errorText(error)); }
@@ -925,7 +985,7 @@ async function downloadReceivedShare() {
     const destination = await chooseDownloadDirectory();
     if (!destination) return;
     const fileName = localDownloadName(selectedItems, packaged);
-    const task = { id: newDownloadId(), fileName, destination, source: '接收分享', packaged, status: 'preparing', progress: 0, downloadedBytes: 0, totalBytes: 0, bytesPerSecond: 0, filePath: '', error: '', createdAt: Date.now(), updatedAt: Date.now() };
+    const task = { id: newDownloadId(), fileName, destination, source: '接收分享', packaged, status: 'preparing', progress: 0, downloadedBytes: 0, totalBytes: 0, bytesPerSecond: 0, segmented: false, connections: 1, filePath: '', error: '', createdAt: Date.now(), updatedAt: Date.now() };
     queueLocalDownload('get_received_share_download', {
       access_token: receivedShare.accessToken,
       file_ids: receivedShare.selected,
@@ -1527,13 +1587,19 @@ async function initialize() {
       if (payload.type === 'progress' || payload.type === 'file') updateUploadProgress(payload);
       if (payload.type === 'gcid-import' && payload.status) applyGcidImportStatus(payload.status);
       if (payload.type === 'download' && payload.download_id) {
+        const current = downloadTasks.value.find((task) => task.id === payload.download_id);
+        if (current?.status === 'cancelled' && payload.state !== 'cancelled') return;
+        if (current?.status === 'completed' && payload.state !== 'done') return;
+        if (current?.status === 'paused' && payload.state === 'downloading') return;
         const changes = {
-          status: payload.state === 'done' ? 'completed' : payload.state === 'error' ? 'failed' : 'downloading',
+          status: payload.state === 'done' ? 'completed' : payload.state === 'error' ? 'failed' : payload.state === 'paused' ? 'paused' : payload.state === 'cancelled' ? 'cancelled' : 'downloading',
         };
         if (payload.percent !== null && payload.percent !== undefined) changes.progress = Number(payload.percent);
         if (payload.downloaded_bytes !== null && payload.downloaded_bytes !== undefined) changes.downloadedBytes = Number(payload.downloaded_bytes);
         if (Number(payload.total_bytes || 0) > 0) changes.totalBytes = Number(payload.total_bytes);
         if (payload.bytes_per_second !== null && payload.bytes_per_second !== undefined) changes.bytesPerSecond = Number(payload.bytes_per_second);
+        if (payload.segmented !== null && payload.segmented !== undefined) changes.segmented = Boolean(payload.segmented);
+        if (payload.connections !== null && payload.connections !== undefined) changes.connections = Number(payload.connections);
         if (payload.file_path) changes.filePath = payload.file_path;
         if (payload.error) changes.error = payload.error;
         updateDownloadTask(payload.download_id, changes);
@@ -1802,6 +1868,7 @@ onBeforeUnmount(() => {
                   <a-space>
                     <a-tag v-if="activeDownloadCount" color="processing">{{ activeDownloadCount }} 个进行中</a-tag>
                     <a-tag v-if="queuedDownloadCount">{{ queuedDownloadCount }} 个等待</a-tag>
+                    <a-tag v-if="pausedDownloadCount" color="warning">{{ pausedDownloadCount }} 个暂停</a-tag>
                     <a-button size="small" :disabled="!finishedDownloadCount" @click="clearFinishedDownloads">清除已结束</a-button>
                   </a-space>
                 </template>
@@ -1816,16 +1883,26 @@ onBeforeUnmount(() => {
                       </div>
                       <div class="download-task-path"><FolderOutlined /><span :title="task.filePath || task.destination">{{ task.filePath || task.destination }}</span></div>
                       <div v-if="task.status === 'downloading' && !task.totalBytes" class="download-indeterminate" title="服务器未返回总大小，正在持续下载"><span></span></div>
-                      <a-progress v-else :percent="task.progress" :status="task.status === 'failed' ? 'exception' : task.status === 'completed' ? 'success' : 'normal'" size="small" />
+                      <a-progress v-else :percent="task.progress" :status="['failed', 'cancelled'].includes(task.status) ? 'exception' : task.status === 'completed' ? 'success' : 'normal'" size="small" />
                       <div class="download-task-meta">
                         <span v-if="task.status === 'queued'">等待下载并发空位（最多 {{ appState.download_concurrency }} 个）</span>
                         <span v-else-if="task.status === 'preparing'">{{ task.packaged ? '等待光鸭完成云端打包' : '正在获取下载地址' }}</span>
                         <span v-else-if="task.status === 'downloading'">{{ task.totalBytes ? `${formatSize(task.downloadedBytes)} / ${formatSize(task.totalBytes)}` : `已下载 ${formatSize(task.downloadedBytes)}` }}<template v-if="task.bytesPerSecond"> · {{ formatUploadSpeed(task.bytesPerSecond) }}</template></span>
+                        <span v-else-if="task.status === 'paused'">已暂停，当前进度 {{ formatSize(task.downloadedBytes) }}</span>
+                        <span v-else-if="task.status === 'cancelled'">已取消，临时分片已清理</span>
                         <span v-else>{{ formatSize(task.downloadedBytes) }}</span>
+                        <span v-if="task.segmented && task.connections > 1">{{ task.connections }} 路分片</span>
                         <span>{{ formatTime(task.createdAt) }}</span>
                       </div>
                       <a-alert v-if="task.error" type="error" :message="task.error" show-icon />
                     </div>
+                    <a-space class="download-task-actions" direction="vertical" size="small">
+                      <a-button v-if="['queued', 'preparing', 'downloading'].includes(task.status)" size="small" @click="pauseLocalDownload(task)"><PauseCircleOutlined />暂停</a-button>
+                      <a-button v-if="task.status === 'paused'" size="small" @click="resumeLocalDownload(task)"><PlayCircleOutlined />继续</a-button>
+                      <a-popconfirm v-if="['queued', 'preparing', 'downloading', 'paused'].includes(task.status)" title="确定取消这个下载任务？临时分片会被清理。" ok-text="取消下载" cancel-text="返回" @confirm="cancelLocalDownload(task)">
+                        <a-button size="small" danger><DeleteOutlined />取消</a-button>
+                      </a-popconfirm>
+                    </a-space>
                   </div>
                 </div>
               </a-card>

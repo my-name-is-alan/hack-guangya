@@ -61,3 +61,23 @@ test('download queue does not start queued work while paused and resumes on pump
   assert.equal(queue.active, 0);
   assert.equal(queue.pending, 0);
 });
+
+test('a queued download can be cancelled before it starts', async () => {
+  const gate = deferred();
+  const started = [];
+  const queue = createConcurrencyQueue(() => 1);
+  queue.enqueue('active', async () => {
+    started.push('active');
+    await gate.promise;
+  });
+  queue.enqueue('cancel-me', async () => { started.push('cancel-me'); });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(queue.cancel('cancel-me'), true);
+  assert.equal(queue.cancel('cancel-me'), false);
+  gate.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(started, ['active']);
+  assert.equal(queue.pending, 0);
+});

@@ -25,7 +25,8 @@ export interface DownloadTask {
   destination: string
   source: string
   packaged: boolean
-  status: 'queued' | 'preparing' | 'downloading' | 'completed' | 'failed'
+  status: 'queued' | 'preparing' | 'downloading' | 'paused' | 'completed' | 'failed' | 'cancelled'
+  started: boolean
   progress: number
   downloadedBytes: number
   totalBytes: number
@@ -44,11 +45,12 @@ export const useTransfersStore = defineStore('transfers', () => {
   const downloadConcurrency = ref(2)
   const downloadPaused = ref(false)
   const queue = createConcurrencyQueue(() => downloadConcurrency.value, () => downloadPaused.value)
+  const downloadJobs = new Map<string, () => Promise<void>>()
 
   const orderedUploads = computed(() => orderUploadProgress(Object.values(uploads.value)) as UploadTask[])
   const activeUploads = computed(() => orderedUploads.value.filter(item => !['done', 'error'].includes(item.state)))
   const uploadSpeed = computed(() => activeUploads.value.reduce((sum, item) => sum + Number(item.bytesPerSecond || 0), 0))
-  const activeDownloads = computed(() => downloads.value.filter(item => ['queued', 'preparing', 'downloading'].includes(item.status)))
+  const activeDownloads = computed(() => downloads.value.filter(item => ['queued', 'preparing', 'downloading', 'paused'].includes(item.status)))
   const overallPercent = computed(() => {
     const activeCount = activeUploads.value.length + activeDownloads.value.length
     if (!activeCount) return 0
@@ -75,8 +77,22 @@ export const useTransfersStore = defineStore('transfers', () => {
       }
     }
     if (payload?.type === 'download' && payload.download_id) {
-      updateDownload(String(payload.download_id), {
-        status: payload.state === 'done' ? 'completed' : payload.state === 'error' ? 'failed' : 'downloading',
+      const downloadId = String(payload.download_id)
+      const current = downloads.value.find(item => item.id === downloadId)
+      if (current?.status === 'cancelled' && payload.state !== 'cancelled') return
+      if (current?.status === 'completed' && payload.state !== 'done') return
+      if (current?.status === 'paused' && payload.state === 'downloading') return
+      const status = payload.state === 'done'
+        ? 'completed'
+        : payload.state === 'error'
+          ? 'failed'
+          : payload.state === 'paused'
+            ? 'paused'
+            : payload.state === 'cancelled'
+              ? 'cancelled'
+              : 'downloading'
+      updateDownload(downloadId, {
+        status,
         progress: payload.percent == null ? undefined : Number(payload.percent),
         downloadedBytes: payload.downloaded_bytes == null ? undefined : Number(payload.downloaded_bytes),
         totalBytes: payload.total_bytes == null ? undefined : Number(payload.total_bytes),
@@ -104,8 +120,10 @@ export const useTransfersStore = defineStore('transfers', () => {
 
   function enqueueLocalDownload(command: string, args: Record<string, unknown>, task: DownloadTask) {
     downloads.value = [task, ...downloads.value]
-    queue.enqueue(async () => {
-      updateDownload(task.id, { status: 'preparing' })
+    const run = async () => {
+      const current = downloads.value.find(item => item.id === task.id)
+      if (!current || current.status === 'cancelled') return
+      updateDownload(task.id, { status: 'preparing', started: true })
       try {
         const data = unwrapData(await bridge.invoke(command, {
           ...args,
@@ -113,6 +131,8 @@ export const useTransfersStore = defineStore('transfers', () => {
           destination_dir: task.destination,
           download_id: task.id,
         }))
+        const latest = downloads.value.find(item => item.id === task.id)
+        if (latest?.status === 'cancelled') return
         updateDownload(task.id, {
           status: 'completed',
           progress: 100,
@@ -123,10 +143,62 @@ export const useTransfersStore = defineStore('transfers', () => {
         message.success(`下载完成：${data.file_path || task.fileName}`)
       }
       catch (error) {
-        updateDownload(task.id, { status: 'failed', error: errorText(error), bytesPerSecond: 0 })
-        message.error(errorText(error))
+        const text = errorText(error)
+        const latest = downloads.value.find(item => item.id === task.id)
+        if (latest?.status === 'cancelled' || text.includes('下载已取消')) {
+          updateDownload(task.id, { status: 'cancelled', error: '', bytesPerSecond: 0 })
+        }
+        else {
+          updateDownload(task.id, { status: 'failed', error: text, bytesPerSecond: 0 })
+          message.error(text)
+        }
       }
-    })
+      finally {
+        const latest = downloads.value.find(item => item.id === task.id)
+        if (!latest || ['completed', 'failed', 'cancelled'].includes(latest.status)) {
+          downloadJobs.delete(task.id)
+        }
+      }
+    }
+    downloadJobs.set(task.id, run)
+    queue.enqueue(task.id, run)
+  }
+
+  async function pauseDownload(id: string) {
+    const task = downloads.value.find(item => item.id === id)
+    if (!task || !['queued', 'preparing', 'downloading'].includes(task.status)) return
+    if (task.status === 'queued' && queue.cancel(id)) {
+      updateDownload(id, { status: 'paused', started: false, bytesPerSecond: 0 })
+      return
+    }
+    await bridge.invoke('pause_download', { task_id: id })
+    updateDownload(id, { status: 'paused', bytesPerSecond: 0 })
+  }
+
+  async function resumeDownload(id: string) {
+    const task = downloads.value.find(item => item.id === id)
+    if (!task || task.status !== 'paused') return
+    if (!task.started) {
+      const run = downloadJobs.get(id)
+      if (!run) throw new Error('下载任务已经失效，请重新添加')
+      updateDownload(id, { status: 'queued', error: '' })
+      queue.enqueue(id, run)
+      return
+    }
+    await bridge.invoke('resume_download', { task_id: id })
+    updateDownload(id, { status: 'downloading', error: '' })
+  }
+
+  async function cancelDownload(id: string) {
+    const task = downloads.value.find(item => item.id === id)
+    if (!task || ['completed', 'failed', 'cancelled'].includes(task.status)) return
+    if ((task.status === 'queued' && queue.cancel(id)) || (task.status === 'paused' && !task.started)) {
+      downloadJobs.delete(id)
+      updateDownload(id, { status: 'cancelled', bytesPerSecond: 0, error: '' })
+      return
+    }
+    await bridge.invoke('cancel_download', { task_id: id })
+    updateDownload(id, { status: 'cancelled', bytesPerSecond: 0, error: '' })
   }
 
   async function downloadRecords(records: any[]) {
@@ -150,7 +222,7 @@ export const useTransfersStore = defineStore('transfers', () => {
     const now = Date.now()
     const task: DownloadTask = {
       id: newDownloadId(), fileName, destination, source: '我的文件', packaged,
-      status: 'queued', progress: 0, downloadedBytes: 0, totalBytes: 0,
+      status: 'queued', started: false, progress: 0, downloadedBytes: 0, totalBytes: 0,
       bytesPerSecond: 0, segmented: false, connections: 1,
       filePath: '', error: '', createdAt: now, updatedAt: now,
     }
@@ -183,7 +255,7 @@ export const useTransfersStore = defineStore('transfers', () => {
     const now = Date.now()
     const task: DownloadTask = {
       id: newDownloadId(), fileName, destination: selected, source: '接收分享', packaged,
-      status: 'queued', progress: 0, downloadedBytes: 0, totalBytes: 0,
+      status: 'queued', started: false, progress: 0, downloadedBytes: 0, totalBytes: 0,
       bytesPerSecond: 0, segmented: false, connections: 1,
       filePath: '', error: '', createdAt: now, updatedAt: now,
     }
@@ -200,7 +272,7 @@ export const useTransfersStore = defineStore('transfers', () => {
       uploads.value = Object.fromEntries(Object.entries(uploads.value).filter(([, item]) => !['done', 'error'].includes(item.state)))
     }
     if (kind !== 'upload') {
-      downloads.value = downloads.value.filter(item => !['completed', 'failed'].includes(item.status))
+      downloads.value = downloads.value.filter(item => !['completed', 'failed', 'cancelled'].includes(item.status))
     }
   }
 
@@ -222,6 +294,9 @@ export const useTransfersStore = defineStore('transfers', () => {
     handleSyncEvent,
     downloadRecords,
     downloadReceivedShare,
+    pauseDownload,
+    resumeDownload,
+    cancelDownload,
     updateDownload,
     setPaused,
     clearFinished,

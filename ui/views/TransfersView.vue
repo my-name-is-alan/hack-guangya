@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, shallowRef, watch } from 'vue'
+import { message } from 'antdv-next'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
 import {
@@ -13,7 +14,7 @@ import {
   PlayCircleOutlined,
 } from '@antdv-next/icons'
 import { bridge } from '../bridge.js'
-import { formatSize } from '../formatters.js'
+import { errorText, formatSize } from '../formatters.js'
 import { useSessionStore } from '../stores/session'
 import { useTransfersStore } from '../stores/transfers'
 import { formatUploadSpeed, uploadProgressStatus } from '../uploadProgress.js'
@@ -30,9 +31,24 @@ const uploadCounts = computed(() => ({
   finished: orderedUploads.value.filter(item => ['done', 'error'].includes(item.state)).length,
 }))
 const downloadCounts = computed(() => ({
-  active: downloads.value.filter(item => ['queued', 'preparing', 'downloading'].includes(item.status)).length,
-  finished: downloads.value.filter(item => ['completed', 'failed'].includes(item.status)).length,
+  active: downloads.value.filter(item => ['queued', 'preparing', 'downloading', 'paused'].includes(item.status)).length,
+  finished: downloads.value.filter(item => ['completed', 'failed', 'cancelled'].includes(item.status)).length,
 }))
+
+async function pauseDownload(id: string) {
+  try { await transfers.pauseDownload(id) }
+  catch (error) { message.error(errorText(error)) }
+}
+
+async function resumeDownload(id: string) {
+  try { await transfers.resumeDownload(id) }
+  catch (error) { message.error(errorText(error)) }
+}
+
+async function cancelDownload(id: string) {
+  try { await transfers.cancelDownload(id) }
+  catch (error) { message.error(errorText(error)) }
+}
 
 async function toggleQueue() {
   await bridge.invoke(session.state.paused ? 'resume_queue' : 'pause_queue')
@@ -85,7 +101,7 @@ watch(tab, value => void router.replace({ query: { ...route.query, tab: value } 
             <span class="transfer-icon download"><CloudDownloadOutlined /></span>
             <div class="transfer-main">
               <div class="transfer-name"><strong :title="item.fileName">{{ item.fileName }}</strong><span>{{ item.filePath || item.destination }}</span></div>
-              <a-progress :percent="Math.round(item.progress || 0)" :status="item.status === 'failed' ? 'exception' : item.status === 'completed' ? 'success' : 'normal'" :show-info="false" size="small" />
+              <a-progress :percent="Math.round(item.progress || 0)" :status="['failed', 'cancelled'].includes(item.status) ? 'exception' : item.status === 'completed' ? 'success' : 'normal'" :show-info="false" size="small" />
             </div>
             <span class="transfer-speed">
               {{ item.bytesPerSecond ? formatUploadSpeed(item.bytesPerSecond) : item.totalBytes ? `${formatSize(item.downloadedBytes)} / ${formatSize(item.totalBytes)}` : '' }}
@@ -93,7 +109,16 @@ watch(tab, value => void router.replace({ query: { ...route.query, tab: value } 
             </span>
             <a-tag v-if="item.status === 'completed'" color="success"><CheckCircleOutlined /> 完成</a-tag>
             <a-tag v-else-if="item.status === 'failed'" color="error"><CloseCircleOutlined /> 失败</a-tag>
+            <a-tag v-else-if="item.status === 'cancelled'"><CloseCircleOutlined /> 已取消</a-tag>
+            <a-tag v-else-if="item.status === 'paused'" color="warning"><PauseCircleOutlined /> 已暂停</a-tag>
             <a-tag v-else color="processing"><LoadingOutlined spin /> {{ Math.round(item.progress || 0) }}%</a-tag>
+            <a-space class="transfer-actions" size="small">
+              <a-button v-if="['queued', 'preparing', 'downloading'].includes(item.status)" size="small" title="暂停下载" @click="pauseDownload(item.id)"><PauseCircleOutlined /></a-button>
+              <a-button v-if="item.status === 'paused'" size="small" title="继续下载" @click="resumeDownload(item.id)"><PlayCircleOutlined /></a-button>
+              <a-popconfirm v-if="['queued', 'preparing', 'downloading', 'paused'].includes(item.status)" title="确定取消这个下载任务？临时分片会被清理。" ok-text="取消下载" cancel-text="返回" @confirm="cancelDownload(item.id)">
+                <a-button size="small" danger title="取消下载"><CloseCircleOutlined /></a-button>
+              </a-popconfirm>
+            </a-space>
           </div>
         </div>
       </a-tab-pane>
@@ -103,7 +128,7 @@ watch(tab, value => void router.replace({ query: { ...route.query, tab: value } 
 
 <style scoped>
 .transfer-list { display: grid; }
-.transfer-row { display: grid; grid-template-columns:38px minmax(260px,1fr) 150px 100px; align-items: center; gap: 12px; min-height: 64px; padding: 8px 4px; border-bottom: 1px solid var(--line, #e7e8eb); }
+.transfer-row { display: grid; grid-template-columns:38px minmax(260px,1fr) 150px 100px auto; align-items: center; gap: 12px; min-height: 64px; padding: 8px 4px; border-bottom: 1px solid var(--line, #e7e8eb); }
 .transfer-icon { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 9px; }
 .transfer-icon.upload { color: var(--primary-strong, #237804); background: var(--primary-soft, #f1f8ed); }
 .transfer-icon.download { color: #1769aa; background: #edf5ff; }
@@ -112,4 +137,5 @@ watch(tab, value => void router.replace({ query: { ...route.query, tab: value } 
 .transfer-name strong, .transfer-name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .transfer-name span, .transfer-speed { color: var(--text-3, #98a2b3); font-size: 11px; }
 .transfer-speed { text-align: right; }
+.transfer-actions { justify-self: end; }
 </style>

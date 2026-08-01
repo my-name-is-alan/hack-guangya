@@ -266,7 +266,8 @@ button, input, textarea { color: inherit; font: inherit; }
 .download-manager-card { min-height: 320px; }
 .transfer-download-card { margin-top: 16px; }
 .download-task-list { display: grid; gap: 12px; }
-.download-task-item { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 13px; padding: 15px; border: 1px solid #e7ecf3; border-radius: 12px; background: #fafcff; }
+.download-task-item { display: grid; grid-template-columns: 42px minmax(0, 1fr) auto; gap: 13px; padding: 15px; border: 1px solid #e7ecf3; border-radius: 12px; background: #fafcff; }
+.download-task-actions { align-self: center; }
 .download-task-icon { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 11px; color: #1677ff; background: #eaf3ff; font-size: 18px; }
 .download-task-content { min-width: 0; }
 .download-task-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }

@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::{self, OpenOptions},
+    future::Future,
     io::{self, SeekFrom},
     path::{Path, PathBuf},
     sync::{
@@ -32,7 +33,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
-        Semaphore,
+        watch, Semaphore,
     },
     time::{sleep, Duration, Instant},
 };
@@ -127,6 +128,31 @@ const CLOUD_FILE_TYPE_AUDIO: u8 = 3;
 const CLOUD_FILE_TYPE_DOCUMENT: u8 = 4;
 const CLOUD_FILE_TYPE_ARCHIVE: u8 = 5;
 type SharedState = Arc<Mutex<RuntimeState>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DownloadControlState {
+    Running,
+    Paused,
+    Cancelled,
+}
+
+#[derive(Clone, Default)]
+struct DownloadRegistry {
+    tasks: Arc<Mutex<HashMap<String, watch::Sender<DownloadControlState>>>>,
+}
+
+struct DownloadRegistration {
+    registry: DownloadRegistry,
+    download_id: String,
+}
+
+impl Drop for DownloadRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut tasks) = self.registry.tasks.lock() {
+            tasks.remove(&self.download_id);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Mapping {
@@ -8280,9 +8306,52 @@ async fn restore_received_share(
 }
 
 #[tauri::command]
+fn pause_download(
+    app: tauri::AppHandle,
+    downloads: tauri::State<'_, DownloadRegistry>,
+    task_id: String,
+) -> Result<Value, String> {
+    set_download_control(downloads.inner(), &task_id, DownloadControlState::Paused)?;
+    emit(
+        &app,
+        json!({ "type": "download", "download_id": task_id, "state": "paused", "bytes_per_second": 0 }),
+    );
+    Ok(json!({ "task_id": task_id, "state": "paused" }))
+}
+
+#[tauri::command]
+fn resume_download(
+    app: tauri::AppHandle,
+    downloads: tauri::State<'_, DownloadRegistry>,
+    task_id: String,
+) -> Result<Value, String> {
+    set_download_control(downloads.inner(), &task_id, DownloadControlState::Running)?;
+    emit(
+        &app,
+        json!({ "type": "download", "download_id": task_id, "state": "downloading", "bytes_per_second": 0 }),
+    );
+    Ok(json!({ "task_id": task_id, "state": "downloading" }))
+}
+
+#[tauri::command]
+fn cancel_download(
+    app: tauri::AppHandle,
+    downloads: tauri::State<'_, DownloadRegistry>,
+    task_id: String,
+) -> Result<Value, String> {
+    set_download_control(downloads.inner(), &task_id, DownloadControlState::Cancelled)?;
+    emit(
+        &app,
+        json!({ "type": "download", "download_id": task_id, "state": "cancelled", "bytes_per_second": 0 }),
+    );
+    Ok(json!({ "task_id": task_id, "state": "cancelled" }))
+}
+
+#[tauri::command]
 async fn get_received_share_download(
     app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
+    downloads: tauri::State<'_, DownloadRegistry>,
     access_token: String,
     file_ids: Vec<String>,
     packaged: bool,
@@ -8297,8 +8366,11 @@ async fn get_received_share_download(
     if !packaged && file_ids.len() != 1 {
         return Err("单文件下载只能选择一个文件".into());
     }
+    let (mut download_control, _download_registration) =
+        begin_download_task(downloads.inner(), &download_id)?;
     let download_task_concurrency = current_download_task_concurrency(state.inner())?;
     let (token, device_id) = auth_context(&state)?;
+    wait_download_running(&mut download_control).await?;
     if !packaged {
         let response = api_post(
             &token,
@@ -8308,6 +8380,7 @@ async fn get_received_share_download(
             &[205, 206, 207, 504],
         )
         .await?;
+        wait_download_running(&mut download_control).await?;
         if response.code != 0 {
             return Err(format!(
                 "当前分享下载受限，请到光鸭官方页面处理（业务码 {}：{}）",
@@ -8331,6 +8404,7 @@ async fn get_received_share_download(
             &destination_dir,
             &download_id,
             download_task_concurrency,
+            download_control,
         )
         .await;
     }
@@ -8342,6 +8416,7 @@ async fn get_received_share_download(
         &[205, 206, 207, 504],
     )
     .await?;
+    wait_download_running(&mut download_control).await?;
     if response.code != 0 {
         return Err(format!(
             "当前批量下载受限，请到光鸭官方页面处理（业务码 {}：{}）",
@@ -8357,6 +8432,7 @@ async fn get_received_share_download(
         .ok_or_else(|| "光鸭没有返回压缩任务 ID".to_string())?
         .to_string();
     for _ in 0..600 {
+        wait_download_running(&mut download_control).await?;
         let result = api_post(
             &token,
             &device_id,
@@ -8365,6 +8441,7 @@ async fn get_received_share_download(
             &[],
         )
         .await?;
+        wait_download_running(&mut download_control).await?;
         let data = result.data.unwrap_or_else(|| json!({}));
         if let Some(download_url) = data
             .get("signedURL")
@@ -8379,11 +8456,18 @@ async fn get_received_share_download(
                 &destination_dir,
                 &download_id,
                 download_task_concurrency,
+                download_control,
             )
             .await;
         }
         ensure_packaging_task_active(&data)?;
-        sleep(Duration::from_secs(1)).await;
+        await_download_operation(
+            &mut download_control,
+            sleep(Duration::from_secs(1)),
+            Duration::from_secs(2),
+            || "等待打包任务响应超时".to_string(),
+        )
+        .await?;
     }
     Err("光鸭打包超过 10 分钟仍未完成，请稍后重试".into())
 }
@@ -8392,6 +8476,7 @@ async fn get_received_share_download(
 async fn get_cloud_download(
     app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
+    downloads: tauri::State<'_, DownloadRegistry>,
     file_ids: Vec<String>,
     packaged: bool,
     file_name: String,
@@ -8402,8 +8487,11 @@ async fn get_cloud_download(
     if !packaged && file_ids.len() != 1 {
         return Err("单文件下载只能选择一个文件".into());
     }
+    let (mut download_control, _download_registration) =
+        begin_download_task(downloads.inner(), &download_id)?;
     let download_task_concurrency = current_download_task_concurrency(state.inner())?;
     let (token, device_id) = auth_context(&state)?;
+    wait_download_running(&mut download_control).await?;
     if !packaged {
         let response = api_post(
             &token,
@@ -8413,6 +8501,7 @@ async fn get_cloud_download(
             &[],
         )
         .await?;
+        wait_download_running(&mut download_control).await?;
         let data = response.data.unwrap_or_else(|| json!({}));
         let download_url = data
             .get("signedURL")
@@ -8428,6 +8517,7 @@ async fn get_cloud_download(
             &destination_dir,
             &download_id,
             download_task_concurrency,
+            download_control,
         )
         .await;
     }
@@ -8439,6 +8529,7 @@ async fn get_cloud_download(
         &[205, 206, 207, 504],
     )
     .await?;
+    wait_download_running(&mut download_control).await?;
     if response.code != 0 {
         return Err(format!(
             "当前批量下载受限（业务码 {}：{}）",
@@ -8454,6 +8545,7 @@ async fn get_cloud_download(
         .ok_or_else(|| "光鸭没有返回压缩任务 ID".to_string())?
         .to_string();
     for _ in 0..600 {
+        wait_download_running(&mut download_control).await?;
         let result = api_post(
             &token,
             &device_id,
@@ -8462,6 +8554,7 @@ async fn get_cloud_download(
             &[],
         )
         .await?;
+        wait_download_running(&mut download_control).await?;
         let data = result.data.unwrap_or_else(|| json!({}));
         if let Some(download_url) = data
             .get("signedURL")
@@ -8476,11 +8569,18 @@ async fn get_cloud_download(
                 &destination_dir,
                 &download_id,
                 download_task_concurrency,
+                download_control,
             )
             .await;
         }
         ensure_packaging_task_active(&data)?;
-        sleep(Duration::from_secs(1)).await;
+        await_download_operation(
+            &mut download_control,
+            sleep(Duration::from_secs(1)),
+            Duration::from_secs(2),
+            || "等待打包任务响应超时".to_string(),
+        )
+        .await?;
     }
     Err("光鸭打包超过 10 分钟仍未完成，请稍后重试".into())
 }
@@ -8612,6 +8712,95 @@ fn configured_download_connections(download_task_concurrency: usize) -> usize {
     (DOWNLOAD_MAX_HTTP_CONNECTIONS / task_concurrency).clamp(2, DOWNLOAD_MAX_CONNECTIONS_PER_FILE)
 }
 
+fn begin_download_task(
+    registry: &DownloadRegistry,
+    download_id: &str,
+) -> Result<(watch::Receiver<DownloadControlState>, DownloadRegistration), String> {
+    let download_id = download_id.trim();
+    if download_id.is_empty() {
+        return Err("下载任务 ID 为空".into());
+    }
+    if download_id.len() > MAX_API_ID_LENGTH {
+        return Err("下载任务 ID 过长".into());
+    }
+    let mut tasks = registry
+        .tasks
+        .lock()
+        .map_err(|_| "下载任务控制器不可用".to_string())?;
+    if tasks.contains_key(download_id) {
+        return Err("同一个下载任务正在运行".into());
+    }
+    let (sender, receiver) = watch::channel(DownloadControlState::Running);
+    tasks.insert(download_id.to_string(), sender);
+    Ok((
+        receiver,
+        DownloadRegistration {
+            registry: registry.clone(),
+            download_id: download_id.to_string(),
+        },
+    ))
+}
+
+fn set_download_control(
+    registry: &DownloadRegistry,
+    download_id: &str,
+    state: DownloadControlState,
+) -> Result<(), String> {
+    let sender = registry
+        .tasks
+        .lock()
+        .map_err(|_| "下载任务控制器不可用".to_string())?
+        .get(download_id.trim())
+        .cloned()
+        .ok_or_else(|| "下载任务不存在或已经结束".to_string())?;
+    if *sender.borrow() == DownloadControlState::Cancelled {
+        return Err("下载任务已经取消".into());
+    }
+    sender.send_replace(state);
+    Ok(())
+}
+
+fn download_is_cancelled(control: &watch::Receiver<DownloadControlState>) -> bool {
+    *control.borrow() == DownloadControlState::Cancelled
+}
+
+async fn wait_download_running(
+    control: &mut watch::Receiver<DownloadControlState>,
+) -> Result<(), String> {
+    loop {
+        let state = *control.borrow_and_update();
+        match state {
+            DownloadControlState::Running => return Ok(()),
+            DownloadControlState::Cancelled => return Err("下载已取消".into()),
+            DownloadControlState::Paused => control
+                .changed()
+                .await
+                .map_err(|_| "下载任务控制器已经关闭".to_string())?,
+        }
+    }
+}
+
+async fn await_download_operation<T>(
+    control: &mut watch::Receiver<DownloadControlState>,
+    operation: impl Future<Output = T>,
+    timeout: Duration,
+    timeout_error: impl Fn() -> String,
+) -> Result<T, String> {
+    tokio::pin!(operation);
+    loop {
+        wait_download_running(control).await?;
+        let idle_timeout = sleep(timeout);
+        tokio::pin!(idle_timeout);
+        tokio::select! {
+            result = &mut operation => return Ok(result),
+            _ = &mut idle_timeout => return Err(timeout_error()),
+            changed = control.changed() => {
+                changed.map_err(|_| "下载任务控制器已经关闭".to_string())?;
+            }
+        }
+    }
+}
+
 fn download_http_semaphore() -> Arc<Semaphore> {
     static LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
     LIMITER
@@ -8645,25 +8834,34 @@ fn download_byte_ranges(total_bytes: u64, connections: usize) -> Vec<DownloadByt
     ranges
 }
 
-async fn probe_download(client: &reqwest::Client, download_url: &str) -> (Option<u64>, bool) {
+async fn probe_download(
+    client: &reqwest::Client,
+    download_url: &str,
+    control: &mut watch::Receiver<DownloadControlState>,
+) -> Result<(Option<u64>, bool), String> {
+    wait_download_running(control).await?;
     let Ok(_permit) = download_http_semaphore().acquire_owned().await else {
-        return (None, false);
+        return Ok((None, false));
     };
-    let response = match tokio::time::timeout(
-        Duration::from_secs(DOWNLOAD_PROBE_TIMEOUT_SECS),
+    let response = match await_download_operation(
+        control,
         client.get(download_url).header(RANGE, "bytes=0-0").send(),
+        Duration::from_secs(DOWNLOAD_PROBE_TIMEOUT_SECS),
+        || "探测下载分片能力超时".to_string(),
     )
     .await
     {
         Ok(Ok(response)) => response,
-        _ => return (None, false),
+        Ok(Err(_)) => return Ok((None, false)),
+        Err(error) if download_is_cancelled(control) => return Err(error),
+        Err(_) => return Ok((None, false)),
     };
     if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
         if let Some(range) = response_content_range(&response) {
-            return (Some(range.total), range.start == 0 && range.end == 0);
+            return Ok((Some(range.total), range.start == 0 && range.end == 0));
         }
     }
-    (response_total_bytes(&response), false)
+    Ok((response_total_bytes(&response), false))
 }
 
 async fn download_range_to_file(
@@ -8673,7 +8871,9 @@ async fn download_range_to_file(
     range: DownloadByteRange,
     total_bytes: u64,
     progress: &AtomicU64,
+    mut control: watch::Receiver<DownloadControlState>,
 ) -> Result<(), String> {
+    wait_download_running(&mut control).await?;
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .open(partial)
@@ -8685,6 +8885,7 @@ async fn download_range_to_file(
     let mut cursor = range.start;
     let mut last_error = "分片数据提前结束".to_string();
     for attempt in 1..=DOWNLOAD_RANGE_ATTEMPTS {
+        wait_download_running(&mut control).await?;
         if cursor > range.end {
             break;
         }
@@ -8693,12 +8894,19 @@ async fn download_range_to_file(
             .await
             .map_err(|_| "下载连接调度器已关闭".to_string())?;
         let requested_range = format!("bytes={cursor}-{}", range.end);
-        let mut response = match tokio::time::timeout(
-            Duration::from_secs(DOWNLOAD_READ_IDLE_TIMEOUT_SECS),
+        let mut response = match await_download_operation(
+            &mut control,
             client
                 .get(download_url)
                 .header(RANGE, requested_range)
                 .send(),
+            Duration::from_secs(DOWNLOAD_READ_IDLE_TIMEOUT_SECS),
+            || {
+                format!(
+                    "连接分片服务器超过 {} 秒无响应",
+                    DOWNLOAD_READ_IDLE_TIMEOUT_SECS
+                )
+            },
         )
         .await
         {
@@ -8707,11 +8915,11 @@ async fn download_range_to_file(
                 last_error = format!("连接分片服务器失败：{error}");
                 continue;
             }
-            Err(_) => {
-                last_error = format!(
-                    "连接分片服务器超过 {} 秒无响应",
-                    DOWNLOAD_READ_IDLE_TIMEOUT_SECS
-                );
+            Err(error) => {
+                if download_is_cancelled(&control) {
+                    return Err(error);
+                }
+                last_error = error;
                 continue;
             }
         };
@@ -8733,9 +8941,16 @@ async fn download_range_to_file(
             ));
         }
         loop {
-            let next = tokio::time::timeout(
-                Duration::from_secs(DOWNLOAD_READ_IDLE_TIMEOUT_SECS),
+            let next = await_download_operation(
+                &mut control,
                 response.chunk(),
+                Duration::from_secs(DOWNLOAD_READ_IDLE_TIMEOUT_SECS),
+                || {
+                    format!(
+                        "下载分片超过 {} 秒没有新数据",
+                        DOWNLOAD_READ_IDLE_TIMEOUT_SECS
+                    )
+                },
             )
             .await;
             let chunk = match next {
@@ -8748,11 +8963,11 @@ async fn download_range_to_file(
                     last_error = format!("读取下载分片失败：{error}");
                     break;
                 }
-                Err(_) => {
-                    last_error = format!(
-                        "下载分片超过 {} 秒没有新数据",
-                        DOWNLOAD_READ_IDLE_TIMEOUT_SECS
-                    );
+                Err(error) => {
+                    if download_is_cancelled(&control) {
+                        return Err(error);
+                    }
+                    last_error = error;
                     break;
                 }
             };
@@ -8802,7 +9017,9 @@ async fn download_parallel_ranges(
     connections: usize,
     download_id: &str,
     actual_name: &str,
+    mut control: watch::Receiver<DownloadControlState>,
 ) -> Result<u64, String> {
+    wait_download_running(&mut control).await?;
     let file = tokio::fs::File::create(partial)
         .await
         .map_err(|error| format!("无法创建临时下载文件 {}：{error}", partial.display()))?;
@@ -8813,11 +9030,14 @@ async fn download_parallel_ranges(
 
     let progress = Arc::new(AtomicU64::new(0));
     let ranges = download_byte_ranges(total_bytes, connections);
-    let tasks = stream::iter(ranges.into_iter().map(|range| {
+    let task_control = control.clone();
+    let task_progress = progress.clone();
+    let tasks = stream::iter(ranges.into_iter().map(move |range| {
         let client = client.clone();
         let download_url = download_url.to_string();
         let partial = partial.to_path_buf();
-        let progress = progress.clone();
+        let progress = task_progress.clone();
+        let control = task_control.clone();
         async move {
             download_range_to_file(
                 &client,
@@ -8826,6 +9046,7 @@ async fn download_parallel_ranges(
                 range,
                 total_bytes,
                 &progress,
+                control,
             )
             .await
         }
@@ -8837,8 +9058,14 @@ async fn download_parallel_ranges(
     let mut last_emit = Instant::now();
     let mut last_emit_bytes = 0_u64;
     let result = loop {
+        wait_download_running(&mut control).await?;
         tokio::select! {
             result = &mut tasks => break result.map(|_| ()),
+            changed = control.changed() => {
+                changed.map_err(|_| "下载任务控制器已经关闭".to_string())?;
+                last_emit = Instant::now();
+                last_emit_bytes = progress.load(Ordering::Relaxed);
+            }
             _ = sleep(Duration::from_millis(400)) => {
                 let downloaded_bytes = progress.load(Ordering::Relaxed);
                 let elapsed = last_emit.elapsed().as_secs_f64();
@@ -8884,7 +9111,9 @@ async fn download_to_local(
     destination_dir: &str,
     download_id: &str,
     download_task_concurrency: usize,
+    mut control: watch::Receiver<DownloadControlState>,
 ) -> Result<Value, String> {
+    wait_download_running(&mut control).await?;
     if destination_dir.trim().is_empty() {
         return Err("请先选择下载保存目录".into());
     }
@@ -8910,7 +9139,8 @@ async fn download_to_local(
         .connect_timeout(Duration::from_secs(API_CONNECT_TIMEOUT_SECS))
         .build()
         .map_err(|error| format!("创建下载客户端失败：{error}"))?;
-    let (probed_total_bytes, supports_ranges) = probe_download(&client, download_url).await;
+    let (probed_total_bytes, supports_ranges) =
+        probe_download(&client, download_url, &mut control).await?;
     let configured_connections = configured_download_connections(download_task_concurrency);
     let segmented = supports_ranges
         && configured_connections > 1
@@ -8943,6 +9173,7 @@ async fn download_to_local(
                 connections,
                 download_id,
                 &actual_name,
+                control.clone(),
             )
             .await
             {
@@ -8951,6 +9182,9 @@ async fn download_to_local(
                 }
                 Err(error) => {
                     let _ = tokio::fs::remove_file(&partial).await;
+                    if download_is_cancelled(&control) {
+                        return Err(error);
+                    }
                     emit(
                         app,
                         json!({
@@ -8975,17 +9209,19 @@ async fn download_to_local(
             .acquire_owned()
             .await
             .map_err(|_| "下载连接调度器已关闭".to_string())?;
-        let mut response = tokio::time::timeout(
-            Duration::from_secs(DOWNLOAD_READ_IDLE_TIMEOUT_SECS),
+        wait_download_running(&mut control).await?;
+        let mut response = await_download_operation(
+            &mut control,
             client.get(download_url).send(),
+            Duration::from_secs(DOWNLOAD_READ_IDLE_TIMEOUT_SECS),
+            || {
+                format!(
+                    "连接光鸭下载服务器超过 {} 秒无响应",
+                    DOWNLOAD_READ_IDLE_TIMEOUT_SECS
+                )
+            },
         )
-        .await
-        .map_err(|_| {
-            format!(
-                "连接光鸭下载服务器超过 {} 秒无响应",
-                DOWNLOAD_READ_IDLE_TIMEOUT_SECS
-            )
-        })?
+        .await?
         .map_err(|error| format!("连接光鸭下载服务器失败：{error}"))?;
         if !response.status().is_success() {
             return Err(format!("光鸭文件下载失败（HTTP {}）", response.status()));
@@ -8998,12 +9234,13 @@ async fn download_to_local(
         let mut last_emit = Instant::now();
         let mut last_emit_bytes = 0_u64;
         loop {
-            let chunk = tokio::time::timeout(
-                Duration::from_secs(DOWNLOAD_READ_IDLE_TIMEOUT_SECS),
+            let chunk = await_download_operation(
+                &mut control,
                 response.chunk(),
+                Duration::from_secs(DOWNLOAD_READ_IDLE_TIMEOUT_SECS),
+                || format!("下载超过 {} 秒没有新数据", DOWNLOAD_READ_IDLE_TIMEOUT_SECS),
             )
-            .await
-            .map_err(|_| format!("下载超过 {} 秒没有新数据", DOWNLOAD_READ_IDLE_TIMEOUT_SECS))?
+            .await?
             .map_err(|error| format!("读取光鸭下载数据失败：{error}"))?;
             let Some(chunk) = chunk else { break };
             file.write_all(&chunk)
@@ -9058,13 +9295,28 @@ async fn download_to_local(
         Ok(result) => result,
         Err(error) => {
             let _ = tokio::fs::remove_file(&partial).await;
-            emit(
-                app,
-                json!({ "type": "download", "download_id": download_id, "state": "error", "error": error }),
-            );
+            if download_is_cancelled(&control) {
+                emit(
+                    app,
+                    json!({ "type": "download", "download_id": download_id, "state": "cancelled", "bytes_per_second": 0 }),
+                );
+            } else {
+                emit(
+                    app,
+                    json!({ "type": "download", "download_id": download_id, "state": "error", "error": error }),
+                );
+            }
             return Err(error);
         }
     };
+    if let Err(error) = wait_download_running(&mut control).await {
+        let _ = tokio::fs::remove_file(&partial).await;
+        emit(
+            app,
+            json!({ "type": "download", "download_id": download_id, "state": "cancelled", "bytes_per_second": 0 }),
+        );
+        return Err(error);
+    }
     if let Err(error) = tokio::fs::rename(&partial, &target).await {
         let _ = tokio::fs::remove_file(&partial).await;
         return Err(format!("完成下载文件失败：{error}"));
@@ -11021,6 +11273,7 @@ fn run() {
                     resource_dir,
                 ),
             }));
+            app.manage(DownloadRegistry::default());
             app.manage(state.clone());
             let app_handle = app.handle().clone();
             if webdav_enabled {
@@ -11149,6 +11402,9 @@ fn run() {
             restore_received_share,
             get_received_share_download,
             get_cloud_download,
+            pause_download,
+            resume_download,
+            cancel_download,
             resolve_offline_resource,
             create_offline_task,
             list_offline_tasks,
@@ -12730,6 +12986,48 @@ mod tests {
         assert!(parse_content_range("bytes */33554432").is_none());
         assert!(parse_content_range("bytes 10-9/20").is_none());
         assert!(parse_content_range("bytes 0-20/20").is_none());
+    }
+
+    #[tokio::test]
+    async fn download_control_waits_while_paused_and_resumes() {
+        let (sender, mut receiver) = watch::channel(DownloadControlState::Paused);
+        let waiter = tokio::spawn(async move { wait_download_running(&mut receiver).await });
+        sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+        sender.send_replace(DownloadControlState::Running);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("paused download should resume promptly")
+            .expect("download control task should join")
+            .expect("resumed download should be runnable");
+    }
+
+    #[tokio::test]
+    async fn download_control_cancellation_interrupts_waiting_tasks() {
+        let (sender, mut receiver) = watch::channel(DownloadControlState::Paused);
+        let waiter = tokio::spawn(async move { wait_download_running(&mut receiver).await });
+        sender.send_replace(DownloadControlState::Cancelled);
+        let error = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("cancelled download should stop promptly")
+            .expect("download control task should join")
+            .expect_err("cancelled download must not keep running");
+        assert_eq!(error, "下载已取消");
+    }
+
+    #[test]
+    fn download_registry_tracks_and_releases_active_tasks() {
+        let registry = DownloadRegistry::default();
+        let (receiver, registration) =
+            begin_download_task(&registry, "download-1").expect("task should register");
+        set_download_control(&registry, "download-1", DownloadControlState::Paused)
+            .expect("task should pause");
+        assert_eq!(*receiver.borrow(), DownloadControlState::Paused);
+        assert!(begin_download_task(&registry, "download-1").is_err());
+        drop(registration);
+        assert!(
+            set_download_control(&registry, "download-1", DownloadControlState::Running).is_err()
+        );
     }
 
     #[test]

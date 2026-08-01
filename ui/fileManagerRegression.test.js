@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 const cloudViewSource = readFile(new URL('./views/CloudView.vue', import.meta.url), 'utf8');
+const appSource = readFile(new URL('./App.vue', import.meta.url), 'utf8');
 const fileSelectionBarSource = readFile(new URL('./components/files/FileSelectionBar.vue', import.meta.url), 'utf8');
 const gcidImportStatusSource = readFile(new URL('./components/files/GcidImportStatus.vue', import.meta.url), 'utf8');
 const renameRulesSource = readFile(new URL('./renameRules.js', import.meta.url), 'utf8');
@@ -95,6 +96,26 @@ test('desktop download progress exposes concurrent range mode', async () => {
   assert.match(transferStoreSource, /connections:\s*payload\.connections == null \? undefined : Number\(payload\.connections\)/);
   assert.match(transferViewSource, /item\.segmented && item\.connections > 1/);
   assert.match(transferViewSource, /\{\{ item\.connections \}\} 路分片/);
+});
+
+test('active transfer management can pause resume and cancel downloads', async () => {
+  const [transferStoreSource, transferViewSource, desktopAppSource] = await Promise.all([transfersSource, transfersViewSource, appSource]);
+  assert.match(transferStoreSource, /bridge\.invoke\(['"]pause_download['"],\s*\{ task_id: id \}\)/);
+  assert.match(transferStoreSource, /bridge\.invoke\(['"]resume_download['"],\s*\{ task_id: id \}\)/);
+  assert.match(transferStoreSource, /bridge\.invoke\(['"]cancel_download['"],\s*\{ task_id: id \}\)/);
+  assert.match(transferStoreSource, /queue\.cancel\(id\)/);
+  assert.match(transferStoreSource, /current\?\.status === 'cancelled' && payload\.state !== 'cancelled'/);
+  assert.match(transferStoreSource, /current\?\.status === 'paused' && payload\.state === 'downloading'/);
+  assert.match(transferViewSource, /暂停下载/);
+  assert.match(transferViewSource, /继续下载/);
+  assert.match(transferViewSource, /临时分片会被清理/);
+  assert.match(transferViewSource, /item\.status === 'cancelled'/);
+  assert.match(desktopAppSource, /bridge\.invoke\(['"]pause_download['"],\s*\{ task_id: task\.id \}\)/);
+  assert.match(desktopAppSource, /bridge\.invoke\(['"]resume_download['"],\s*\{ task_id: task\.id \}\)/);
+  assert.match(desktopAppSource, /bridge\.invoke\(['"]cancel_download['"],\s*\{ task_id: task\.id \}\)/);
+  assert.match(desktopAppSource, /localDownloadQueue\.cancel\(task\.id\)/);
+  assert.match(desktopAppSource, /临时分片会被清理/);
+  assert.match(desktopAppSource, /task\.segmented && task\.connections > 1/);
 });
 
 test('rename request keeps file identifiers and names in camelCase', async () => {

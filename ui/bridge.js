@@ -145,6 +145,9 @@ export const bridge = isTauri ? {
     if (command === 'list_received_share_files') return webRequest('/api/received-share/files', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'restore_received_share') return webRequest('/api/received-share/restore', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'get_received_share_download') return webRequest('/api/received-share/download', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'pause_download') throw new Error('Docker Web 下载由浏览器接管，请在浏览器下载面板中暂停');
+    if (command === 'resume_download') throw new Error('Docker Web 下载由浏览器接管，请在浏览器下载面板中继续');
+    if (command === 'cancel_download') throw new Error('Docker Web 下载由浏览器接管，请在浏览器下载面板中取消');
     if (command === 'create_offline_task') return webRequest('/api/offline', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'resolve_offline_resource') return webRequest('/api/offline/resolve', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'list_offline_tasks') {

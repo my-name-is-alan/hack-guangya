@@ -16,7 +16,7 @@ export function createConcurrencyQueue(getLimit, getPaused = () => false) {
     if (getPaused()) return;
     const limit = normalizeTransferConcurrency(getLimit());
     while (active < limit && pending.length) {
-      const run = pending.shift();
+      const { run } = pending.shift();
       active += 1;
       Promise.resolve()
         .then(run)
@@ -29,9 +29,22 @@ export function createConcurrencyQueue(getLimit, getPaused = () => false) {
   }
 
   return {
-    enqueue(run) {
-      pending.push(run);
+    enqueue(idOrRun, maybeRun) {
+      const hasId = typeof idOrRun !== 'function';
+      const id = hasId ? String(idOrRun) : '';
+      const run = hasId ? maybeRun : idOrRun;
+      if (typeof run !== 'function') throw new TypeError('下载队列任务必须是函数');
+      if (id && pending.some((item) => item.id === id)) return false;
+      pending.push({ id, run });
       pump();
+      return true;
+    },
+    cancel(id) {
+      const key = String(id || '');
+      const index = pending.findIndex((item) => item.id === key);
+      if (index < 0) return false;
+      pending.splice(index, 1);
+      return true;
     },
     pump,
     get active() {
