@@ -12,6 +12,7 @@ import {
 } from './uploadProgress.js';
 import { readJsonResponse } from './httpResponse.js';
 import { parseGuangyaShareLink } from './shareLink.js';
+import { needsTmdbReview } from './receiptReview.js';
 import { createConcurrencyQueue, normalizeTransferConcurrency } from './transferQueue.js';
 import { gcidImportPercent, shouldConvertPasteToFile } from './gcidImport.js';
 import {
@@ -1801,7 +1802,7 @@ onBeforeUnmount(() => {
                   <div class="receipt-main"><strong>{{ receipt.target_key }}</strong><a-tag color="green">光鸭分享成功</a-tag><a-tag :color="receiptColor(receipt.status)">{{ receiptStatusLabel(receipt) }}</a-tag><a-tag v-if="receipt.action" color="purple">{{ receiptActionLabel(receipt.action) }}</a-tag><a-tag v-if="receipt.notification_status">通知：{{ receipt.notification_status }}</a-tag><span>{{ receiptDisplayMessage(receipt) }}</span></div>
                   <a-flex gap="small" align="center" wrap="wrap">
                     <a v-if="receipt.share_url" :href="receipt.share_url" target="_blank" rel="noreferrer">分享链接</a><a v-if="receipt.resource_url" :href="receipt.resource_url" target="_blank" rel="noreferrer">Hdhive 资源</a>
-                    <template v-if="receipt.status === 'needs_review' && String(receipt.message || '').includes('TMDB')"><a-input v-model:value="receiptReview[receipt.event_id].tmdb_id" size="small" placeholder="TMDB ID" class="receipt-tmdb" /><a-select v-model:value="receiptReview[receipt.event_id].media_type" size="small" placeholder="类型" :options="[{ label: '电视剧', value: 'tv' }, { label: '电影', value: 'movie' }]" class="receipt-media" /></template>
+                    <template v-if="needsTmdbReview(receipt)"><a-input v-model:value="receiptReview[receipt.event_id].tmdb_id" size="small" placeholder="TMDB ID" class="receipt-tmdb" /><a-select v-model:value="receiptReview[receipt.event_id].media_type" size="small" placeholder="类型" :options="[{ label: '电视剧', value: 'tv' }, { label: '电影', value: 'movie' }]" class="receipt-media" /></template>
                     <a-button v-if="['needs_review', 'failed', 'delivery_failed'].includes(receipt.status)" size="small" :loading="autoShareBusy[receipt.event_id]" @click="retryAutoShareReceipt(receipt)">重试</a-button>
                   </a-flex>
                 </div>
