@@ -2,6 +2,7 @@ import { computed, shallowRef } from 'vue'
 import { defineStore } from 'pinia'
 import { bridge, isTauri } from '../bridge.js'
 import { errorText, unwrapData } from '../formatters.js'
+import { normalizeUpdateMetadata } from '../updateMetadata.js'
 
 const AUTO_CHECK_KEY = 'guangya:auto-update'
 
@@ -66,7 +67,7 @@ export const useUpdaterStore = defineStore('updater', () => {
     error.value = ''
     try {
       if (!currentVersion.value) await loadCurrentVersion()
-      const update = unwrapData(await bridge.invoke('fetch_app_update')) as AppUpdateMetadata | null
+      const update = normalizeUpdateMetadata(await bridge.invoke('fetch_app_update')) as AppUpdateMetadata | null
       availableUpdate.value = update
       promptOpen.value = Boolean(update)
       lastCheckedAt.value = new Date()
@@ -111,8 +112,8 @@ export const useUpdaterStore = defineStore('updater', () => {
   async function initialize() {
     if (!isTauri || initialized) return
     initialized = true
-    unsubscribe = await bridge.subscribe(handleUpdateEvent)
     try {
+      unsubscribe = await bridge.subscribe(handleUpdateEvent)
       await loadCurrentVersion()
       if (autoCheckEnabled.value) await checkForUpdates(true)
     } catch (reason) {

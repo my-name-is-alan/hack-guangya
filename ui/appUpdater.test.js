@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
+import { normalizeUpdateMetadata } from './updateMetadata.js'
 
 const read = (path) => readFile(new URL(path, import.meta.url), 'utf8')
 
@@ -25,6 +26,18 @@ test('updater store checks on startup, reports progress and only installs after 
   assert.match(source, /bridge\.invoke\('install_app_update'\)/)
   assert.match(source, /payload\?\.type !== 'app-update'/)
   assert.match(source, /if \(autoCheckEnabled\.value\) await checkForUpdates\(true\)/)
+  assert.match(source, /normalizeUpdateMetadata\(await bridge\.invoke\('fetch_app_update'\)\)/)
+})
+
+test('no-update responses never become a phantom update modal', () => {
+  assert.equal(normalizeUpdateMetadata(null), null)
+  assert.equal(normalizeUpdateMetadata(undefined), null)
+  assert.equal(normalizeUpdateMetadata({}), null)
+  assert.equal(normalizeUpdateMetadata({ data: null }), null)
+  assert.deepEqual(
+    normalizeUpdateMetadata({ version: ' 0.1.22 ', current_version: '0.1.21', notes: null }),
+    { version: '0.1.22', current_version: '0.1.21', notes: '' },
+  )
 })
 
 test('Tauri updater is signed and points to the latest GitHub release manifest', async () => {

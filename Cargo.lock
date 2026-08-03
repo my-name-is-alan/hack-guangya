@@ -1798,7 +1798,7 @@ dependencies = [
 
 [[package]]
 name = "guangya-folder-sync"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "axum",
  "base64 0.22.1",
