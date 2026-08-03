@@ -5,6 +5,7 @@ import {
   DatabaseOutlined,
   FolderOpenOutlined,
   LockOutlined,
+  ReloadOutlined,
   SettingOutlined,
   SwapOutlined,
   UserOutlined,
@@ -17,6 +18,7 @@ import HdhiveSettingsPanel from '../components/settings/HdhiveSettingsPanel.vue'
 import MountSettingsPanel from '../components/settings/MountSettingsPanel.vue'
 import PreferenceSettingsPanel from '../components/settings/PreferenceSettingsPanel.vue'
 import TransferSettingsPanel from '../components/settings/TransferSettingsPanel.vue'
+import UpdateSettingsPanel from '../components/settings/UpdateSettingsPanel.vue'
 
 const activeTab = shallowRef('account')
 </script>
@@ -57,6 +59,11 @@ const activeTab = shallowRef('account')
       <a-tab-pane key="cache">
         <template #tab><span class="setting-tab"><DatabaseOutlined />缓存</span></template>
         <CacheSettingsPanel />
+      </a-tab-pane>
+
+      <a-tab-pane v-if="isTauri" key="update">
+        <template #tab><span class="setting-tab"><ReloadOutlined />更新</span></template>
+        <UpdateSettingsPanel />
       </a-tab-pane>
     </a-tabs>
   </div>

@@ -8,6 +8,7 @@
 ## 桌面端能力
 
 - 应用内扫码登录和验证码登录：二维码、用户验证码和轮询状态都在工作台内显示，不保存账号密码；授权会话保存到当前系统用户的本地 SQLite，重启后自动恢复。
+- 桌面端自动更新：启动时默认检查 GitHub 最新正式版，也可在“设置 → 更新”手动检查；发现新版本后展示版本说明和下载进度，经确认后校验签名并安装。
 - 云盘文件管理：浏览根目录和子目录，拖入文件或文件夹上传，并支持新建文件夹、详情、云端最近、批量复制、剪切、移动、重命名、移入回收站和创建分享；回收站支持批量恢复、彻底删除和清空，异步文件操作完成后才刷新。
 - 本地目录挂载：通过 WebDAV 将整个云盘映射为 Windows 盘符、macOS Finder 目录或 Linux/FUSE 目录；支持列目录、读取、新建、覆盖、重命名、移动、复制和删除，Docker Web 同样提供 `/dav/`。
 - 批量重命名：规则按顺序链式执行，支持普通替换、正则替换、前后缀、序号模板及大小写转换，执行前实时预览并检查重名。
@@ -30,7 +31,18 @@ pnpm tauri dev
 pnpm tauri build
 ```
 
-安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.20_x64-setup.exe`
+安装包：`src-tauri/target/release/bundle/nsis/光鸭文件夹同步_0.1.21_x64-setup.exe`
+
+正式更新包必须使用长期保存的同一把 Tauri 私钥签名。构建机设置 `TAURI_SIGNING_PRIVATE_KEY`（可填私钥内容或私钥文件路径）和可选的 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 后执行构建，再生成 GitHub Release 所需文件：
+
+```powershell
+$env:TAURI_SIGNING_PRIVATE_KEY="C:\安全目录\hack-guangya.key"
+$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
+pnpm tauri build
+pnpm package:updater
+```
+
+把 `release/` 中的安装包、`.sig`、`.sha256` 和 `latest.json` 一起上传到 `v版本号` Release。客户端固定读取最新 Release 的 `latest.json`；签名私钥丢失后，已安装版本将不能信任新密钥签出的更新包，因此必须离线备份且不能提交仓库。
 
 ## WebDAV 本地挂载
 
@@ -79,7 +91,7 @@ WebDAV 是在线文件系统，不是离线镜像。打开大文件时由系统 
 Docker Hub 镜像：[`94xhzy/guangya-sync`](https://hub.docker.com/r/94xhzy/guangya-sync)，推荐固定使用版本标签：
 
 ```bash
-docker pull 94xhzy/guangya-sync:0.1.20
+docker pull 94xhzy/guangya-sync:0.1.21
 ```
 
 先准备管理账号。用户名默认是 `admin`；请生成独立的强随机密码，复制 `.env.example` 为 `.env` 并填入 `GUANGYA_ADMIN_PASSWORD`：
@@ -125,7 +137,7 @@ docker compose -f docker-compose.yml -f docker-compose.fuse.yml up -d
 
 Docker Web 不能直接读取浏览器所在电脑的任意本地目录。默认 `GUANGYA_FILE_ROOTS=/watch,/archive`，只能浏览和监控明确挂载到这两个容器目录中的文件。网页支持扫码和短信验证码登录；也可以在启动前通过 `GUANGYA_TOKEN` 环境变量注入令牌。登录会话和上传历史保存在 `/data/state.sqlite3`。
 
-Hdhive 联动可在网页“备份任务”页设置，也可通过环境变量配置：`HDHIVE_BASE_URL`、`HDHIVE_GUANGYA_SYNC_SECRET`、`HDHIVE_GUANGYA_SYNC_INSTANCE_ID`。实例 ID 未设置时会首次生成并持久化到 `/data/state.sqlite3`；密钥不通过状态接口返回。`GUANGYA_AUTO_SHARE_QUIET_MS` 可调整聚合静默时间，默认 30000 毫秒。
+HDHive 联动可在“设置 → HDHive”中配置，也可通过环境变量配置：`HDHIVE_BASE_URL`、`HDHIVE_GUANGYA_SYNC_SECRET`、`HDHIVE_GUANGYA_SYNC_INSTANCE_ID`。设置页会显示并可复制当前实例 ID；未显式设置时会首次生成并持久化到 `/data/state.sqlite3`，密钥不通过状态接口返回。先在 HDHive 管理后台“光鸭同步 → 添加账号”中填写此实例 ID 和已绑定账号的 Telegram 数字 ID，再把后台一次性生成的 HMAC 密钥填回同步端。`GUANGYA_AUTO_SHARE_QUIET_MS` 可调整聚合静默时间，默认 30000 毫秒。
 
 多个光鸭账号需要运行多个同步实例，每个实例使用不同的 `/data` 卷和实例 ID。先在 Hdhive 管理后台“光鸭同步”页面添加实例与投稿账号绑定，再把后台一次性生成的密钥填入对应同步端；不要让多个容器共用状态库。
 
@@ -160,7 +172,7 @@ pnpm web
 pnpm package:ubuntu
 ```
 
-输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.20.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
+输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.21.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
 
 ## 接口边界
 

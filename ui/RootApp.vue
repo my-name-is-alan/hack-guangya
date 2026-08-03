@@ -3,16 +3,25 @@ import { onBeforeUnmount, onMounted } from 'vue'
 import { storeToRefs } from 'pinia'
 import useIllustrationTheme from './illustrationTheme'
 import { useSessionStore } from './stores/session'
+import { useUpdaterStore } from './stores/updater'
 import AccessGate from './components/auth/AccessGate.vue'
 import AuthGate from './components/auth/AuthGate.vue'
 import AppShell from './components/shell/AppShell.vue'
+import AppUpdatePrompt from './components/update/AppUpdatePrompt.vue'
 
 const configProps = useIllustrationTheme()
 const session = useSessionStore()
+const updater = useUpdaterStore()
 const { bootLoading, accessGranted, forceAuth } = storeToRefs(session)
 
-onMounted(() => session.initialize())
-onBeforeUnmount(() => session.dispose())
+onMounted(() => {
+  void session.initialize()
+  void updater.initialize()
+})
+onBeforeUnmount(() => {
+  session.dispose()
+  updater.dispose()
+})
 </script>
 
 <template>
@@ -22,6 +31,7 @@ onBeforeUnmount(() => session.dispose())
       <AccessGate v-else-if="!accessGranted" />
       <AuthGate v-else-if="forceAuth || !session.state.logged_in" />
       <AppShell v-else />
+      <AppUpdatePrompt />
     </a-app>
   </a-config-provider>
 </template>

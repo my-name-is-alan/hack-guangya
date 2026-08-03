@@ -183,6 +183,10 @@ export const bridge = isTauri ? {
     if (command === 'update_cache_settings') return webRequest('/api/settings/cache', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'get_metadata_cache_stats') return webRequest('/api/cache');
     if (command === 'clear_metadata_cache') return webRequest('/api/cache/clear', { method: 'POST', body: '{}' });
+    if (command === 'get_app_version') return { version: 'Docker Web' };
+    if (command === 'fetch_app_update' || command === 'install_app_update') {
+      throw new Error('Docker Web 版本随镜像更新，桌面自动更新仅在 Windows 客户端可用');
+    }
     if (command === 'request_sms_code') return webRequest('/api/auth/sms/send', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'login_with_sms') return webRequest('/api/auth/sms/login', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'poll_device_login') return webRequest('/api/auth/device/poll', { method: 'POST', body: JSON.stringify(args) });

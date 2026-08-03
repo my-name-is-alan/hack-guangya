@@ -1,6 +1,6 @@
 {
   "name": "guangya-folder-sync",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "type": "module",
   "packageManager": "pnpm@11.15.1",
   "engines": {
@@ -17,6 +17,7 @@
     "ui:build": "vite build",
     "ui:test": "node --test ui/*.test.js",
     "server:test": "node --test server/*.test.mjs",
+    "package:updater": "node scripts/create-updater-manifest.mjs",
     "package:ubuntu": "node scripts/package-ubuntu-native.mjs",
     "web": "node server/server.mjs"
   },

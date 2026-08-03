@@ -84,7 +84,10 @@ commands.allow = [
   "update_cache_settings",
   "get_metadata_cache_stats",
   "clear_metadata_cache",
-  "resume_queue"
+  "resume_queue",
+  "get_app_version",
+  "fetch_app_update",
+  "install_app_update"
 ]
 
 [[permission]]

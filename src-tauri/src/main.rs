@@ -29,6 +29,7 @@ use std::{
     },
 };
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::{
@@ -128,6 +129,9 @@ const CLOUD_FILE_TYPE_AUDIO: u8 = 3;
 const CLOUD_FILE_TYPE_DOCUMENT: u8 = 4;
 const CLOUD_FILE_TYPE_ARCHIVE: u8 = 5;
 type SharedState = Arc<Mutex<RuntimeState>>;
+
+#[derive(Default)]
+struct PendingAppUpdate(Mutex<Option<Update>>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DownloadControlState {
@@ -308,6 +312,19 @@ struct HdhivePublicConfig {
     configured: bool,
     base_url: String,
     instance_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AppVersionInfo {
+    version: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AppUpdateMetadata {
+    version: String,
+    current_version: String,
+    notes: String,
+    published_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -11111,6 +11128,96 @@ async fn resume_queue(
     Ok(())
 }
 
+#[tauri::command]
+fn get_app_version() -> AppVersionInfo {
+    AppVersionInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+#[tauri::command]
+async fn fetch_app_update(
+    app: tauri::AppHandle,
+    pending: tauri::State<'_, PendingAppUpdate>,
+) -> Result<Option<AppUpdateMetadata>, String> {
+    let update = app
+        .updater_builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("初始化更新检查失败：{error}"))?
+        .check()
+        .await
+        .map_err(|error| format!("检查更新失败：{error}"))?;
+
+    let metadata = update.as_ref().map(|item| AppUpdateMetadata {
+        version: item.version.clone(),
+        current_version: item.current_version.clone(),
+        notes: item.body.clone().unwrap_or_default(),
+        published_at: item.date.map(|date| date.to_string()),
+    });
+    *pending
+        .0
+        .lock()
+        .map_err(|_| "更新状态锁已损坏".to_string())? = update;
+    Ok(metadata)
+}
+
+#[tauri::command]
+async fn install_app_update(
+    app: tauri::AppHandle,
+    pending: tauri::State<'_, PendingAppUpdate>,
+) -> Result<(), String> {
+    let update = pending
+        .0
+        .lock()
+        .map_err(|_| "更新状态锁已损坏".to_string())?
+        .take()
+        .ok_or_else(|| "没有待安装的更新，请先检查更新".to_string())?;
+
+    let version = update.version.clone();
+    let received = Arc::new(AtomicU64::new(0));
+    let progress_app = app.clone();
+    let progress_received = received.clone();
+    let finished_app = app.clone();
+    let started_payload = json!({
+        "type": "app-update",
+        "event": "started",
+        "version": version,
+    });
+    let _ = app.emit("sync-event", started_payload);
+
+    update
+        .download_and_install(
+            move |chunk_length, content_length| {
+                let downloaded = progress_received
+                    .fetch_add(chunk_length as u64, Ordering::Relaxed)
+                    + chunk_length as u64;
+                let _ = progress_app.emit(
+                    "sync-event",
+                    json!({
+                        "type": "app-update",
+                        "event": "progress",
+                        "downloaded": downloaded,
+                        "total": content_length,
+                    }),
+                );
+            },
+            move || {
+                let _ = finished_app.emit(
+                    "sync-event",
+                    json!({
+                        "type": "app-update",
+                        "event": "downloaded",
+                    }),
+                );
+            },
+        )
+        .await
+        .map_err(|error| format!("下载或安装更新失败：{error}"))?;
+
+    Ok(())
+}
+
 async fn event_loop(app: tauri::AppHandle, state: SharedState, mut rx: UnboundedReceiver<FsEvent>) {
     while let Some(event) = rx.recv().await {
         let app = app.clone();
@@ -11124,6 +11231,7 @@ async fn event_loop(app: tauri::AppHandle, state: SharedState, mut rx: Unbounded
 
 fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let (event_tx, event_rx) = mpsc::unbounded_channel();
             let config_path = app
@@ -11274,6 +11382,7 @@ fn run() {
                 ),
             }));
             app.manage(DownloadRegistry::default());
+            app.manage(PendingAppUpdate::default());
             app.manage(state.clone());
             let app_handle = app.handle().clone();
             if webdav_enabled {
@@ -11433,7 +11542,10 @@ fn run() {
             update_cache_settings,
             get_metadata_cache_stats,
             clear_metadata_cache,
-            resume_queue
+            resume_queue,
+            get_app_version,
+            fetch_app_update,
+            install_app_update
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
