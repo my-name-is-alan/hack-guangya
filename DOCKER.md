@@ -163,6 +163,17 @@ GUANGYA_TOKEN_REFRESH_MS=1200000
 
 令牌为空不影响容器启动。不要把真实令牌写进 `docker-compose.yml` 或提交到仓库。
 
+### 4.1 开发者接口与小号 TOKEN
+
+推荐在网页“设置 → 账号 → 开发者模式”中填写当前登录账号自己的开发者凭据，完成同一文件所有权验证后开启模式，再添加小号接收 TOKEN。也可以用环境变量托管开发者凭据：
+
+```dotenv
+GUANGYA_DEVELOPER_CLIENT_ID=
+GUANGYA_DEVELOPER_CLIENT_SECRET=
+```
+
+环境变量存在时对应字段不能从页面覆盖，但不能绕过账号绑定：仍需登录该 `client_id` 所属账号，在账号页验证并开启模式。小号接收 TOKEN 仍在设置页中添加，完整 TOKEN 与 `client_secret` 均不会通过状态接口回显，但会保存在持久化的 `/data/state.sqlite3`，因此应限制 `docker-data` 的读取权限并纳入加密备份策略。一个 TOKEN 只支持当前开发者账号向该小号授权目录发送；反向互传需要另一方向独立配置。
+
 ## 5. HDHive 配置
 
 HDHive 可以在网页“设置 → HDHive”中配置和关闭；也可以使用环境变量：

@@ -183,6 +183,17 @@ export const bridge = isTauri ? {
     if (command === 'update_cache_settings') return webRequest('/api/settings/cache', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'get_metadata_cache_stats') return webRequest('/api/cache');
     if (command === 'clear_metadata_cache') return webRequest('/api/cache/clear', { method: 'POST', body: '{}' });
+    if (command === 'get_developer_settings') return webRequest('/api/developer/settings');
+    if (command === 'update_developer_credentials') return webRequest('/api/developer/credentials', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'test_developer_credentials') return webRequest('/api/developer/test', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'update_developer_mode') return webRequest('/api/developer/mode', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'upsert_developer_target') return webRequest('/api/developer/targets', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'delete_developer_target') return webRequest(`/api/developer/targets/${encodeURIComponent(args.id)}`, { method: 'DELETE' });
+    if (command === 'list_developer_transfers') {
+      const params = new URLSearchParams({ limit: String(Math.max(1, Number(args.limit || 50))) });
+      return webRequest(`/api/developer/transfers?${params}`);
+    }
+    if (command === 'start_developer_transfer') return webRequest('/api/developer/transfers', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'get_app_version') return { version: 'Docker Web' };
     if (command === 'fetch_app_update' || command === 'install_app_update') {
       throw new Error('Docker Web 版本随镜像更新，桌面自动更新仅在 Windows 客户端可用');

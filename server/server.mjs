@@ -18,6 +18,7 @@ import {
   isAuthExpiredBusinessCode,
   resolveGuangyaProfile,
 } from './guangya-protocol.mjs';
+import { createGuangyaDeveloperClient, DeveloperApiError } from './guangya-developer.mjs';
 import { createNativeMountManager, normalizeNativeMountOptions } from './native-mount.mjs';
 import { uploadPartSize } from './upload-parts.mjs';
 import { createWebDavHandler, normalizeWebDavEntry, WebDavError } from './webdav.mjs';
@@ -214,6 +215,36 @@ database.exec(`
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (mapping_id, target_key, relative_path)
   );
+  CREATE TABLE IF NOT EXISTS developer_targets (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    token_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS developer_transfer_jobs (
+    id TEXT PRIMARY KEY,
+    target_id TEXT NOT NULL,
+    target_name TEXT NOT NULL,
+    file_ids_json TEXT NOT NULL,
+    file_names_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    pre_task_id TEXT,
+    upload_task_id TEXT,
+    total_count INTEGER NOT NULL DEFAULT 0,
+    passed_count INTEGER NOT NULL DEFAULT 0,
+    rejected_count INTEGER NOT NULL DEFAULT 0,
+    pending_count INTEGER NOT NULL DEFAULT 0,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    skipped_count INTEGER NOT NULL DEFAULT 0,
+    error_code INTEGER,
+    message TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS developer_transfer_jobs_status
+    ON developer_transfer_jobs(status, updated_at);
 `);
 if (!database.prepare("PRAGMA table_info(auth_session)").all().some((column) => column.name === 'refresh_token')) database.exec('ALTER TABLE auth_session ADD COLUMN refresh_token TEXT');
 if (!database.prepare("PRAGMA table_info(auto_share_events)").all().some((column) => column.name === 'notification_status')) database.exec('ALTER TABLE auto_share_events ADD COLUMN notification_status TEXT');
@@ -310,6 +341,7 @@ const storedDevice = database.prepare("SELECT value FROM app_state WHERE key = '
 const deviceId = normalizeDeviceId(storedDevice?.value);
 database.prepare("INSERT INTO app_state (key, value, updated_at) VALUES ('device_id', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at").run(deviceId, Math.floor(Date.now() / 1000));
 const clients = new Set();
+const developerTransferRunning = new Set();
 const watchers = new Map();
 const queue = new Map();
 const flashPreflightCache = new Map();
@@ -514,6 +546,474 @@ function clearManagedCaches() {
   remoteCache.set('', '');
   return cacheState();
 }
+
+function maskDeveloperValue(value) {
+  const normalized = String(value || '');
+  if (!normalized) return '';
+  if (normalized.length <= 8) return '••••••••';
+  return `${normalized.slice(0, 4)}••••${normalized.slice(-4)}`;
+}
+
+function normalizeDeveloperSetting(value, label, maximum = 256) {
+  const normalized = String(value || '').trim();
+  if (!normalized) throw new Error(`${label}不能为空`);
+  if (normalized.length > maximum) throw new Error(`${label}不能超过 ${maximum} 个字符`);
+  if (/[^\x21-\x7e]/.test(normalized)) throw new Error(`${label}只能包含可见 ASCII 字符`);
+  return normalized;
+}
+
+function normalizeDeveloperTargetName(value) {
+  const normalized = String(value || '').trim();
+  if (!normalized) throw new Error('小号名称不能为空');
+  if (normalized.length > 64 || /[\u0000-\u001f\u007f]/.test(normalized)) throw new Error('小号名称不能超过 64 个字符或包含控制字符');
+  return normalized;
+}
+
+function developerCredentials() {
+  const environmentClientId = String(process.env.GUANGYA_DEVELOPER_CLIENT_ID || '').trim();
+  const environmentClientSecret = String(process.env.GUANGYA_DEVELOPER_CLIENT_SECRET || '').trim();
+  return {
+    clientId: environmentClientId || String(appStateValue('developer_client_id') || '').trim(),
+    clientSecret: environmentClientSecret || String(appStateValue('developer_client_secret') || '').trim(),
+    clientIdFromEnvironment: Boolean(environmentClientId),
+    clientSecretFromEnvironment: Boolean(environmentClientSecret),
+  };
+}
+
+function accountIdFromProfile(payload) {
+  const data = payload?.data ?? payload;
+  const profile = data?.user ?? data?.profile ?? data;
+  for (const key of ['sub', 'userId', 'user_id', 'id']) {
+    const value = String(profile?.[key] ?? '').trim();
+    if (value) return value;
+  }
+  return '';
+}
+
+async function currentDeveloperAccountId() {
+  if (!token) throw new Error('请先登录当前光鸭账号');
+  const accountId = accountIdFromProfile(await accountGet('/v1/user/me'));
+  if (!accountId) throw new Error('当前登录态没有返回可识别的账号 ID，无法绑定开发者模式');
+  return accountId;
+}
+
+function developerBinding() {
+  return {
+    requestedEnabled: appStateValue('developer_mode_enabled') === '1',
+    accountId: String(appStateValue('developer_account_id') || '').trim(),
+    verifiedClientId: String(appStateValue('developer_verified_client_id') || '').trim(),
+    verifiedAt: Number(appStateValue('developer_account_verified_at') || 0) || 0,
+  };
+}
+
+function developerTargetFromRow(row) {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    token_masked: maskDeveloperValue(row.token_id),
+    created_at: Number(row.created_at),
+    updated_at: Number(row.updated_at),
+  };
+}
+
+function developerSettingsState(currentAccountId = '') {
+  const credentials = developerCredentials();
+  const binding = developerBinding();
+  const targets = database.prepare('SELECT id, name, token_id, created_at, updated_at FROM developer_targets ORDER BY updated_at DESC, name').all();
+  const accountMatchesCurrent = Boolean(currentAccountId && binding.accountId && currentAccountId === binding.accountId);
+  const accountVerified = Boolean(binding.accountId && binding.verifiedAt > 0 && binding.verifiedClientId === credentials.clientId);
+  return {
+    configured: Boolean(credentials.clientId && credentials.clientSecret),
+    enabled: Boolean(binding.requestedEnabled && accountVerified && accountMatchesCurrent && credentials.clientId && credentials.clientSecret),
+    requested_enabled: binding.requestedEnabled,
+    client_id: credentials.clientId,
+    client_secret_set: Boolean(credentials.clientSecret),
+    account_id: binding.accountId,
+    current_account_id: currentAccountId,
+    account_verified: accountVerified,
+    account_matches_current: accountMatchesCurrent,
+    verified_at: binding.verifiedAt,
+    managed_by_environment: credentials.clientIdFromEnvironment || credentials.clientSecretFromEnvironment,
+    client_id_managed_by_environment: credentials.clientIdFromEnvironment,
+    client_secret_managed_by_environment: credentials.clientSecretFromEnvironment,
+    targets: targets.map(developerTargetFromRow),
+  };
+}
+
+async function developerSettingsForCurrentAccount() {
+  let currentAccountId = '';
+  try { currentAccountId = await currentDeveloperAccountId(); } catch {}
+  return developerSettingsState(currentAccountId);
+}
+
+function updateDeveloperCredentials(body) {
+  const current = developerCredentials();
+  if (body.clear === true) {
+    if (current.clientIdFromEnvironment || current.clientSecretFromEnvironment) throw new Error('开发者凭据由环境变量托管，不能在页面中清除');
+    saveAppStateValue('developer_client_id', '');
+    saveAppStateValue('developer_client_secret', '');
+    saveAppStateValue('developer_mode_enabled', '0');
+    saveAppStateValue('developer_account_id', '');
+    saveAppStateValue('developer_verified_client_id', '');
+    saveAppStateValue('developer_account_verified_at', '0');
+    return developerSettingsState();
+  }
+  const clientId = normalizeDeveloperSetting(body.client_id ?? body.clientId ?? current.clientId, '开发者 client_id');
+  const requestedSecret = body.client_secret ?? body.clientSecret;
+  const clientSecret = requestedSecret == null || String(requestedSecret).trim() === ''
+    ? current.clientSecret
+    : normalizeDeveloperSetting(requestedSecret, '开发者 client_secret');
+  if (!clientSecret) throw new Error('首次配置时必须填写开发者 client_secret');
+  if (current.clientIdFromEnvironment && clientId !== current.clientId) throw new Error('client_id 由 GUANGYA_DEVELOPER_CLIENT_ID 托管');
+  if (current.clientSecretFromEnvironment && requestedSecret != null && String(requestedSecret).trim()) throw new Error('client_secret 由 GUANGYA_DEVELOPER_CLIENT_SECRET 托管');
+  const credentialsChanged = clientId !== current.clientId || clientSecret !== current.clientSecret;
+  if (!current.clientIdFromEnvironment) saveAppStateValue('developer_client_id', clientId);
+  if (!current.clientSecretFromEnvironment) saveAppStateValue('developer_client_secret', clientSecret);
+  if (credentialsChanged) {
+    saveAppStateValue('developer_mode_enabled', '0');
+    saveAppStateValue('developer_account_id', '');
+    saveAppStateValue('developer_verified_client_id', '');
+    saveAppStateValue('developer_account_verified_at', '0');
+  }
+  return developerSettingsState();
+}
+
+function upsertDeveloperTarget(body) {
+  const id = body.id == null || String(body.id).trim() === '' ? crypto.randomUUID() : validateIdentifier(body.id, '小号配置 ID');
+  const existing = database.prepare('SELECT id, token_id, created_at FROM developer_targets WHERE id = ?').get(id);
+  const name = normalizeDeveloperTargetName(body.name);
+  const requestedToken = body.token_id ?? body.tokenId;
+  const tokenId = requestedToken == null || String(requestedToken).trim() === ''
+    ? String(existing?.token_id || '')
+    : normalizeDeveloperSetting(requestedToken, '接收 TOKEN');
+  if (!tokenId) throw new Error('首次添加小号时必须填写接收 TOKEN');
+  const now = Math.floor(Date.now() / 1000);
+  database.prepare(`INSERT INTO developer_targets (id, name, token_id, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET name = excluded.name, token_id = excluded.token_id, updated_at = excluded.updated_at`)
+    .run(id, name, tokenId, Number(existing?.created_at || now), now);
+  return developerTargetFromRow(database.prepare('SELECT id, name, token_id, created_at, updated_at FROM developer_targets WHERE id = ?').get(id));
+}
+
+function deleteDeveloperTarget(idValue) {
+  const id = validateIdentifier(idValue, '小号配置 ID');
+  const active = database.prepare("SELECT 1 FROM developer_transfer_jobs WHERE target_id = ? AND status IN ('queued', 'direct', 'auditing', 'copying', 'running') LIMIT 1").get(id);
+  if (active) throw new Error('这个小号仍有进行中的互传任务，暂时不能删除');
+  const result = database.prepare('DELETE FROM developer_targets WHERE id = ?').run(id);
+  if (!result.changes) throw httpError(404, '小号配置不存在');
+  return {};
+}
+
+function parseJobArray(value) {
+  try { return JSON.parse(String(value || '[]')); } catch { return []; }
+}
+
+function developerTransferJob(row) {
+  if (!row) return null;
+  return {
+    id: String(row.id),
+    target_id: String(row.target_id),
+    target_name: String(row.target_name),
+    file_ids: parseJobArray(row.file_ids_json),
+    file_names: parseJobArray(row.file_names_json),
+    status: String(row.status),
+    phase: String(row.phase),
+    pre_task_id: row.pre_task_id == null ? null : String(row.pre_task_id),
+    upload_task_id: row.upload_task_id == null ? null : String(row.upload_task_id),
+    total_count: Number(row.total_count || 0),
+    passed_count: Number(row.passed_count || 0),
+    rejected_count: Number(row.rejected_count || 0),
+    pending_count: Number(row.pending_count || 0),
+    success_count: Number(row.success_count || 0),
+    skipped_count: Number(row.skipped_count || 0),
+    error_code: row.error_code == null ? null : Number(row.error_code),
+    message: row.message == null ? null : String(row.message),
+    created_at: Number(row.created_at),
+    updated_at: Number(row.updated_at),
+  };
+}
+
+function loadDeveloperTransferJob(id) {
+  return developerTransferJob(database.prepare('SELECT * FROM developer_transfer_jobs WHERE id = ?').get(id));
+}
+
+function listDeveloperTransfers(limit = 50) {
+  const normalizedLimit = Math.max(1, Math.min(100, Math.floor(Number(limit) || 50)));
+  return database.prepare('SELECT * FROM developer_transfer_jobs ORDER BY created_at DESC LIMIT ?').all(normalizedLimit).map(developerTransferJob);
+}
+
+function updateDeveloperTransferJob(id, patch) {
+  const allowed = new Set([
+    'status', 'phase', 'pre_task_id', 'upload_task_id', 'total_count', 'passed_count',
+    'rejected_count', 'pending_count', 'success_count', 'skipped_count', 'error_code', 'message',
+  ]);
+  const entries = Object.entries(patch).filter(([key, value]) => allowed.has(key) && value !== undefined);
+  if (entries.length) {
+    const assignments = entries.map(([key]) => `${key} = ?`).join(', ');
+    database.prepare(`UPDATE developer_transfer_jobs SET ${assignments}, updated_at = ? WHERE id = ?`)
+      .run(...entries.map(([, value]) => value), Math.floor(Date.now() / 1000), id);
+  }
+  const job = loadDeveloperTransferJob(id);
+  if (job) publish({ type: 'developer-transfer', job });
+  return job;
+}
+
+function developerClient() {
+  const credentials = developerCredentials();
+  if (!credentials.clientId || !credentials.clientSecret) throw new Error('请先在设置中填写开发者 client_id 和 client_secret');
+  return createGuangyaDeveloperClient({
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    timeoutMs: requestTimeoutMs,
+  });
+}
+
+async function verifyDeveloperAccountOwnership(probeFileIdValue = '') {
+  const currentAccountId = await currentDeveloperAccountId();
+  let probeFileId = String(probeFileIdValue || '').trim();
+  if (probeFileId) {
+    probeFileId = validateIdentifier(probeFileId, '账号校验文件 ID');
+    await apiPost('/userres/v1/file/get_file_detail', { fileId: probeFileId });
+  } else {
+    const payload = await apiPost('/userres/v1/file/get_file_list', {
+      parentId: '',
+      page: 0,
+      pageSize: 1,
+      dirType: 0,
+      orderBy: 0,
+      sortType: 0,
+    });
+    probeFileId = String(payload?.data?.list?.[0]?.fileId || '').trim();
+  }
+  if (!probeFileId) {
+    throw new Error('当前账号没有可用于所有权校验的文件或目录，请先在根目录创建一个文件夹后重试');
+  }
+  await developerPostWithRetry(developerClient(), '/userres/v1/file/get_file_detail', { fileId: probeFileId }, 0);
+  return { accountId: currentAccountId, probeFileId };
+}
+
+async function ensureDeveloperModeForCurrentAccount(probeFileId = '') {
+  const binding = developerBinding();
+  if (!binding.requestedEnabled) throw new Error('请先在“设置 → 账号”中开启开发者模式');
+  const credentials = developerCredentials();
+  if (!binding.accountId || binding.verifiedAt <= 0 || binding.verifiedClientId !== credentials.clientId) {
+    throw new Error('开发者凭据尚未通过当前账号所有权校验');
+  }
+  const currentAccountId = await currentDeveloperAccountId();
+  if (currentAccountId !== binding.accountId) {
+    throw new Error('开发者模式绑定的账号与当前登录账号不一致，请切回原账号或重新验证凭据');
+  }
+  const client = developerClient();
+  if (probeFileId) {
+    await developerPostWithRetry(client, '/userres/v1/file/get_file_detail', {
+      fileId: validateIdentifier(probeFileId, '账号校验文件 ID'),
+    }, 0);
+  }
+  return client;
+}
+
+async function updateDeveloperMode(enabledValue) {
+  const enabled = enabledValue === true;
+  if (!enabled) {
+    saveAppStateValue('developer_mode_enabled', '0');
+    return developerSettingsForCurrentAccount();
+  }
+  developerClient();
+  const credentials = developerCredentials();
+  const binding = developerBinding();
+  const currentAccountId = await currentDeveloperAccountId();
+  if (!binding.accountId || binding.verifiedAt <= 0) throw new Error('请先验证 client_id 确实属于当前账号');
+  if (binding.verifiedClientId !== credentials.clientId) throw new Error('开发者 client_id 已变化，请重新验证当前账号');
+  if (binding.accountId !== currentAccountId) throw new Error('这套开发者凭据绑定的不是当前登录账号，请重新配置并验证');
+  saveAppStateValue('developer_mode_enabled', '1');
+  resumeDeveloperTransfers();
+  return developerSettingsState(currentAccountId);
+}
+
+async function apiFileReadWithDeveloperFallback(endpoint, body, timeoutMs = requestTimeoutMs) {
+  try {
+    return await apiPost(endpoint, body, [], true, timeoutMs);
+  } catch (primaryError) {
+    if (!developerBinding().requestedEnabled) throw primaryError;
+    try {
+      const client = await ensureDeveloperModeForCurrentAccount();
+      return await developerPostWithRetry(client, endpoint, body, 0);
+    } catch (fallbackError) {
+      const error = new Error(`主接口读取失败：${primaryError?.message || primaryError}；开发者接口兜底失败：${fallbackError?.message || fallbackError}`);
+      error.statusCode = Number(fallbackError?.statusCode || primaryError?.statusCode || 502);
+      throw error;
+    }
+  }
+}
+
+async function developerPostWithRetry(client, endpoint, body, retries = 2) {
+  for (let attempt = 0; ; attempt += 1) {
+    try { return await client.post(endpoint, body); }
+    catch (error) {
+      if (!(error instanceof DeveloperApiError) || !error.retryable || attempt >= retries) throw error;
+      const delay = error.apiCode === 18010 ? 60_000 : Math.min(2_000 * (attempt + 1), 5_000);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
+
+function developerTaskId(payload) {
+  return String(payload?.data?.task_id ?? payload?.data?.taskId ?? payload?.task_id ?? payload?.taskId ?? '').trim();
+}
+
+function developerCounts(data = {}) {
+  const count = (...keys) => {
+    const value = keys.map((key) => data[key]).find((entry) => entry != null && entry !== '');
+    if (value == null) return undefined;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed)) : undefined;
+  };
+  return {
+    total_count: count('total_count', 'totalCount'),
+    passed_count: count('passed_count', 'passedCount'),
+    rejected_count: count('rejected_count', 'rejectedCount'),
+    pending_count: count('pending_count', 'pendingCount'),
+    success_count: count('success_count', 'successCount', 'use_count', 'useCount'),
+    skipped_count: count('skipped_count', 'skippedCount'),
+  };
+}
+
+async function finishDeveloperUpload(client, jobId, taskId) {
+  updateDeveloperTransferJob(jobId, { status: 'running', phase: 'upload', upload_task_id: taskId, message: '小号正在接收文件' });
+  for (let index = 0; index < 400; index += 1) {
+    const payload = await developerPostWithRetry(client, '/developer/v1/upload_status', { task_id: taskId });
+    const data = payload?.data || {};
+    const stateValue = String(data.status || payload.status || '').toLowerCase();
+    const counts = developerCounts(data);
+    if (stateValue === 'success') {
+      return updateDeveloperTransferJob(jobId, { ...counts, status: 'success', phase: 'completed', error_code: null, message: '文件已秒传到小号授权目录' });
+    }
+    if (stateValue === 'failed') throw new Error(String(data.message || data.msg || '小号秒传任务失败'));
+    updateDeveloperTransferJob(jobId, { ...counts, status: 'running', phase: 'upload', message: '小号正在接收文件' });
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+  }
+  throw new Error('小号秒传任务长时间未完成，请稍后在任务记录中重试');
+}
+
+async function submitDeveloperUpload(client, job, targetToken) {
+  updateDeveloperTransferJob(job.id, { status: 'copying', phase: 'upload', message: '正在提交小号秒传' });
+  const payload = await developerPostWithRetry(client, '/developer/v1/upload_by_fileid', {
+    token_id: targetToken,
+    file_ids: job.file_ids,
+  });
+  const taskId = developerTaskId(payload);
+  if (!taskId) throw new Error('开发者接口没有返回秒传任务 ID');
+  return finishDeveloperUpload(client, job.id, taskId);
+}
+
+async function finishDeveloperPreAudit(client, job, targetToken, taskId) {
+  updateDeveloperTransferJob(job.id, { status: 'auditing', phase: 'pre_upload', pre_task_id: taskId, message: '文件正在预审，通过后会自动秒传' });
+  for (let index = 0; index < 7_200; index += 1) {
+    const payload = await developerPostWithRetry(client, '/developer/v1/pre_upload_status', { task_id: taskId });
+    const data = payload?.data || {};
+    const auditStatus = Number(data.status ?? payload.status ?? 0);
+    const counts = developerCounts(data);
+    updateDeveloperTransferJob(job.id, { ...counts, status: 'auditing', phase: 'pre_upload', message: '文件正在预审，通过后会自动秒传' });
+    if (auditStatus === 4) throw new Error(String(data.message || data.msg || '文件预审失败'));
+    if (auditStatus === 3) return submitDeveloperUpload(client, loadDeveloperTransferJob(job.id), targetToken);
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
+  }
+  throw new Error('文件预审超过 6 小时仍未完成');
+}
+
+async function runDeveloperTransferJob(jobId) {
+  if (developerTransferRunning.has(jobId)) return;
+  developerTransferRunning.add(jobId);
+  try {
+    let job = loadDeveloperTransferJob(jobId);
+    if (!job || ['success', 'failed'].includes(job.status)) return;
+    const target = database.prepare('SELECT token_id FROM developer_targets WHERE id = ?').get(job.target_id);
+    if (!target?.token_id) throw new Error('小号接收 TOKEN 配置已不存在');
+    const client = developerClient();
+    if (job.upload_task_id) {
+      await finishDeveloperUpload(client, job.id, job.upload_task_id);
+      return;
+    }
+    if (job.pre_task_id) {
+      await finishDeveloperPreAudit(client, job, target.token_id, job.pre_task_id);
+      return;
+    }
+    updateDeveloperTransferJob(job.id, { status: 'direct', phase: 'direct', message: '正在尝试直接秒传' });
+    try {
+      await submitDeveloperUpload(client, job, target.token_id);
+    } catch (error) {
+      if (error instanceof DeveloperApiError && error.apiCode === 18014) {
+        updateDeveloperTransferJob(job.id, { status: 'success', phase: 'completed', skipped_count: job.total_count, error_code: null, message: '这些文件此前已传给该小号，无需重复传输' });
+        return;
+      }
+      if (!(error instanceof DeveloperApiError) || error.apiCode !== 18011) throw error;
+      const payload = await developerPostWithRetry(client, '/developer/v1/pre_upload', {
+        token_id: target.token_id,
+        file_ids: job.file_ids,
+      });
+      const taskId = developerTaskId(payload);
+      if (!taskId) throw new Error('开发者接口没有返回预审任务 ID');
+      job = updateDeveloperTransferJob(job.id, { status: 'auditing', phase: 'pre_upload', pre_task_id: taskId, message: '直传条件不足，已自动转入预审' });
+      await finishDeveloperPreAudit(client, job, target.token_id, taskId);
+    }
+  } catch (error) {
+    const code = error instanceof DeveloperApiError ? error.apiCode : null;
+    updateDeveloperTransferJob(jobId, {
+      status: 'failed',
+      phase: 'failed',
+      error_code: code,
+      message: String(error?.message || error || '小号互传失败'),
+    });
+  } finally {
+    developerTransferRunning.delete(jobId);
+  }
+}
+
+function resumeDeveloperTransfers() {
+  const binding = developerBinding();
+  const credentials = developerCredentials();
+  if (!binding.requestedEnabled || !binding.accountId || binding.verifiedAt <= 0 || binding.verifiedClientId !== credentials.clientId) return;
+  const rows = database.prepare("SELECT id FROM developer_transfer_jobs WHERE status IN ('queued', 'direct', 'auditing', 'copying', 'running') ORDER BY created_at").all();
+  for (const row of rows) setImmediate(() => void runDeveloperTransferJob(String(row.id)));
+}
+
+async function startDeveloperTransfer(body) {
+  const targetId = validateIdentifier(body.target_id ?? body.targetId, '小号配置 ID');
+  const target = database.prepare('SELECT id, name FROM developer_targets WHERE id = ?').get(targetId);
+  if (!target) throw new Error('请选择有效的小号接收 TOKEN');
+  const fileIds = validateFileIds(body.file_ids ?? body.fileIds);
+  if (fileIds.length > 20) throw new Error('开发者接口一次最多互传 20 项');
+  await ensureDeveloperModeForCurrentAccount(fileIds[0]);
+  const fileNames = Array.isArray(body.file_names ?? body.fileNames)
+    ? (body.file_names ?? body.fileNames).slice(0, fileIds.length).map((value) => String(value || '').slice(0, 255))
+    : [];
+  const identity = JSON.stringify([...fileIds].sort());
+  const duplicate = database.prepare("SELECT * FROM developer_transfer_jobs WHERE target_id = ? AND file_ids_json = ? AND status IN ('queued', 'direct', 'auditing', 'copying', 'running') ORDER BY created_at DESC LIMIT 1").get(targetId, identity);
+  if (duplicate) return { ...developerTransferJob(duplicate), reused: true };
+  const id = crypto.randomUUID();
+  const now = Math.floor(Date.now() / 1000);
+  database.prepare(`INSERT INTO developer_transfer_jobs
+    (id, target_id, target_name, file_ids_json, file_names_json, status, phase, total_count, message, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?)`)
+    .run(id, targetId, target.name, identity, JSON.stringify(fileNames), fileIds.length, '已加入小号互传队列', now, now);
+  const job = loadDeveloperTransferJob(id);
+  setImmediate(() => void runDeveloperTransferJob(id));
+  return job;
+}
+
+async function testDeveloperCredentials(probeFileId = '') {
+  const verified = await verifyDeveloperAccountOwnership(probeFileId);
+  saveAppStateValue('developer_account_id', verified.accountId);
+  saveAppStateValue('developer_verified_client_id', developerCredentials().clientId);
+  saveAppStateValue('developer_account_verified_at', String(Math.floor(Date.now() / 1000)));
+  saveAppStateValue('developer_mode_enabled', '0');
+  return {
+    ok: true,
+    account_id: verified.accountId,
+    settings: developerSettingsState(verified.accountId),
+  };
+}
+
 function state() { return { logged_in: Boolean(token), paused, pending: queue.size + waitingFiles.size + pendingUploads.size, active_uploads: active, upload_concurrency: uploadConcurrency, download_concurrency: downloadConcurrency, multipart: multipartMode, multipart_part_size: multipartMode, mappings, saved_shares: savedShares, hdhive: { enabled: hdhiveEnabled, configured: Boolean(hdhiveBaseUrl && hdhiveSecret), base_url: hdhiveBaseUrl, instance_id: hdhiveInstanceId }, auto_share_receipts: autoShareReceipts() }; }
 function publish(payload) { const line = `data: ${JSON.stringify(payload)}\n\n`; for (const response of clients) response.write(line); }
 function publishState() { publish({ type: 'state', state: state() }); }
@@ -2963,6 +3463,36 @@ async function routeApiV2(request, response, url) {
     const body = await readBody(request);
     return json(response, 200, updateCacheSettings(body));
   }
+  if (request.method === 'GET' && url.pathname === '/api/developer/settings') {
+    return json(response, 200, await developerSettingsForCurrentAccount(), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/developer/credentials') {
+    const body = await readBody(request, { maxBytes: 8 * 1024 });
+    return json(response, 200, updateDeveloperCredentials(body), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/developer/test') {
+    const body = await readBody(request, { maxBytes: 4 * 1024 });
+    return json(response, 200, await testDeveloperCredentials(body.probe_file_id ?? body.probeFileId), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/developer/mode') {
+    const body = await readBody(request, { maxBytes: 4 * 1024 });
+    return json(response, 200, await updateDeveloperMode(body.enabled), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/developer/targets') {
+    const body = await readBody(request, { maxBytes: 8 * 1024 });
+    return json(response, 200, upsertDeveloperTarget(body), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'DELETE' && url.pathname.startsWith('/api/developer/targets/')) {
+    const id = decodeURIComponent(url.pathname.split('/').pop());
+    return json(response, 200, deleteDeveloperTarget(id), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'GET' && url.pathname === '/api/developer/transfers') {
+    return json(response, 200, { list: listDeveloperTransfers(url.searchParams.get('limit')) }, { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/developer/transfers') {
+    const body = await readBody(request, { maxBytes: 32 * 1024 });
+    return json(response, 202, await startDeveloperTransfer(body), { 'cache-control': 'no-store' });
+  }
   if (request.method === 'GET' && url.pathname === '/api/cache') return json(response, 200, cacheState());
   if (request.method === 'POST' && url.pathname === '/api/cache/clear') return json(response, 200, clearManagedCaches());
   if (request.method === 'GET' && url.pathname === '/api/state') return json(response, 200, state());
@@ -2984,11 +3514,11 @@ async function routeApiV2(request, response, url) {
       sortType: 0,
     };
     if (url.searchParams.get('resType') === '2') body.resType = 2;
-    return json(response, 200, await apiPost('/userres/v1/file/get_file_list', body, [], true, fileListRequestTimeoutMs));
+    return json(response, 200, await apiFileReadWithDeveloperFallback('/userres/v1/file/get_file_list', body, fileListRequestTimeoutMs));
   }
   if (request.method === 'GET' && url.pathname === '/api/files/detail') {
     const fileId = validateIdentifier(url.searchParams.get('fileId'), '文件 ID');
-    return json(response, 200, await apiPost('/userres/v1/file/get_file_detail', { fileId }));
+    return json(response, 200, await apiFileReadWithDeveloperFallback('/userres/v1/file/get_file_detail', { fileId }));
   }
   if (request.method === 'GET' && url.pathname === '/api/recent') {
     const body = {
@@ -3215,6 +3745,7 @@ restoreUploadCheckpoints();
 await restartWatchers();
 restorePendingAutoShares();
 resumeHdhiveReceiptPolling();
+resumeDeveloperTransfers();
 pump();
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);

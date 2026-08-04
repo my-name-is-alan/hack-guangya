@@ -48,15 +48,14 @@ test('云添加使用官方 cursor、资源预解析、子文件序号和任务�
   assert.doesNotMatch(bridge.match(/command === 'list_offline_tasks'[\s\S]*?return webRequest\(`\/api\/offline\?\$\{params\}`\);/)?.[0] || '', /page:/);
 });
 
-test('资产、分享编辑、失效清理和文件直链均有活跃 UI 消费者', () => {
+test('账号开发者模式、分享编辑、失效清理和文件直链均有活跃 UI 消费者', () => {
   const account = read('components', 'settings', 'AccountSettingsPanel.vue');
   const shares = read('views', 'SharesView.vue');
   const details = read('components', 'files', 'FileDetailsDrawer.vue');
 
-  assert.match(account, /bridge\.invoke\('get_assets'/);
-  assert.match(account, /bridge\.invoke\('get_global_config'/);
-  assert.match(account, /highSpeedTraffic/);
-  assert.match(account, /vipRights/);
+  assert.match(account, /DeveloperSettingsPanel/);
+  assert.match(account, /session\.loadOverview\(\)/);
+  assert.doesNotMatch(account, /get_global_config|vipRights|当前权益规则/);
   assert.match(shares, /bridge\.invoke\('update_share'/);
   assert.match(shares, /bridge\.invoke\('delete_invalid_shares'/);
   assert.match(shares, /trafficLimit = editForm\.downloadType === 0/);

@@ -1,6 +1,6 @@
 <script setup>
 import { computed, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
-import { useRoute } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 import { message, Modal } from 'antdv-next';
 import {
   ArrowDownOutlined,
@@ -73,6 +73,7 @@ import {
 
 const transfers = useTransfersStore();
 const route = useRoute();
+const router = useRouter();
 const { folderOpenMode } = useFolderOpenPreference();
 
 const selectedKeys = ref([]);
@@ -126,6 +127,7 @@ const fileContextMenuItems = computed(() => {
     { key: 'rename', icon: () => h(EditOutlined), label: '重命名 (F2)' },
     { key: 'download', icon: () => h(DownloadOutlined), label: '下载' },
     { key: 'share', icon: () => h(ShareAltOutlined), label: '创建分享' },
+    { key: 'transferAccount', icon: () => h(SwapOutlined), label: '秒传到小号' },
     { type: 'divider' },
     { key: 'delete', icon: () => h(DeleteOutlined), label: '删除 (Del)', danger: true },
   ];
@@ -142,6 +144,15 @@ const gcidImport = reactive({
   concurrency: 4,
   status: null,
 });
+const developerTransfer = reactive({
+  open: false,
+  loading: false,
+  submitting: false,
+  records: [],
+  targets: [],
+  targetId: '',
+});
+const developerTerminalNotified = new Set();
 const gcidImportRunning = computed(() => ['preparing', 'running'].includes(gcidImport.status?.status));
 const gcidImportProgress = computed(() => gcidImportPercent(gcidImport.status));
 const fileActionBarVisible = computed(() => selectedKeys.value.length > 0 || fileClipboard.items.length > 0);
@@ -497,6 +508,66 @@ function selectedRecords() {
   return files.value.filter((item) => ids.has(fileId(item)));
 }
 
+async function openDeveloperTransfer(records = selectedRecords()) {
+  const targets = (Array.isArray(records) ? records : []).filter((item) => fileId(item));
+  if (!targets.length) {
+    message.warning('请先选择要传给小号的文件或文件夹');
+    return;
+  }
+  if (targets.length > 20) {
+    message.warning('开发者接口一次最多互传 20 项，请减少选择后重试');
+    return;
+  }
+  developerTransfer.loading = true;
+  try {
+    const settings = unwrapData(await bridge.invoke('get_developer_settings'));
+    if (!settings.enabled || !Array.isArray(settings.targets) || !settings.targets.length) {
+      Modal.confirm({
+        title: settings.enabled ? '先添加小号接收 TOKEN' : '先为当前账号开启开发者模式',
+        content: settings.enabled
+          ? '在“设置 → 账号 → 开发者模式”中添加小号生成的接收 TOKEN。'
+          : '在“设置 → 账号”中填写并验证当前账号自己的 client_id / client_secret，开启开发者模式后添加小号接收 TOKEN。',
+        okText: '去设置',
+        cancelText: '取消',
+        onOk: () => router.push({ name: 'settings' }),
+      });
+      return;
+    }
+    developerTransfer.records = targets;
+    developerTransfer.targets = settings.targets;
+    developerTransfer.targetId = settings.targets.some((item) => item.id === developerTransfer.targetId)
+      ? developerTransfer.targetId
+      : settings.targets[0].id;
+    developerTransfer.open = true;
+  } catch (error) {
+    message.error(errorText(error));
+  } finally {
+    developerTransfer.loading = false;
+  }
+}
+
+async function submitDeveloperTransfer() {
+  if (!developerTransfer.targetId) {
+    message.warning('请选择接收小号');
+    return;
+  }
+  developerTransfer.submitting = true;
+  try {
+    const job = unwrapData(await bridge.invoke('start_developer_transfer', {
+      target_id: developerTransfer.targetId,
+      file_ids: developerTransfer.records.map(fileId),
+      file_names: developerTransfer.records.map((item) => String(item.fileName || '未命名文件')),
+    }));
+    developerTransfer.open = false;
+    clearSelection();
+    message.success(job.reused ? '相同的互传任务已在处理中' : '已开始小号秒传；需要预审时会自动续传');
+  } catch (error) {
+    message.error(errorText(error));
+  } finally {
+    developerTransfer.submitting = false;
+  }
+}
+
 function contextTargetRecords() {
   const record = fileContextMenu.record;
   if (!record) return [];
@@ -525,6 +596,7 @@ async function handleFileContextMenuClick({ key }) {
   if (key === 'copyTo') return openFolderPicker('copy', targets);
   if (key === 'moveTo') return openFolderPicker('move', targets);
   if (key === 'share') return createCloudShare(targets);
+  if (key === 'transferAccount') return openDeveloperTransfer(targets);
   if (key === 'delete') return deleteCloudFiles(targets);
 }
 
@@ -1350,7 +1422,7 @@ function handleWindowClick(event) {
 
 useFileKeyboardShortcuts({
   getState: () => ({
-    blocked: fileContextMenu.open || shareAccess.open || shareResult.open || shareResult.creating || renameModal.open || folderPicker.open || gcidImport.open || gcidImport.detailsOpen || serverFilePicker.open || operationBusy.value,
+    blocked: fileContextMenu.open || shareAccess.open || shareResult.open || shareResult.creating || renameModal.open || folderPicker.open || gcidImport.open || gcidImport.detailsOpen || developerTransfer.open || serverFilePicker.open || operationBusy.value,
     fileCount: files.value.length,
     selectedCount: selectedKeys.value.length,
     clipboardCount: fileClipboard.items.length,
@@ -1371,6 +1443,7 @@ useFileKeyboardShortcuts({
 });
 
 let unlistenDrag = null;
+let unlistenDeveloperTransfer = null;
 onMounted(async () => {
   window.addEventListener('keydown', handleFileContextMenuKeydown, true);
   window.addEventListener('dragover', handleWindowDragOver);
@@ -1378,6 +1451,13 @@ onMounted(async () => {
   window.addEventListener('dragend', handleWindowDragEnd);
   window.addEventListener('drop', handleWindowDrop);
   window.addEventListener('click', handleWindowClick);
+  unlistenDeveloperTransfer = await bridge.subscribe((payload) => {
+    const job = payload?.type === 'developer-transfer' ? payload.job : null;
+    if (!job?.id || !['success', 'failed'].includes(job.status) || developerTerminalNotified.has(job.id)) return;
+    developerTerminalNotified.add(job.id);
+    if (job.status === 'success') message.success(job.message || `已完成到 ${job.target_name} 的小号秒传`);
+    else message.error(job.message || `传到 ${job.target_name} 失败`);
+  });
   if (isTauri) {
     void resumeGcidImport();
     unlistenDrag = await bridge.subscribeDrag(async (phase, payload) => {
@@ -1413,6 +1493,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('drop', handleWindowDrop);
   window.removeEventListener('click', handleWindowClick);
   unlistenDrag?.();
+  unlistenDeveloperTransfer?.();
 });
 </script>
 
@@ -1433,6 +1514,7 @@ onBeforeUnmount(() => {
           @rename="openRenameModal(selectedRecords())"
           @download="downloadCloudFiles(selectedRecords())"
           @share="createCloudShare(selectedRecords())"
+          @transfer-account="openDeveloperTransfer(selectedRecords())"
           @delete="deleteCloudFiles(selectedRecords())"
           @paste="pasteFileClipboard"
           @clear-selection="clearSelection"
@@ -1649,6 +1731,41 @@ onBeforeUnmount(() => {
     </a-modal>
 
     <a-modal
+      v-model:open="developerTransfer.open"
+      title="秒传到小号"
+      ok-text="开始秒传"
+      cancel-text="取消"
+      :width="520"
+      :confirm-loading="developerTransfer.submitting"
+      :mask-closable="!developerTransfer.submitting"
+      @ok="submitDeveloperTransfer"
+    >
+      <a-alert type="info" show-icon class="developer-transfer-note">
+        <template #message>服务端直接复制，不下载文件</template>
+        <template #description>若文件还未通过开发者预审，应用会自动提交预审，并在通过后继续传输。</template>
+      </a-alert>
+      <a-form layout="vertical">
+        <a-form-item label="接收小号" required>
+          <a-select
+            v-model:value="developerTransfer.targetId"
+            :options="developerTransfer.targets.map((item) => ({ value: item.id, label: `${item.name} · ${item.token_masked}` }))"
+            placeholder="请选择小号 TOKEN"
+          />
+        </a-form-item>
+        <a-form-item :label="`本次传输（${developerTransfer.records.length} 项）`">
+          <div class="developer-transfer-files">
+            <div v-for="record in developerTransfer.records" :key="fileId(record)">
+              <FolderOutlined v-if="isFolder(record)" />
+              <FileOutlined v-else />
+              <span :title="record.fileName">{{ record.fileName }}</span>
+            </div>
+          </div>
+        </a-form-item>
+      </a-form>
+      <div class="modal-hint">提交前会再次确认文件属于当前开发者账号；一个接收 TOKEN 不能反向传回。</div>
+    </a-modal>
+
+    <a-modal
       v-if="isTauri"
       v-model:open="gcidImport.open"
       title="导入 GCID JSON"
@@ -1799,6 +1916,37 @@ onBeforeUnmount(() => {
 
 .gcid-import-form :deep(.ant-form-item) {
   margin-bottom: 14px;
+}
+
+.developer-transfer-note {
+  margin-bottom: 16px;
+}
+
+.developer-transfer-files {
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--line, #e5e7eb);
+  border-radius: 8px;
+  background: var(--bg-toolbar, #fafafa);
+}
+
+.developer-transfer-files > div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line, #e5e7eb);
+}
+
+.developer-transfer-files > div:last-child {
+  border-bottom: 0;
+}
+
+.developer-transfer-files span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .file-list-region {

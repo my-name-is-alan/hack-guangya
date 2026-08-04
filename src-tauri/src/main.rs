@@ -16,7 +16,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::Sha1;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::{self, OpenOptions},
@@ -42,6 +42,7 @@ use uuid::Uuid;
 
 const API_BASE: &str = "https://api.guangyapan.com";
 const ACCOUNT_BASE: &str = "https://account.guangyapan.com";
+const DEVELOPER_API_BASE: &str = "https://dapi.guangyapan.com";
 // Kept in sync with api_map's live Windows PC profile.
 const OAUTH_CLIENT_ID: &str = "aMe_SVSlkrbQXpUT";
 const OAUTH_CLIENT_SECRET: &str = "FNAfp5IFEfCn5MYsIUTewg";
@@ -296,6 +297,7 @@ struct RuntimeState {
     hdhive_instance_id: String,
     auto_share_processing: HashSet<String>,
     gcid_import_running: HashSet<String>,
+    developer_transfer_running: HashSet<String>,
     sms_verifications: HashMap<String, SmsVerificationSession>,
     webdav_enabled: bool,
     webdav_port: u16,
@@ -313,6 +315,71 @@ struct HdhivePublicConfig {
     base_url: String,
     instance_id: String,
 }
+
+#[derive(Debug, Clone, Serialize)]
+struct DeveloperTarget {
+    id: String,
+    name: String,
+    token_masked: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DeveloperSettings {
+    configured: bool,
+    enabled: bool,
+    requested_enabled: bool,
+    client_id: String,
+    client_secret_set: bool,
+    account_id: String,
+    current_account_id: String,
+    account_verified: bool,
+    account_matches_current: bool,
+    verified_at: i64,
+    managed_by_environment: bool,
+    client_id_managed_by_environment: bool,
+    client_secret_managed_by_environment: bool,
+    targets: Vec<DeveloperTarget>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DeveloperTransferJob {
+    id: String,
+    target_id: String,
+    target_name: String,
+    file_ids: Vec<String>,
+    file_names: Vec<String>,
+    status: String,
+    phase: String,
+    pre_task_id: Option<String>,
+    upload_task_id: Option<String>,
+    total_count: i64,
+    passed_count: i64,
+    rejected_count: i64,
+    pending_count: i64,
+    success_count: i64,
+    skipped_count: i64,
+    error_code: Option<i64>,
+    message: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug)]
+struct DeveloperApiError {
+    message: String,
+    code: Option<i64>,
+    retryable: bool,
+}
+
+impl std::fmt::Display for DeveloperApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DeveloperApiError {}
 
 #[derive(Debug, Clone, Serialize)]
 struct AppVersionInfo {
@@ -1336,6 +1403,34 @@ fn init_database(path: &Path) -> Result<(), String> {
                error TEXT,
                updated_at INTEGER NOT NULL,
                PRIMARY KEY (job_id, path)
+             );
+             CREATE TABLE IF NOT EXISTS developer_targets (
+               id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               token_id TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS developer_transfer_jobs (
+               id TEXT PRIMARY KEY,
+               target_id TEXT NOT NULL,
+               target_name TEXT NOT NULL,
+               file_ids_json TEXT NOT NULL,
+               file_names_json TEXT NOT NULL,
+               status TEXT NOT NULL,
+               phase TEXT NOT NULL,
+               pre_task_id TEXT,
+               upload_task_id TEXT,
+               total_count INTEGER NOT NULL DEFAULT 0,
+               passed_count INTEGER NOT NULL DEFAULT 0,
+               rejected_count INTEGER NOT NULL DEFAULT 0,
+               pending_count INTEGER NOT NULL DEFAULT 0,
+               success_count INTEGER NOT NULL DEFAULT 0,
+               skipped_count INTEGER NOT NULL DEFAULT 0,
+               error_code INTEGER,
+               message TEXT,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL
              );",
         )
         .map_err(|e| format!("初始化 SQLite 失败：{e}"))?;
@@ -1343,6 +1438,8 @@ fn init_database(path: &Path) -> Result<(), String> {
         .execute_batch(
             "CREATE INDEX IF NOT EXISTS gcid_import_files_status
                ON gcid_import_files(job_id, status, path);
+             CREATE INDEX IF NOT EXISTS developer_transfer_jobs_status
+               ON developer_transfer_jobs(status, updated_at);
              UPDATE gcid_import_files
                SET status = 'pending', error = '应用上次退出，已等待继续'
                WHERE status = 'processing';
@@ -2137,6 +2234,456 @@ fn save_app_state(path: &Path, key: &str, value: &str) -> Result<(), String> {
         )
         .map_err(|error| format!("保存本地设置失败：{error}"))?;
     Ok(())
+}
+
+fn mask_developer_value(value: &str) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return String::new();
+    }
+    if chars.len() <= 8 {
+        return "••••••••".to_string();
+    }
+    format!(
+        "{}••••{}",
+        chars[..4].iter().collect::<String>(),
+        chars[chars.len() - 4..].iter().collect::<String>()
+    )
+}
+
+fn normalize_developer_setting(value: &str, label: &str) -> Result<String, String> {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return Err(format!("{label}不能为空"));
+    }
+    if normalized.len() > 256 || !normalized.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return Err(format!("{label}必须是 1 到 256 个可见 ASCII 字符"));
+    }
+    Ok(normalized.to_string())
+}
+
+fn normalize_developer_target_name(value: &str) -> Result<String, String> {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return Err("小号名称不能为空".to_string());
+    }
+    if normalized.chars().count() > 64 || normalized.chars().any(char::is_control) {
+        return Err("小号名称不能超过 64 个字符或包含控制字符".to_string());
+    }
+    Ok(normalized.to_string())
+}
+
+fn developer_credentials(path: &Path) -> Result<(String, String, bool, bool), String> {
+    let environment_client_id = std::env::var("GUANGYA_DEVELOPER_CLIENT_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let environment_client_secret = std::env::var("GUANGYA_DEVELOPER_CLIENT_SECRET")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let client_id_from_environment = environment_client_id.is_some();
+    let client_secret_from_environment = environment_client_secret.is_some();
+    let client_id = environment_client_id
+        .or(load_app_state(path, "developer_client_id")?)
+        .unwrap_or_default();
+    let client_secret = environment_client_secret
+        .or(load_app_state(path, "developer_client_secret")?)
+        .unwrap_or_default();
+    Ok((
+        client_id,
+        client_secret,
+        client_id_from_environment,
+        client_secret_from_environment,
+    ))
+}
+
+fn developer_target_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeveloperTarget> {
+    let token_id: String = row.get(2)?;
+    Ok(DeveloperTarget {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        token_masked: mask_developer_value(&token_id),
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
+    })
+}
+
+fn load_developer_targets(path: &Path) -> Result<Vec<DeveloperTarget>, String> {
+    let connection = open_database(path)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, name, token_id, created_at, updated_at
+             FROM developer_targets ORDER BY updated_at DESC, name",
+        )
+        .map_err(|error| format!("读取小号 TOKEN 配置失败：{error}"))?;
+    let rows = statement
+        .query_map([], developer_target_from_row)
+        .map_err(|error| format!("读取小号 TOKEN 配置失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析小号 TOKEN 配置失败：{error}"))?;
+    Ok(rows)
+}
+
+fn load_developer_settings_for_account(
+    path: &Path,
+    current_account_id: &str,
+) -> Result<DeveloperSettings, String> {
+    let (client_id, client_secret, client_id_from_environment, client_secret_from_environment) =
+        developer_credentials(path)?;
+    let requested_enabled = load_app_state(path, "developer_mode_enabled")?.as_deref() == Some("1");
+    let account_id = load_app_state(path, "developer_account_id")?.unwrap_or_default();
+    let verified_client_id =
+        load_app_state(path, "developer_verified_client_id")?.unwrap_or_default();
+    let verified_at = load_app_state(path, "developer_account_verified_at")?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let account_verified =
+        !account_id.is_empty() && verified_at > 0 && verified_client_id == client_id;
+    let account_matches_current =
+        !current_account_id.is_empty() && account_id == current_account_id;
+    let configured = !client_id.is_empty() && !client_secret.is_empty();
+    Ok(DeveloperSettings {
+        configured,
+        enabled: requested_enabled && account_verified && account_matches_current && configured,
+        requested_enabled,
+        client_id,
+        client_secret_set: !client_secret.is_empty(),
+        account_id,
+        current_account_id: current_account_id.to_string(),
+        account_verified,
+        account_matches_current,
+        verified_at,
+        managed_by_environment: client_id_from_environment || client_secret_from_environment,
+        client_id_managed_by_environment: client_id_from_environment,
+        client_secret_managed_by_environment: client_secret_from_environment,
+        targets: load_developer_targets(path)?,
+    })
+}
+
+fn load_developer_settings(path: &Path) -> Result<DeveloperSettings, String> {
+    load_developer_settings_for_account(path, "")
+}
+
+fn developer_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeveloperTransferJob> {
+    let file_ids_raw: String = row.get(3)?;
+    let file_names_raw: String = row.get(4)?;
+    Ok(DeveloperTransferJob {
+        id: row.get(0)?,
+        target_id: row.get(1)?,
+        target_name: row.get(2)?,
+        file_ids: serde_json::from_str(&file_ids_raw).unwrap_or_default(),
+        file_names: serde_json::from_str(&file_names_raw).unwrap_or_default(),
+        status: row.get(5)?,
+        phase: row.get(6)?,
+        pre_task_id: row.get(7)?,
+        upload_task_id: row.get(8)?,
+        total_count: row.get(9)?,
+        passed_count: row.get(10)?,
+        rejected_count: row.get(11)?,
+        pending_count: row.get(12)?,
+        success_count: row.get(13)?,
+        skipped_count: row.get(14)?,
+        error_code: row.get(15)?,
+        message: row.get(16)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
+    })
+}
+
+const DEVELOPER_JOB_COLUMNS: &str =
+    "id, target_id, target_name, file_ids_json, file_names_json, status, phase,
+     pre_task_id, upload_task_id, total_count, passed_count, rejected_count,
+     pending_count, success_count, skipped_count, error_code, message, created_at, updated_at";
+
+fn load_developer_transfer_job(
+    path: &Path,
+    job_id: &str,
+) -> Result<Option<DeveloperTransferJob>, String> {
+    open_database(path)?
+        .query_row(
+            &format!("SELECT {DEVELOPER_JOB_COLUMNS} FROM developer_transfer_jobs WHERE id = ?1"),
+            params![job_id],
+            developer_job_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取小号互传任务失败：{error}"))
+}
+
+fn list_developer_transfer_jobs(
+    path: &Path,
+    limit: Option<usize>,
+) -> Result<Vec<DeveloperTransferJob>, String> {
+    let limit = limit.unwrap_or(50).clamp(1, 100) as i64;
+    let connection = open_database(path)?;
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT {DEVELOPER_JOB_COLUMNS} FROM developer_transfer_jobs
+             ORDER BY created_at DESC LIMIT ?1"
+        ))
+        .map_err(|error| format!("读取小号互传任务失败：{error}"))?;
+    let rows = statement
+        .query_map(params![limit], developer_job_from_row)
+        .map_err(|error| format!("读取小号互传任务失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析小号互传任务失败：{error}"))?;
+    Ok(rows)
+}
+
+fn save_developer_transfer_job(path: &Path, job: &DeveloperTransferJob) -> Result<(), String> {
+    open_database(path)?
+        .execute(
+            "UPDATE developer_transfer_jobs SET
+               status = ?2, phase = ?3, pre_task_id = ?4, upload_task_id = ?5,
+               total_count = ?6, passed_count = ?7, rejected_count = ?8,
+               pending_count = ?9, success_count = ?10, skipped_count = ?11,
+               error_code = ?12, message = ?13, updated_at = ?14
+             WHERE id = ?1",
+            params![
+                job.id,
+                job.status,
+                job.phase,
+                job.pre_task_id,
+                job.upload_task_id,
+                job.total_count,
+                job.passed_count,
+                job.rejected_count,
+                job.pending_count,
+                job.success_count,
+                job.skipped_count,
+                job.error_code,
+                job.message,
+                job.updated_at,
+            ],
+        )
+        .map_err(|error| format!("更新小号互传任务失败：{error}"))?;
+    Ok(())
+}
+
+fn mutate_developer_transfer_job<F>(
+    path: &Path,
+    job_id: &str,
+    mutate: F,
+) -> Result<DeveloperTransferJob, String>
+where
+    F: FnOnce(&mut DeveloperTransferJob),
+{
+    let mut job = load_developer_transfer_job(path, job_id)?
+        .ok_or_else(|| "小号互传任务不存在".to_string())?;
+    mutate(&mut job);
+    job.updated_at = unix_timestamp();
+    save_developer_transfer_job(path, &job)?;
+    Ok(job)
+}
+
+fn update_and_emit_developer_job<F>(
+    app: &tauri::AppHandle,
+    path: &Path,
+    job_id: &str,
+    mutate: F,
+) -> Result<DeveloperTransferJob, String>
+where
+    F: FnOnce(&mut DeveloperTransferJob),
+{
+    let job = mutate_developer_transfer_job(path, job_id, mutate)?;
+    emit(app, json!({ "type": "developer-transfer", "job": job }));
+    Ok(job)
+}
+
+fn developer_signature(
+    client_id: &str,
+    client_secret: &str,
+    nonce: &str,
+    timestamp: i64,
+) -> String {
+    let source = format!(
+        "client_id={client_id}&client_secret={client_secret}&nonce={nonce}&timestamp={timestamp}"
+    );
+    let md5_bytes = Md5::digest(source.as_bytes());
+    hex::encode(Sha512::digest(md5_bytes))
+}
+
+fn developer_headers(client_id: &str, client_secret: &str) -> Result<HeaderMap, String> {
+    let client_id = normalize_developer_setting(client_id, "开发者 client_id")?;
+    let client_secret = normalize_developer_setting(client_secret, "开发者 client_secret")?;
+    let nonce = Uuid::new_v4().simple().to_string();
+    let timestamp = unix_timestamp();
+    let sign = developer_signature(&client_id, &client_secret, &nonce, timestamp);
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(
+        "client_id",
+        HeaderValue::from_str(&client_id).map_err(|error| error.to_string())?,
+    );
+    headers.insert(
+        "nonce",
+        HeaderValue::from_str(&nonce).map_err(|error| error.to_string())?,
+    );
+    headers.insert(
+        "timestamp",
+        HeaderValue::from_str(&timestamp.to_string()).map_err(|error| error.to_string())?,
+    );
+    headers.insert(
+        "sign",
+        HeaderValue::from_str(&sign).map_err(|error| error.to_string())?,
+    );
+    Ok(headers)
+}
+
+fn developer_error_message(code: i64, fallback: &str) -> String {
+    match code {
+        18001 => "接收 TOKEN 不存在或已删除",
+        18002 => "接收 TOKEN 已绑定其他开发者账号",
+        18003 => "发送账号与接收账号相同，不能互传",
+        18006 => "所选文件不属于当前开发者账号",
+        18007 => "小号云盘空间不足",
+        18008 => "小号授权的目标目录已不存在",
+        18009 => "任务不存在，或不属于当前开发者凭据",
+        18010 => "操作过于频繁，请稍后重试",
+        18011 => "文件尚未通过预审，暂时不能秒传",
+        18012 => "一次最多互传 20 项",
+        18013 => "开发者服务繁忙，请稍后重试",
+        18014 => "这些文件已经传给该小号，不能重复传输",
+        18020 => "开发者凭据无效或已删除",
+        18021 => "开发者签名校验失败",
+        18022 => "开发者签名已过期，请校准系统时间",
+        18023 => "开发者请求 nonce 已被使用",
+        18025 => "当前开发者凭据没有此接口权限",
+        18026 => "当前开发者账号已被限制使用接口",
+        _ if !fallback.trim().is_empty() => fallback,
+        _ => return format!("开发者接口失败（业务码 {code}）"),
+    }
+    .to_string()
+}
+
+async fn developer_api_post(
+    client_id: &str,
+    client_secret: &str,
+    endpoint: &str,
+    body: Value,
+) -> Result<Value, DeveloperApiError> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(API_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(API_REQUEST_TIMEOUT_SECS))
+        .build()
+        .map_err(|error| DeveloperApiError {
+            message: format!("创建开发者接口客户端失败：{error}"),
+            code: None,
+            retryable: true,
+        })?;
+    let headers =
+        developer_headers(client_id, client_secret).map_err(|message| DeveloperApiError {
+            message,
+            code: None,
+            retryable: false,
+        })?;
+    let response = client
+        .post(format!("{DEVELOPER_API_BASE}{endpoint}"))
+        .headers(headers)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| DeveloperApiError {
+            message: format!("无法连接开发者接口 {endpoint}：{error}"),
+            code: None,
+            retryable: true,
+        })?;
+    let http_status = response.status().as_u16();
+    let raw = response.text().await.map_err(|error| DeveloperApiError {
+        message: format!("读取开发者接口 {endpoint} 响应失败：{error}"),
+        code: None,
+        retryable: true,
+    })?;
+    let payload: Value =
+        serde_json::from_str(raw.trim().trim_start_matches('\u{feff}')).map_err(|error| {
+            DeveloperApiError {
+                message: format!("开发者接口 {endpoint} 返回了非 JSON 响应：{error}"),
+                code: None,
+                retryable: http_status >= 500,
+            }
+        })?;
+    let code = payload
+        .get("code")
+        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+        .unwrap_or(0);
+    if !(200..300).contains(&http_status) || code != 0 {
+        let fallback = payload
+            .get("msg")
+            .or_else(|| payload.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return Err(DeveloperApiError {
+            message: developer_error_message(code, fallback),
+            code: Some(code),
+            retryable: http_status == 429 || http_status >= 500 || matches!(code, 18010 | 18013),
+        });
+    }
+    Ok(payload)
+}
+
+async fn developer_post_with_retry(
+    client_id: &str,
+    client_secret: &str,
+    endpoint: &str,
+    body: Value,
+    retries: usize,
+) -> Result<Value, DeveloperApiError> {
+    for attempt in 0..=retries {
+        match developer_api_post(client_id, client_secret, endpoint, body.clone()).await {
+            Ok(payload) => return Ok(payload),
+            Err(error) if error.retryable && attempt < retries => {
+                let delay = if error.code == Some(18010) {
+                    60
+                } else {
+                    2 * (attempt as u64 + 1)
+                };
+                sleep(Duration::from_secs(delay.min(60))).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
+}
+
+fn developer_task_id(payload: &Value) -> Option<String> {
+    payload
+        .get("data")
+        .and_then(|data| data.get("task_id").or_else(|| data.get("taskId")))
+        .or_else(|| payload.get("task_id"))
+        .or_else(|| payload.get("taskId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn developer_count(data: &Value, snake: &str, camel: &str) -> Option<i64> {
+    data.get(snake)
+        .or_else(|| data.get(camel))
+        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+}
+
+fn apply_developer_counts(job: &mut DeveloperTransferJob, data: &Value) {
+    if let Some(value) = developer_count(data, "total_count", "totalCount") {
+        job.total_count = value.max(job.total_count);
+    }
+    if let Some(value) = developer_count(data, "passed_count", "passedCount") {
+        job.passed_count = value;
+    }
+    if let Some(value) = developer_count(data, "rejected_count", "rejectedCount") {
+        job.rejected_count = value;
+    }
+    if let Some(value) = developer_count(data, "pending_count", "pendingCount") {
+        job.pending_count = value;
+    }
+    if let Some(value) = developer_count(data, "success_count", "successCount")
+        .or_else(|| developer_count(data, "use_count", "useCount"))
+    {
+        job.success_count = value;
+    }
+    if let Some(value) = developer_count(data, "skipped_count", "skippedCount") {
+        job.skipped_count = value;
+    }
 }
 
 fn load_auto_share_receipts(path: &Path) -> Result<Vec<AutoShareReceipt>, String> {
@@ -7187,6 +7734,185 @@ fn auth_context(state: &tauri::State<'_, SharedState>) -> Result<(String, String
     ))
 }
 
+fn account_id_from_profile(payload: &Value) -> Option<String> {
+    let data = payload.get("data").unwrap_or(payload);
+    let profile = data
+        .get("user")
+        .or_else(|| data.get("profile"))
+        .unwrap_or(data);
+    ["sub", "userId", "user_id", "id"]
+        .into_iter()
+        .find_map(|key| match profile.get(key) {
+            Some(Value::String(value)) if !value.trim().is_empty() => {
+                Some(value.trim().to_string())
+            }
+            Some(Value::Number(value)) => Some(value.to_string()),
+            _ => None,
+        })
+}
+
+async fn current_developer_account_id(token: &str, device_id: &str) -> Result<String, String> {
+    let profile = account_get(token, device_id, "/v1/user/me").await?;
+    account_id_from_profile(&profile)
+        .ok_or_else(|| "当前登录态没有返回可识别的账号 ID，无法绑定开发者模式".to_string())
+}
+
+fn developer_mode_requested(path: &Path) -> Result<bool, String> {
+    Ok(load_app_state(path, "developer_mode_enabled")?.as_deref() == Some("1"))
+}
+
+async fn verify_developer_account_ownership(
+    state: &tauri::State<'_, SharedState>,
+    probe_file_id: Option<&str>,
+) -> Result<(String, String), String> {
+    let (token, device_id) = auth_context(state)?;
+    let database_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    let current_account_id = current_developer_account_id(&token, &device_id).await?;
+    let probe_file_id = if let Some(value) = probe_file_id.filter(|value| !value.trim().is_empty())
+    {
+        let file_id = normalize_api_id(value, "账号校验文件 ID")?;
+        api_post(
+            &token,
+            &device_id,
+            "/userres/v1/file/get_file_detail",
+            json!({ "fileId": file_id }),
+            &[],
+        )
+        .await?;
+        file_id
+    } else {
+        let response = api_post(
+            &token,
+            &device_id,
+            "/userres/v1/file/get_file_list",
+            json!({
+                "parentId": "",
+                "page": 0,
+                "pageSize": 1,
+                "dirType": 0,
+                "orderBy": 0,
+                "sortType": 0
+            }),
+            &[],
+        )
+        .await?;
+        response
+            .data
+            .as_ref()
+            .and_then(|data| data.get("list"))
+            .and_then(Value::as_array)
+            .and_then(|list| list.first())
+            .and_then(|item| item.get("fileId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                "当前账号没有可用于所有权校验的文件或目录，请先在根目录创建一个文件夹后重试"
+                    .to_string()
+            })?
+    };
+    let (client_id, client_secret, _, _) = developer_credentials(&database_path)?;
+    if client_id.is_empty() || client_secret.is_empty() {
+        return Err("请先填写开发者 client_id 和 client_secret".to_string());
+    }
+    developer_post_with_retry(
+        &client_id,
+        &client_secret,
+        "/userres/v1/file/get_file_detail",
+        json!({ "fileId": probe_file_id }),
+        0,
+    )
+    .await
+    .map_err(|error| error.message)?;
+    Ok((current_account_id, probe_file_id))
+}
+
+async fn ensure_developer_mode_for_current_account(
+    state: &tauri::State<'_, SharedState>,
+    probe_file_id: Option<&str>,
+) -> Result<(String, String, String), String> {
+    let (token, device_id) = auth_context(state)?;
+    let database_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    if !developer_mode_requested(&database_path)? {
+        return Err("请先在“设置 → 账号”中开启开发者模式".to_string());
+    }
+    let bound_account_id =
+        load_app_state(&database_path, "developer_account_id")?.unwrap_or_default();
+    let verified_client_id =
+        load_app_state(&database_path, "developer_verified_client_id")?.unwrap_or_default();
+    let verified_at = load_app_state(&database_path, "developer_account_verified_at")?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    if bound_account_id.is_empty() || verified_at <= 0 {
+        return Err("开发者凭据尚未通过当前账号所有权校验".to_string());
+    }
+    let current_account_id = current_developer_account_id(&token, &device_id).await?;
+    if current_account_id != bound_account_id {
+        return Err(
+            "开发者模式绑定的账号与当前登录账号不一致，请切回原账号或重新验证凭据".to_string(),
+        );
+    }
+    let (client_id, client_secret, _, _) = developer_credentials(&database_path)?;
+    if client_id.is_empty() || client_secret.is_empty() {
+        return Err("请先填写开发者 client_id 和 client_secret".to_string());
+    }
+    if verified_client_id != client_id {
+        return Err("开发者 client_id 已变化，请重新验证当前账号".to_string());
+    }
+    if let Some(value) = probe_file_id.filter(|value| !value.trim().is_empty()) {
+        let file_id = normalize_api_id(value, "账号校验文件 ID")?;
+        developer_post_with_retry(
+            &client_id,
+            &client_secret,
+            "/userres/v1/file/get_file_detail",
+            json!({ "fileId": file_id }),
+            0,
+        )
+        .await
+        .map_err(|error| error.message)?;
+    }
+    Ok((client_id, client_secret, current_account_id))
+}
+
+async fn developer_file_read_fallback(
+    state: &tauri::State<'_, SharedState>,
+    endpoint: &str,
+    body: Value,
+    primary_error: String,
+) -> Result<Value, String> {
+    let database_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    if !developer_mode_requested(&database_path)? {
+        return Err(primary_error);
+    }
+    let (client_id, client_secret, _) = ensure_developer_mode_for_current_account(state, None)
+        .await
+        .map_err(|fallback| {
+            format!("主接口读取失败：{primary_error}；开发者接口兜底失败：{fallback}")
+        })?;
+    let payload = developer_post_with_retry(&client_id, &client_secret, endpoint, body, 0)
+        .await
+        .map_err(|error| {
+            format!(
+                "主接口读取失败：{primary_error}；开发者接口兜底失败：{}",
+                error.message
+            )
+        })?;
+    Ok(payload.get("data").cloned().unwrap_or_else(|| json!({})))
+}
+
 #[tauri::command]
 async fn get_overview(state: tauri::State<'_, SharedState>) -> Result<Value, String> {
     let (token, device_id) = auth_context(&state)?;
@@ -7341,17 +8067,28 @@ async fn get_file_detail(
 ) -> Result<Value, String> {
     let request = file_detail_request(&file_id)?;
     let (token, device_id) = auth_context(&state)?;
-    let response = api_post(
+    let primary = api_post(
         &token,
         &device_id,
         "/userres/v1/file/get_file_detail",
-        request,
+        request.clone(),
         &[],
     )
-    .await?;
-    response
-        .data
-        .ok_or_else(|| "光鸭没有返回文件详情".to_string())
+    .await;
+    match primary {
+        Ok(response) => response
+            .data
+            .ok_or_else(|| "光鸭没有返回文件详情".to_string()),
+        Err(primary_error) => {
+            developer_file_read_fallback(
+                &state,
+                "/userres/v1/file/get_file_detail",
+                request,
+                primary_error,
+            )
+            .await
+        }
+    }
 }
 
 #[tauri::command]
@@ -7388,21 +8125,41 @@ async fn list_files(
     folders_only: Option<bool>,
 ) -> Result<Value, String> {
     let (token, device_id) = auth_context(&state)?;
-    let response = tokio::time::timeout(
+    let request = file_list_request(&parent_id, page, folders_only.unwrap_or(false));
+    let primary = tokio::time::timeout(
         Duration::from_secs(FILE_LIST_REQUEST_TIMEOUT_SECS),
         api_post(
             &token,
             &device_id,
             "/userres/v1/file/get_file_list",
-            file_list_request(&parent_id, page, folders_only.unwrap_or(false)),
+            request.clone(),
             &[],
         ),
     )
-    .await
-    .map_err(|_| "文件目录加载超过 12 秒，请重试".to_string())??;
-    Ok(response
-        .data
-        .unwrap_or_else(|| json!({ "list": [], "total": 0 })))
+    .await;
+    match primary {
+        Ok(Ok(response)) => Ok(response
+            .data
+            .unwrap_or_else(|| json!({ "list": [], "total": 0 }))),
+        Ok(Err(primary_error)) => {
+            developer_file_read_fallback(
+                &state,
+                "/userres/v1/file/get_file_list",
+                request,
+                primary_error,
+            )
+            .await
+        }
+        Err(_) => {
+            developer_file_read_fallback(
+                &state,
+                "/userres/v1/file/get_file_list",
+                request,
+                "文件目录加载超过 12 秒，请重试".to_string(),
+            )
+            .await
+        }
+    }
 }
 
 fn file_list_request(parent_id: &str, page: u64, folders_only: bool) -> Value {
@@ -11032,6 +11789,763 @@ fn pause_queue(app: tauri::AppHandle, state: tauri::State<'_, SharedState>) {
     emit_state(&app, state.inner());
 }
 #[tauri::command]
+async fn get_developer_settings(
+    state: tauri::State<'_, SharedState>,
+) -> Result<DeveloperSettings, String> {
+    let (token, device_id) = auth_context(&state)?;
+    let database_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    let current_account_id = current_developer_account_id(&token, &device_id)
+        .await
+        .unwrap_or_default();
+    load_developer_settings_for_account(&database_path, &current_account_id)
+}
+
+#[tauri::command]
+fn update_developer_credentials(
+    state: tauri::State<'_, SharedState>,
+    client_id: String,
+    client_secret: Option<String>,
+    clear: Option<bool>,
+) -> Result<DeveloperSettings, String> {
+    let database_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    let (current_id, current_secret, id_from_environment, secret_from_environment) =
+        developer_credentials(&database_path)?;
+    if clear.unwrap_or(false) {
+        if id_from_environment || secret_from_environment {
+            return Err("开发者凭据由环境变量托管，不能在页面中清除".to_string());
+        }
+        save_app_state(&database_path, "developer_client_id", "")?;
+        save_app_state(&database_path, "developer_client_secret", "")?;
+        save_app_state(&database_path, "developer_mode_enabled", "0")?;
+        save_app_state(&database_path, "developer_account_id", "")?;
+        save_app_state(&database_path, "developer_verified_client_id", "")?;
+        save_app_state(&database_path, "developer_account_verified_at", "0")?;
+        return load_developer_settings(&database_path);
+    }
+    let next_id = normalize_developer_setting(
+        if client_id.trim().is_empty() {
+            &current_id
+        } else {
+            &client_id
+        },
+        "开发者 client_id",
+    )?;
+    let requested_secret = client_secret.unwrap_or_default();
+    let next_secret = if requested_secret.trim().is_empty() {
+        current_secret.clone()
+    } else {
+        normalize_developer_setting(&requested_secret, "开发者 client_secret")?
+    };
+    if next_secret.is_empty() {
+        return Err("首次配置时必须填写开发者 client_secret".to_string());
+    }
+    if id_from_environment && next_id != current_id {
+        return Err("client_id 由 GUANGYA_DEVELOPER_CLIENT_ID 托管".to_string());
+    }
+    if secret_from_environment && !requested_secret.trim().is_empty() {
+        return Err("client_secret 由 GUANGYA_DEVELOPER_CLIENT_SECRET 托管".to_string());
+    }
+    let credentials_changed = next_id != current_id || next_secret != current_secret;
+    if !id_from_environment {
+        save_app_state(&database_path, "developer_client_id", &next_id)?;
+    }
+    if !secret_from_environment {
+        save_app_state(&database_path, "developer_client_secret", &next_secret)?;
+    }
+    if credentials_changed {
+        save_app_state(&database_path, "developer_mode_enabled", "0")?;
+        save_app_state(&database_path, "developer_account_id", "")?;
+        save_app_state(&database_path, "developer_verified_client_id", "")?;
+        save_app_state(&database_path, "developer_account_verified_at", "0")?;
+    }
+    load_developer_settings(&database_path)
+}
+
+#[tauri::command]
+fn upsert_developer_target(
+    state: tauri::State<'_, SharedState>,
+    id: Option<String>,
+    name: String,
+    token_id: Option<String>,
+) -> Result<DeveloperTarget, String> {
+    let database_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    let id = match id.filter(|value| !value.trim().is_empty()) {
+        Some(value) => normalize_api_id(&value, "小号配置 ID")?,
+        None => Uuid::new_v4().to_string(),
+    };
+    let name = normalize_developer_target_name(&name)?;
+    let connection = open_database(&database_path)?;
+    let existing = connection
+        .query_row(
+            "SELECT token_id, created_at FROM developer_targets WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("读取小号 TOKEN 配置失败：{error}"))?;
+    let requested_token = token_id.unwrap_or_default();
+    let token_id = if requested_token.trim().is_empty() {
+        existing
+            .as_ref()
+            .map(|(token, _)| token.clone())
+            .unwrap_or_default()
+    } else {
+        normalize_developer_setting(&requested_token, "接收 TOKEN")?
+    };
+    if token_id.is_empty() {
+        return Err("首次添加小号时必须填写接收 TOKEN".to_string());
+    }
+    let now = unix_timestamp();
+    let created_at = existing.map(|(_, created_at)| created_at).unwrap_or(now);
+    connection
+        .execute(
+            "INSERT INTO developer_targets (id, name, token_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name, token_id = excluded.token_id, updated_at = excluded.updated_at",
+            params![id, name, token_id, created_at, now],
+        )
+        .map_err(|error| format!("保存小号 TOKEN 配置失败：{error}"))?;
+    connection
+        .query_row(
+            "SELECT id, name, token_id, created_at, updated_at FROM developer_targets WHERE id = ?1",
+            params![id],
+            developer_target_from_row,
+        )
+        .map_err(|error| format!("读取保存后的小号 TOKEN 配置失败：{error}"))
+}
+
+#[tauri::command]
+fn delete_developer_target(
+    state: tauri::State<'_, SharedState>,
+    id: String,
+) -> Result<Value, String> {
+    let id = normalize_api_id(&id, "小号配置 ID")?;
+    let database_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    let connection = open_database(&database_path)?;
+    let active = connection
+        .query_row(
+            "SELECT 1 FROM developer_transfer_jobs
+             WHERE target_id = ?1 AND status IN ('queued', 'direct', 'auditing', 'copying', 'running')
+             LIMIT 1",
+            params![id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| format!("检查小号互传任务失败：{error}"))?;
+    if active.is_some() {
+        return Err("这个小号仍有进行中的互传任务，暂时不能删除".to_string());
+    }
+    let changed = connection
+        .execute("DELETE FROM developer_targets WHERE id = ?1", params![id])
+        .map_err(|error| format!("删除小号 TOKEN 配置失败：{error}"))?;
+    if changed == 0 {
+        return Err("小号配置不存在".to_string());
+    }
+    Ok(json!({}))
+}
+
+#[tauri::command]
+fn list_developer_transfers(
+    state: tauri::State<'_, SharedState>,
+    limit: Option<usize>,
+) -> Result<Value, String> {
+    let database_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    Ok(json!({ "list": list_developer_transfer_jobs(&database_path, limit)? }))
+}
+
+#[tauri::command]
+async fn test_developer_credentials(
+    state: tauri::State<'_, SharedState>,
+    probe_file_id: Option<String>,
+) -> Result<Value, String> {
+    let database_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    let (account_id, _) =
+        verify_developer_account_ownership(&state, probe_file_id.as_deref()).await?;
+    let verified_at = unix_timestamp();
+    save_app_state(&database_path, "developer_account_id", &account_id)?;
+    let (client_id, _, _, _) = developer_credentials(&database_path)?;
+    save_app_state(&database_path, "developer_verified_client_id", &client_id)?;
+    save_app_state(
+        &database_path,
+        "developer_account_verified_at",
+        &verified_at.to_string(),
+    )?;
+    save_app_state(&database_path, "developer_mode_enabled", "0")?;
+    Ok(json!({
+        "ok": true,
+        "account_id": account_id,
+        "settings": load_developer_settings_for_account(&database_path, &account_id)?
+    }))
+}
+
+#[tauri::command]
+async fn update_developer_mode(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+    enabled: bool,
+) -> Result<DeveloperSettings, String> {
+    let database_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    if !enabled {
+        save_app_state(&database_path, "developer_mode_enabled", "0")?;
+        let current_account_id = match auth_context(&state) {
+            Ok((token, device_id)) => current_developer_account_id(&token, &device_id)
+                .await
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+        return load_developer_settings_for_account(&database_path, &current_account_id);
+    }
+    let (token, device_id) = auth_context(&state)?;
+    let current_account_id = current_developer_account_id(&token, &device_id).await?;
+    let settings = load_developer_settings_for_account(&database_path, &current_account_id)?;
+    if !settings.configured {
+        return Err("请先填写开发者 client_id 和 client_secret".to_string());
+    }
+    if !settings.account_verified {
+        return Err("请先验证 client_id 确实属于当前账号".to_string());
+    }
+    if !settings.account_matches_current {
+        return Err("这套开发者凭据绑定的不是当前登录账号，请重新配置并验证".to_string());
+    }
+    save_app_state(&database_path, "developer_mode_enabled", "1")?;
+    resume_developer_transfer_jobs(app, state.inner().clone())?;
+    load_developer_settings_for_account(&database_path, &current_account_id)
+}
+
+async fn finish_developer_upload(
+    app: &tauri::AppHandle,
+    database_path: &Path,
+    client_id: &str,
+    client_secret: &str,
+    job_id: &str,
+    task_id: &str,
+) -> Result<DeveloperTransferJob, DeveloperApiError> {
+    update_and_emit_developer_job(app, database_path, job_id, |job| {
+        job.status = "running".to_string();
+        job.phase = "upload".to_string();
+        job.upload_task_id = Some(task_id.to_string());
+        job.message = Some("小号正在接收文件".to_string());
+    })
+    .map_err(|message| DeveloperApiError {
+        message,
+        code: None,
+        retryable: false,
+    })?;
+    for _ in 0..400 {
+        let payload = developer_post_with_retry(
+            client_id,
+            client_secret,
+            "/developer/v1/upload_status",
+            json!({ "task_id": task_id }),
+            2,
+        )
+        .await?;
+        let data = payload.get("data").cloned().unwrap_or_else(|| json!({}));
+        let status_value = data
+            .get("status")
+            .or_else(|| payload.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if status_value == "failed" {
+            let message = data
+                .get("message")
+                .or_else(|| data.get("msg"))
+                .and_then(Value::as_str)
+                .unwrap_or("小号秒传任务失败")
+                .to_string();
+            return Err(DeveloperApiError {
+                message,
+                code: None,
+                retryable: false,
+            });
+        }
+        let completed = status_value == "success";
+        let job = update_and_emit_developer_job(app, database_path, job_id, |job| {
+            apply_developer_counts(job, &data);
+            job.status = if completed { "success" } else { "running" }.to_string();
+            job.phase = if completed { "completed" } else { "upload" }.to_string();
+            job.error_code = None;
+            job.message = Some(
+                if completed {
+                    "文件已秒传到小号授权目录"
+                } else {
+                    "小号正在接收文件"
+                }
+                .to_string(),
+            );
+        })
+        .map_err(|message| DeveloperApiError {
+            message,
+            code: None,
+            retryable: false,
+        })?;
+        if completed {
+            return Ok(job);
+        }
+        sleep(Duration::from_millis(1_500)).await;
+    }
+    Err(DeveloperApiError {
+        message: "小号秒传任务长时间未完成，请稍后在任务记录中重试".to_string(),
+        code: None,
+        retryable: false,
+    })
+}
+
+async fn submit_developer_upload(
+    app: &tauri::AppHandle,
+    database_path: &Path,
+    client_id: &str,
+    client_secret: &str,
+    job: &DeveloperTransferJob,
+    target_token: &str,
+) -> Result<DeveloperTransferJob, DeveloperApiError> {
+    update_and_emit_developer_job(app, database_path, &job.id, |job| {
+        job.status = "copying".to_string();
+        job.phase = "upload".to_string();
+        job.message = Some("正在提交小号秒传".to_string());
+    })
+    .map_err(|message| DeveloperApiError {
+        message,
+        code: None,
+        retryable: false,
+    })?;
+    let payload = developer_post_with_retry(
+        client_id,
+        client_secret,
+        "/developer/v1/upload_by_fileid",
+        json!({ "token_id": target_token, "file_ids": job.file_ids }),
+        2,
+    )
+    .await?;
+    let task_id = developer_task_id(&payload).ok_or_else(|| DeveloperApiError {
+        message: "开发者接口没有返回秒传任务 ID".to_string(),
+        code: None,
+        retryable: false,
+    })?;
+    finish_developer_upload(
+        app,
+        database_path,
+        client_id,
+        client_secret,
+        &job.id,
+        &task_id,
+    )
+    .await
+}
+
+async fn finish_developer_pre_audit(
+    app: &tauri::AppHandle,
+    database_path: &Path,
+    client_id: &str,
+    client_secret: &str,
+    job: &DeveloperTransferJob,
+    target_token: &str,
+    task_id: &str,
+) -> Result<DeveloperTransferJob, DeveloperApiError> {
+    update_and_emit_developer_job(app, database_path, &job.id, |job| {
+        job.status = "auditing".to_string();
+        job.phase = "pre_upload".to_string();
+        job.pre_task_id = Some(task_id.to_string());
+        job.message = Some("文件正在预审，通过后会自动秒传".to_string());
+    })
+    .map_err(|message| DeveloperApiError {
+        message,
+        code: None,
+        retryable: false,
+    })?;
+    for _ in 0..7_200 {
+        let payload = developer_post_with_retry(
+            client_id,
+            client_secret,
+            "/developer/v1/pre_upload_status",
+            json!({ "task_id": task_id }),
+            2,
+        )
+        .await?;
+        let data = payload.get("data").cloned().unwrap_or_else(|| json!({}));
+        let audit_status = data
+            .get("status")
+            .or_else(|| payload.get("status"))
+            .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+            .unwrap_or(0);
+        let current = update_and_emit_developer_job(app, database_path, &job.id, |job| {
+            apply_developer_counts(job, &data);
+            job.status = "auditing".to_string();
+            job.phase = "pre_upload".to_string();
+            job.message = Some("文件正在预审，通过后会自动秒传".to_string());
+        })
+        .map_err(|message| DeveloperApiError {
+            message,
+            code: None,
+            retryable: false,
+        })?;
+        if audit_status == 4 {
+            let message = data
+                .get("message")
+                .or_else(|| data.get("msg"))
+                .and_then(Value::as_str)
+                .unwrap_or("文件预审失败")
+                .to_string();
+            return Err(DeveloperApiError {
+                message,
+                code: None,
+                retryable: false,
+            });
+        }
+        if audit_status == 3 {
+            return submit_developer_upload(
+                app,
+                database_path,
+                client_id,
+                client_secret,
+                &current,
+                target_token,
+            )
+            .await;
+        }
+        sleep(Duration::from_secs(3)).await;
+    }
+    Err(DeveloperApiError {
+        message: "文件预审超过 6 小时仍未完成".to_string(),
+        code: None,
+        retryable: false,
+    })
+}
+
+async fn run_developer_transfer_job(app: tauri::AppHandle, state: SharedState, job_id: String) {
+    let database_path = match state.lock() {
+        Ok(guard) => guard.db_path.clone(),
+        Err(error) => {
+            status(&app, "error", format!("读取小号互传状态失败：{error}"));
+            return;
+        }
+    };
+    let result = async {
+        let mut job = load_developer_transfer_job(&database_path, &job_id)
+            .map_err(|message| DeveloperApiError {
+                message,
+                code: None,
+                retryable: false,
+            })?
+            .ok_or_else(|| DeveloperApiError {
+                message: "小号互传任务不存在".to_string(),
+                code: None,
+                retryable: false,
+            })?;
+        if matches!(job.status.as_str(), "success" | "failed") {
+            return Ok(job);
+        }
+        let (client_id, client_secret, _, _) =
+            developer_credentials(&database_path).map_err(|message| DeveloperApiError {
+                message,
+                code: None,
+                retryable: false,
+            })?;
+        if client_id.is_empty() || client_secret.is_empty() {
+            return Err(DeveloperApiError {
+                message: "请先在设置中填写开发者 client_id 和 client_secret".to_string(),
+                code: None,
+                retryable: false,
+            });
+        }
+        let target_token = open_database(&database_path)
+            .and_then(|connection| {
+                connection
+                    .query_row(
+                        "SELECT token_id FROM developer_targets WHERE id = ?1",
+                        params![job.target_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| format!("读取小号接收 TOKEN 失败：{error}"))
+            })
+            .map_err(|message| DeveloperApiError {
+                message,
+                code: None,
+                retryable: false,
+            })?
+            .ok_or_else(|| DeveloperApiError {
+                message: "小号接收 TOKEN 配置已不存在".to_string(),
+                code: None,
+                retryable: false,
+            })?;
+        if let Some(task_id) = job.upload_task_id.clone() {
+            return finish_developer_upload(
+                &app,
+                &database_path,
+                &client_id,
+                &client_secret,
+                &job.id,
+                &task_id,
+            )
+            .await;
+        }
+        if let Some(task_id) = job.pre_task_id.clone() {
+            return finish_developer_pre_audit(
+                &app,
+                &database_path,
+                &client_id,
+                &client_secret,
+                &job,
+                &target_token,
+                &task_id,
+            )
+            .await;
+        }
+        job = update_and_emit_developer_job(&app, &database_path, &job.id, |job| {
+            job.status = "direct".to_string();
+            job.phase = "direct".to_string();
+            job.message = Some("正在尝试直接秒传".to_string());
+        })
+        .map_err(|message| DeveloperApiError {
+            message,
+            code: None,
+            retryable: false,
+        })?;
+        match submit_developer_upload(
+            &app,
+            &database_path,
+            &client_id,
+            &client_secret,
+            &job,
+            &target_token,
+        )
+        .await
+        {
+            Ok(job) => Ok(job),
+            Err(error) if error.code == Some(18014) => {
+                update_and_emit_developer_job(&app, &database_path, &job.id, |current| {
+                    current.status = "success".to_string();
+                    current.phase = "completed".to_string();
+                    current.skipped_count = current.total_count;
+                    current.error_code = None;
+                    current.message = Some("这些文件此前已传给该小号，无需重复传输".to_string());
+                })
+                .map_err(|message| DeveloperApiError {
+                    message,
+                    code: None,
+                    retryable: false,
+                })
+            }
+            Err(error) if error.code == Some(18011) => {
+                let payload = developer_post_with_retry(
+                    &client_id,
+                    &client_secret,
+                    "/developer/v1/pre_upload",
+                    json!({ "token_id": target_token, "file_ids": job.file_ids }),
+                    2,
+                )
+                .await?;
+                let task_id = developer_task_id(&payload).ok_or_else(|| DeveloperApiError {
+                    message: "开发者接口没有返回预审任务 ID".to_string(),
+                    code: None,
+                    retryable: false,
+                })?;
+                job = update_and_emit_developer_job(&app, &database_path, &job.id, |current| {
+                    current.status = "auditing".to_string();
+                    current.phase = "pre_upload".to_string();
+                    current.pre_task_id = Some(task_id.clone());
+                    current.message = Some("直传条件不足，已自动转入预审".to_string());
+                })
+                .map_err(|message| DeveloperApiError {
+                    message,
+                    code: None,
+                    retryable: false,
+                })?;
+                finish_developer_pre_audit(
+                    &app,
+                    &database_path,
+                    &client_id,
+                    &client_secret,
+                    &job,
+                    &target_token,
+                    &task_id,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = update_and_emit_developer_job(&app, &database_path, &job_id, |job| {
+            job.status = "failed".to_string();
+            job.phase = "failed".to_string();
+            job.error_code = error.code;
+            job.message = Some(error.message.clone());
+        });
+    }
+    if let Ok(mut guard) = state.lock() {
+        guard.developer_transfer_running.remove(&job_id);
+    }
+}
+
+fn spawn_developer_transfer_job(app: tauri::AppHandle, state: SharedState, job_id: String) {
+    let should_spawn = state
+        .lock()
+        .map(|mut guard| guard.developer_transfer_running.insert(job_id.clone()))
+        .unwrap_or(false);
+    if should_spawn {
+        tauri::async_runtime::spawn(run_developer_transfer_job(app, state, job_id));
+    }
+}
+
+fn resume_developer_transfer_jobs(app: tauri::AppHandle, state: SharedState) -> Result<(), String> {
+    let database_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    if !developer_mode_requested(&database_path)? {
+        return Ok(());
+    }
+    let bound_account_id =
+        load_app_state(&database_path, "developer_account_id")?.unwrap_or_default();
+    let verified_client_id =
+        load_app_state(&database_path, "developer_verified_client_id")?.unwrap_or_default();
+    let verified_at = load_app_state(&database_path, "developer_account_verified_at")?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let (client_id, _, _, _) = developer_credentials(&database_path)?;
+    if bound_account_id.is_empty() || verified_at <= 0 || verified_client_id != client_id {
+        return Ok(());
+    }
+    let connection = open_database(&database_path)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id FROM developer_transfer_jobs
+             WHERE status IN ('queued', 'direct', 'auditing', 'copying', 'running')
+             ORDER BY created_at",
+        )
+        .map_err(|error| format!("读取未完成小号互传任务失败：{error}"))?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("读取未完成小号互传任务失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析未完成小号互传任务失败：{error}"))?;
+    drop(statement);
+    drop(connection);
+    for id in ids {
+        spawn_developer_transfer_job(app.clone(), state.clone(), id);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_developer_transfer(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+    target_id: String,
+    file_ids: Vec<String>,
+    file_names: Option<Vec<String>>,
+) -> Result<DeveloperTransferJob, String> {
+    let target_id = normalize_api_id(&target_id, "小号配置 ID")?;
+    let mut file_ids = normalize_id_list(&file_ids, "文件或文件夹")?;
+    if file_ids.len() > 20 {
+        return Err("开发者接口一次最多互传 20 项".to_string());
+    }
+    ensure_developer_mode_for_current_account(&state, file_ids.first().map(String::as_str)).await?;
+    file_ids.sort();
+    let file_names = file_names
+        .unwrap_or_default()
+        .into_iter()
+        .take(file_ids.len())
+        .map(|value| value.chars().take(255).collect::<String>())
+        .collect::<Vec<_>>();
+    let database_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    let (client_id, client_secret, _, _) = developer_credentials(&database_path)?;
+    if client_id.is_empty() || client_secret.is_empty() {
+        return Err("请先在设置中填写开发者 client_id 和 client_secret".to_string());
+    }
+    let connection = open_database(&database_path)?;
+    let target_name = connection
+        .query_row(
+            "SELECT name FROM developer_targets WHERE id = ?1",
+            params![target_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取小号 TOKEN 配置失败：{error}"))?
+        .ok_or_else(|| "请选择有效的小号接收 TOKEN".to_string())?;
+    let file_ids_json = serde_json::to_string(&file_ids).map_err(|error| error.to_string())?;
+    let duplicate = connection
+        .query_row(
+            &format!(
+                "SELECT {DEVELOPER_JOB_COLUMNS} FROM developer_transfer_jobs
+                 WHERE target_id = ?1 AND file_ids_json = ?2
+                   AND status IN ('queued', 'direct', 'auditing', 'copying', 'running')
+                 ORDER BY created_at DESC LIMIT 1"
+            ),
+            params![target_id, file_ids_json],
+            developer_job_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("检查重复小号互传任务失败：{error}"))?;
+    if let Some(job) = duplicate {
+        return Ok(job);
+    }
+    let id = Uuid::new_v4().to_string();
+    let now = unix_timestamp();
+    connection
+        .execute(
+            "INSERT INTO developer_transfer_jobs
+               (id, target_id, target_name, file_ids_json, file_names_json,
+                status, phase, total_count, message, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', 'queued', ?6, ?7, ?8, ?8)",
+            params![
+                id,
+                target_id,
+                target_name,
+                file_ids_json,
+                serde_json::to_string(&file_names).map_err(|error| error.to_string())?,
+                file_ids.len() as i64,
+                "已加入小号互传队列",
+                now,
+            ],
+        )
+        .map_err(|error| format!("创建小号互传任务失败：{error}"))?;
+    let job = load_developer_transfer_job(&database_path, &id)?
+        .ok_or_else(|| "创建后无法读取小号互传任务".to_string())?;
+    emit(&app, json!({ "type": "developer-transfer", "job": job }));
+    spawn_developer_transfer_job(app, state.inner().clone(), id);
+    Ok(job)
+}
+
+#[tauri::command]
 fn get_transfer_settings(state: tauri::State<'_, SharedState>) -> Result<TransferSettings, String> {
     let guard = state.lock().map_err(|error| error.to_string())?;
     Ok(TransferSettings {
@@ -11368,6 +12882,7 @@ fn run() {
                 hdhive_instance_id,
                 auto_share_processing: HashSet::new(),
                 gcid_import_running: HashSet::new(),
+                developer_transfer_running: HashSet::new(),
                 sms_verifications: HashMap::new(),
                 webdav_enabled,
                 webdav_port,
@@ -11454,6 +12969,7 @@ fn run() {
             ));
             tauri::async_runtime::spawn(auto_share_loop(app_handle.clone(), state.clone()));
             tauri::async_runtime::spawn(token_refresh_loop(app_handle.clone(), state.clone()));
+            resume_developer_transfer_jobs(app_handle.clone(), state.clone())?;
             drain_queue(app_handle.clone(), state.clone());
             emit_state(&app_handle, &state);
             Ok(())
@@ -11542,6 +13058,14 @@ fn run() {
             update_cache_settings,
             get_metadata_cache_stats,
             clear_metadata_cache,
+            get_developer_settings,
+            update_developer_credentials,
+            test_developer_credentials,
+            update_developer_mode,
+            upsert_developer_target,
+            delete_developer_target,
+            list_developer_transfers,
+            start_developer_transfer,
             resume_queue,
             get_app_version,
             fetch_app_update,
@@ -11562,6 +13086,35 @@ fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn developer_signature_hashes_binary_md5_with_sha512() {
+        assert_eq!(
+            developer_signature(
+                "developer-client",
+                "developer-secret",
+                "0123456789abcdef",
+                1_700_000_000,
+            ),
+            "217fb5d9f8a9b7c9c65e307cda0dea4f893b5e553e231f148b9b710a609d3aa643a78574605c1f9bdff14e267811ed04bec5f4e5674a67f81493c5c818d885ac"
+        );
+    }
+
+    #[test]
+    fn developer_account_binding_reads_supported_profile_ids() {
+        assert_eq!(
+            account_id_from_profile(&json!({ "data": { "user": { "user_id": "user-1" } } })),
+            Some("user-1".to_string())
+        );
+        assert_eq!(
+            account_id_from_profile(&json!({ "profile": { "id": 42 } })),
+            Some("42".to_string())
+        );
+        assert_eq!(
+            account_id_from_profile(&json!({ "nickname": "no-id" })),
+            None
+        );
+    }
 
     #[test]
     fn business_headers_follow_the_live_windows_api_profile() {

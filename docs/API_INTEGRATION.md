@@ -1,6 +1,6 @@
 # App 接口对接总账
 
-> 最后核对：2026-08-01
+> 最后核对：2026-08-04
 >
 > 上游基线：光鸭 PC 1.0.2 逆向资料与同日脱敏实测样本
 >
@@ -8,7 +8,7 @@
 
 本文是本项目的接口源真值索引。排查一个按钮时，应沿着“活跃 UI → bridge 命令或 Web 请求 → Tauri handler / Web route → 光鸭上游或本地服务”逐列核对。旧的 `ui/App.vue` 不在当前 Vite 入口中，因此不作为活跃 UI 契约；仍保留的兼容入口会单独标注。
 
-本文不复述 PC 协议实现所需的 OAuth `client_id` / `client_secret` 常量。Bearer/refresh token、HDHive 密钥、WebDAV 密码、设备 ID、OSS 临时密钥和已签名下载地址属于运行时敏感数据，不得写入文档、日志或故障单。
+PC OAuth 凭据与官方开发者凭据是两套独立身份：前者供登录画像使用；后者由用户在“设置 → 账号 → 开发者模式”填写，并在绑定当前账号后用于 `dapi.guangyapan.com`。本文不记录任何真实值。Bearer/refresh token、两类 `client_secret`、接收 TOKEN、HDHive 密钥、WebDAV 密码、设备 ID、OSS 临时密钥和已签名下载地址都属于运行时敏感数据，不得写入文档、日志或故障单。
 
 ## 1. 证据级别与来源优先级
 
@@ -19,17 +19,19 @@
 | **L** | `api_map` 或当前仓库的隔离验证实例在 2026-08-01 使用 PC 1.0.2 当前登录态做过脱敏实测；只代表样本覆盖的请求形态、账号权益与结果。 |
 | **P** | 来自同版本官方 PC 1.0.2 安装包中实际界面调用点；可以确认 method、payload 和产品语义，但仍不等于当前账号成功实测。 |
 | **S** | 来自 PC 类型、APK 字符串、OpenAPI 或静态逆向，尚无对应的成功实测样本。 |
+| **D** | 来自光鸭《TOKEN 上传 API 文档》v1.0（2026-07-28 首发，2026-08-03 更新）的公开开发者契约；尚未用真实开发者凭据做生产写入验证。 |
 | **R** | 当前仓库已经实现该调用链并接受源码/自动化测试核对；不等于生产账号实测。 |
 | **Local** | App 本地状态、文件系统、SQLite、SSE/Tauri event、WebDAV/rclone 或访问控制，不调用光鸭业务 API。 |
 | **3P** | HDHive 集成契约，不属于光鸭 API。 |
 
 来源优先级从高到低：
 
-1. `H:\Soft Ware\hack_guangya_逆向\api_map\SUMMARY.md` 与 `API_COMPLETE.md` 的 2026-08-01 实测结论；
-2. `api_map/live_samples/` 的脱敏响应；
-3. 同一份官方 PC 1.0.2 安装包中 `app.asar` 的实际调用点；
-4. 当前仓库的 Rust/Node 实现和测试；
-5. `API_DETAILED.md`、`openapi.json`、`paths*.json`、`err_codes.json` 的静态信息。
+1. 对开发者 TOKEN 接口，优先使用光鸭《TOKEN 上传 API 文档》v1.0；
+2. `H:\Soft Ware\hack_guangya_逆向\api_map\SUMMARY.md` 与 `API_COMPLETE.md` 的 2026-08-01 实测结论；
+3. `api_map/live_samples/` 的脱敏响应；
+4. 同一份官方 PC 1.0.2 安装包中 `app.asar` 的实际调用点；
+5. 当前仓库的 Rust/Node 实现和测试；
+6. `API_DETAILED.md`、`openapi.json`、`paths*.json`、`err_codes.json` 的静态信息。
 
 当旧静态资料与新实测或同版本产品调用点冲突时，以新实测优先；没有写操作实测时，以产品调用点确认其语义。例如 Windows 当前使用 `dt: 5`，不能沿用旧草稿中的其它值。`delete_file` / `recycle_file` 的产品语义也不能只按旧常量说明猜测。
 
@@ -42,6 +44,7 @@ Vue 活跃界面
       └─ Docker Web：HTTP /api/* → server/server.mjs / webdav.mjs
              ├─ account.guangyapan.com：OAuth、验证码、用户资料
              ├─ api.guangyapan.com：文件、上传任务、分享、离线、资产
+             ├─ dapi.guangyapan.com：开发者文件读取、预审、TOKEN 秒传
              ├─ OSS 临时 endpoint：实际上传字节
              ├─ *.guangyacdn.com：实际下载字节
              └─ 已配置的 HDHive：投稿事件与回执
@@ -57,6 +60,7 @@ Vue 活跃界面
 |---|---|---|
 | 账号与 OAuth | `https://account.guangyapan.com` | 登录、刷新、验证码、当前用户。 |
 | 业务 API | `https://api.guangyapan.com` | 文件、资产、上传任务、分享、离线和打包任务。 |
+| 开发者 API | `https://dapi.guangyapan.com` | 使用独立 `client_id/client_secret` 签名；文件读取、预审与接收 TOKEN 秒传。 |
 | 下载 | 上游返回的 `*.guangyacdn.com` 签名 URL | `get_res_download_url` 实测有效期 `21600` 秒；App 不应把 URL 持久化为永久地址。 |
 | 上传 | `get_res_center_token` 返回的 `fullEndPoint`/`objectPath` | 使用短期 OSS STS；优先 `fullEndPoint`，凭据仅驻留在上传过程。 |
 | HDHive | 用户配置的 HTTP(S) Base URL | 第三方集成，不复用光鸭 Bearer。 |
@@ -147,6 +151,33 @@ UI 通过 bridge 的登录失效通知统一清空账号概览和文件状态。
 | `241`–`251` | 直链/流量限制或对象类型错误 | 提示到官方页或补充流量，不能自动绕过；设置目标必须是根级文件夹，获取目标必须是其内部文件。 | 241/242/245=L；其余 S/R |
 | HTTP `429` / `5xx` / 网络错误 | 限流或临时故障 | 有界退避重试；不可无限循环。 | R |
 
+### 3.6 官方开发者签名与 TOKEN 上传
+
+开发者请求固定使用 `POST + JSON`，每次重新生成签名头：
+
+```http
+client_id: <developer-client-id>
+nonce: <16-32-char-unique-value>
+timestamp: <unix-seconds>
+sign: <lowercase-hex>
+Content-Type: application/json
+```
+
+签名源串和算法必须严格为：
+
+```text
+src = "client_id=" + client_id
+    + "&client_secret=" + client_secret
+    + "&nonce=" + nonce
+    + "&timestamp=" + timestamp
+
+sign = lower_hex(SHA512(MD5_binary(src)))
+```
+
+第二步 SHA-512 的输入是 **MD5 的 16 字节二进制摘要**，不是 32 字符 MD5 十六进制文本。`nonce` 每次请求唯一，时间戳与服务端偏差不得超过 300 秒。完整 `client_secret` 只从本机状态库或环境变量读取，不进入 bridge 返回、SSE、日志和错误文本。Rust 与 Node 使用同一固定向量测试签名结果。
+
+开发者高频业务码：`18001` TOKEN 不存在、`18002` TOKEN 已绑定其他上传者、`18003` 上传者与接收者相同、`18006` 文件不属于当前开发者、`18007` 接收空间不足、`18008` 目标目录不存在、`18009` 任务/凭据不匹配、`18010` 频率限制、`18011` 暂无已通过预审的文件、`18012` 超过 20 项、`18013` 服务繁忙、`18014` 文件已传过、`18020` 凭据无效、`18021` 签名失败、`18022` 签名过期、`18023` nonce 重用、`18025` 接口未授权、`18026` 开发者受限。只有 `18010`、`18013`、HTTP 429/5xx 与网络故障进入有界重试；`18011` 进入预审兜底，`18014` 作为“目标已存在”完成，其余直接终止并保留业务码。
+
 ## 4. 活跃 UI 到接口的完整矩阵
 
 表中“Web route”为 Docker Web 服务的本地 HTTP 契约；“Tauri handler”是桌面端命令。`—` 表示该端不需要该层，而不是遗漏实现。
@@ -168,7 +199,7 @@ UI 通过 bridge 的登录失效通知统一清空账号概览和文件状态。
 | 自动续期 | bridge 内部 `refresh_session` | 应用恢复/后台 `refresh_saved_session` + bridge 单次重放 | 业务失效分支/后台刷新 | account `POST /v1/auth/token`，refresh-token grant | S/R；两端最多重放一次。 |
 | 账号与容量概览 | `get_overview` | `get_overview` | `GET /api/overview` | business `POST /assets/v1/get_assets` + account `GET /v1/user/me` | assets=L；profile=S；资料失败时容量仍可显示。 |
 | 独立资产快照 | `get_assets` | `get_assets` | `GET /api/assets` | `POST /assets/v1/get_assets` | L/R；不再把容量、VIP、SVIP 的读取绑在账号资料请求上。 |
-| 当前权益和限额 | `get_global_config` | `get_global_config` | `GET /api/global-config` | `POST /misc/v1/get_global_config` | L/R；账号设置只展示服务端返回的当前规则，不提供没有支付闭环的购买按钮。 |
+| 全局配置（无当前 UI） | `get_global_config` | `get_global_config` | `GET /api/global-config` | `POST /misc/v1/get_global_config` | L/R；账号页已移除原权益规则展示，兼容命令暂保留但没有活跃界面消费者。 |
 
 兼容但非活跃 UI：Web `POST /api/auth` 可注入一个 Bearer token；Tauri `open_login`/`capture_token` 是旧网页登录捕获路径。新功能不要继续依赖这些入口，主流程是扫码或短信登录。
 
@@ -308,6 +339,35 @@ HDHive 请求矩阵：
 | 启停原生挂载 | `start_native_mount` / `stop_native_mount` | 同名 | `POST /api/mount/native/start` / `stop` | — | Local/R；原生挂载连接本机 WebDAV。 |
 | 选择挂载点/rclone | `select_native_mount_target` / `select_rclone_binary` | 同名 | Web 返回空（平台限制） | — | Local/R；桌面文件选择器。 |
 
+### 4.9 开发者凭据与小号 TOKEN 秒传
+
+| UI 能力 | bridge | Tauri handler | Web route | 上游/本地实现 | 状态/备注 |
+|---|---|---|---|---|---|
+| 读取开发者设置 | `get_developer_settings` | 同名 | `GET /api/developer/settings` | SQLite `app_state` + `developer_targets` + 当前 `/v1/user/me` | Local/R；返回模式状态、绑定账号、`client_id`、secret 是否已设置和脱敏 TOKEN，永不回显完整 secret/TOKEN。 |
+| 保存开发者凭据 | `update_developer_credentials` | 同名 | `POST /api/developer/credentials` | SQLite；可由环境变量覆盖 | Local/R；空 secret 表示保留旧值；`client_id`/secret 发生变化时清除旧验证并关闭模式。 |
+| 验证当前账号 | `test_developer_credentials` | 同名 | `POST /api/developer/test` | 当前 PC 会话与开发者接口分别调用 `get_file_detail` | D/R；双方读取同一个当前账号 `fileId` 才绑定账号；文档的 `FileInfo` 不含账号 ID，因此不能只看列表响应宣称匹配。 |
+| 开关开发者模式 | `update_developer_mode` | 同名 | `POST /api/developer/mode` | SQLite `app_state` + 当前 `/v1/user/me` | Local/R；只有已验证账号与当前登录账号相同且验证时的 `client_id` 未变化才能开启。 |
+| 新增/更新小号 TOKEN | `upsert_developer_target` | 同名 | `POST /api/developer/targets` | SQLite `developer_targets` | Local/R；编辑时空 TOKEN 表示保留旧值。 |
+| 删除小号 TOKEN | `delete_developer_target` | 同名 | `DELETE /api/developer/targets/{id}` | SQLite | Local/R；该目标有进行中任务时拒绝删除。 |
+| 开始小号秒传 | `start_developer_transfer` | 同名 | `POST /api/developer/transfers` | 所有权复核 → 直传 → 预审兜底 → 直传 | D/R；仅开发者模式开启时可用；提交前用开发者 `get_file_detail` 复核首个源文件，`file_ids` 去重且最多 20。 |
+| 查看互传任务 | `list_developer_transfers` | 同名 | `GET /api/developer/transfers` | SQLite + SSE/Tauri event | Local/R；进行中任务随应用启动恢复。 |
+
+上游状态机：
+
+```text
+upload_by_fileid
+  ├─ accepted + task_id → upload_status: pending/running → success|failed
+  ├─ 18014 → 目标已传过，按幂等完成
+  └─ 18011 → pre_upload → pre_upload_status: 0/1/2 ... → 3
+                                                └────────→ upload_by_fileid
+```
+
+预审状态 `0/1/2/3/4` 分别表示未开始、提交中、审核中、完成、失败；查询间隔不短于 3 秒。上传状态查询间隔为 1–3 秒。目标端同名文件由官方自动改名，不覆盖既有内容。任务表只保存源文件 ID/名称、目标配置 ID、上游 task ID、计数和脱敏错误；接收 TOKEN 只保存在目标表中。
+
+开发者模式只为文档明确提供的 `get_file_list` / `get_file_detail` 增加读兜底：先调用当前 PC 登录态的主接口，失败后才检查模式开关、绑定账号、当前账号与已验证 `client_id`，全部一致才调用 `dapi`。创建、移动、复制、重命名、删除等写操作不切换到开发者接口。
+
+官方绑定边界：一个接收 TOKEN 只支持“当前开发者账号 → TOKEN 接收账号”，首次成功使用后可能绑定上传者；发送者与接收者相同返回 `18003`。因此当前 UI 的“小号秒传”是明确的单向通道；真正双向互传必须为反方向再配置一套可执行凭据/TOKEN，不能把单个 TOKEN 宣称成双向能力。
+
 ## 5. WebDAV 到光鸭的映射
 
 桌面默认只监听 `http://127.0.0.1:19090/`；Docker/Web 使用独立 WebDAV 端口和 `/dav/` 前缀，管理 API 与 WebDAV 账号不能混用。原生挂载只是让 rclone/FUSE 连接这个本地 WebDAV facade。
@@ -412,8 +472,9 @@ share_file 成功
 8. 上传历史、pending task 和自动分享目标当前按 App 实例/数据目录保存，没有把 OAuth 账号 subject 放进主键；主动切换账号前应使用独立数据目录或完成历史隔离/核对，不能默认复用旧账号记录。
 9. scheduler 打包查询以“出现签名 URL”为成功条件；字符串失败状态或非零 `errorCode` 会立即终止，其它尚未识别的数字终态仍可能等到 10 分钟超时。
 10. WebDAV 只声明实际支持的 DAV class 1，网络/超时/上游 5xx 已映射为 502/504；部分未分类的业务错误仍可能落成本地 HTTP 400。
-11. 所有错误必须保留可诊断的 HTTP/业务码，但错误文本不得包含 Bearer、refresh token、OAuth secret、HDHive secret、OSS STS 或签名 URL。
+11. 所有错误必须保留可诊断的 HTTP/业务码，但错误文本不得包含 Bearer、refresh token、OAuth secret、开发者 `client_secret`、接收 TOKEN、HDHive secret、OSS STS 或签名 URL。
 12. 本轮未调用账号级的 `clear_recycle_bin` 和 `delete_invalid_share`，因为登录账号原本就有回收站与分享记录；这两个破坏性批量接口继续只保留官方调用点与仓库契约测试证据。免登录分享在当前账号返回 205，文件取直链返回 241，属于当前账号权益限制，不能改写成接口成功或由 App 绕过。
+13. 开发者 TOKEN 上传链当前证据为官方文档 + 仓库签名/编译/桥接测试（D/R），未使用真实 `client_id`、接收 TOKEN 做生产写入。发布前应以自有两个测试账号验证 18011→预审→秒传、18014 幂等、重启恢复和 TOKEN 绑定边界；验证期间不得把凭据写入 fixture 或日志。
 
 ## 10. 新增或修改接口时的同步清单
 
