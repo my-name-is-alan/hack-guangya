@@ -17,8 +17,13 @@ test('developer transfer is wired through the active UI and both runtime bridges
   ]);
 
   assert.match(settingsView, /AccountSettingsPanel/);
-  assert.doesNotMatch(settingsView, /key="developer"/);
-  assert.match(accountPanel, /DeveloperSettingsPanel/);
+  assert.match(settingsView, /key="developerTransfer"/);
+  assert.match(settingsView, /<DeveloperSettingsPanel\s*\/>/);
+  assert.doesNotMatch(accountPanel, /DeveloperSettingsPanel/);
+  assert.match(panel, /key="tokens"/);
+  assert.match(panel, /key="jobs"/);
+  assert.match(panel, /Token 配置/);
+  assert.match(panel, /任务记录/);
   assert.doesNotMatch(accountPanel, /vipRights|get_global_config|当前权益规则/);
   assert.match(panel, /update_developer_credentials/);
   assert.match(panel, /update_developer_mode/);
@@ -26,8 +31,11 @@ test('developer transfer is wired through the active UI and both runtime bridges
   assert.match(panel, /probe_file_id/);
   assert.match(panel, /token_masked/);
   assert.match(panel, /一个 TOKEN 只对应/);
+  assert.match(panel, /targetListFromPayload/);
+  assert.match(panel, /jobListFromPayload/);
   assert.match(selectionBar, /transferAccount/);
   assert.match(cloud, /start_developer_transfer/);
+  assert.match(cloud, /normalizeDeveloperSettings/);
   assert.match(cloud, /一次最多互传 20 项/);
 
   for (const command of [

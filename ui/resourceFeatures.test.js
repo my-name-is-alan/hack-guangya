@@ -50,10 +50,12 @@ test('云添加使用官方 cursor、资源预解析、子文件序号和任务�
 
 test('账号开发者模式、分享编辑、失效清理和文件直链均有活跃 UI 消费者', () => {
   const account = read('components', 'settings', 'AccountSettingsPanel.vue');
+  const settings = read('views', 'SystemSettingsView.vue');
   const shares = read('views', 'SharesView.vue');
   const details = read('components', 'files', 'FileDetailsDrawer.vue');
 
-  assert.match(account, /DeveloperSettingsPanel/);
+  assert.match(settings, /DeveloperSettingsPanel/);
+  assert.match(settings, /key="developerTransfer"/);
   assert.match(account, /session\.loadOverview\(\)/);
   assert.doesNotMatch(account, /get_global_config|vipRights|当前权益规则/);
   assert.match(shares, /bridge\.invoke\('update_share'/);

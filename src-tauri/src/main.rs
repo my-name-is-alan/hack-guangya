@@ -11792,15 +11792,20 @@ fn pause_queue(app: tauri::AppHandle, state: tauri::State<'_, SharedState>) {
 async fn get_developer_settings(
     state: tauri::State<'_, SharedState>,
 ) -> Result<DeveloperSettings, String> {
-    let (token, device_id) = auth_context(&state)?;
     let database_path = state
         .lock()
         .map_err(|error| error.to_string())?
         .db_path
         .clone();
-    let current_account_id = current_developer_account_id(&token, &device_id)
-        .await
-        .unwrap_or_default();
+    // Settings are local data and must remain visible even when the cloud
+    // session has expired. Transfer actions still require a live session and
+    // perform the account-bound checks in their own handlers.
+    let current_account_id = match auth_context(&state) {
+        Ok((token, device_id)) => current_developer_account_id(&token, &device_id)
+            .await
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    };
     load_developer_settings_for_account(&database_path, &current_account_id)
 }
 

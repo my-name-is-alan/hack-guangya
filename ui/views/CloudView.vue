@@ -508,6 +508,30 @@ function selectedRecords() {
   return files.value.filter((item) => ids.has(fileId(item)));
 }
 
+function normalizeDeveloperSettings(payload) {
+  let value = unwrapData(payload);
+  if (value?.settings && typeof value.settings === 'object') value = value.settings;
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const candidates = [source.targets, source.data?.targets, source.list, source.items];
+  const targets = (candidates.find((item) => Array.isArray(item)) || [])
+    .map((item) => {
+      const id = String(item?.id ?? item?.target_id ?? item?.targetId ?? '').trim();
+      if (!id) return null;
+      return {
+        ...item,
+        id,
+        name: String(item?.name ?? item?.target_name ?? item?.targetName ?? '未命名小号').trim() || '未命名小号',
+        token_masked: String(item?.token_masked ?? item?.tokenMasked ?? item?.masked_token ?? item?.token ?? '已配置'),
+      };
+    })
+    .filter(Boolean);
+  return {
+    ...source,
+    enabled: source.enabled === true,
+    targets,
+  };
+}
+
 async function openDeveloperTransfer(records = selectedRecords()) {
   const targets = (Array.isArray(records) ? records : []).filter((item) => fileId(item));
   if (!targets.length) {
@@ -520,13 +544,13 @@ async function openDeveloperTransfer(records = selectedRecords()) {
   }
   developerTransfer.loading = true;
   try {
-    const settings = unwrapData(await bridge.invoke('get_developer_settings'));
+    const settings = normalizeDeveloperSettings(await bridge.invoke('get_developer_settings'));
     if (!settings.enabled || !Array.isArray(settings.targets) || !settings.targets.length) {
       Modal.confirm({
         title: settings.enabled ? '先添加小号接收 TOKEN' : '先为当前账号开启开发者模式',
         content: settings.enabled
-          ? '在“设置 → 账号 → 开发者模式”中添加小号生成的接收 TOKEN。'
-          : '在“设置 → 账号”中填写并验证当前账号自己的 client_id / client_secret，开启开发者模式后添加小号接收 TOKEN。',
+          ? '在“设置 → 多号秒传 → Token 配置”中添加小号生成的接收 TOKEN。'
+          : '在“设置 → 多号秒传 → Token 配置”中填写并验证当前账号自己的 client_id / client_secret，开启开发者模式后添加小号接收 TOKEN。',
         okText: '去设置',
         cancelText: '取消',
         onOk: () => router.push({ name: 'settings' }),

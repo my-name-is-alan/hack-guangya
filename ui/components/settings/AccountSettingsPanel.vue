@@ -4,7 +4,6 @@ import { storeToRefs } from 'pinia'
 import { ReloadOutlined, UserOutlined } from '@antdv-next/icons'
 import { errorText, formatSize, pick } from '../../formatters.js'
 import { useSessionStore } from '../../stores/session'
-import DeveloperSettingsPanel from './DeveloperSettingsPanel.vue'
 
 const session = useSessionStore()
 const { userName, userAvatar, usedSpace, totalSpace, quotaPercent } = storeToRefs(session)
@@ -73,8 +72,6 @@ onMounted(refreshAccountData)
       <a-progress :percent="quotaPercent" :show-info="false" class="quota-progress" />
     </div>
 
-    <a-divider />
-    <DeveloperSettingsPanel />
   </section>
 </template>
 

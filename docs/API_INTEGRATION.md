@@ -8,7 +8,7 @@
 
 本文是本项目的接口源真值索引。排查一个按钮时，应沿着“活跃 UI → bridge 命令或 Web 请求 → Tauri handler / Web route → 光鸭上游或本地服务”逐列核对。旧的 `ui/App.vue` 不在当前 Vite 入口中，因此不作为活跃 UI 契约；仍保留的兼容入口会单独标注。
 
-PC OAuth 凭据与官方开发者凭据是两套独立身份：前者供登录画像使用；后者由用户在“设置 → 账号 → 开发者模式”填写，并在绑定当前账号后用于 `dapi.guangyapan.com`。本文不记录任何真实值。Bearer/refresh token、两类 `client_secret`、接收 TOKEN、HDHive 密钥、WebDAV 密码、设备 ID、OSS 临时密钥和已签名下载地址都属于运行时敏感数据，不得写入文档、日志或故障单。
+PC OAuth 凭据与官方开发者凭据是两套独立身份：前者供登录画像使用；后者由用户在“设置 → 多号秒传 → Token 配置”填写，并在绑定当前账号后用于 `dapi.guangyapan.com`。本文不记录任何真实值。Bearer/refresh token、两类 `client_secret`、接收 TOKEN、HDHive 密钥、WebDAV 密码、设备 ID、OSS 临时密钥和已签名下载地址都属于运行时敏感数据，不得写入文档、日志或故障单。
 
 ## 1. 证据级别与来源优先级
 
@@ -199,7 +199,7 @@ sign = lower_hex(SHA512(MD5_binary(src)))
 | 自动续期 | bridge 内部 `refresh_session` | 应用恢复/后台 `refresh_saved_session` + bridge 单次重放 | 业务失效分支/后台刷新 | account `POST /v1/auth/token`，refresh-token grant | S/R；两端最多重放一次。 |
 | 账号与容量概览 | `get_overview` | `get_overview` | `GET /api/overview` | business `POST /assets/v1/get_assets` + account `GET /v1/user/me` | assets=L；profile=S；资料失败时容量仍可显示。 |
 | 独立资产快照 | `get_assets` | `get_assets` | `GET /api/assets` | `POST /assets/v1/get_assets` | L/R；不再把容量、VIP、SVIP 的读取绑在账号资料请求上。 |
-| 全局配置（无当前 UI） | `get_global_config` | `get_global_config` | `GET /api/global-config` | `POST /misc/v1/get_global_config` | L/R；账号页已移除原权益规则展示，兼容命令暂保留但没有活跃界面消费者。 |
+| 全局配置（无当前 UI） | `get_global_config` | `get_global_config` | `GET /api/global-config` | `POST /misc/v1/get_global_config` | L/R；设置页已移除原权益规则展示，兼容命令暂保留但没有活跃界面消费者。 |
 
 兼容但非活跃 UI：Web `POST /api/auth` 可注入一个 Bearer token；Tauri `open_login`/`capture_token` 是旧网页登录捕获路径。新功能不要继续依赖这些入口，主流程是扫码或短信登录。
 

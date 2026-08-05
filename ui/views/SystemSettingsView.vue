@@ -4,6 +4,7 @@ import {
   CloudServerOutlined,
   DatabaseOutlined,
   FolderOpenOutlined,
+  KeyOutlined,
   LockOutlined,
   ReloadOutlined,
   SettingOutlined,
@@ -14,6 +15,7 @@ import { isTauri } from '../bridge.js'
 import AccessCodeSettingsPanel from '../components/settings/AccessCodeSettingsPanel.vue'
 import AccountSettingsPanel from '../components/settings/AccountSettingsPanel.vue'
 import CacheSettingsPanel from '../components/settings/CacheSettingsPanel.vue'
+import DeveloperSettingsPanel from '../components/settings/DeveloperSettingsPanel.vue'
 import HdhiveSettingsPanel from '../components/settings/HdhiveSettingsPanel.vue'
 import MountSettingsPanel from '../components/settings/MountSettingsPanel.vue'
 import PreferenceSettingsPanel from '../components/settings/PreferenceSettingsPanel.vue'
@@ -29,6 +31,11 @@ const activeTab = shallowRef('account')
       <a-tab-pane key="account">
         <template #tab><span class="setting-tab"><UserOutlined />账号</span></template>
         <AccountSettingsPanel />
+      </a-tab-pane>
+
+      <a-tab-pane key="developerTransfer">
+        <template #tab><span class="setting-tab"><KeyOutlined />多号秒传</span></template>
+        <DeveloperSettingsPanel />
       </a-tab-pane>
 
       <a-tab-pane v-if="!isTauri" key="access">
