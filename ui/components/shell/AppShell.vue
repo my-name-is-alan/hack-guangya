@@ -14,14 +14,12 @@ import {
   ToolOutlined,
   UserOutlined,
 } from '@antdv-next/icons'
-import { bridge } from '../../bridge.js'
-import { errorText } from '../../formatters.js'
-import { message } from 'antdv-next'
 import { formatSize } from '../../formatters.js'
 import { formatUploadSpeed } from '../../uploadProgress.js'
 import { useSessionStore } from '../../stores/session'
 import { useTransfersStore } from '../../stores/transfers'
 import GlobalSearch from '../search/GlobalSearch.vue'
+import NetworkTestDialog from '../network/NetworkTestDialog.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -41,6 +39,7 @@ const navigation = [
 
 const activeName = computed(() => String(route.name || 'files'))
 const activeTransferCount = computed(() => activeUploads.value.length + activeDownloads.value.length)
+const networkTestOpen = shallowRef(false)
 const quotaLabel = computed(() => totalSpace.value
   ? `${formatSize(usedSpace.value)} / ${formatSize(totalSpace.value)}`
   : '— / —')
@@ -57,19 +56,13 @@ const accountMenu = {
 
 const networkMenu = {
   items: [
-    { key: 'tmdb', label: '测试 TMDB' },
-    { key: 'tg', label: '测试 Telegram' },
-    { key: 'github', label: '测试 GitHub' },
+    { key: 'test', label: '检测网络可用性' },
     { type: 'divider' },
     { key: 'settings', label: '打开网络偏好' },
   ],
-  onClick: async ({ key }: { key: string }) => {
+  onClick: ({ key }: { key: string }) => {
+    if (key === 'test') { networkTestOpen.value = true; return }
     if (key === 'settings') { void router.push({ name: 'settings', query: { tab: 'network' } }); return }
-    try {
-      const result = await bridge.invoke('test_network', { target: key })
-      if (result?.reachable) message.success(`${key.toUpperCase()}：${result.message || '网络可达'}（${result.latency_ms || 0} ms）`)
-      else message.error(`${key.toUpperCase()}：${result?.message || '网络不可达'}`)
-    } catch (error) { message.error(errorText(error)) }
   },
 }
 
@@ -160,6 +153,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleGlobalKeydown)
     </section>
 
     <GlobalSearch v-model:open="searchOpen" />
+    <NetworkTestDialog v-model:open="networkTestOpen" />
   </div>
 </template>
 

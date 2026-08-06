@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import { fetch as undiciFetch } from 'undici';
 
 export const NATIVE_ENGINE_VERSION = 'guangya-cloud-native-v2';
 
@@ -658,7 +659,7 @@ function normalizeTmdbDetails(item, mediaType, imageUrl) {
   };
 }
 
-export function createTmdbClient({ apiKey, language = 'zh-CN', imageLanguage = 'zh,null,en', includeAdult = false, apiBase = 'https://api.themoviedb.org/3', imageBase = 'https://image.tmdb.org/t/p', fetchImpl = fetch } = {}) {
+export function createTmdbClient({ apiKey, language = 'zh-CN', imageLanguage = 'zh,null,en', includeAdult = false, apiBase = 'https://api.themoviedb.org/3', imageBase = 'https://image.tmdb.org/t/p', fetchImpl = undiciFetch } = {}) {
   const key = cleanText(apiKey);
   const normalizedApiBase = cleanText(apiBase).replace(/\/+$/, '');
   const normalizedImageBase = cleanText(imageBase).replace(/\/+$/, '');
@@ -1499,7 +1500,7 @@ async function cleanupEmptyParents(source, boundary) {
   }
 }
 
-export async function executeNativePreview(preview, { fetchImpl = fetch, sourceBoundary = null } = {}) {
+export async function executeNativePreview(preview, { fetchImpl = undiciFetch, sourceBoundary = null } = {}) {
   const classification = classifyNativePreview(preview);
   if (!classification.ready) throw new Error(classification.message);
   const items = preview.data.items;

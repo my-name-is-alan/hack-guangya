@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, reactive, ref, toRaw } from 'vue';
 import { message, Modal } from 'antdv-next';
 import {
   ArrowLeftOutlined,
@@ -140,6 +140,32 @@ const templateExamples = computed(() => organizerTemplateExamples(
   settingsForm.tv_category,
 ));
 
+function cloneSerializable(value) {
+  const raw = toRaw(value);
+  // These settings are JSON data. Serializing after unwrapping the top-level
+  // Vue proxy guarantees that no reactive proxy reaches Tauri's clone bridge.
+  return JSON.parse(JSON.stringify(raw));
+}
+
+function organizerSettingsInput() {
+  return {
+    api_key: String(settingsForm.api_key || ''),
+    language: String(settingsForm.language || ''),
+    image_language: String(settingsForm.image_language || ''),
+    include_adult: Boolean(settingsForm.include_adult),
+    minimum_match_score: Number(settingsForm.minimum_match_score ?? DEFAULT_SETTINGS.minimum_match_score),
+    movie_path_template: String(settingsForm.movie_path_template || ''),
+    tv_path_template: String(settingsForm.tv_path_template || ''),
+    movie_category: String(settingsForm.movie_category || ''),
+    tv_category: String(settingsForm.tv_category || ''),
+    tmdb_api_base: String(settingsForm.tmdb_api_base || ''),
+    tmdb_image_base: String(settingsForm.tmdb_image_base || ''),
+    category_rules: cloneSerializable(settingsForm.category_rules),
+    scrape_targets: cloneSerializable(settingsForm.scrape_targets),
+    default_scrape_types: cloneSerializable(settingsForm.default_scrape_types || []),
+  };
+}
+
 const jobColumns = [
   { title: '来源', key: 'source', width: 270 },
   { title: '识别与目标', key: 'result' },
@@ -172,8 +198,8 @@ function hydrateSettings(settings, force = false) {
     tv_category: settings.tv_category || DEFAULT_SETTINGS.tv_category,
     tmdb_api_base: settings.tmdb_api_base || DEFAULT_SETTINGS.tmdb_api_base,
     tmdb_image_base: settings.tmdb_image_base || DEFAULT_SETTINGS.tmdb_image_base,
-    category_rules: Array.isArray(settings.category_rules) ? structuredClone(settings.category_rules) : [],
-    scrape_targets: Array.isArray(settings.scrape_targets) ? structuredClone(settings.scrape_targets) : [],
+    category_rules: Array.isArray(settings.category_rules) ? cloneSerializable(settings.category_rules) : [],
+    scrape_targets: Array.isArray(settings.scrape_targets) ? cloneSerializable(settings.scrape_targets) : [],
     default_scrape_types: Array.isArray(settings.default_scrape_types) ? [...settings.default_scrape_types] : [...DEFAULT_SETTINGS.default_scrape_types],
   });
   settingsHydrated = true;
@@ -208,7 +234,8 @@ async function loadState({ silent = false } = {}) {
 async function saveSettings() {
   settingsSaving.value = true;
   try {
-    const saved = await bridge.invoke('update_organizer_settings', { input: { ...settingsForm } });
+    const input = organizerSettingsInput();
+    const saved = await bridge.invoke('update_organizer_settings', { input });
     organizer.settings = { ...DEFAULT_SETTINGS, ...(saved || {}) };
     hydrateSettings(organizer.settings, true);
     await loadState({ silent: true });
@@ -223,7 +250,8 @@ async function saveSettings() {
 async function testSettings() {
   settingsTesting.value = true;
   try {
-    const result = await bridge.invoke('test_organizer_connection', { input: { ...settingsForm } });
+    const input = organizerSettingsInput();
+    const result = await bridge.invoke('test_organizer_connection', { input });
     message.success(result?.message || 'TMDB 连接成功');
   } catch (error) {
     message.error(errorText(error));

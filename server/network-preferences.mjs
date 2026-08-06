@@ -5,6 +5,8 @@ const TARGETS = Object.freeze({
   tg: 'https://api.telegram.org',
 });
 
+export const NETWORK_TARGETS = Object.freeze(['github', 'tmdb', 'tg', 'hdhive']);
+
 function text(value) {
   return String(value ?? '').trim();
 }
@@ -44,15 +46,26 @@ export function normalizeProxyUrl(value, label = '代理') {
 }
 
 export function normalizeNetworkPreferences(input = {}, current = {}) {
-  const get = (name, aliases = []) => {
-    for (const key of [name, ...aliases]) if (Object.prototype.hasOwnProperty.call(input, key)) return input[key];
-    return current[name] || '';
+  const hasValue = (source, key) => Object.prototype.hasOwnProperty.call(source, key)
+    && source[key] !== undefined && source[key] !== null;
+  const firstValue = (source, keys) => {
+    const key = keys.find((candidate) => hasValue(source, candidate));
+    return key == null ? undefined : source[key];
   };
-  return {
-    github_proxy: normalizeProxyUrl(get('github_proxy', ['github']), 'GitHub 代理'),
-    tmdb_proxy: normalizeProxyUrl(get('tmdb_proxy', ['tmdb']), 'TMDB 代理'),
-    tg_proxy: normalizeProxyUrl(get('tg_proxy', ['telegram_proxy', 'telegram']), 'Telegram 代理'),
-  };
+  const globalKeys = ['proxy_url', 'proxy', 'global_proxy', 'network_proxy'];
+  const legacyKeys = ['github_proxy', 'tmdb_proxy', 'tg_proxy', 'github', 'tmdb', 'telegram_proxy', 'telegram'];
+  let raw;
+  if (globalKeys.some((key) => hasValue(input, key))) {
+    raw = firstValue(input, globalKeys);
+  } else if (legacyKeys.some((key) => hasValue(input, key))) {
+    // Versions before the unified setting stored one value per upstream. On
+    // upgrade, keep the first configured value as the global default.
+    raw = legacyKeys.map((key) => firstValue(input, [key])).find((value) => text(value)) || '';
+  } else {
+    raw = firstValue(current, globalKeys);
+    if (!text(raw)) raw = legacyKeys.map((key) => firstValue(current, [key])).find((value) => text(value)) || '';
+  }
+  return { proxy_url: normalizeProxyUrl(raw, '全局代理') };
 }
 
 const dispatcherCache = new Map();
@@ -110,10 +123,11 @@ export async function testNetworkTarget(target, {
   proxyUrl = '',
   tmdbApiBase = 'https://api.themoviedb.org/3',
   tmdbApiKey = '',
+  hdhiveBaseUrl = '',
   fetchImpl = undiciFetch,
 } = {}) {
   const normalizedTarget = text(target).toLowerCase();
-  if (!['github', 'tmdb', 'tg'].includes(normalizedTarget)) throw new Error('不支持的网络测试目标');
+  if (!NETWORK_TARGETS.includes(normalizedTarget)) throw new Error('不支持的网络测试目标');
   let endpoint = TARGETS[normalizedTarget];
   const headers = { accept: 'application/json' };
   if (normalizedTarget === 'tmdb') {
@@ -122,6 +136,20 @@ export async function testNetworkTarget(target, {
     const key = text(tmdbApiKey);
     if (key.startsWith('eyJ') || key.length > 80) headers.authorization = `Bearer ${key}`;
     else if (key) endpoint += `?api_key=${encodeURIComponent(key)}`;
+  } else if (normalizedTarget === 'hdhive') {
+    endpoint = text(hdhiveBaseUrl);
+    if (!endpoint) {
+      return {
+        target: normalizedTarget,
+        success: false,
+        reachable: false,
+        configured: false,
+        status: 0,
+        latency_ms: 0,
+        proxy: safeProxyLabel(proxyUrl),
+        message: '尚未配置 HDHive 地址',
+      };
+    }
   }
   const proxied = createProxiedFetch(proxyUrl, fetchImpl);
   const started = Date.now();
@@ -151,13 +179,17 @@ export async function testNetworkTarget(target, {
   }
 }
 
+export async function testNetworkTargets(targets = NETWORK_TARGETS, options = {}) {
+  const requested = Array.isArray(targets) ? targets : NETWORK_TARGETS;
+  const normalized = [...new Set(requested.map((target) => text(target).toLowerCase()))]
+    .filter((target) => NETWORK_TARGETS.includes(target));
+  return Promise.all(normalized.map((target) => testNetworkTarget(target, options)));
+}
+
 export function networkPreferencesPublic(preferences = {}) {
+  const proxyUrl = text(preferences.proxy_url ?? preferences.proxy);
   return {
-    github_proxy: text(preferences.github_proxy),
-    tmdb_proxy: text(preferences.tmdb_proxy),
-    tg_proxy: text(preferences.tg_proxy),
-    github_configured: Boolean(preferences.github_proxy),
-    tmdb_configured: Boolean(preferences.tmdb_proxy),
-    tg_configured: Boolean(preferences.tg_proxy),
+    proxy_url: proxyUrl,
+    configured: Boolean(proxyUrl),
   };
 }

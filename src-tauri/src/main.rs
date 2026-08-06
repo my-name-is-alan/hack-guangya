@@ -13,9 +13,9 @@ use native_mount::{NativeMountInfo, NativeMountManager, NativeMountOptions};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use organizer::{
     add_organizer_mapping, get_organizer_state, remove_organizer_job, remove_organizer_mapping,
-    retry_organizer_job, run_organizer_job, scan_organizer_mapping, start as start_organizer,
-    test_organizer_connection, update_organizer_mapping, update_organizer_settings,
-    scrape_selected_files,
+    retry_organizer_job, run_organizer_job, scan_organizer_mapping, scrape_selected_files,
+    start as start_organizer, test_organizer_connection, update_organizer_mapping,
+    update_organizer_settings,
 };
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use reqwest::header::{
@@ -414,16 +414,14 @@ struct TransferSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct NetworkPreferences {
-    github_proxy: String,
-    tmdb_proxy: String,
-    tg_proxy: String,
-    github_configured: bool,
-    tmdb_configured: bool,
-    tg_configured: bool,
+    proxy_url: String,
+    configured: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct NetworkPreferencesInput {
+    #[serde(alias = "proxy", alias = "global_proxy", alias = "network_proxy")]
+    proxy_url: Option<String>,
     #[serde(alias = "github")]
     github_proxy: Option<String>,
     #[serde(alias = "tmdb")]
@@ -4495,6 +4493,7 @@ async fn hdhive_request(
     base_url: &str,
     secret: &str,
     instance_id: &str,
+    proxy: &str,
     method: reqwest::Method,
     path_segments: &[&str],
     body: Option<&Value>,
@@ -4507,9 +4506,16 @@ async fn hdhive_request(
         build_hdhive_target_url(&normalized_base_url, path_segments)?;
     let body_text = body.map(Value::to_string).unwrap_or_default();
     let timestamp = unix_timestamp().to_string();
-    let client = reqwest::Client::builder()
+    let mut client_builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(API_CONNECT_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(API_CONNECT_TIMEOUT_SECS));
+    if !proxy.trim().is_empty() {
+        client_builder = client_builder.proxy(
+            reqwest::Proxy::all(proxy.trim())
+                .map_err(|error| format!("初始化 Hdhive 代理失败：{error}"))?,
+        );
+    }
+    let client = client_builder
         .build()
         .map_err(|error| format!("创建 Hdhive 客户端失败：{error}"))?;
     let response = client
@@ -4671,10 +4677,15 @@ async fn poll_hdhive_receipt(
             Ok(_) => return,
             Err(_) => return,
         };
+        let proxy = match load_global_network_proxy(&db_path) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
         match hdhive_request(
             &base_url,
             &secret,
             &instance_id,
+            &proxy,
             reqwest::Method::GET,
             &[
                 "api",
@@ -4964,10 +4975,12 @@ async fn process_auto_share(
         &payload,
     )?;
     emit_state(&app, &state);
+    let proxy = load_global_network_proxy(&db_path)?;
     let accepted = hdhive_request(
         &base_url,
         &secret,
         &instance_id,
+        &proxy,
         reqwest::Method::POST,
         &["api", "integrations", "guangya-sync", "events"],
         Some(&payload),
@@ -10475,6 +10488,7 @@ async fn create_share(
             guard.db_path.clone(),
         )
     };
+    let proxy = load_global_network_proxy(&db_path)?;
     let mapping_id = "__manual__";
     if hdhive_enabled {
         let _ = save_auto_share_event(
@@ -10504,6 +10518,7 @@ async fn create_share(
             &base_url,
             &secret,
             &instance_id,
+            &proxy,
             reqwest::Method::POST,
             &["api", "integrations", "guangya-sync", "events"],
             Some(&payload),
@@ -11840,6 +11855,7 @@ async fn retry_auto_share_event(
         }),
         None => json!({}),
     };
+    let proxy = load_global_network_proxy(&db_path)?;
     let mut payload = serde_json::from_str::<Value>(&payload_raw).unwrap_or_default();
     if status_value == "delivery_failed" {
         let normalized_share_id = payload
@@ -11859,6 +11875,7 @@ async fn retry_auto_share_event(
                 &base_url,
                 &secret,
                 &instance_id,
+                &proxy,
                 reqwest::Method::POST,
                 &["api", "integrations", "guangya-sync", "events"],
                 Some(&payload),
@@ -11872,6 +11889,7 @@ async fn retry_auto_share_event(
                 &base_url,
                 &secret,
                 &instance_id,
+                &proxy,
                 reqwest::Method::POST,
                 &[
                     "api",
@@ -12716,28 +12734,65 @@ fn get_transfer_settings(state: tauri::State<'_, SharedState>) -> Result<Transfe
 
 fn normalize_proxy_value(value: Option<String>, label: &str) -> Result<String, String> {
     let raw = value.unwrap_or_default().trim().to_string();
-    if raw.is_empty() { return Ok(String::new()); }
-    if raw.len() > 512 { return Err(format!("{label}地址不能超过 512 个字符")); }
-    let candidate = if raw.contains("://") { raw.clone() } else { format!("http://{raw}") };
-    let mut parsed = reqwest::Url::parse(&candidate).map_err(|_| format!("{label}地址格式不正确"))?;
+    if raw.is_empty() {
+        return Ok(String::new());
+    }
+    if raw.len() > 512 {
+        return Err(format!("{label}地址不能超过 512 个字符"));
+    }
+    let candidate = if raw.contains("://") {
+        raw.clone()
+    } else {
+        format!("http://{raw}")
+    };
+    let mut parsed =
+        reqwest::Url::parse(&candidate).map_err(|_| format!("{label}地址格式不正确"))?;
     let mut scheme = parsed.scheme().to_ascii_lowercase();
-    if !matches!(scheme.as_str(), "http" | "https" | "socks" | "socks5" | "socks5h") {
+    if !matches!(
+        scheme.as_str(),
+        "http" | "https" | "socks" | "socks5" | "socks5h"
+    ) {
         return Err(format!("{label}仅支持 HTTP、HTTPS 或 SOCKS5"));
     }
-    if parsed.host_str().unwrap_or_default().is_empty() || parsed.query().is_some() || parsed.fragment().is_some() {
+    if parsed.host_str().unwrap_or_default().is_empty()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
         return Err(format!("{label}地址格式不正确"));
     }
     if scheme == "socks5h" {
         // reqwest/undici use the SOCKS5 hostname resolution path for the
         // socks5 scheme; normalize the common socks5h alias so the saved
         // value is accepted by both desktop and Web runtimes.
-        parsed.set_scheme("socks5").map_err(|_| format!("{label}协议格式不正确"))?;
+        parsed
+            .set_scheme("socks5")
+            .map_err(|_| format!("{label}协议格式不正确"))?;
         scheme = "socks5".to_string();
     }
     if matches!(scheme.as_str(), "socks" | "socks5") && parsed.port().is_none() {
-        parsed.set_port(Some(1080)).map_err(|_| format!("{label}端口格式不正确"))?;
+        parsed
+            .set_port(Some(1080))
+            .map_err(|_| format!("{label}端口格式不正确"))?;
     }
     Ok(parsed.to_string().trim_end_matches('/').to_string())
+}
+
+/// Read the unified proxy setting and migrate the first legacy per-service
+/// value when opening a database created by an older release.
+fn load_global_network_proxy(path: &Path) -> Result<String, String> {
+    if let Some(value) = load_app_state(path, "network_proxy")? {
+        return normalize_proxy_value(Some(value), "全局代理");
+    }
+    for key in [
+        "network_proxy_github",
+        "network_proxy_tmdb",
+        "network_proxy_tg",
+    ] {
+        if let Some(value) = load_app_state(path, key)?.filter(|value| !value.trim().is_empty()) {
+            return normalize_proxy_value(Some(value), "全局代理");
+        }
+    }
+    Ok(String::new())
 }
 
 fn redact_network_error(error: &str, proxy: &str) -> String {
@@ -12759,19 +12814,17 @@ fn redact_network_error(error: &str, proxy: &str) -> String {
 }
 
 fn network_public(mut value: NetworkPreferences) -> NetworkPreferences {
-    value.github_configured = !value.github_proxy.trim().is_empty();
-    value.tmdb_configured = !value.tmdb_proxy.trim().is_empty();
-    value.tg_configured = !value.tg_proxy.trim().is_empty();
+    value.configured = !value.proxy_url.trim().is_empty();
     value
 }
 
 #[tauri::command]
-fn get_network_preferences(state: tauri::State<'_, SharedState>) -> Result<NetworkPreferences, String> {
+fn get_network_preferences(
+    state: tauri::State<'_, SharedState>,
+) -> Result<NetworkPreferences, String> {
     let guard = state.lock().map_err(|error| error.to_string())?;
     Ok(network_public(NetworkPreferences {
-        github_proxy: load_app_state(&guard.db_path, "network_proxy_github")?.unwrap_or_default(),
-        tmdb_proxy: load_app_state(&guard.db_path, "network_proxy_tmdb")?.unwrap_or_default(),
-        tg_proxy: load_app_state(&guard.db_path, "network_proxy_tg")?.unwrap_or_default(),
+        proxy_url: load_global_network_proxy(&guard.db_path)?,
         ..Default::default()
     }))
 }
@@ -12782,19 +12835,22 @@ fn update_network_preferences(
     input: NetworkPreferencesInput,
 ) -> Result<NetworkPreferences, String> {
     let guard = state.lock().map_err(|error| error.to_string())?;
-    let current = NetworkPreferences {
-        github_proxy: load_app_state(&guard.db_path, "network_proxy_github")?.unwrap_or_default(),
-        tmdb_proxy: load_app_state(&guard.db_path, "network_proxy_tmdb")?.unwrap_or_default(),
-        tg_proxy: load_app_state(&guard.db_path, "network_proxy_tg")?.unwrap_or_default(),
+    let current = load_global_network_proxy(&guard.db_path)?;
+    let requested = input
+        .proxy_url
+        .or(input.github_proxy)
+        .or(input.tmdb_proxy)
+        .or(input.tg_proxy);
+    let proxy_url = normalize_proxy_value(requested.or(Some(current)), "全局代理")?;
+    save_app_state(&guard.db_path, "network_proxy", &proxy_url)?;
+    // Keep the legacy keys synchronized for downgrade compatibility.
+    save_app_state(&guard.db_path, "network_proxy_github", &proxy_url)?;
+    save_app_state(&guard.db_path, "network_proxy_tmdb", &proxy_url)?;
+    save_app_state(&guard.db_path, "network_proxy_tg", &proxy_url)?;
+    Ok(network_public(NetworkPreferences {
+        proxy_url,
         ..Default::default()
-    };
-    let github = normalize_proxy_value(input.github_proxy.or(Some(current.github_proxy)), "GitHub 代理")?;
-    let tmdb = normalize_proxy_value(input.tmdb_proxy.or(Some(current.tmdb_proxy)), "TMDB 代理")?;
-    let tg = normalize_proxy_value(input.tg_proxy.or(Some(current.tg_proxy)), "Telegram 代理")?;
-    save_app_state(&guard.db_path, "network_proxy_github", &github)?;
-    save_app_state(&guard.db_path, "network_proxy_tmdb", &tmdb)?;
-    save_app_state(&guard.db_path, "network_proxy_tg", &tg)?;
-    Ok(network_public(NetworkPreferences { github_proxy: github, tmdb_proxy: tmdb, tg_proxy: tg, ..Default::default() }))
+    }))
 }
 
 #[tauri::command]
@@ -12805,32 +12861,59 @@ async fn test_network(
     tmdb_api_base: Option<String>,
     tmdb_api_key: Option<String>,
 ) -> Result<Value, String> {
-    let db_path = state.lock().map_err(|error| error.to_string())?.db_path.clone();
+    let db_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
     let normalized_target = target.trim().to_ascii_lowercase();
-    if !matches!(normalized_target.as_str(), "github" | "tmdb" | "tg") {
+    if !matches!(
+        normalized_target.as_str(),
+        "github" | "tmdb" | "tg" | "hdhive"
+    ) {
         return Err("不支持的网络测试目标".to_string());
     }
-    let stored_key = match normalized_target.as_str() {
-        "tmdb" => "network_proxy_tmdb",
-        "tg" => "network_proxy_tg",
-        _ => "network_proxy_github",
-    };
-    let proxy = normalize_proxy_value(proxy_url.or(load_app_state(&db_path, stored_key)?), "网络代理")?;
+    let proxy = normalize_proxy_value(
+        proxy_url.or(Some(load_global_network_proxy(&db_path)?)),
+        "全局代理",
+    )?;
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(15));
     if !proxy.is_empty() {
-        builder = builder.proxy(reqwest::Proxy::all(&proxy).map_err(|error| format!("初始化网络代理失败：{error}"))?);
+        builder = builder.proxy(
+            reqwest::Proxy::all(&proxy).map_err(|error| format!("初始化网络代理失败：{error}"))?,
+        );
     }
-    let client = builder.build().map_err(|error| format!("初始化网络测试客户端失败：{error}"))?;
+    let client = builder
+        .build()
+        .map_err(|error| format!("初始化网络测试客户端失败：{error}"))?;
     let mut endpoint = match normalized_target.as_str() {
         "github" => "https://api.github.com/zen".to_string(),
         "tg" => "https://api.telegram.org".to_string(),
-        _ => format!("{}/configuration", tmdb_api_base.unwrap_or_else(|| "https://api.themoviedb.org/3".to_string()).trim_end_matches('/')),
+        "hdhive" => load_app_state(&db_path, "hdhive_base_url")?.unwrap_or_default(),
+        _ => format!(
+            "{}/configuration",
+            tmdb_api_base
+                .unwrap_or_else(|| "https://api.themoviedb.org/3".to_string())
+                .trim_end_matches('/')
+        ),
     };
+    if normalized_target == "hdhive" && endpoint.trim().is_empty() {
+        return Ok(
+            json!({ "target": normalized_target, "success": false, "reachable": false, "configured": false, "status": 0, "latency_ms": 0, "proxy": if proxy.is_empty() { "直连" } else { "已配置代理" }, "message": "尚未配置 HDHive 地址" }),
+        );
+    }
     let mut request = client.get(&endpoint).header("accept", "application/json");
     if normalized_target == "tmdb" {
         if let Some(key) = tmdb_api_key.filter(|value| !value.trim().is_empty()) {
-            if key.starts_with("eyJ") || key.len() > 80 { request = request.bearer_auth(key); }
-            else { endpoint.push_str(&format!("?api_key={}", utf8_percent_encode(&key, NON_ALPHANUMERIC))); request = client.get(&endpoint).header("accept", "application/json"); }
+            if key.starts_with("eyJ") || key.len() > 80 {
+                request = request.bearer_auth(key);
+            } else {
+                endpoint.push_str(&format!(
+                    "?api_key={}",
+                    utf8_percent_encode(&key, NON_ALPHANUMERIC)
+                ));
+                request = client.get(&endpoint).header("accept", "application/json");
+            }
         }
     }
     let started = Instant::now();
@@ -12839,10 +12922,20 @@ async fn test_network(
             let status = response.status().as_u16();
             let reachable = true;
             let success = status < 500 && (normalized_target != "tmdb" || status < 400);
-            let message = if success { "网络可达".to_string() } else if reachable { format!("网络可达，上游返回 HTTP {status}") } else { format!("上游返回 HTTP {status}") };
-            Ok(json!({ "target": normalized_target, "success": success, "reachable": reachable, "status": status, "latency_ms": started.elapsed().as_millis(), "proxy": if proxy.is_empty() { "直连" } else { "已配置代理" }, "message": message }))
+            let message = if success {
+                "网络可达".to_string()
+            } else if reachable {
+                format!("网络可达，上游返回 HTTP {status}")
+            } else {
+                format!("上游返回 HTTP {status}")
+            };
+            Ok(
+                json!({ "target": normalized_target, "success": success, "reachable": reachable, "status": status, "latency_ms": started.elapsed().as_millis(), "proxy": if proxy.is_empty() { "直连" } else { "已配置代理" }, "message": message }),
+            )
         }
-        Err(error) => Ok(json!({ "target": normalized_target, "success": false, "reachable": false, "status": 0, "latency_ms": started.elapsed().as_millis(), "proxy": if proxy.is_empty() { "直连" } else { "已配置代理" }, "message": format!("连接失败：{}", redact_network_error(&error.to_string(), &proxy)) })),
+        Err(error) => Ok(
+            json!({ "target": normalized_target, "success": false, "reachable": false, "status": 0, "latency_ms": started.elapsed().as_millis(), "proxy": if proxy.is_empty() { "直连" } else { "已配置代理" }, "message": format!("连接失败：{}", redact_network_error(&error.to_string(), &proxy)) }),
+        ),
     }
 }
 #[tauri::command]
@@ -12946,12 +13039,17 @@ async fn fetch_app_update(
     state: tauri::State<'_, SharedState>,
     pending: tauri::State<'_, PendingAppUpdate>,
 ) -> Result<Option<AppUpdateMetadata>, String> {
-    let db_path = state.lock().map_err(|error| error.to_string())?.db_path.clone();
-    let github_proxy = load_app_state(&db_path, "network_proxy_github")?.unwrap_or_default();
+    let db_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    let global_proxy = load_global_network_proxy(&db_path)?;
     let mut updater = app.updater_builder().timeout(Duration::from_secs(30));
-    if !github_proxy.trim().is_empty() {
-        let normalized = normalize_proxy_value(Some(github_proxy), "GitHub 代理")?;
-        let url = reqwest::Url::parse(&normalized).map_err(|error| format!("GitHub 代理地址格式不正确：{error}"))?;
+    if !global_proxy.trim().is_empty() {
+        let normalized = normalize_proxy_value(Some(global_proxy), "全局代理")?;
+        let url = reqwest::Url::parse(&normalized)
+            .map_err(|error| format!("GitHub 代理地址格式不正确：{error}"))?;
         updater = updater.proxy(url);
     }
     let update = updater

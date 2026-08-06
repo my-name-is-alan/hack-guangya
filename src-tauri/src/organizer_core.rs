@@ -1389,10 +1389,15 @@ impl TmdbClient {
             vote_count: item.get("vote_count").and_then(Value::as_i64).unwrap_or(0),
             genres: string_list("genres", "name"),
             genre_ids: item
-            .get("genres")
-            .and_then(Value::as_array)
-            .map(|items| items.iter().filter_map(|item| item.get("id").and_then(Value::as_i64)).collect())
-            .unwrap_or_default(),
+                .get("genres")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.get("id").and_then(Value::as_i64))
+                        .collect()
+                })
+                .unwrap_or_default(),
             studios: string_list("production_companies", "name"),
             countries: string_list("production_countries", "iso_3166_1"),
             directors,

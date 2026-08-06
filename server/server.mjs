@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
 import chokidar from 'chokidar';
 import OSS from 'ali-oss';
+import { fetch as undiciFetch } from 'undici';
 import { autoShareTargetFor, shareFilePayload, signHdhiveRequest } from './auto-share.mjs';
 import { createAccessControl } from './access-control.mjs';
 import { createDirectoryCache } from './directory-cache.mjs';
@@ -21,6 +22,7 @@ import {
 import { createGuangyaDeveloperClient, DeveloperApiError } from './guangya-developer.mjs';
 import { createNativeMountManager, normalizeNativeMountOptions } from './native-mount.mjs';
 import {
+  createProxiedFetch,
   networkPreferencesPublic,
   normalizeNetworkPreferences,
   testNetworkTarget,
@@ -282,6 +284,7 @@ function saveAppStateValue(key, value) {
     .run(key, String(value), Math.floor(Date.now() / 1000));
 }
 let networkPreferences = normalizeNetworkPreferences({
+  proxy_url: appStateValue('network_proxy'),
   github_proxy: appStateValue('network_proxy_github'),
   tmdb_proxy: appStateValue('network_proxy_tmdb'),
   tg_proxy: appStateValue('network_proxy_tg'),
@@ -292,9 +295,13 @@ function publicNetworkPreferences() {
 function updateNetworkPreferences(input = {}) {
   const next = normalizeNetworkPreferences(input, networkPreferences);
   networkPreferences = next;
-  saveAppStateValue('network_proxy_github', next.github_proxy);
-  saveAppStateValue('network_proxy_tmdb', next.tmdb_proxy);
-  saveAppStateValue('network_proxy_tg', next.tg_proxy);
+  // Keep the legacy keys in sync so an older binary can still start with the
+  // same proxy after an upgrade or rollback. All new requests use this one
+  // canonical value.
+  saveAppStateValue('network_proxy', next.proxy_url);
+  saveAppStateValue('network_proxy_github', next.proxy_url);
+  saveAppStateValue('network_proxy_tmdb', next.proxy_url);
+  saveAppStateValue('network_proxy_tg', next.proxy_url);
   return publicNetworkPreferences();
 }
 function normalizeWebDavUsername(value) {
@@ -1306,7 +1313,7 @@ const organizer = createOrganizerService({
   database,
   publish,
   env: process.env,
-  fetchImpl: fetch,
+  fetchImpl: undiciFetch,
   getNetworkPreferences: () => networkPreferences,
   cloud: {
     isAuthenticated: () => Boolean(token),
@@ -1672,7 +1679,7 @@ async function hdhiveRequest(method, pathname, body = null) {
   if (!hdhiveBaseUrl || !hdhiveSecret) throw new Error('尚未配置 Hdhive 接入地址和密钥');
   const bodyText = body == null ? '' : JSON.stringify(body);
   const timestamp = String(Math.floor(Date.now() / 1000));
-  const response = await fetch(hdhiveTargetUrl(pathname), { method, headers: { 'content-type': 'application/json', 'X-GuangYa-Instance-Id': hdhiveInstanceId, 'X-GuangYa-Timestamp': timestamp, 'X-GuangYa-Signature': hdhiveSignature(method, pathname, bodyText, timestamp) }, body: body == null ? undefined : bodyText, redirect: 'error', signal: AbortSignal.timeout(30_000) });
+  const response = await createProxiedFetch(networkPreferences.proxy_url, undiciFetch)(hdhiveTargetUrl(pathname), { method, headers: { 'content-type': 'application/json', 'X-GuangYa-Instance-Id': hdhiveInstanceId, 'X-GuangYa-Timestamp': timestamp, 'X-GuangYa-Signature': hdhiveSignature(method, pathname, bodyText, timestamp) }, body: body == null ? undefined : bodyText, redirect: 'error', signal: AbortSignal.timeout(30_000) });
   const raw = await response.text();
   let parsed = {};
   try { parsed = raw ? JSON.parse(raw) : {}; } catch { throw new Error(`Hdhive 返回非 JSON 响应（HTTP ${response.status}）：${raw.slice(0, 200)}`); }
@@ -3575,13 +3582,13 @@ async function routeApiV2(request, response, url) {
   if (request.method === 'POST' && url.pathname === '/api/network/test') {
     const body = await readBody(request, { maxBytes: 16 * 1024 });
     const target = String(body.target || '').trim().toLowerCase();
-    const proxyKey = target === 'tmdb' ? 'tmdb_proxy' : target === 'tg' ? 'tg_proxy' : 'github_proxy';
     const organizerState = organizer.state();
     const result = await testNetworkTarget(target, {
-      proxyUrl: body.proxy_url ?? body.proxy ?? networkPreferences[proxyKey],
+      proxyUrl: body.proxy_url ?? body.proxy ?? networkPreferences.proxy_url,
       tmdbApiBase: body.tmdb_api_base || organizerState.settings.tmdb_api_base,
       tmdbApiKey: body.tmdb_api_key || '',
-      fetchImpl: fetch,
+      hdhiveBaseUrl: body.hdhive_base_url || hdhiveBaseUrl,
+      fetchImpl: undiciFetch,
     });
     return json(response, 200, result, { 'cache-control': 'no-store' });
   }

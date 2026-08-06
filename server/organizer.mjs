@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
+import { fetch as undiciFetch } from 'undici';
 import {
   DEFAULT_ORGANIZER_SETTINGS,
   DEFAULT_CATEGORY_RULES,
@@ -358,7 +359,7 @@ function jobSelect() {
     episode_end, query_title, query_year, preview_json, result_json, error_code, message, created_at, updated_at FROM organizer_jobs`;
 }
 
-export function createOrganizerService({ database, cloud, publish = () => {}, env = process.env, fetchImpl = fetch, getNetworkPreferences = () => ({}) }) {
+export function createOrganizerService({ database, cloud, publish = () => {}, env = process.env, fetchImpl = undiciFetch, getNetworkPreferences = () => ({}) }) {
   initializeSchema(database);
   const envApiKey = cleanText(env.TMDB_API_KEY || env.TMDB_READ_ACCESS_TOKEN);
   const envLanguage = cleanText(env.TMDB_LANGUAGE);
@@ -407,7 +408,8 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
       category_rules: categoryRules,
       scrape_targets: scrapeTargets,
       default_scrape_types: defaultScrapeTypes,
-      tmdb_proxy: cleanText(configuredNetwork.tmdb_proxy),
+      // TMDB and all other external integrations share one proxy setting.
+      tmdb_proxy: cleanText(configuredNetwork.proxy_url || configuredNetwork.tmdb_proxy),
       api_key_managed_by_environment: Boolean(envApiKey),
       language_managed_by_environment: Boolean(envLanguage),
       image_language_managed_by_environment: Boolean(envImageLanguage),

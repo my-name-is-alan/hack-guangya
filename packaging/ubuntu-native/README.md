@@ -5,8 +5,8 @@
 ## 安装
 
 ```bash
-tar -xzf guangya-sync-native-ubuntu-x64-0.1.25.tar.gz
-cd guangya-sync-native-ubuntu-x64-0.1.25
+tar -xzf guangya-sync-native-ubuntu-x64-0.1.26.tar.gz
+cd guangya-sync-native-ubuntu-x64-0.1.26
 sudo ./install.sh
 ```
 

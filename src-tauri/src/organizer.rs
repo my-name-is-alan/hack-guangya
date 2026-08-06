@@ -5,9 +5,9 @@ use crate::organizer_core::{
     VIDEO_EXTENSIONS,
 };
 use crate::{
-    api_post, finish_operation_response, hdhive_request, organizer_upload_bytes,
-    poll_hdhive_receipt, save_auto_share_event, share_file_payload, share_id_for_hdhive,
-    PendingAutoShare, SharedState,
+    api_post, finish_operation_response, hdhive_request, load_global_network_proxy,
+    organizer_upload_bytes, poll_hdhive_receipt, save_auto_share_event, share_file_payload,
+    share_id_for_hdhive, PendingAutoShare, SharedState,
 };
 use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -110,7 +110,9 @@ fn standard_template_examples(secrets: &OrganizerSecrets) -> Value {
     let movie_category = resolve_media_category(&movie, secrets);
     let movie_context = template_context(&movie, &movie_parsed, "", &movie_category, "mkv");
     let movie_path = render_path_template(&secrets.movie_path_template, &movie_context)
-        .unwrap_or_else(|_| format!("电影/US/2024/示例电影 (2024) [tmdb-12345]/示例电影 (2024).mkv"));
+        .unwrap_or_else(|_| {
+            format!("电影/US/2024/示例电影 (2024) [tmdb-12345]/示例电影 (2024).mkv")
+        });
 
     let mut tv = MediaMetadata::default();
     tv.media_type = "tv".to_string();
@@ -125,8 +127,10 @@ fn standard_template_examples(secrets: &OrganizerSecrets) -> Value {
     tv_parsed.quality = "1080p".to_string();
     let tv_category = resolve_media_category(&tv, secrets);
     let tv_context = template_context(&tv, &tv_parsed, "第二集", &tv_category, "mkv");
-    let tv_path = render_path_template(&secrets.tv_path_template, &tv_context)
-        .unwrap_or_else(|_| format!("电视剧/CN/2024/示例剧集 (2024) [tmdb-67890]/Season 01/示例剧集.S01E02.mkv"));
+    let tv_path =
+        render_path_template(&secrets.tv_path_template, &tv_context).unwrap_or_else(|_| {
+            format!("电视剧/CN/2024/示例剧集 (2024) [tmdb-67890]/Season 01/示例剧集.S01E02.mkv")
+        });
 
     json!({
         "movie": {
@@ -154,8 +158,14 @@ impl OrganizerSecrets {
             api_key_managed_by_environment: self.api_key_from_environment,
             language_managed_by_environment: self.language_from_environment,
             image_language_managed_by_environment: self.image_language_from_environment,
-            tmdb_api_base_managed_by_environment: std::env::var("TMDB_API_BASE").ok().filter(|v| !v.trim().is_empty()).is_some(),
-            tmdb_image_base_managed_by_environment: std::env::var("TMDB_IMAGE_BASE").ok().filter(|v| !v.trim().is_empty()).is_some(),
+            tmdb_api_base_managed_by_environment: std::env::var("TMDB_API_BASE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .is_some(),
+            tmdb_image_base_managed_by_environment: std::env::var("TMDB_IMAGE_BASE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .is_some(),
             language: self.native.language.clone(),
             image_language: self.native.image_language.clone(),
             include_adult: self.native.include_adult,
@@ -547,7 +557,10 @@ pub fn init_database(path: &Path) -> Result<(), String> {
         ("tmdb_image_base", "TEXT NOT NULL DEFAULT ''"),
         ("category_rules", "TEXT NOT NULL DEFAULT '[]'"),
         ("scrape_targets", "TEXT NOT NULL DEFAULT '[]'"),
-        ("default_scrape_types", "TEXT NOT NULL DEFAULT '[\"movie_nfo\",\"tvshow_nfo\",\"poster\",\"fanart\"]'"),
+        (
+            "default_scrape_types",
+            "TEXT NOT NULL DEFAULT '[\"movie_nfo\",\"tvshow_nfo\",\"poster\",\"fanart\"]'",
+        ),
     ] {
         ensure_column(&connection, "organizer_settings", column, definition)?;
     }
@@ -660,7 +673,11 @@ fn normalize_category(value: &str, fallback: &str, label: &str) -> Result<String
 }
 
 fn normalize_mirror_url(value: &str, fallback: &str, label: &str) -> Result<String, String> {
-    let value = if value.trim().is_empty() { fallback } else { value.trim() };
+    let value = if value.trim().is_empty() {
+        fallback
+    } else {
+        value.trim()
+    };
     if !value.starts_with("http://") && !value.starts_with("https://") {
         return Err(format!("{label}必须以 http:// 或 https:// 开头"));
     }
@@ -673,7 +690,11 @@ fn normalize_mirror_url(value: &str, fallback: &str, label: &str) -> Result<Stri
 fn normalize_category_rules(value: Option<Vec<Value>>) -> Result<Vec<Value>, String> {
     let mut result = Vec::new();
     for (index, rule) in value.unwrap_or_default().into_iter().take(100).enumerate() {
-        let name = rule.get("name").and_then(Value::as_str).unwrap_or_default().trim();
+        let name = rule
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
         if name.is_empty() || name.len() > 80 || name.contains(['/', '\\']) {
             return Err(format!("第 {} 条媒体分类名称无效", index + 1));
         }
@@ -685,7 +706,10 @@ fn normalize_category_rules(value: Option<Vec<Value>>) -> Result<Vec<Value>, Str
             .into_iter()
             .flat_map(|item| {
                 if let Some(value) = item.as_str() {
-                    value.split([',', '，', '\n']).map(|term| json!(term.trim().to_lowercase())).collect::<Vec<_>>()
+                    value
+                        .split([',', '，', '\n'])
+                        .map(|term| json!(term.trim().to_lowercase()))
+                        .collect::<Vec<_>>()
                 } else if let Some(value) = item.as_i64() {
                     vec![json!(value.to_string())]
                 } else {
@@ -698,9 +722,22 @@ fn normalize_category_rules(value: Option<Vec<Value>>) -> Result<Vec<Value>, Str
         if genres.is_empty() {
             return Err(format!("第 {} 条媒体分类至少配置一个 TMDB 类型", index + 1));
         }
-        let media_type = rule.get("media_type").and_then(Value::as_str).unwrap_or("all").trim().to_lowercase();
-        let media_type = if matches!(media_type.as_str(), "movie" | "tv" | "all") { media_type } else { "all".to_string() };
-        let id = rule.get("id").and_then(Value::as_str).filter(|value| !value.trim().is_empty()).map(str::to_string)
+        let media_type = rule
+            .get("media_type")
+            .and_then(Value::as_str)
+            .unwrap_or("all")
+            .trim()
+            .to_lowercase();
+        let media_type = if matches!(media_type.as_str(), "movie" | "tv" | "all") {
+            media_type
+        } else {
+            "all".to_string()
+        };
+        let id = rule
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
             .unwrap_or_else(|| format!("category-{}", index + 1));
         result.push(json!({
             "id": id,
@@ -716,14 +753,38 @@ fn normalize_category_rules(value: Option<Vec<Value>>) -> Result<Vec<Value>, Str
 fn normalize_scrape_targets(value: Option<Vec<Value>>) -> Result<Vec<Value>, String> {
     let mut result = Vec::new();
     for (index, target) in value.unwrap_or_default().into_iter().take(50).enumerate() {
-        let name = target.get("name").and_then(Value::as_str).unwrap_or_default().trim();
-        let dir_id = target.get("dir_id").or_else(|| target.get("target_dir_id"))
-            .and_then(Value::as_str).unwrap_or_default().trim();
-        if dir_id.is_empty() { return Err(format!("第 {} 个刮削目标未选择云盘目录", index + 1)); }
-        let path = normalize_cloud_path(target.get("path").or_else(|| target.get("target_path")).and_then(Value::as_str).unwrap_or("/"));
-        let id = target.get("id").and_then(Value::as_str).filter(|value| !value.trim().is_empty()).map(str::to_string)
+        let name = target
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let dir_id = target
+            .get("dir_id")
+            .or_else(|| target.get("target_dir_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if dir_id.is_empty() {
+            return Err(format!("第 {} 个刮削目标未选择云盘目录", index + 1));
+        }
+        let path = normalize_cloud_path(
+            target
+                .get("path")
+                .or_else(|| target.get("target_path"))
+                .and_then(Value::as_str)
+                .unwrap_or("/"),
+        );
+        let id = target
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
             .unwrap_or_else(|| format!("target-{}", Uuid::new_v4()));
-        let name = if name.is_empty() { format!("媒体库 {}", index + 1) } else { name.chars().take(80).collect() };
+        let name = if name.is_empty() {
+            format!("媒体库 {}", index + 1)
+        } else {
+            name.chars().take(80).collect()
+        };
         result.push(json!({
             "id": id,
             "name": name,
@@ -735,7 +796,11 @@ fn normalize_scrape_targets(value: Option<Vec<Value>>) -> Result<Vec<Value>, Str
 }
 
 fn resolve_media_category(metadata: &MediaMetadata, secrets: &OrganizerSecrets) -> String {
-    let media_type = if metadata.media_type == "tv" { "tv" } else { "movie" };
+    let media_type = if metadata.media_type == "tv" {
+        "tv"
+    } else {
+        "movie"
+    };
     let mut terms = metadata
         .genres
         .iter()
@@ -743,20 +808,44 @@ fn resolve_media_category(metadata: &MediaMetadata, secrets: &OrganizerSecrets) 
         .collect::<HashSet<_>>();
     terms.extend(metadata.genre_ids.iter().map(ToString::to_string));
     for rule in &secrets.category_rules {
-        if rule.get("enabled").and_then(Value::as_bool) == Some(false) { continue; }
-        let rule_type = rule.get("media_type").and_then(Value::as_str).unwrap_or("all");
-        if rule_type != "all" && rule_type != media_type { continue; }
-        let matches = rule.get("genres").and_then(Value::as_array).map(|items| items.iter().any(|item| {
-            let term = item.as_str().map(str::to_lowercase).or_else(|| item.as_i64().map(|value| value.to_string()));
-            term.map(|value| terms.contains(&value)).unwrap_or(false)
-        })).unwrap_or(false);
+        if rule.get("enabled").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
+        let rule_type = rule
+            .get("media_type")
+            .and_then(Value::as_str)
+            .unwrap_or("all");
+        if rule_type != "all" && rule_type != media_type {
+            continue;
+        }
+        let matches = rule
+            .get("genres")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items.iter().any(|item| {
+                    let term = item
+                        .as_str()
+                        .map(str::to_lowercase)
+                        .or_else(|| item.as_i64().map(|value| value.to_string()));
+                    term.map(|value| terms.contains(&value)).unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
         if matches {
-            if let Some(name) = rule.get("name").and_then(Value::as_str).filter(|value| !value.trim().is_empty()) {
+            if let Some(name) = rule
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
                 return name.trim().to_string();
             }
         }
     }
-    if media_type == "tv" { secrets.tv_category.clone() } else { secrets.movie_category.clone() }
+    if media_type == "tv" {
+        secrets.tv_category.clone()
+    } else {
+        secrets.movie_category.clone()
+    }
 }
 
 fn normalize_transfer_type(value: &str) -> Result<String, String> {
@@ -970,20 +1059,26 @@ fn load_secrets(path: &Path) -> Result<OrganizerSecrets, String> {
         normalize_image_language(environment_image_language.as_deref().unwrap_or(&stored.2))?;
     native.include_adult = stored.3;
     native.minimum_match_score = normalize_match_score(stored.4)?;
-    let stored_api_base = normalize_mirror_url(&stored.9, "https://api.themoviedb.org/3", "TMDB API 镜像")?;
-    let stored_image_base = normalize_mirror_url(&stored.10, "https://image.tmdb.org/t/p", "TMDB 图片镜像")?;
-    let category_rules = normalize_category_rules(parse_json::<Vec<Value>>(Some(stored.11.clone())))
-        .unwrap_or_default();
-    let scrape_targets = normalize_scrape_targets(parse_json::<Vec<Value>>(Some(stored.12.clone())))
-        .unwrap_or_default();
-    let stored_scrape_types = parse_json::<Vec<String>>(Some(stored.13.clone())).unwrap_or_default();
-    let default_scrape_types = normalize_scrape_types(&stored_scrape_types, true)
-        .unwrap_or_else(|_| DEFAULT_SCRAPE_TYPES.iter().map(|value| value.to_string()).collect());
-    let tmdb_proxy = connection
-        .query_row("SELECT value FROM app_state WHERE key='network_proxy_tmdb'", [], |row| row.get::<_, String>(0))
-        .optional()
-        .map_err(|error| format!("读取 TMDB 代理设置失败：{error}"))?
-        .unwrap_or_default();
+    let stored_api_base =
+        normalize_mirror_url(&stored.9, "https://api.themoviedb.org/3", "TMDB API 镜像")?;
+    let stored_image_base =
+        normalize_mirror_url(&stored.10, "https://image.tmdb.org/t/p", "TMDB 图片镜像")?;
+    let category_rules =
+        normalize_category_rules(parse_json::<Vec<Value>>(Some(stored.11.clone())))
+            .unwrap_or_default();
+    let scrape_targets =
+        normalize_scrape_targets(parse_json::<Vec<Value>>(Some(stored.12.clone())))
+            .unwrap_or_default();
+    let stored_scrape_types =
+        parse_json::<Vec<String>>(Some(stored.13.clone())).unwrap_or_default();
+    let default_scrape_types =
+        normalize_scrape_types(&stored_scrape_types, true).unwrap_or_else(|_| {
+            DEFAULT_SCRAPE_TYPES
+                .iter()
+                .map(|value| value.to_string())
+                .collect()
+        });
+    let tmdb_proxy = crate::load_global_network_proxy(path)?;
     Ok(OrganizerSecrets {
         api_key: environment_key.clone().unwrap_or(stored.0),
         native,
@@ -1010,8 +1105,14 @@ fn load_secrets(path: &Path) -> Result<OrganizerSecrets, String> {
         api_key_from_environment: environment_key.is_some(),
         language_from_environment: environment_language.is_some(),
         image_language_from_environment: environment_image_language.is_some(),
-        api_base: std::env::var("TMDB_API_BASE").ok().filter(|v| !v.trim().is_empty()).unwrap_or(stored_api_base),
-        image_base: std::env::var("TMDB_IMAGE_BASE").ok().filter(|v| !v.trim().is_empty()).unwrap_or(stored_image_base),
+        api_base: std::env::var("TMDB_API_BASE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or(stored_api_base),
+        image_base: std::env::var("TMDB_IMAGE_BASE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or(stored_image_base),
         tmdb_proxy,
         category_rules,
         scrape_targets,
@@ -1062,7 +1163,9 @@ const MAPPING_SELECT: &str = "SELECT id, source_path, target_path, source_dir_id
 fn list_mappings(path: &Path) -> Result<Vec<OrganizerMapping>, String> {
     let connection = open_database(path)?;
     let mut statement = connection
-        .prepare(&format!("{MAPPING_SELECT} WHERE id NOT LIKE 'manual:%' ORDER BY created_at"))
+        .prepare(&format!(
+            "{MAPPING_SELECT} WHERE id NOT LIKE 'manual:%' ORDER BY created_at"
+        ))
         .map_err(|error| format!("读取整理监控失败：{error}"))?;
     let result = statement
         .query_map([], row_mapping)
@@ -2927,6 +3030,7 @@ async fn create_fresh_organizer_share(
             guard.db_path.clone(),
         )
     };
+    let proxy = load_global_network_proxy(&db_path)?;
     let data = api_post(
         &token,
         &device_id,
@@ -2983,6 +3087,7 @@ async fn create_fresh_organizer_share(
         &base_url,
         &secret,
         &instance_id,
+        &proxy,
         reqwest::Method::POST,
         &["api", "integrations", "guangya-sync", "events"],
         Some(&payload),
@@ -3118,14 +3223,28 @@ fn update_settings(
         "TMDB API 镜像",
     )?;
     let image_base = normalize_mirror_url(
-        input.tmdb_image_base.as_deref().unwrap_or(&current.image_base),
+        input
+            .tmdb_image_base
+            .as_deref()
+            .unwrap_or(&current.image_base),
         "https://image.tmdb.org/t/p",
         "TMDB 图片镜像",
     )?;
-    let category_rules = normalize_category_rules(input.category_rules.or_else(|| Some(current.category_rules.clone())))?;
-    let scrape_targets = normalize_scrape_targets(input.scrape_targets.or_else(|| Some(current.scrape_targets.clone())))?;
+    let category_rules = normalize_category_rules(
+        input
+            .category_rules
+            .or_else(|| Some(current.category_rules.clone())),
+    )?;
+    let scrape_targets = normalize_scrape_targets(
+        input
+            .scrape_targets
+            .or_else(|| Some(current.scrape_targets.clone())),
+    )?;
     let default_scrape_types = normalize_scrape_types(
-        input.default_scrape_types.as_deref().unwrap_or(&current.default_scrape_types),
+        input
+            .default_scrape_types
+            .as_deref()
+            .unwrap_or(&current.default_scrape_types),
         true,
     )?;
     let connection = open_database(path)?;
@@ -3510,7 +3629,8 @@ async fn recognize_job(
         }
         let match_result =
             resolve_tmdb_match(&analysis, &secrets.client()?, &secrets.native, &resolved).await?;
-        let preview = build_preview(app, &loaded, &analysis, &match_result, &mapping, &secrets).await?;
+        let preview =
+            build_preview(app, &loaded, &analysis, &match_result, &mapping, &secrets).await?;
         Ok::<_, String>((match_result, preview))
     }
     .await;
@@ -3520,13 +3640,21 @@ async fn recognize_job(
             let needs_review = error.contains("没有找到可整理的视频")
                 || error.contains("无法从文件名提取媒体名称");
             let error_code = if needs_review {
-                if error.contains("视频") { "video_required" } else { "title_required" }
+                if error.contains("视频") {
+                    "video_required"
+                } else {
+                    "title_required"
+                }
             } else if error.contains("TMDB") {
                 "tmdb_unavailable"
             } else {
                 "recognition_failed"
             };
-            let status = if needs_review { "needs_review" } else { "failed" };
+            let status = if needs_review {
+                "needs_review"
+            } else {
+                "failed"
+            };
             update_job_fields(
                 &path,
                 id,
@@ -3741,13 +3869,13 @@ async fn execute_job(
                 .await
                 {
                     Ok(value) => share = Some(value),
-                    Err(error) => warnings.push(format!(
-                        "整理已完成，但创建 B 目录新分享失败：{error}"
-                    )),
+                    Err(error) => {
+                        warnings.push(format!("整理已完成，但创建 B 目录新分享失败：{error}"))
+                    }
                 },
-                Err(error) => warnings.push(format!(
-                    "整理已完成，但无法定位 B 目录分享目标：{error}"
-                )),
+                Err(error) => {
+                    warnings.push(format!("整理已完成，但无法定位 B 目录分享目标：{error}"))
+                }
             }
         }
         Ok::<OrganizerExecutionResult, String>(OrganizerExecutionResult {
@@ -4070,7 +4198,10 @@ pub async fn test_organizer_connection(
         "TMDB API 镜像",
     )?;
     let image_base = normalize_mirror_url(
-        input.tmdb_image_base.as_deref().unwrap_or(&current.image_base),
+        input
+            .tmdb_image_base
+            .as_deref()
+            .unwrap_or(&current.image_base),
         "https://image.tmdb.org/t/p",
         "TMDB 图片镜像",
     )?;
@@ -4102,16 +4233,43 @@ pub async fn scrape_selected_files(
         return Err("请先选择至少一个视频文件或目录".to_string());
     }
     let targets = &secrets.scrape_targets;
-    let target = targets.iter().find(|item| {
-        input.target_id.as_deref().is_some_and(|id| item.get("id").and_then(Value::as_str) == Some(id))
-    }).or_else(|| (targets.len() == 1).then(|| &targets[0]))
-        .ok_or_else(|| if targets.is_empty() { "请先在设置 > 整理 > 刮削偏好中配置媒体库目标" } else { "请选择一个已配置的刮削目标目录" })?;
-    let target_dir_id = target.get("dir_id").or_else(|| target.get("target_dir_id")).and_then(Value::as_str).unwrap_or_default().to_string();
-    let target_path = target.get("path").or_else(|| target.get("target_path")).and_then(Value::as_str).unwrap_or("/").to_string();
-    if target_dir_id.trim().is_empty() { return Err("刮削目标目录配置无效".to_string()); }
+    let target = targets
+        .iter()
+        .find(|item| {
+            input
+                .target_id
+                .as_deref()
+                .is_some_and(|id| item.get("id").and_then(Value::as_str) == Some(id))
+        })
+        .or_else(|| (targets.len() == 1).then(|| &targets[0]))
+        .ok_or_else(|| {
+            if targets.is_empty() {
+                "请先在设置 > 整理 > 刮削偏好中配置媒体库目标"
+            } else {
+                "请选择一个已配置的刮削目标目录"
+            }
+        })?;
+    let target_dir_id = target
+        .get("dir_id")
+        .or_else(|| target.get("target_dir_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let target_path = target
+        .get("path")
+        .or_else(|| target.get("target_path"))
+        .and_then(Value::as_str)
+        .unwrap_or("/")
+        .to_string();
+    if target_dir_id.trim().is_empty() {
+        return Err("刮削目标目录配置无效".to_string());
+    }
     let default_scrape_types = secrets.default_scrape_types.clone();
     let scrape_types = normalize_scrape_types(
-        input.scrape_types.as_deref().unwrap_or(&default_scrape_types),
+        input
+            .scrape_types
+            .as_deref()
+            .unwrap_or(&default_scrape_types),
         true,
     )?;
     let transfer_type_input = input.transfer_type.clone();
@@ -4123,11 +4281,22 @@ pub async fn scrape_selected_files(
         let result = async {
             let source_id = source.id.trim().to_string();
             let source_parent_id = source.parent_id.trim().to_string();
-            if source_id.is_empty() || source_parent_id.is_empty() { return Err("选中项缺少文件 ID 或来源目录".to_string()); }
-            let source_path = normalize_cloud_path(source.parent_path.as_deref().or(source.path.as_deref()).unwrap_or("/"));
-            let transfer_type = normalize_transfer_type(transfer_type_input.as_deref().unwrap_or("copy"))?;
+            if source_id.is_empty() || source_parent_id.is_empty() {
+                return Err("选中项缺少文件 ID 或来源目录".to_string());
+            }
+            let source_path = normalize_cloud_path(
+                source
+                    .parent_path
+                    .as_deref()
+                    .or(source.path.as_deref())
+                    .unwrap_or("/"),
+            );
+            let transfer_type =
+                normalize_transfer_type(transfer_type_input.as_deref().unwrap_or("copy"))?;
             let risk = share_risk_acknowledged;
-            if transfer_type == "move" && !risk { return Err("移动可能使已有分享失效，请先确认风险".to_string()); }
+            if transfer_type == "move" && !risk {
+                return Err("移动可能使已有分享失效，请先确认风险".to_string());
+            }
             let mapping = OrganizerMapping {
                 id: format!("manual:{}", Uuid::new_v4()),
                 source_path,
@@ -4138,7 +4307,12 @@ pub async fn scrape_selected_files(
                 scan_existing: false,
                 monitor_mode: "manual".to_string(),
                 transfer_type,
-                media_type: normalize_media_type(media_type_input.as_deref().or(source.media_type.as_deref()).unwrap_or(""))?,
+                media_type: normalize_media_type(
+                    media_type_input
+                        .as_deref()
+                        .or(source.media_type.as_deref())
+                        .unwrap_or(""),
+                )?,
                 scrape: true,
                 scrape_types: scrape_types.clone(),
                 sync_extras: true,
@@ -4151,13 +4325,31 @@ pub async fn scrape_selected_files(
                 created_at: now_seconds(),
                 updated_at: now_seconds(),
             };
-            let loaded = load_candidate(&app, &mapping, &source_id).await?.ok_or_else(|| "待整理云端项目不存在或不在来源目录中".to_string())?;
-            if loaded.fingerprint.video_count < 1 { return Err("选中项中没有可识别的视频文件".to_string()); }
+            let loaded = load_candidate(&app, &mapping, &source_id)
+                .await?
+                .ok_or_else(|| "待整理云端项目不存在或不在来源目录中".to_string())?;
+            if loaded.fingerprint.video_count < 1 {
+                return Err("选中项中没有可识别的视频文件".to_string());
+            }
             save_mapping(&path, &mapping)?;
-            let job_id = insert_job(&path, &mapping, &loaded.candidate, &loaded.fingerprint, false)?;
-            let job = recognize_job(&app, state.inner(), &job_id, OrganizerJobInput::default(), true).await?;
+            let job_id = insert_job(
+                &path,
+                &mapping,
+                &loaded.candidate,
+                &loaded.fingerprint,
+                false,
+            )?;
+            let job = recognize_job(
+                &app,
+                state.inner(),
+                &job_id,
+                OrganizerJobInput::default(),
+                true,
+            )
+            .await?;
             Ok::<OrganizerJob, String>(job)
-        }.await;
+        }
+        .await;
         match result {
             Ok(job) => jobs.push(job),
             Err(error) => failures.push(json!({ "id": source.id, "message": error })),
