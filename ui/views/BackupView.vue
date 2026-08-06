@@ -49,8 +49,11 @@ const backupForm = reactive({
   policy: 'keep',
   monitor_mode: isTauri ? 'native' : 'polling',
   auto_share: false,
+  organizer_mapping_id: '',
   sync_types: [...defaultSyncExtensions],
 });
+const organizerMappings = ref([]);
+const autoOrganizeEditor = reactive({ open: false, saving: false, mapping: null, selected: '' });
 const cloudFolderPicker = reactive({
   open: false,
   loading: false,
@@ -71,6 +74,26 @@ const receiptMediaOptions = [
   { label: '电视剧', value: 'tv' },
   { label: '电影', value: 'movie' },
 ];
+const matchingOrganizerOptions = computed(() => organizerMappings.value
+  .filter((item) => item.enabled && item.source_dir_id === backupForm.remoteParentId)
+  .map((item) => ({ label: `${item.source_path} → ${item.target_path}`, value: item.id })));
+const editorOrganizerOptions = computed(() => organizerMappings.value
+  .filter((item) => item.enabled && item.source_dir_id === String(autoOrganizeEditor.mapping?.remote_parent_id || ''))
+  .map((item) => ({ label: `${item.source_path} → ${item.target_path}`, value: item.id })));
+
+function organizerMappingLabel(id) {
+  const mapping = organizerMappings.value.find((item) => item.id === id);
+  return mapping ? `${mapping.source_path} → ${mapping.target_path}` : '已关联整理任务';
+}
+
+async function loadOrganizerMappings() {
+  try {
+    const data = await bridge.invoke('get_organizer_state');
+    organizerMappings.value = Array.isArray(data?.mappings) ? data.mappings : [];
+  } catch {
+    organizerMappings.value = [];
+  }
+}
 
 const allAutoShareEvents = computed(() => Array.isArray(appState.auto_share_events)
   ? appState.auto_share_events
@@ -122,7 +145,7 @@ function activityTimestamp(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function openBackupDrawer() {
+async function openBackupDrawer() {
   backupForm.local = '';
   backupForm.remote = '';
   backupForm.remoteParentId = '';
@@ -132,7 +155,9 @@ function openBackupDrawer() {
   backupForm.policy = 'keep';
   backupForm.monitor_mode = isTauri ? 'native' : 'polling';
   backupForm.auto_share = false;
+  backupForm.organizer_mapping_id = '';
   backupForm.sync_types = [...defaultSyncExtensions];
+  await loadOrganizerMappings();
   backupDrawerOpen.value = true;
 }
 async function pickBackupFolder(kind) {
@@ -179,6 +204,7 @@ function chooseCloudFolder() {
   backupForm.remote = names.length ? `/${names.join('/')}` : '';
   backupForm.remoteLabel = names.length ? `全部文件 / ${names.join(' / ')}` : '全部文件';
   backupForm.remoteChosen = true;
+  if (!organizerMappings.value.some((item) => item.id === backupForm.organizer_mapping_id && item.source_dir_id === backupForm.remoteParentId)) backupForm.organizer_mapping_id = '';
   cloudFolderPicker.open = false;
 }
 function handleCloudFolderTableChange(pagination) {
@@ -205,6 +231,7 @@ async function addBackup() {
       scan_existing: true,
       monitor_mode: backupForm.monitor_mode,
       auto_share: backupForm.auto_share,
+      organizer_mapping_id: backupForm.organizer_mapping_id,
       sync_types: normalizeExtensions(backupForm.sync_types),
     });
     backupDrawerOpen.value = false;
@@ -335,6 +362,29 @@ async function retryAutoShareEvent(event) {
     autoShareBusy[eventId] = false;
   }
 }
+
+async function openAutoOrganizeEditor(item) {
+  await loadOrganizerMappings();
+  autoOrganizeEditor.mapping = item;
+  autoOrganizeEditor.selected = String(item.organizer_mapping_id || '');
+  autoOrganizeEditor.open = true;
+}
+
+async function saveAutoOrganizeEditor() {
+  const item = autoOrganizeEditor.mapping;
+  if (!item) return;
+  autoOrganizeEditor.saving = true;
+  try {
+    await bridge.invoke('update_mapping_organizer', { id: item.id, organizer_mapping_id: autoOrganizeEditor.selected });
+    autoOrganizeEditor.open = false;
+    await refreshState();
+    message.success(autoOrganizeEditor.selected ? '已启用“上传 → 整理 B → 分享”流程' : '已恢复原上传后分享流程');
+  } catch (error) {
+    message.error(errorText(error));
+  } finally {
+    autoOrganizeEditor.saving = false;
+  }
+}
 </script>
 
 <template>
@@ -362,6 +412,7 @@ async function retryAutoShareEvent(event) {
               <a-tag :color="item.enabled ? 'success' : 'default'">{{ item.enabled ? '运行中' : '已停用' }}</a-tag>
               <a-tag :color="item.monitor_mode === 'native' ? 'processing' : 'default'">{{ item.monitor_mode === 'native' ? '系统监听' : '轮询扫描' }}</a-tag>
               <a-tag v-if="item.auto_share" color="purple">自动分享</a-tag>
+              <a-tag v-if="item.organizer_mapping_id" color="blue" :title="organizerMappingLabel(item.organizer_mapping_id)">上传后先整理</a-tag>
             </div>
             <div class="task-meta">
               <span>云端：{{ item.remote_path || '全部文件' }}</span>
@@ -374,8 +425,9 @@ async function retryAutoShareEvent(event) {
             <a-button size="small" @click="setMonitorMode(item, item.monitor_mode === 'native' ? 'polling' : 'native')">{{ item.monitor_mode === 'native' ? '改轮询扫描' : '改系统监听' }}</a-button>
             <a-button size="small" @click="openSyncTypesEditor(item)"><template #icon><EditOutlined /></template>格式</a-button>
             <a-button size="small" @click="toggleAutoShare(item)">{{ item.auto_share ? '关自动分享' : '开自动分享' }}</a-button>
+            <a-button size="small" @click="openAutoOrganizeEditor(item)">{{ item.organizer_mapping_id ? '改整理流程' : '上传后整理' }}</a-button>
             <a-button v-if="item.auto_share" size="small" @click="openAutoShareHistory(item)">分享记录</a-button>
-            <a-button v-if="item.auto_share" size="small" @click="backfillAutoShares(item)">补发</a-button>
+            <a-button v-if="item.auto_share && !item.organizer_mapping_id" size="small" @click="backfillAutoShares(item)">补发</a-button>
             <a-button size="small" danger type="text" aria-label="删除备份任务" @click="removeMapping(item)"><template #icon><DeleteOutlined /></template></a-button>
           </a-flex>
         </a-flex>
@@ -474,7 +526,11 @@ async function retryAutoShareEvent(event) {
         </a-form-item>
         <a-form-item label="自动分享">
           <a-switch v-model:checked="backupForm.auto_share" aria-label="上传完成后自动分享并通知 HDHive" />
-          <small class="form-hint">上传完成后自动创建分享并通知 HDHive</small>
+          <small class="form-hint">未启用上传后整理时走原分享逻辑；启用后会等待 B 目录整理完成，再创建新分享并通知 HDHive</small>
+        </a-form-item>
+        <a-form-item label="上传后自动整理">
+          <a-select v-model:value="backupForm.organizer_mapping_id" allow-clear placeholder="不启用，保持原上传逻辑" :options="matchingOrganizerOptions" />
+          <small class="form-hint">只显示 A 目录与当前上传目标完全一致的整理任务。请先在“媒体整理”中创建 A → B 规则。</small>
         </a-form-item>
         <a-button type="primary" block :loading="backupSubmitting" @click="addBackup"><template #icon><PlusOutlined /></template>创建备份任务</a-button>
       </a-form>
@@ -511,6 +567,12 @@ async function retryAutoShareEvent(event) {
           </template>
         </template>
       </a-table>
+    </a-modal>
+
+    <a-modal v-model:open="autoOrganizeEditor.open" title="上传后自动整理" :confirm-loading="autoOrganizeEditor.saving" ok-text="保存" cancel-text="取消" width="560px" @ok="saveAutoOrganizeEditor">
+      <a-alert type="warning" show-icon message="启用后，上传完成不会立即分享 A 目录；光鸭会先整理到 B 目录，再从 B 目录创建新分享。这样可避免移动或删除导致刚创建的分享失效。" class="receipt-alert" />
+      <a-select v-model:value="autoOrganizeEditor.selected" allow-clear placeholder="关闭上传后自动整理" :options="editorOrganizerOptions" style="width: 100%" />
+      <p class="form-hint">只有来源 A 目录与本备份任务云端目标完全一致的整理任务可选。</p>
     </a-modal>
 
     <a-modal v-model:open="syncTypesEditor.open" title="同步格式" :confirm-loading="syncTypesEditor.saving" ok-text="保存" cancel-text="取消" width="520px" @ok="saveSyncTypes">

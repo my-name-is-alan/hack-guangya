@@ -273,7 +273,7 @@ sign = lower_hex(SHA512(MD5_binary(src)))
 
 | UI 能力 | bridge | Tauri handler | Web route | 光鸭/其它 | 状态/备注 |
 |---|---|---|---|---|---|
-| 创建当前快照分享 | `create_share` | `create_share` | `POST /api/share` | `POST /userres/v1/share_file`；可继续投递 HDHive event | L/R；手动分享不复用旧文件夹快照；隔离实测关闭 HDHive，临时分享已清理。 |
+| 创建当前资源分享 | `create_share` | `create_share` | `POST /api/share` | `POST /userres/v1/share_file`；可继续投递 HDHive event | L/R；每次创建当前资源的新分享，不把分享当作不可变快照；移动/删除/覆盖可能使旧链接失效。 |
 | 我的分享列表与统计 | `list_shares` | `list_shares` | `GET /api/shares` | 分页聚合 `POST /userres/v1/get_share_list` | L/R；不能只显示第一页；UI 展示状态、剩余时间、浏览数和转存数，并支持筛选/批量取消。 |
 | 修改分享设置 | `update_share` | `update_share` | `POST /api/shares/update` | `POST /userres/v1/update_share` | L/R；只透传官方产品使用的 `id/validateDuration/downloadType/trafficLimit`；永久有效为 `validateDuration:0`。`downloadType:0` 才使用免登录 `trafficLimit`，`1` 时固定为 `0`；当前账号的普通模式实测 code 0，免登录模式实测 code 205（权益不足），UI 保留原业务错误。 |
 | 删除分享记录 | `delete_shares` | `delete_shares` | `POST /api/shares/delete` | `POST /userres/v1/delete_share` | L/R；参数是分享记录 `ids`，不是文件 ID；仅删除本轮临时分享实测成功。 |
@@ -325,7 +325,23 @@ HDHive 请求矩阵：
 
 请求使用实例 ID、时间戳和 HMAC 签名头；签名密钥不进入文档、日志或 UI 返回值。手动分享使用 `mapping_id="__manual__"`；备份分享使用真实 mapping ID。UI 以 `event_id` 定位重试记录，以 `target_key` 展示分享目标。`status=needs_review` 且 `error_code=tmdb_required` 是人工补 TMDB 的稳定判据，不应只解析可变中文消息。
 
-### 4.8 队列、传输、缓存和挂载设置
+### 4.8 光鸭原生媒体识别与整理
+
+| UI 能力 | bridge | Tauri handler | Web route | TMDB/云端依赖 | 状态/备注 |
+|---|---|---|---|---|---|
+| 读取整理状态 | `get_organizer_state` | 同名 | `GET /api/organizer` | SQLite | Local/R；返回原生引擎版本、TMDB 公开配置、监控映射和最近 100 条任务，不返回密钥。 |
+| 保存识别设置 | `update_organizer_settings` | 同名 | `PUT /api/organizer/settings` | SQLite | Local/R；保存语言、匹配阈值、成人内容开关、电影/电视剧完整路径模板和分类值；页面提供三个模板预设；空密钥表示保留旧值，`TMDB_API_KEY` / `TMDB_READ_ACCESS_TOKEN` 等非空环境变量优先。 |
+| 测试 TMDB | `test_organizer_connection` | 同名 | `POST /api/organizer/test` | `GET /3/configuration` | 3P/R；v3 Key 使用 `api_key`，Read Access Token 使用 Bearer，不记录完整凭据。 |
+| 新增/更新监控 | `add_organizer_mapping` / `update_organizer_mapping` | 同名 | `POST/PATCH /api/organizer/mappings` | 光鸭云盘文件列表 | Local/R；来源 A 与目标 B 必须是已选择的云端目录 ID，路径仅用于展示；两者不得相同或互相包含；固定为云端轮询，识别或整理期间拒绝修改。 |
+| 删除监控 | `remove_organizer_mapping` | 同名 | `DELETE /api/organizer/mappings/{id}` | SQLite/云端列表 | Local/R；识别或整理期间拒绝删除；删除监控和历史记录不删除 A/B 中任何云端文件。 |
+| 立即扫描 | `scan_organizer_mapping` | 同名 | `POST /api/organizer/mappings/{id}/scan` | 光鸭云盘文件列表 | Local/R；A 根目录一级文件夹或单个视频为候选项，候选内部递归识别视频、字幕、音轨和花絮。 |
+| 执行整理 | `run_organizer_job` | 同名 | `POST /api/organizer/jobs/{id}/run` | 光鸭云盘 copy/move/rename/upload | Local/RW；重新校验源指纹和配置签名后，只执行云盘内复制/移动、冲突策略和可选刮削；不支持硬链接/软链接或跨盘路径；移动/覆盖需确认旧分享失效风险。模板变量同时接受 `{tmdb_id}`/`{tmdbid}`、`{category}`/`{catgroy}` 和 `{Season x}`/`{Expose n}` 别名。 |
+| 重新识别 | `retry_organizer_job` | 同名 | `POST /api/organizer/jobs/{id}/retry` | TMDB search/details/season | 3P/R；可覆盖标题、年份、`tmdb_id`、媒体类型、季号、集号及结束集号。 |
+| 删除单条历史 | `remove_organizer_job` | 同名 | `DELETE /api/organizer/jobs/{id}` | SQLite | Local/RW；运行中的任务不可删除，只删除整理记录，不触碰 A/B 云端文件。 |
+
+整理状态机为 `recognizing → ready → running → completed`；识别歧义或必要信息不足进入 `needs_review`，网络、TMDB 或提交前的云端操作错误进入 `failed`，主体整理成功但图片/NFO 等非关键刮削失败进入 `completed_warning`。自动执行也必须先生成完整预览且匹配分数达到阈值，不能跳过预览直接修改云端文件。识别、候选评分、命名、云盘内文件转移、NFO 与图片刮削由光鸭原生引擎完成；TMDB 只提供元数据。若开启整理后分享，始终从 B 目录创建新分享并通知 HDHive，不复用 A 或历史分享，因为光鸭分享不是不可变快照。
+
+### 4.9 队列、传输、缓存和挂载设置
 
 | UI 能力 | bridge | Tauri handler | Web route | 上游 | 状态/备注 |
 |---|---|---|---|---|---|
@@ -339,7 +355,7 @@ HDHive 请求矩阵：
 | 启停原生挂载 | `start_native_mount` / `stop_native_mount` | 同名 | `POST /api/mount/native/start` / `stop` | — | Local/R；原生挂载连接本机 WebDAV。 |
 | 选择挂载点/rclone | `select_native_mount_target` / `select_rclone_binary` | 同名 | Web 返回空（平台限制） | — | Local/R；桌面文件选择器。 |
 
-### 4.9 开发者凭据与小号 TOKEN 秒传
+### 4.10 开发者凭据与小号 TOKEN 秒传
 
 | UI 能力 | bridge | Tauri handler | Web route | 上游/本地实现 | 状态/备注 |
 |---|---|---|---|---|---|

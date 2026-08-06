@@ -523,12 +523,16 @@ onBeforeUnmount(() => unsubscribe?.())
 </template>
 
 <style scoped>
-.developer-panel { max-width: 980px; padding: 8px 18px 36px 24px; }
-.panel-lead { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
+.developer-panel { width: 100%; max-width: none; min-width: 0; box-sizing: border-box; padding: 8px 18px 36px 24px; }
+.panel-lead { display: flex; min-width: 0; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
+.panel-lead > div:first-child { min-width: 0; }
 .panel-lead strong, .panel-lead span { display: block; }
 .panel-lead strong { font-size: 18px; }
 .panel-lead span { margin-top: 5px; color: var(--text-3, #98a2b3); font-size: 12px; line-height: 1.55; }
-.mode-control { display: flex; align-items: center; gap: 10px; }
+.mode-control { display: flex; min-width: max-content; align-items: center; gap: 10px; white-space: nowrap; }
+.developer-tabs { display: block; min-width: 0; }
+.developer-tabs :deep(.ant-tabs-nav) { width: auto; min-width: 0; flex: none; }
+.developer-tabs :deep(.ant-tabs-content-holder), .developer-tabs :deep(.ant-tabs-content) { min-width: 0; }
 .inner-tab { display: inline-flex; align-items: center; gap: 7px; }
 .inner-tab em { min-width: 18px; padding: 0 5px; border-radius: 10px; color: var(--text-2, #475467); background: var(--bg-toolbar, #f2f4f7); font-size: 11px; font-style: normal; line-height: 18px; text-align: center; }
 .load-alert { margin-bottom: 16px; }

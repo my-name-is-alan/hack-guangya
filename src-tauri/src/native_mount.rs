@@ -344,11 +344,11 @@ fn build_mount_arguments(
         "--vfs-cache-max-age".to_string(),
         "24h".to_string(),
         "--vfs-cache-poll-interval".to_string(),
-        "1m".to_string(),
+        "5s".to_string(),
         "--vfs-write-back".to_string(),
         "5s".to_string(),
         "--dir-cache-time".to_string(),
-        "5m".to_string(),
+        "2s".to_string(),
         "--poll-interval".to_string(),
         "0".to_string(),
         "--buffer-size".to_string(),
@@ -689,7 +689,7 @@ mod tests {
             .any(|pair| pair == ["--vfs-cache-max-size", "32G"]));
         assert!(arguments
             .windows(2)
-            .any(|pair| pair == ["--dir-cache-time", "5m"]));
+            .any(|pair| pair == ["--dir-cache-time", "2s"]));
         assert!(arguments
             .windows(2)
             .any(|pair| pair == ["--vfs-cache-max-age", "24h"]));

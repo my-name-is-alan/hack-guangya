@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod native_mount;
+mod organizer;
+mod organizer_core;
 mod webdav;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -9,6 +11,13 @@ use hmac::{Hmac, Mac};
 use md5::Md5;
 use native_mount::{NativeMountInfo, NativeMountManager, NativeMountOptions};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use organizer::{
+    add_organizer_mapping, get_organizer_state, remove_organizer_job, remove_organizer_mapping,
+    retry_organizer_job, run_organizer_job, scan_organizer_mapping, start as start_organizer,
+    test_organizer_connection, update_organizer_mapping, update_organizer_settings,
+    scrape_selected_files,
+};
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use reqwest::header::{
     HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_RANGE, CONTENT_TYPE, DATE, ETAG, RANGE,
 };
@@ -181,6 +190,8 @@ struct Mapping {
     monitor_mode: String,
     #[serde(default)]
     auto_share: bool,
+    #[serde(default)]
+    organizer_mapping_id: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SavedShare {
@@ -399,6 +410,26 @@ struct TransferSettings {
     upload_concurrency: usize,
     download_concurrency: usize,
     multipart_part_size: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct NetworkPreferences {
+    github_proxy: String,
+    tmdb_proxy: String,
+    tg_proxy: String,
+    github_configured: bool,
+    tmdb_configured: bool,
+    tg_configured: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct NetworkPreferencesInput {
+    #[serde(alias = "github")]
+    github_proxy: Option<String>,
+    #[serde(alias = "tmdb")]
+    tmdb_proxy: Option<String>,
+    #[serde(alias = "telegram_proxy", alias = "telegram")]
+    tg_proxy: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -5710,7 +5741,7 @@ async fn requeue_busy_upload(app: tauri::AppHandle, state: SharedState, mut item
         guard.waiting_files.remove(&key);
         if metadata.is_none() {
             false
-        } else if item.mapping_id != "__manual__"
+        } else if !item.mapping_id.starts_with("__")
             && !guard
                 .mappings
                 .iter()
@@ -5766,7 +5797,7 @@ async fn requeue_resumable_upload(app: tauri::AppHandle, state: SharedState, ite
     };
     let key = item_key(&item.mapping_id, &item.file_path);
     let queued = if let Ok(mut guard) = state.lock() {
-        let mapping_active = item.mapping_id == "__manual__"
+        let mapping_active = item.mapping_id.starts_with("__")
             || guard
                 .mappings
                 .iter()
@@ -6336,6 +6367,42 @@ async fn upload_item(
     Ok(outcome)
 }
 
+pub(crate) async fn organizer_upload_bytes(
+    app: &tauri::AppHandle,
+    parent_id: &str,
+    name: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
+    let temp_dir =
+        std::env::temp_dir().join(format!("guangya-organizer-{}", Uuid::new_v4().simple()));
+    fs::create_dir_all(&temp_dir).map_err(|error| format!("创建刮削上传临时目录失败：{error}"))?;
+    let file_path = temp_dir.join(name);
+    fs::write(&file_path, bytes).map_err(|error| format!("写入刮削上传临时文件失败：{error}"))?;
+    let metadata =
+        fs::metadata(&file_path).map_err(|error| format!("读取刮削临时文件失败：{error}"))?;
+    let item = UploadItem {
+        mapping_id: "__organizer__".to_string(),
+        file_path: file_path.clone(),
+        remote_parent_id: parent_id.to_string(),
+        remote_dir: String::new(),
+        relative_path: name.to_string(),
+        change_kind: "added".to_string(),
+        size: metadata.len(),
+        modified_ms: modified_ms(&metadata),
+    };
+    let state = app.state::<SharedState>();
+    let result = upload_item(app, state.inner(), &item).await;
+    if result.is_ok() {
+        let _ = fs::remove_file(&file_path);
+        let _ = fs::remove_dir(&temp_dir);
+    }
+    result.and_then(|outcome| {
+        outcome
+            .remote_file_id
+            .ok_or_else(|| "刮削文件已上传，但云端没有返回文件 ID".to_string())
+    })
+}
+
 fn archive_candidate(base: &Path, modified_ms: u128, collision: u64) -> PathBuf {
     if collision == 0 {
         return base.to_path_buf();
@@ -6500,7 +6567,7 @@ fn archive_file_without_overwrite(
 }
 
 fn apply_source_policy(state: &SharedState, item: &UploadItem) -> Result<Option<String>, String> {
-    if item.mapping_id == "__manual__" {
+    if item.mapping_id.starts_with("__") {
         return Ok(None);
     }
     let mapping = state
@@ -6561,7 +6628,7 @@ fn source_changed_since_upload(item: &UploadItem) -> bool {
 }
 
 fn resubmit_source_if_changed(state: &SharedState, item: &UploadItem) -> bool {
-    if item.mapping_id == "__manual__" {
+    if item.mapping_id.starts_with("__") {
         return false;
     }
     if source_changed_since_upload(item) {
@@ -6605,7 +6672,32 @@ async fn finalize_successful_upload(
             status(app, "error", message);
         }
     }
-    if let Err(message) = schedule_auto_share(state, item, outcome).await {
+    let organizer_flow = state.lock().ok().and_then(|guard| {
+        guard
+            .mappings
+            .iter()
+            .find(|mapping| mapping.id == item.mapping_id)
+            .filter(|mapping| !mapping.organizer_mapping_id.is_empty())
+            .map(|mapping| (mapping.organizer_mapping_id.clone(), mapping.auto_share))
+    });
+    if let Some((organizer_mapping_id, share_after)) = organizer_flow {
+        let remote_file_id = outcome.remote_file_id.clone().unwrap_or_default();
+        if let Err(message) = organizer::notify_upload(
+            app.clone(),
+            organizer_mapping_id,
+            remote_file_id,
+            item.relative_path.clone(),
+            share_after,
+        )
+        .await
+        {
+            status(
+                app,
+                "error",
+                format!("文件已上传，但上传后整理排队失败；为避免分享 A 目录，未执行原自动分享：{message}"),
+            );
+        }
+    } else if let Err(message) = schedule_auto_share(state, item, outcome).await {
         status(
             app,
             "error",
@@ -6719,7 +6811,7 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
                 if auth_expired {
                     guard.token = None;
                 }
-                let mapping_active = item.mapping_id == "__manual__"
+                let mapping_active = item.mapping_id.starts_with("__")
                     || guard
                         .mappings
                         .iter()
@@ -7057,10 +7149,11 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                     .and_then(|path| load_upload_checkpoint(path, &item).ok().flatten());
                 let auto_share_enabled = resumable.is_none()
                     && state2.lock().ok().is_some_and(|guard| {
-                        guard
-                            .mappings
-                            .iter()
-                            .any(|mapping| mapping.id == item.mapping_id && mapping.auto_share)
+                        guard.mappings.iter().any(|mapping| {
+                            mapping.id == item.mapping_id
+                                && mapping.auto_share
+                                && mapping.organizer_mapping_id.is_empty()
+                        })
                     });
                 if auto_share_enabled {
                     if let Some(path) = db_path.as_deref() {
@@ -7143,6 +7236,7 @@ async fn enqueue_path(app: &tauri::AppHandle, state: &SharedState, event: FsEven
     .collect::<Vec<_>>()
     .join("/");
     let auto_share_enabled = mapping.auto_share;
+    let organizer_mapping_id = mapping.organizer_mapping_id.clone();
     let mut item = UploadItem {
         mapping_id: mapping.id,
         file_path: event.path.clone(),
@@ -7214,7 +7308,23 @@ async fn enqueue_path(app: &tauri::AppHandle, state: &SharedState, event: FsEven
         return;
     };
     if let Some((source_mapping_id, outcome)) = reused_upload {
-        if auto_share_enabled {
+        if !organizer_mapping_id.is_empty() {
+            if let Err(error) = organizer::notify_upload(
+                app.clone(),
+                organizer_mapping_id,
+                outcome.remote_file_id.clone().unwrap_or_default(),
+                item.relative_path.clone(),
+                auto_share_enabled,
+            )
+            .await
+            {
+                status(
+                    app,
+                    "error",
+                    format!("历史文件无需重复上传，但上传后整理排队失败；未分享 A 目录：{error}"),
+                );
+            }
+        } else if auto_share_enabled {
             let target = auto_share_target(&item);
             let binding_reused = match target.as_ref() {
                 Some(target) => reuse_auto_share_binding(
@@ -7375,7 +7485,7 @@ fn seed_existing_files(state: &SharedState, mapping: &Mapping) {
 
 fn hydrate_pending_item(state: &SharedState, pending: &PendingUpload) -> UploadItem {
     let mut item = pending.item.clone();
-    if item.mapping_id == "__manual__" {
+    if item.mapping_id.starts_with("__") {
         return item;
     }
     let mapping = state.lock().ok().and_then(|guard| {
@@ -7435,7 +7545,7 @@ fn queue_rejected_pending_upload(state: &SharedState, pending: &PendingUpload) -
     let Ok(mut guard) = state.lock() else {
         return false;
     };
-    if item.mapping_id != "__manual__"
+    if !item.mapping_id.starts_with("__")
         && !guard
             .mappings
             .iter()
@@ -10317,8 +10427,8 @@ async fn create_share(
     let (token, device_id) = auth_context(&state)?;
     let (share_type, code, auto_fill_code) =
         normalize_share_access(share_type, code.as_deref(), auto_fill_code)?;
-    // 手动分享始终创建当前快照。复用旧的文件夹分享会保留创建时的
-    // 空目录状态，导致云盘已有文件而分享页仍为空。
+    // 光鸭分享不是不可变快照，而是依赖当前云端资源关系；移动、删除
+    // 或覆盖后旧链接可能失效。因此手动分享始终创建当前资源的新链接。
     let reused_existing = false;
     let mut data = api_post(
         &token,
@@ -11305,6 +11415,7 @@ fn add_mapping(
     sync_types: Vec<String>,
     monitor_mode: String,
     auto_share: bool,
+    organizer_mapping_id: Option<String>,
 ) -> Result<Mapping, String> {
     if !["keep", "archive", "delete"].contains(&source_policy.as_str()) {
         return Err("无效的上传后源文件策略".into());
@@ -11328,7 +11439,13 @@ fn add_mapping(
         watch_error: None,
         monitor_mode: normalize_monitor_mode(&monitor_mode),
         auto_share,
+        organizer_mapping_id: organizer_mapping_id.unwrap_or_default().trim().to_string(),
     };
+    organizer::validate_backup_mapping_link(
+        &app,
+        &mapping.organizer_mapping_id,
+        &mapping.remote_parent_id,
+    )?;
     if !Path::new(&mapping.local_path).is_dir() {
         return Err("本地目录不存在".into());
     }
@@ -11570,6 +11687,37 @@ fn update_mapping_auto_share(
 }
 
 #[tauri::command]
+fn update_mapping_organizer(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+    id: String,
+    organizer_mapping_id: String,
+) -> Result<(), String> {
+    let remote_parent_id = {
+        let guard = state.lock().map_err(|error| error.to_string())?;
+        guard
+            .mappings
+            .iter()
+            .find(|mapping| mapping.id == id)
+            .map(|mapping| mapping.remote_parent_id.clone())
+            .ok_or_else(|| "备份任务不存在".to_string())?
+    };
+    let organizer_mapping_id = organizer_mapping_id.trim().to_string();
+    organizer::validate_backup_mapping_link(&app, &organizer_mapping_id, &remote_parent_id)?;
+    let mut guard = state.lock().map_err(|error| error.to_string())?;
+    let mapping = guard
+        .mappings
+        .iter_mut()
+        .find(|mapping| mapping.id == id)
+        .ok_or_else(|| "备份任务不存在".to_string())?;
+    mapping.organizer_mapping_id = organizer_mapping_id;
+    save_config(&guard);
+    drop(guard);
+    emit_state(&app, state.inner());
+    Ok(())
+}
+
+#[tauri::command]
 async fn backfill_auto_shares(
     app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
@@ -11588,6 +11736,12 @@ async fn backfill_auto_shares(
             .ok_or_else(|| "备份任务不存在".to_string())?;
         if !mapping.auto_share {
             return Err("请先开启该任务的自动分享".to_string());
+        }
+        if !mapping.organizer_mapping_id.is_empty() {
+            return Err(
+                "该任务已启用上传后整理；请扫描对应整理 A 目录，由整理完成后的 B 目录重新分享"
+                    .to_string(),
+            );
         }
         (mapping, guard.db_path.clone())
     };
@@ -12559,6 +12713,138 @@ fn get_transfer_settings(state: tauri::State<'_, SharedState>) -> Result<Transfe
         multipart_part_size: guard.multipart_part_size.clone(),
     })
 }
+
+fn normalize_proxy_value(value: Option<String>, label: &str) -> Result<String, String> {
+    let raw = value.unwrap_or_default().trim().to_string();
+    if raw.is_empty() { return Ok(String::new()); }
+    if raw.len() > 512 { return Err(format!("{label}地址不能超过 512 个字符")); }
+    let candidate = if raw.contains("://") { raw.clone() } else { format!("http://{raw}") };
+    let mut parsed = reqwest::Url::parse(&candidate).map_err(|_| format!("{label}地址格式不正确"))?;
+    let mut scheme = parsed.scheme().to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https" | "socks" | "socks5" | "socks5h") {
+        return Err(format!("{label}仅支持 HTTP、HTTPS 或 SOCKS5"));
+    }
+    if parsed.host_str().unwrap_or_default().is_empty() || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(format!("{label}地址格式不正确"));
+    }
+    if scheme == "socks5h" {
+        // reqwest/undici use the SOCKS5 hostname resolution path for the
+        // socks5 scheme; normalize the common socks5h alias so the saved
+        // value is accepted by both desktop and Web runtimes.
+        parsed.set_scheme("socks5").map_err(|_| format!("{label}协议格式不正确"))?;
+        scheme = "socks5".to_string();
+    }
+    if matches!(scheme.as_str(), "socks" | "socks5") && parsed.port().is_none() {
+        parsed.set_port(Some(1080)).map_err(|_| format!("{label}端口格式不正确"))?;
+    }
+    Ok(parsed.to_string().trim_end_matches('/').to_string())
+}
+
+fn redact_network_error(error: &str, proxy: &str) -> String {
+    let mut value = error.to_string();
+    if !proxy.trim().is_empty() {
+        value = value.replace(proxy, "[代理]");
+        if let Ok(url) = reqwest::Url::parse(proxy) {
+            if !url.username().is_empty() {
+                value = value.replace(url.username(), "[用户名]");
+            }
+            if let Some(password) = url.password() {
+                if !password.is_empty() {
+                    value = value.replace(password, "[密码]");
+                }
+            }
+        }
+    }
+    value.chars().take(240).collect()
+}
+
+fn network_public(mut value: NetworkPreferences) -> NetworkPreferences {
+    value.github_configured = !value.github_proxy.trim().is_empty();
+    value.tmdb_configured = !value.tmdb_proxy.trim().is_empty();
+    value.tg_configured = !value.tg_proxy.trim().is_empty();
+    value
+}
+
+#[tauri::command]
+fn get_network_preferences(state: tauri::State<'_, SharedState>) -> Result<NetworkPreferences, String> {
+    let guard = state.lock().map_err(|error| error.to_string())?;
+    Ok(network_public(NetworkPreferences {
+        github_proxy: load_app_state(&guard.db_path, "network_proxy_github")?.unwrap_or_default(),
+        tmdb_proxy: load_app_state(&guard.db_path, "network_proxy_tmdb")?.unwrap_or_default(),
+        tg_proxy: load_app_state(&guard.db_path, "network_proxy_tg")?.unwrap_or_default(),
+        ..Default::default()
+    }))
+}
+
+#[tauri::command]
+fn update_network_preferences(
+    state: tauri::State<'_, SharedState>,
+    input: NetworkPreferencesInput,
+) -> Result<NetworkPreferences, String> {
+    let guard = state.lock().map_err(|error| error.to_string())?;
+    let current = NetworkPreferences {
+        github_proxy: load_app_state(&guard.db_path, "network_proxy_github")?.unwrap_or_default(),
+        tmdb_proxy: load_app_state(&guard.db_path, "network_proxy_tmdb")?.unwrap_or_default(),
+        tg_proxy: load_app_state(&guard.db_path, "network_proxy_tg")?.unwrap_or_default(),
+        ..Default::default()
+    };
+    let github = normalize_proxy_value(input.github_proxy.or(Some(current.github_proxy)), "GitHub 代理")?;
+    let tmdb = normalize_proxy_value(input.tmdb_proxy.or(Some(current.tmdb_proxy)), "TMDB 代理")?;
+    let tg = normalize_proxy_value(input.tg_proxy.or(Some(current.tg_proxy)), "Telegram 代理")?;
+    save_app_state(&guard.db_path, "network_proxy_github", &github)?;
+    save_app_state(&guard.db_path, "network_proxy_tmdb", &tmdb)?;
+    save_app_state(&guard.db_path, "network_proxy_tg", &tg)?;
+    Ok(network_public(NetworkPreferences { github_proxy: github, tmdb_proxy: tmdb, tg_proxy: tg, ..Default::default() }))
+}
+
+#[tauri::command]
+async fn test_network(
+    state: tauri::State<'_, SharedState>,
+    target: String,
+    proxy_url: Option<String>,
+    tmdb_api_base: Option<String>,
+    tmdb_api_key: Option<String>,
+) -> Result<Value, String> {
+    let db_path = state.lock().map_err(|error| error.to_string())?.db_path.clone();
+    let normalized_target = target.trim().to_ascii_lowercase();
+    if !matches!(normalized_target.as_str(), "github" | "tmdb" | "tg") {
+        return Err("不支持的网络测试目标".to_string());
+    }
+    let stored_key = match normalized_target.as_str() {
+        "tmdb" => "network_proxy_tmdb",
+        "tg" => "network_proxy_tg",
+        _ => "network_proxy_github",
+    };
+    let proxy = normalize_proxy_value(proxy_url.or(load_app_state(&db_path, stored_key)?), "网络代理")?;
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(15));
+    if !proxy.is_empty() {
+        builder = builder.proxy(reqwest::Proxy::all(&proxy).map_err(|error| format!("初始化网络代理失败：{error}"))?);
+    }
+    let client = builder.build().map_err(|error| format!("初始化网络测试客户端失败：{error}"))?;
+    let mut endpoint = match normalized_target.as_str() {
+        "github" => "https://api.github.com/zen".to_string(),
+        "tg" => "https://api.telegram.org".to_string(),
+        _ => format!("{}/configuration", tmdb_api_base.unwrap_or_else(|| "https://api.themoviedb.org/3".to_string()).trim_end_matches('/')),
+    };
+    let mut request = client.get(&endpoint).header("accept", "application/json");
+    if normalized_target == "tmdb" {
+        if let Some(key) = tmdb_api_key.filter(|value| !value.trim().is_empty()) {
+            if key.starts_with("eyJ") || key.len() > 80 { request = request.bearer_auth(key); }
+            else { endpoint.push_str(&format!("?api_key={}", utf8_percent_encode(&key, NON_ALPHANUMERIC))); request = client.get(&endpoint).header("accept", "application/json"); }
+        }
+    }
+    let started = Instant::now();
+    match request.send().await {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let reachable = true;
+            let success = status < 500 && (normalized_target != "tmdb" || status < 400);
+            let message = if success { "网络可达".to_string() } else if reachable { format!("网络可达，上游返回 HTTP {status}") } else { format!("上游返回 HTTP {status}") };
+            Ok(json!({ "target": normalized_target, "success": success, "reachable": reachable, "status": status, "latency_ms": started.elapsed().as_millis(), "proxy": if proxy.is_empty() { "直连" } else { "已配置代理" }, "message": message }))
+        }
+        Err(error) => Ok(json!({ "target": normalized_target, "success": false, "reachable": false, "status": 0, "latency_ms": started.elapsed().as_millis(), "proxy": if proxy.is_empty() { "直连" } else { "已配置代理" }, "message": format!("连接失败：{}", redact_network_error(&error.to_string(), &proxy)) })),
+    }
+}
 #[tauri::command]
 fn update_transfer_settings(
     app: tauri::AppHandle,
@@ -12657,11 +12943,18 @@ fn get_app_version() -> AppVersionInfo {
 #[tauri::command]
 async fn fetch_app_update(
     app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
     pending: tauri::State<'_, PendingAppUpdate>,
 ) -> Result<Option<AppUpdateMetadata>, String> {
-    let update = app
-        .updater_builder()
-        .timeout(Duration::from_secs(30))
+    let db_path = state.lock().map_err(|error| error.to_string())?.db_path.clone();
+    let github_proxy = load_app_state(&db_path, "network_proxy_github")?.unwrap_or_default();
+    let mut updater = app.updater_builder().timeout(Duration::from_secs(30));
+    if !github_proxy.trim().is_empty() {
+        let normalized = normalize_proxy_value(Some(github_proxy), "GitHub 代理")?;
+        let url = reqwest::Url::parse(&normalized).map_err(|error| format!("GitHub 代理地址格式不正确：{error}"))?;
+        updater = updater.proxy(url);
+    }
+    let update = updater
         .build()
         .map_err(|error| format!("初始化更新检查失败：{error}"))?
         .check()
@@ -12769,6 +13062,7 @@ fn run() {
                 .to_path_buf();
             let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
             init_database(&db_path)?;
+            let organizer_state = organizer::initialize(app.handle().clone(), db_path.clone())?;
             let auth_session = load_auth_session(&db_path)?;
             let upload_history = load_upload_history(&db_path)?;
             let pending_cloud = pending_upload_stamps(&db_path)?;
@@ -12849,7 +13143,7 @@ fn run() {
                 .collect::<Vec<_>>();
             let mut resumable_uploads = load_resumable_uploads(&db_path)?;
             resumable_uploads.retain(|item| {
-                item.mapping_id == "__manual__"
+                item.mapping_id.starts_with("__")
                     || mappings
                         .iter()
                         .any(|mapping| mapping.id == item.mapping_id && mapping.enabled)
@@ -12904,6 +13198,13 @@ fn run() {
             app.manage(DownloadRegistry::default());
             app.manage(PendingAppUpdate::default());
             app.manage(state.clone());
+            app.manage(organizer_state);
+            start_organizer(
+                app.handle().clone(),
+                app.state::<organizer::OrganizerSharedState>()
+                    .inner()
+                    .clone(),
+            );
             let app_handle = app.handle().clone();
             if webdav_enabled {
                 tauri::async_runtime::spawn(webdav::serve(
@@ -13053,12 +13354,16 @@ fn run() {
             update_mapping_sync_types,
             update_mapping_monitor_mode,
             update_mapping_auto_share,
+            update_mapping_organizer,
             update_hdhive_config,
             backfill_auto_shares,
             retry_auto_share_event,
             pause_queue,
             get_transfer_settings,
             update_transfer_settings,
+            get_network_preferences,
+            update_network_preferences,
+            test_network,
             get_cache_settings,
             update_cache_settings,
             get_metadata_cache_stats,
@@ -13071,6 +13376,17 @@ fn run() {
             delete_developer_target,
             list_developer_transfers,
             start_developer_transfer,
+            get_organizer_state,
+            update_organizer_settings,
+            test_organizer_connection,
+            add_organizer_mapping,
+            update_organizer_mapping,
+            remove_organizer_mapping,
+            remove_organizer_job,
+            scan_organizer_mapping,
+            run_organizer_job,
+            retry_organizer_job,
+            scrape_selected_files,
             resume_queue,
             get_app_version,
             fetch_app_update,

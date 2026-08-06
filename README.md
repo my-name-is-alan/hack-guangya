@@ -17,10 +17,30 @@
 - 云添加：先解析磁力、HTTP、HTTPS、ED2K 资源，再选择云端目录并创建任务；展示进度、错误和当日次数，支持取消、重试和清理记录，磁力资源会按解析结果提交可用子文件序号。
 - 分享管理：查看状态、剩余有效期、访问/转存/下载统计和流量，支持批量取消、编辑有效期与免登录流量上限、清理失效记录；根级文件夹详情中开关直链文件夹，内部文件详情中获取长链或短链。分享收藏仍保存在本机配置，不保存光鸭密码或 OSS 临时密钥。
 - 备份任务：可创建多个监控目录，可视化选择云端目标文件夹，保留本地目录结构并自动创建子目录；同步范围直接按文件后缀配置，支持视频、图片、字幕、音频快捷填充，也可以输入任意自定义后缀，默认填入图片、视频、音频的常用后缀。本地磁盘使用系统文件事件，网盘映射盘、NAS 或同步盘可切换为每 5 秒轮询；重复文件事件不会再次加入正在上传的任务。
+- 光鸭原生媒体整理：独立于 MoviePilot 的原生云盘引擎，只在同一个光鸭云盘内执行 A → B 复制/移动，不调用 MoviePilot API、不经过本地挂载盘，也不存在跨盘整理。可创建多个云盘目录监控（每 15 秒轮询 A 目录），内置电影/电视剧解析、TMDB 候选评分与人工复核、字幕/音轨/预告片/花絮同步和冲突预览；目标路径支持分类、国家、年份、标题、TMDB ID、季集、版本、清晰度等字段自由组合。元数据刮削默认关闭，开启后只刮选中的 NFO、海报、背景图或季海报类型。移动/覆盖前必须确认已有分享可能失效；整理后若启用分享，会从 B 目录创建新分享并通知 HDHive，不复用 A 目录旧分享。
 - 账户配置：展示账号昵称、账号 ID、手机号与空间；严格绑定当前账号的开发者模式和多号秒传配置在独立面板中管理；不再展示 VIP/SVIP、流量和权益规则。
 - 上传完成后的源文件策略：保留（默认）、移动到归档目录、删除源文件。删除策略只有显式选择后才执行，并且上传期间源文件发生变化时不会删除或移动。
 - 上传队列：上传、下载任务并发数均可在 1–8 之间设置，可暂停和继续；桌面端下载不小于 16 MiB 的单个大文件时会探测 CDN Range 能力，并在总连接预算 8 路内自动使用 1–4 路并发分片，不支持 Range 或分片失败时回退单流；界面会显示准备目录、下载分片、OSS 分片进度和云端入库状态；OSS 上传或秒传完成后立即把文件指纹和云端任务 ID 持久化到 SQLite，不依赖后续入库轮询，重启后不会重复上传未变更文件。
 - 上传完成自动分享：按同步根目录第一层聚合。根目录单文件直接分享文件；`tvname/season 1/s01.mkv`、`tvname/season 2/s02.mkv` 始终复用 `tvname` 文件夹分享。目标无排队/上传且静默 30 秒后通知 Hdhive；现有任务升级后默认关闭，已有内容只通过“补建已有内容”显式处理。
+
+## 云盘内原生媒体整理
+
+在“媒体识别与整理”中先选择光鸭云盘内的来源 A 文件夹和目标 B 文件夹。A、B 必须是两个已存在的云端文件夹，不能相同或互相包含；整理器只提交光鸭官方的云端复制、移动、重命名、建目录和上传接口，不读取或搬运本地路径。
+
+默认模板示例（保存的是相对于 B 的路径）：
+
+```text
+电影：{category}/{country}/{year}/{title} ({year}) [tmdb-{tmdb_id}]/{title} ({year}){edition}{quality}{part}.{ext}
+电视剧：{category}/{country}/{year}/{title} ({year}) [tmdb-{tmdb_id}]/Season {season:02}/{title}.S{season:02}E{episode:02}{episode_end}.{ext}
+```
+
+可用字段包括 `{category}`、兼容拼写 `{catgroy}`、`{country}`、`{year}`、`{title}`、`{original_title}`、`{tmdb_id}`（兼容 `{tmdbid}`）、`{season}`、`{episode}`、`{episode_end}`、`{Season x}`、`{Expose n}`、`{edition}`、`{quality}`、`{part}` 和 `{ext}`；字段可以自由组合，系统会清理非法文件名字符并拒绝 `.`/`..` 路径跳转。页面提供三个预设，也可直接编辑完整相对路径。
+
+整理监控是云端轮询，不是本机文件事件监听。两个 WebDAV/原生挂载共用同一云端目录时，写操作会立即失效本进程缓存；服务端目录缓存最长保留 15 秒，rclone 默认目录缓存为 2 秒、VFS 变化轮询为 5 秒，通常几秒内即可看到另一挂载创建的新文件夹。客户端自身的离线缓存仍可能需要手动刷新。
+
+刮削开关默认关闭。打开后先选择要执行的类型（默认预选电影 NFO、剧集 NFO、海报、背景图），不会把所有可用元数据全部下载；刮削失败会记录为警告并保留已完成的主体整理。上传任务可在“上传后自动整理”中关联 A 目录：关闭时沿用原上传后自动分享流程，开启时先等待 A → B 完成，再从 B 创建新分享，避免把即将移动的 A 目录提交给 HDHive。
+
+光鸭分享不是不可变快照。移动、删除或覆盖云端文件可能使旧分享失效或内容不再完整，因此整理器对 `move`/`overwrite` 强制风险确认，整理后的分享始终是 B 目录的新链接；A 目录或历史分享不会被复用。
 
 ## 开发和打包
 
@@ -32,7 +52,7 @@ pnpm tauri dev
 pnpm tauri build
 ```
 
-安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.24_x64-setup.exe`
+安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.25_x64-setup.exe`
 
 正式更新包必须使用长期保存的同一把 Tauri 私钥签名。构建机设置 `TAURI_SIGNING_PRIVATE_KEY`（可填私钥内容或私钥文件路径）和可选的 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 后执行构建，再生成 GitHub Release 所需文件：
 
@@ -103,7 +123,7 @@ WebDAV 是在线文件系统，不是离线镜像。打开大文件时由系统 
 Docker Hub 镜像：[`94xhzy/guangya-sync`](https://hub.docker.com/r/94xhzy/guangya-sync)，推荐固定使用版本标签：
 
 ```bash
-docker pull 94xhzy/guangya-sync:0.1.24
+docker pull 94xhzy/guangya-sync:0.1.25
 ```
 
 先准备管理账号。用户名默认是 `admin`；请生成独立的强随机密码，复制 `.env.example` 为 `.env` 并填入 `GUANGYA_ADMIN_PASSWORD`：
@@ -143,11 +163,14 @@ docker compose -f docker-compose.yml -f docker-compose.fuse.yml up -d
 
 默认挂载关系为：
 
-- `./watch` → `/watch`：允许添加为监控任务的目录；
-- `./archive` → `/archive`：Docker 版归档策略可使用的目录；
+- `./watch` → `/watch`：本地备份任务的源目录；
+- `./archive` → `/archive`：Docker 版“上传后移动到归档”策略的目录；
+- `./media` → `/media`：可选的本地备份允许根目录，不是云盘内原生整理的目标；
 - `./docker-data` → `/data`：任务和分享收藏配置。
 
-Docker Web 不能直接读取浏览器所在电脑的任意本地目录。默认 `GUANGYA_FILE_ROOTS=/watch,/archive`，只能浏览和监控明确挂载到这两个容器目录中的文件。网页支持扫码和短信验证码登录；也可以在启动前通过 `GUANGYA_TOKEN` 环境变量注入令牌。登录会话和上传历史保存在 `/data/state.sqlite3`。
+Docker Web 不能直接读取浏览器所在电脑的任意本地目录。默认 `GUANGYA_FILE_ROOTS=/watch,/archive,/media`，只能浏览和操作明确挂载到这些容器目录中的文件。网页支持扫码和短信验证码登录；也可以在启动前通过 `GUANGYA_TOKEN` 环境变量注入令牌。登录会话和上传历史保存在 `/data/state.sqlite3`。
+
+媒体整理的 TMDB 凭据可在“整理”页配置，也可设置 `TMDB_API_KEY` 或 `TMDB_READ_ACCESS_TOKEN`；`TMDB_LANGUAGE`、`TMDB_IMAGE_LANGUAGE`、`TMDB_API_BASE` 和 `TMDB_IMAGE_BASE` 可调整元数据语言及 API/图片镜像。整理页会从登录账号的云盘文件夹选择 A/B，并通过云端 file ID 递归扫描和执行；Docker 容器不需要把 `/watch` 或 `/media` 映射成整理目标。`/watch`、`/archive`、`/media` 仍只用于本地备份任务和服务器文件上传。
 
 HDHive 联动可在“设置 → HDHive”中配置，也可通过环境变量配置：`HDHIVE_BASE_URL`、`HDHIVE_GUANGYA_SYNC_SECRET`、`HDHIVE_GUANGYA_SYNC_INSTANCE_ID`。设置页会显示并可复制当前实例 ID；未显式设置时会首次生成并持久化到 `/data/state.sqlite3`，密钥不通过状态接口返回。先在 HDHive 管理后台“光鸭同步 → 添加账号”中填写此实例 ID 和已绑定账号的 Telegram 数字 ID，再把后台一次性生成的 HMAC 密钥填回同步端。`GUANGYA_AUTO_SHARE_QUIET_MS` 可调整聚合静默时间，默认 30000 毫秒。
 
@@ -184,7 +207,7 @@ pnpm web
 pnpm package:ubuntu
 ```
 
-输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.24.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
+输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.25.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
 
 ## 接口边界
 

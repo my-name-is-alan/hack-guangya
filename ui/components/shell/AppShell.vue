@@ -6,12 +6,17 @@ import {
   CloudOutlined,
   CloudUploadOutlined,
   DownloadOutlined,
+  FolderOpenOutlined,
   SearchOutlined,
   SettingOutlined,
   ShareAltOutlined,
   SyncOutlined,
+  ToolOutlined,
   UserOutlined,
 } from '@antdv-next/icons'
+import { bridge } from '../../bridge.js'
+import { errorText } from '../../formatters.js'
+import { message } from 'antdv-next'
 import { formatSize } from '../../formatters.js'
 import { formatUploadSpeed } from '../../uploadProgress.js'
 import { useSessionStore } from '../../stores/session'
@@ -28,6 +33,7 @@ const searchOpen = shallowRef(false)
 
 const navigation = [
   { name: 'backup', label: '备份', icon: CloudUploadOutlined },
+  { name: 'organizer', label: '整理', icon: FolderOpenOutlined },
   { name: 'transfers', label: '传输', icon: SyncOutlined },
   { name: 'offline', label: '离线', icon: DownloadOutlined },
   { name: 'shares', label: '分享', icon: ShareAltOutlined },
@@ -46,6 +52,24 @@ const accountMenu = {
   onClick: ({ key }: { key: string }) => {
     if (key === 'settings') void router.push({ name: 'settings' })
     if (key === 'relogin') void bridgeRelogin()
+  },
+}
+
+const networkMenu = {
+  items: [
+    { key: 'tmdb', label: '测试 TMDB' },
+    { key: 'tg', label: '测试 Telegram' },
+    { key: 'github', label: '测试 GitHub' },
+    { type: 'divider' },
+    { key: 'settings', label: '打开网络偏好' },
+  ],
+  onClick: async ({ key }: { key: string }) => {
+    if (key === 'settings') { void router.push({ name: 'settings', query: { tab: 'network' } }); return }
+    try {
+      const result = await bridge.invoke('test_network', { target: key })
+      if (result?.reachable) message.success(`${key.toUpperCase()}：${result.message || '网络可达'}（${result.latency_ms || 0} ms）`)
+      else message.error(`${key.toUpperCase()}：${result?.message || '网络不可达'}`)
+    } catch (error) { message.error(errorText(error)) }
   },
 }
 
@@ -103,6 +127,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleGlobalKeydown)
             <small>{{ uploadSpeed ? formatUploadSpeed(uploadSpeed) : `${overallPercent}%` }}</small>
           </button>
 
+          <a-dropdown :trigger="['click']" :menu="networkMenu">
+            <button type="button" class="network-tools-trigger" aria-label="网络工具"><ToolOutlined /></button>
+          </a-dropdown>
+
           <a-dropdown :trigger="['click']" :menu="accountMenu">
             <button type="button" class="account-trigger">
               <a-avatar class="account-avatar" :size="32" :src="userAvatar || undefined"><template #icon><UserOutlined /></template></a-avatar>
@@ -152,6 +180,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleGlobalKeydown)
 .search-trigger span { flex: 1; }
 .search-trigger kbd { padding: 2px 6px; border: 1px solid var(--line, #d9dde5); border-radius: 4px; background: var(--surface, #fff); font-size: 10px; }
 .top-actions { display: flex; align-items: center; gap: 14px; }
+.network-tools-trigger { display: grid; width: 30px; height: 30px; place-items: center; border: 0; border-radius: 8px; color: var(--text-2, #667085); background: transparent; font-size: 17px; cursor: pointer; }
+.network-tools-trigger:hover { color: var(--text-1, #20242c); background: var(--surface-hover, #f3f4f6); }
 .transfer-summary { display: grid; min-width: 136px; grid-template-columns:1fr auto; align-items: center; gap: 3px 8px; padding: 3px 0; border: 0; color: var(--text-2, #667085); background: transparent; cursor: pointer; }
 .transfer-label { font-size: 11px; text-align: left; }
 .transfer-summary small { grid-column:2; grid-row:1 / span 2; color: var(--text-3, #98a2b3); font-size: 10px; }

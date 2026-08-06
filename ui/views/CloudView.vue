@@ -32,6 +32,7 @@ import {
   ScissorOutlined,
   ShareAltOutlined,
   SwapOutlined,
+  TagsOutlined,
   UploadOutlined,
   VideoCameraOutlined,
 } from '@antdv-next/icons';
@@ -128,6 +129,7 @@ const fileContextMenuItems = computed(() => {
     { key: 'download', icon: () => h(DownloadOutlined), label: '下载' },
     { key: 'share', icon: () => h(ShareAltOutlined), label: '创建分享' },
     { key: 'transferAccount', icon: () => h(SwapOutlined), label: '秒传到小号' },
+    { key: 'scrape', icon: () => h(TagsOutlined), label: '刮削到媒体库' },
     { type: 'divider' },
     { key: 'delete', icon: () => h(DeleteOutlined), label: '删除 (Del)', danger: true },
   ];
@@ -152,6 +154,7 @@ const developerTransfer = reactive({
   targets: [],
   targetId: '',
 });
+const scrapeDialog = reactive({ open: false, loading: false, saving: false, targets: [], targetId: '', records: [] });
 const developerTerminalNotified = new Set();
 const gcidImportRunning = computed(() => ['preparing', 'running'].includes(gcidImport.status?.status));
 const gcidImportProgress = computed(() => gcidImportPercent(gcidImport.status));
@@ -592,6 +595,66 @@ async function submitDeveloperTransfer() {
   }
 }
 
+function cloudPathLabel() {
+  const parts = currentPath.value.slice(1).map((item) => String(item.name || item.fileName || '')).filter(Boolean);
+  return `/${parts.join('/')}` || '/';
+}
+
+async function openScrapeSelected(records = selectedRecords()) {
+  const targets = (Array.isArray(records) ? records : []).filter((item) => fileId(item));
+  if (!targets.length) {
+    message.warning('请先选择要刮削的文件或文件夹');
+    return;
+  }
+  scrapeDialog.loading = true;
+  try {
+    const state = unwrapData(await bridge.invoke('get_organizer_state'));
+    const settings = state?.settings || {};
+    if (!settings.configured) {
+      Modal.confirm({ title: '先配置 TMDB', content: '请先在“设置 → 整理与刮削 → TMDB 配置”中配置 TMDB Key。', okText: '去设置', cancelText: '取消', onOk: () => router.push({ name: 'settings', query: { tab: 'organizer' } }) });
+      return;
+    }
+    scrapeDialog.records = targets;
+    scrapeDialog.targets = Array.isArray(settings.scrape_targets) ? settings.scrape_targets : [];
+    scrapeDialog.targetId = scrapeDialog.targets.some((item) => item.id === scrapeDialog.targetId) ? scrapeDialog.targetId : (scrapeDialog.targets[0]?.id || '');
+    if (!scrapeDialog.targets.length) {
+      Modal.confirm({ title: '先配置刮削目标', content: '请先在“设置 → 整理与刮削 → 刮削偏好”中添加一个或多个媒体库目标。', okText: '去设置', cancelText: '取消', onOk: () => router.push({ name: 'settings', query: { tab: 'organizer' } }) });
+      return;
+    }
+    scrapeDialog.open = true;
+  } catch (error) {
+    message.error(errorText(error));
+  } finally {
+    scrapeDialog.loading = false;
+  }
+}
+
+async function submitScrapeSelected() {
+  if (!scrapeDialog.targetId) { message.warning('请选择刮削目标'); return; }
+  scrapeDialog.saving = true;
+  try {
+    const parentId = String(currentFolderId.value || '');
+    const parentPath = cloudPathLabel();
+    const files = scrapeDialog.records.map((record) => ({
+      id: String(fileId(record)),
+      name: String(record.fileName || record.name || ''),
+      parent_id: String(record.parentId || record.parent_id || parentId),
+      parent_path: String(record.parentPath || record.parent_path || parentPath),
+      is_directory: isFolder(record),
+    }));
+    const result = await bridge.invoke('scrape_selected_files', { input: { files, target_id: scrapeDialog.targetId } });
+    const jobs = Array.isArray(result?.jobs) ? result.jobs.length : 0;
+    const failures = Array.isArray(result?.failures) ? result.failures.length : 0;
+    scrapeDialog.open = false;
+    clearSelection();
+    message.success(`已提交 ${jobs} 个刮削任务${failures ? `，${failures} 项未提交` : ''}`);
+  } catch (error) {
+    message.error(errorText(error));
+  } finally {
+    scrapeDialog.saving = false;
+  }
+}
+
 function contextTargetRecords() {
   const record = fileContextMenu.record;
   if (!record) return [];
@@ -621,6 +684,7 @@ async function handleFileContextMenuClick({ key }) {
   if (key === 'moveTo') return openFolderPicker('move', targets);
   if (key === 'share') return createCloudShare(targets);
   if (key === 'transferAccount') return openDeveloperTransfer(targets);
+  if (key === 'scrape') return openScrapeSelected(targets);
   if (key === 'delete') return deleteCloudFiles(targets);
 }
 
@@ -1538,6 +1602,7 @@ onBeforeUnmount(() => {
           @rename="openRenameModal(selectedRecords())"
           @download="downloadCloudFiles(selectedRecords())"
           @share="createCloudShare(selectedRecords())"
+          @scrape="openScrapeSelected(selectedRecords())"
           @transfer-account="openDeveloperTransfer(selectedRecords())"
           @delete="deleteCloudFiles(selectedRecords())"
           @paste="pasteFileClipboard"
@@ -1626,6 +1691,16 @@ onBeforeUnmount(() => {
             @press-enter="submitNewFolder"
           />
         </a-form-item>
+      </a-form>
+    </a-modal>
+
+    <a-modal v-model:open="scrapeDialog.open" title="刮削到媒体库" ok-text="提交刮削" cancel-text="取消" :confirm-loading="scrapeDialog.saving" @ok="submitScrapeSelected">
+      <a-alert type="info" show-icon message="会复制选中的云盘文件/目录到所选媒体库，并按设置中的模板识别、整理和生成已勾选的元数据。原文件不会被删除。" />
+      <a-form layout="vertical" class="scrape-dialog-form">
+        <a-form-item label="刮削目标" required>
+          <a-select v-model:value="scrapeDialog.targetId" :options="scrapeDialog.targets.map((item) => ({ label: `${item.name} · ${item.path}`, value: item.id }))" />
+        </a-form-item>
+        <a-form-item label="选中项目"><a-tag v-for="record in scrapeDialog.records" :key="fileId(record)">{{ record.fileName || record.name }}</a-tag></a-form-item>
       </a-form>
     </a-modal>
 

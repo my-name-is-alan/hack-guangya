@@ -15,8 +15,11 @@ use axum::{
 use percent_encoding::percent_decode_str;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DIRECTORY_CACHE_FRESH_SECS: u64 = 60;
-const DIRECTORY_CACHE_STALE_SECS: u64 = 10 * 60;
+// Native mounts already cache directory listings. A short server-side cache
+// prevents changes made through another WebDAV/native mount from remaining
+// invisible for minutes because two independent caches are stacked.
+const DIRECTORY_CACHE_FRESH_SECS: u64 = 2;
+const DIRECTORY_CACHE_STALE_SECS: u64 = 15;
 const DIRECTORY_CACHE_MAX_ENTRIES: usize = 2_048;
 
 #[derive(Clone)]

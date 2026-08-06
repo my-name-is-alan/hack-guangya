@@ -9,6 +9,7 @@ import {
   ScissorOutlined,
   ShareAltOutlined,
   SwapOutlined,
+  TagsOutlined,
 } from '@antdv-next/icons'
 
 defineProps<{
@@ -24,6 +25,7 @@ defineEmits<{
   rename: []
   download: []
   share: []
+  scrape: []
   transferAccount: []
   delete: []
   paste: []
@@ -47,6 +49,7 @@ defineEmits<{
       <a-button type="text" size="small" @click="$emit('move')"><template #icon><SwapOutlined /></template>移动到</a-button>
       <a-button type="text" size="small" @click="$emit('download')"><template #icon><DownloadOutlined /></template>下载</a-button>
       <a-button type="text" size="small" @click="$emit('share')"><template #icon><ShareAltOutlined /></template>分享</a-button>
+      <a-button type="text" size="small" @click="$emit('scrape')"><template #icon><TagsOutlined /></template>刮削到媒体库</a-button>
       <a-button type="text" size="small" @click="$emit('transferAccount')"><template #icon><SwapOutlined /></template>小号秒传</a-button>
       <a-button type="text" size="small" danger title="删除 (Delete)" @click="$emit('delete')"><template #icon><DeleteOutlined /></template>删除 <kbd>Del</kbd></a-button>
     </div>

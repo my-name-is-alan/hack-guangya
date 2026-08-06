@@ -172,6 +172,7 @@ export const bridge = isTauri ? {
     if (command === 'update_mapping_sync_types') return webRequest(`/api/mappings/${encodeURIComponent(args.id)}`, { method: 'PATCH', body: JSON.stringify({ sync_types: args.sync_types }) });
     if (command === 'update_mapping_monitor_mode') return webRequest(`/api/mappings/${encodeURIComponent(args.id)}`, { method: 'PATCH', body: JSON.stringify({ monitor_mode: args.monitor_mode }) });
     if (command === 'update_mapping_auto_share') return webRequest(`/api/mappings/${encodeURIComponent(args.id)}`, { method: 'PATCH', body: JSON.stringify({ auto_share: args.auto_share }) });
+    if (command === 'update_mapping_organizer') return webRequest(`/api/mappings/${encodeURIComponent(args.id)}`, { method: 'PATCH', body: JSON.stringify({ organizer_mapping_id: args.organizer_mapping_id || '' }) });
     if (command === 'update_hdhive_config') return webRequest('/api/hdhive/config', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'backfill_auto_shares') return webRequest(`/api/mappings/${encodeURIComponent(args.id)}/auto-share-backfill`, { method: 'POST', body: '{}' });
     if (command === 'retry_auto_share_event') return webRequest(`/api/auto-share/events/${encodeURIComponent(args.event_id)}/retry`, { method: 'POST', body: JSON.stringify({ tmdb_id: args.tmdb_id, media_type: args.media_type }) });
@@ -179,6 +180,9 @@ export const bridge = isTauri ? {
     if (command === 'resume_queue') return webRequest('/api/queue/resume', { method: 'POST' });
     if (command === 'get_transfer_settings') return webRequest('/api/settings');
     if (command === 'update_transfer_settings') return webRequest('/api/settings/transfer', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'get_network_preferences') return webRequest('/api/settings/network');
+    if (command === 'update_network_preferences') return webRequest('/api/settings/network', { method: 'POST', body: JSON.stringify(args.input || args) });
+    if (command === 'test_network') return webRequest('/api/network/test', { method: 'POST', body: JSON.stringify(args.input || args) });
     if (command === 'get_cache_settings') return webRequest('/api/settings/cache');
     if (command === 'update_cache_settings') return webRequest('/api/settings/cache', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'get_metadata_cache_stats') return webRequest('/api/cache');
@@ -194,6 +198,17 @@ export const bridge = isTauri ? {
       return webRequest(`/api/developer/transfers?${params}`);
     }
     if (command === 'start_developer_transfer') return webRequest('/api/developer/transfers', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'get_organizer_state') return webRequest('/api/organizer');
+    if (command === 'update_organizer_settings') return webRequest('/api/organizer/settings', { method: 'PUT', body: JSON.stringify(args.input || args) });
+    if (command === 'test_organizer_connection') return webRequest('/api/organizer/test', { method: 'POST', body: JSON.stringify(args.input || args) });
+    if (command === 'add_organizer_mapping') return webRequest('/api/organizer/mappings', { method: 'POST', body: JSON.stringify(args.input || args) });
+    if (command === 'update_organizer_mapping') return webRequest(`/api/organizer/mappings/${encodeURIComponent(args.id)}`, { method: 'PATCH', body: JSON.stringify(args.input || {}) });
+    if (command === 'remove_organizer_mapping') return webRequest(`/api/organizer/mappings/${encodeURIComponent(args.id)}`, { method: 'DELETE' });
+    if (command === 'remove_organizer_job') return webRequest(`/api/organizer/jobs/${encodeURIComponent(args.id)}`, { method: 'DELETE' });
+    if (command === 'scan_organizer_mapping') return webRequest(`/api/organizer/mappings/${encodeURIComponent(args.id)}/scan`, { method: 'POST', body: '{}' });
+    if (command === 'run_organizer_job') return webRequest(`/api/organizer/jobs/${encodeURIComponent(args.id)}/run`, { method: 'POST', body: JSON.stringify(args.input || {}) });
+    if (command === 'retry_organizer_job') return webRequest(`/api/organizer/jobs/${encodeURIComponent(args.id)}/retry`, { method: 'POST', body: JSON.stringify(args.input || {}) });
+    if (command === 'scrape_selected_files') return webRequest('/api/organizer/scrape-selected', { method: 'POST', body: JSON.stringify(args.input || args) });
     if (command === 'get_app_version') return { version: 'Docker Web' };
     if (command === 'fetch_app_update' || command === 'install_app_update') {
       throw new Error('Docker Web 版本随镜像更新，桌面自动更新仅在 Windows 客户端可用');

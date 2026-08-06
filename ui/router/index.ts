@@ -4,6 +4,7 @@ const routes = [
   { path: '/', redirect: '/files' },
   { path: '/files', name: 'files', component: () => import('../views/FilesWorkspaceView.vue') },
   { path: '/backup', name: 'backup', component: () => import('../views/BackupView.vue') },
+  { path: '/organizer', name: 'organizer', component: () => import('../views/OrganizerView.vue') },
   { path: '/transfers', name: 'transfers', component: () => import('../views/TransfersView.vue') },
   { path: '/offline', name: 'offline', component: () => import('../views/OfflineView.vue') },
   { path: '/shares', name: 'shares', component: () => import('../views/SharesView.vue') },

@@ -1,6 +1,6 @@
 services:
   guangya-sync:
-    image: ${GUANGYA_IMAGE:-94xhzy/guangya-sync:0.1.24}
+    image: ${GUANGYA_IMAGE:-94xhzy/guangya-sync:0.1.25}
     pull_policy: always
     container_name: guangya-sync
     restart: unless-stopped
@@ -21,7 +21,7 @@ services:
       GUANGYA_ADMIN_PASSWORD: ${GUANGYA_ADMIN_PASSWORD:?请先在 .env 中设置强随机管理密码}
       GUANGYA_WATCH_ROOT: /watch
       GUANGYA_ARCHIVE_ROOT: /archive
-      GUANGYA_FILE_ROOTS: /watch,/archive
+      GUANGYA_FILE_ROOTS: /watch,/archive,/media
       GUANGYA_DEFAULT_MONITOR_MODE: polling
       GUANGYA_UPLOAD_CONCURRENCY: ${GUANGYA_UPLOAD_CONCURRENCY:-2}
       GUANGYA_DOWNLOAD_CONCURRENCY: ${GUANGYA_DOWNLOAD_CONCURRENCY:-2}
@@ -41,7 +41,14 @@ services:
       GUANGYA_TOKEN: ${GUANGYA_TOKEN:-}
       GUANGYA_DEVELOPER_CLIENT_ID: ${GUANGYA_DEVELOPER_CLIENT_ID:-}
       GUANGYA_DEVELOPER_CLIENT_SECRET: ${GUANGYA_DEVELOPER_CLIENT_SECRET:-}
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
+      TMDB_READ_ACCESS_TOKEN: ${TMDB_READ_ACCESS_TOKEN:-}
+      TMDB_LANGUAGE: ${TMDB_LANGUAGE:-zh-CN}
+      TMDB_IMAGE_LANGUAGE: ${TMDB_IMAGE_LANGUAGE:-zh,null,en}
+      TMDB_API_BASE: ${TMDB_API_BASE:-}
+      TMDB_IMAGE_BASE: ${TMDB_IMAGE_BASE:-}
     volumes:
       - ./docker-data:/data
       - ./watch:/watch
       - ./archive:/archive
+      - ./media:/media

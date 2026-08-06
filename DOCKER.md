@@ -1,13 +1,13 @@
 # Docker Web 部署配置
 
-本文档适用于 Docker Hub 镜像 `94xhzy/guangya-sync:0.1.17`。容器提供光鸭云盘 Web 管理界面、服务器目录监控、断点续传、自动分享与 HDHive 投稿。
+本文档适用于 Docker Hub 镜像 `94xhzy/guangya-sync:0.1.25`。容器提供光鸭云盘 Web 管理界面、服务器目录监控、断点续传、媒体整理、自动分享与 HDHive 投稿。
 
 ## 1. 准备目录和配置
 
 服务器需要 Docker Engine 24+ 与 Docker Compose v2。把仓库中的 `docker-compose.yml` 和 `.env.example` 放到同一目录：
 
 ```bash
-mkdir -p guangya-sync/{docker-data,watch,archive}
+mkdir -p guangya-sync/{docker-data,watch,archive,media}
 cd guangya-sync
 cp /path/to/docker-compose.yml .
 cp /path/to/.env.example .env
@@ -23,13 +23,20 @@ openssl rand -hex 24
 把结果写入 `.env`：
 
 ```dotenv
-GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.17
+GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.25
 GUANGYA_HTTP_PORT=8080
 GUANGYA_ADMIN_USERNAME=admin
 GUANGYA_ADMIN_PASSWORD=替换为上面生成的强随机密码
 GUANGYA_WEBDAV_PORT=19090
 GUANGYA_WEBDAV_USERNAME=guangya
 GUANGYA_WEBDAV_PASSWORD=
+TMDB_API_KEY=
+TMDB_READ_ACCESS_TOKEN=
+TMDB_LANGUAGE=zh-CN
+TMDB_IMAGE_LANGUAGE=zh,null,en
+# 可选，留空时使用官方地址；也可在网页设置中填写
+TMDB_API_BASE=
+TMDB_IMAGE_BASE=
 ```
 
 `GUANGYA_ADMIN_PASSWORD` 为空时 Compose 会拒绝启动。`.env` 包含敏感信息，不要提交到 Git，也不要发到聊天或工单。
@@ -60,8 +67,9 @@ GUANGYA_HTTP_PORT=18080
 | 宿主机目录 | 容器目录 | 用途 |
 | --- | --- | --- |
 | `./docker-data` | `/data` | 登录会话、上传记录、断点、分享与任务配置 |
-| `./watch` | `/watch` | 可浏览和创建监控任务的源目录 |
+| `./watch` | `/watch` | 本地备份任务的源目录 |
 | `./archive` | `/archive` | “上传后移动到归档”策略的目标目录 |
+| `./media` | `/media` | 可选的本地备份允许根目录；云盘内原生整理不写入这里 |
 
 必须持久化 `/data`。升级或重建容器不会丢数据，但删除 `docker-data` 会清除登录会话、上传指纹和任务配置。
 
@@ -116,8 +124,12 @@ rclone config create guangya webdav \
 
 rclone mount guangya: /mnt/guangya \
   --vfs-cache-mode full \
-  --dir-cache-time 30s
+  --dir-cache-time 2s \
+  --vfs-cache-poll-interval 5s \
+  --poll-interval 0
 ```
+
+两个挂载点通过同一个 WebDAV 服务访问云端时，WebDAV 写操作会主动失效服务端目录缓存；来自另一个进程或实例的变化则按短 TTL 重新读取。服务端新鲜缓存为 2 秒、过期后台刷新窗口为 15 秒，rclone 目录缓存建议保持 2 秒，通常几秒内可看到另一挂载创建的新文件夹。若客户端仍显示旧目录，先执行挂载客户端自己的刷新或重新进入目录。
 
 在同一个 Compose 网络中的其他容器可直接访问私有地址 `http://guangya-sync:19090/dav/`。如果要在容器内执行 FUSE 挂载，需要显式提供 `/dev/fuse` 和相应权限；普通业务容器优先直接使用 WebDAV，不要无条件开启 `privileged`。
 
@@ -173,6 +185,31 @@ GUANGYA_DEVELOPER_CLIENT_SECRET=
 ```
 
 环境变量存在时对应字段不能从页面覆盖，但不能绕过账号绑定：仍需登录该 `client_id` 所属账号，在账号页验证并开启模式。小号接收 TOKEN 仍在设置页中添加，完整 TOKEN 与 `client_secret` 均不会通过状态接口回显，但会保存在持久化的 `/data/state.sqlite3`，因此应限制 `docker-data` 的读取权限并纳入加密备份策略。一个 TOKEN 只支持当前开发者账号向该小号授权目录发送；反向互传需要另一方向独立配置。
+
+### 4.2 光鸭原生媒体整理
+
+媒体整理由光鸭自身完成，不需要部署 MoviePilot，也不使用容器内本地路径搬运。整理范围严格限定为同一个光鸭云盘内的来源 A 文件夹到目标 B 文件夹；A/B 通过云端目录 ID 选择，不能相同或互相包含。
+
+TMDB 凭据可以在网页“整理”中配置，也可以由环境变量托管；API Key 与 Read Access Token 二选一：
+
+```dotenv
+TMDB_API_KEY=替换为TMDB的v3 API Key
+TMDB_READ_ACCESS_TOKEN=
+TMDB_LANGUAGE=zh-CN
+TMDB_IMAGE_LANGUAGE=zh,null,en
+```
+
+也可以把 `TMDB_API_KEY` 留空并填写 `TMDB_READ_ACCESS_TOKEN`。凭据只保存在 `/data/state.sqlite3` 或环境变量中，状态接口与事件不会回显完整值；环境变量非空时优先于页面设置。
+
+`/watch`、`/archive`、`/media` 只服务于本地备份任务和服务器文件上传；云盘内原生整理不读取这些容器路径。打开“整理 → 添加目录监控”后，分别从光鸭云盘选择来源 A 文件夹和目标 B 文件夹，系统保存它们的云端目录 ID。
+
+光鸭会每 15 秒递归分析 A 的一级候选（文件夹或视频），忽略样片，识别电影/电视剧、季集、版本和清晰度，查询 TMDB 后生成完整相对路径、转移、字幕/音轨/花絮同步及刮削预览。可选 `copy`（推荐）或云盘内 `move`；`move` 和覆盖冲突策略必须确认已有分享可能失效。执行时先创建 B 下的目标目录，再通过云端 copy/move/rename 完成事务；中途失败会按已记录的步骤回滚，不能回滚的部分会明确告警。
+
+命名模板相对于 B 根目录保存，支持 `{category}`/`{catgroy}`、`{country}`、`{year}`、`{title}`、`{original_title}`、`{tmdb_id}`/`{tmdbid}`、`{season}`、`{episode}`、`{episode_end}`、`{Season x}`、`{Expose n}`、`{edition}`、`{quality}`、`{part}`、`{ext}` 等字段。页面提供三个预设，电影和电视剧模板可分别自由组合；模板必须包含目录和文件名，并拒绝越界路径。
+
+元数据刮削默认关闭。开启后只执行选中的类型，初始预选电影 NFO、剧集 NFO、海报、背景图；单集 NFO、季海报等类型需明确勾选。NFO/图片写入 B 目录失败会进入 `completed_warning`，不会撤销已经成功的媒体文件转移。
+
+如果备份任务没有关联“上传后自动整理”，则继续执行原来的上传完成后自动分享逻辑。关联 A 目录后，上传确认只触发 A 目录扫描；若备份任务打开自动分享，整理完成后才从 B 目录创建新分享并通知 HDHive，绝不会先分享 A。光鸭分享不是不可变快照，移动、删除或覆盖会让旧链接失效，所以整理器不会复用 A 或历史分享。
 
 ## 5. HDHive 配置
 

@@ -20,6 +20,12 @@ import {
 } from './guangya-protocol.mjs';
 import { createGuangyaDeveloperClient, DeveloperApiError } from './guangya-developer.mjs';
 import { createNativeMountManager, normalizeNativeMountOptions } from './native-mount.mjs';
+import {
+  networkPreferencesPublic,
+  normalizeNetworkPreferences,
+  testNetworkTarget,
+} from './network-preferences.mjs';
+import { createOrganizerService } from './organizer.mjs';
 import { uploadPartSize } from './upload-parts.mjs';
 import { createWebDavHandler, normalizeWebDavEntry, WebDavError } from './webdav.mjs';
 import { parseGuangyaShareLink } from '../ui/shareLink.js';
@@ -274,6 +280,22 @@ function appStateValue(key) {
 function saveAppStateValue(key, value) {
   database.prepare('INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
     .run(key, String(value), Math.floor(Date.now() / 1000));
+}
+let networkPreferences = normalizeNetworkPreferences({
+  github_proxy: appStateValue('network_proxy_github'),
+  tmdb_proxy: appStateValue('network_proxy_tmdb'),
+  tg_proxy: appStateValue('network_proxy_tg'),
+}, {});
+function publicNetworkPreferences() {
+  return networkPreferencesPublic(networkPreferences);
+}
+function updateNetworkPreferences(input = {}) {
+  const next = normalizeNetworkPreferences(input, networkPreferences);
+  networkPreferences = next;
+  saveAppStateValue('network_proxy_github', next.github_proxy);
+  saveAppStateValue('network_proxy_tmdb', next.tmdb_proxy);
+  saveAppStateValue('network_proxy_tg', next.tg_proxy);
+  return publicNetworkPreferences();
 }
 function normalizeWebDavUsername(value) {
   const normalized = String(value || '').trim();
@@ -1280,6 +1302,24 @@ function samePath(left, right) {
 }
 function allowedPath(value) { const resolved = canonicalizePathSync(String(value || fileRoots[0])); if (!fileRoots.some((root) => isWithinRoot(root, resolved))) throw new Error(`路径超出允许范围：${fileRoots.join(', ')}`); if (isWithinRoot(dataDir, resolved)) throw new Error('应用状态目录不可浏览或上传'); return resolved; }
 function allowedArchivePath(value) { return allowedPath(value || archiveRoot); }
+const organizer = createOrganizerService({
+  database,
+  publish,
+  env: process.env,
+  fetchImpl: fetch,
+  getNetworkPreferences: () => networkPreferences,
+  cloud: {
+    isAuthenticated: () => Boolean(token),
+    listChildren: organizerListCloudChildren,
+    createDirectory: organizerCreateCloudDirectory,
+    copyEntry: (fileId, parentId) => executeFileTask('/userres/v1/file/copy_file', { fileIds: [String(fileId)], parentId: String(parentId) }),
+    moveEntry: (fileId, parentId) => executeFileTask('/userres/v1/file/move_file', { fileIds: [String(fileId)], parentId: String(parentId) }),
+    renameEntry: (fileId, name) => renameRemote(String(fileId), String(name)),
+    deleteEntry: (fileId) => executeFileTask('/userres/v1/file/delete_file', { fileIds: [String(fileId)] }),
+    uploadBuffer: organizerUploadBuffer,
+    shareAfterOrganize: createOrganizerShare,
+  },
+});
 async function resolveMappingPath(mapping, value, expectedType = null) {
   const mappingRoot = await fsp.realpath(mapping.local_path);
   if (!samePath(mappingRoot, mapping.local_path)
@@ -1673,8 +1713,8 @@ async function createManualShare(body) {
   const fileIds = validateFileIds(body.file_ids);
   const title = String(body.title || '').trim() || '云盘分享';
   const targetType = body.target_type === 'folder' ? 'folder' : 'file';
-  // 光鸭分享是创建时的内容快照。手动分享不复用旧链接，避免曾经
-  // 在空目录阶段创建的分享一直显示为空。
+  // 光鸭分享不是不可变快照；它依赖当前云端资源关系。手动分享始终
+  // 创建当前资源的新链接，避免复用可能已被移动或删除影响的旧链接。
   const response = await apiPost('/userres/v1/share_file', shareFilePayload(fileIds, title, body));
   const data = response.data || response;
   const reusedExisting = false;
@@ -1716,6 +1756,49 @@ async function createManualShare(body) {
     saveAutoShareEvent(eventId, mappingId, title, shareUrl, hdhiveStatus, '', hdhiveMessage, '', payload);
   }
   return { ...data, share_id: shareId, share_url: shareUrl, reused_existing: reusedExisting, hdhive_event_id: eventId, hdhive_status: hdhiveStatus, hdhive_message: hdhiveMessage };
+}
+async function createOrganizerShare({ mappingId, remoteTargetId, title, targetType = 'folder' }) {
+  const normalizedMappingId = String(mappingId || '').trim();
+  const targetId = validateIdentifier(remoteTargetId, '整理后分享目标 ID');
+  const normalizedTitle = String(title || '').trim() || '整理后的媒体';
+  if (!normalizedMappingId) throw new Error('整理后分享缺少任务 ID');
+  // 云端移动、删除或覆盖可能使旧链接失效，因此整理完成后始终从 B
+  // 目录创建新分享，不查询、不复用 A 目录或历史分享绑定。
+  const response = await apiPost('/userres/v1/share_file', shareFilePayload([targetId], normalizedTitle));
+  const data = response.data || response;
+  const shareUrl = pickShareUrl(data);
+  const shareId = String(shareIdFromUrl(shareUrl) || data.shareCode || data.share_code || data.shareId || data.shareID || data.share_id || '');
+  if (!shareUrl || !shareId) throw new Error('光鸭没有返回完整分享链接');
+  const eventId = crypto.randomUUID();
+  const payload = {
+    event_id: eventId,
+    occurred_at: new Date().toISOString(),
+    mapping_id: normalizedMappingId,
+    target_key: normalizedTitle,
+    target_type: targetType === 'file' ? 'file' : 'folder',
+    remote_target_id: targetId,
+    share_id: shareId,
+    share_url: shareUrl,
+    title: normalizedTitle,
+    intent: 'new',
+    change_hint: { added: [], changed: [], removed: [] },
+  };
+  if (!hdhiveEnabled) {
+    saveAutoShareEvent(eventId, normalizedMappingId, normalizedTitle, shareUrl, 'disabled', '', 'B 目录新分享已创建，Hdhive 已关闭', '', payload);
+    return { ...data, share_id: shareId, share_url: shareUrl, hdhive_event_id: eventId, hdhive_status: 'disabled', hdhive_message: 'B 目录新分享已创建，Hdhive 已关闭' };
+  }
+  saveAutoShareEvent(eventId, normalizedMappingId, normalizedTitle, shareUrl, 'sending', '', 'B 目录新分享已创建，正在通知 Hdhive', '', payload);
+  try {
+    const accepted = await hdhiveRequest('POST', '/api/integrations/guangya-sync/events', payload);
+    const hdhiveStatus = accepted.status || 'accepted';
+    saveAutoShareEvent(eventId, normalizedMappingId, normalizedTitle, shareUrl, hdhiveStatus, '', 'Hdhive 已接收整理后的 B 目录分享', '', payload);
+    void pollHdhiveReceipt(eventId, normalizedMappingId, normalizedTitle, shareUrl, payload);
+    return { ...data, share_id: shareId, share_url: shareUrl, hdhive_event_id: eventId, hdhive_status: hdhiveStatus, hdhive_message: 'Hdhive 已接收整理后的 B 目录分享' };
+  } catch (error) {
+    const message = `B 目录新分享已创建，但提交 Hdhive 失败：${error.message}`;
+    saveAutoShareEvent(eventId, normalizedMappingId, normalizedTitle, shareUrl, 'delivery_failed', '', message, '', payload);
+    return { ...data, share_id: shareId, share_url: shareUrl, hdhive_event_id: eventId, hdhive_status: 'delivery_failed', hdhive_message: message };
+  }
 }
 async function resolveAutoShareTarget(item, taskData, target) {
   if (target.type === 'file') {
@@ -1844,6 +1927,7 @@ async function backfillAutoShares(mappingId) {
   const mapping = mappings.find((entry) => entry.id === mappingId);
   if (!mapping) throw new Error('备份任务不存在');
   if (!mapping.auto_share) throw new Error('请先开启该任务的自动分享');
+  if (mapping.organizer_mapping_id) throw new Error('该任务已启用上传后自动整理；请在媒体整理页扫描 A 目录，光鸭会在整理完成后从 B 目录创建新分享');
   const rows = database.prepare("SELECT file_path, remote_file_id FROM uploaded_files WHERE mapping_id = ? AND status = 'cloud_confirmed' AND remote_file_id IS NOT NULL AND remote_file_id <> ?").all(mappingId, '');
   let scheduled = 0;
   for (const row of rows) {
@@ -2617,8 +2701,24 @@ async function finalizeConfirmedUpload(key, item, taskData, recovered = false) {
     }
   }
   clearAutoShareFailure(item);
-  try { await scheduleAutoShare(item, taskData); }
-  catch (error) { status('error', `文件已确认入库，但自动分享排队失败：${error.message}`); }
+  if (mapping?.organizer_mapping_id) {
+    try {
+      await organizer.notifyUpload({
+        mappingId: mapping.organizer_mapping_id,
+        remoteFileId: taskData.remoteFileId,
+        relativePath: item.relative_path,
+        shareAfter: mapping.auto_share === true,
+      });
+      status('success', mapping.auto_share
+        ? '文件已确认入库，已进入“先整理 B 目录、再重新分享”流程'
+        : '文件已确认入库，已进入云盘自动整理流程');
+    } catch (error) {
+      status('error', `文件已确认入库，但上传后自动整理排队失败；为避免分享 A 目录后失效，本次没有执行原自动分享：${error.message}`);
+    }
+  } else {
+    try { await scheduleAutoShare(item, taskData); }
+    catch (error) { status('error', `文件已确认入库，但自动分享排队失败：${error.message}`); }
+  }
   try {
     const action = await applySourcePolicy(item);
     if (action) status('success', action);
@@ -2855,7 +2955,13 @@ async function enqueue(mapping, file) {
   try { reused = reuseMatchingConfirmedUpload(item); }
   catch (error) { status('warning', error.message); }
   if (reused) {
-    if (mapping.auto_share && !reuseAutoShareBinding(item, reused.sourceMappingId)) {
+    if (mapping.organizer_mapping_id) {
+      try {
+        await organizer.notifyUpload({ mappingId: mapping.organizer_mapping_id, remoteFileId: reused.remoteFileId, relativePath: item.relative_path, shareAfter: mapping.auto_share === true });
+      } catch (error) {
+        status('error', `历史文件无需重复上传，但上传后自动整理排队失败；本次没有分享 A 目录：${error.message}`);
+      }
+    } else if (mapping.auto_share && !reuseAutoShareBinding(item, reused.sourceMappingId)) {
       try { await scheduleAutoShare(item, reused); }
       catch (error) { status('error', `历史文件无需重复上传，但自动分享排队失败：${error.message}`); }
     }
@@ -3098,6 +3204,71 @@ async function executeFileTask(endpoint, payload) {
   remoteCache.set('', '');
   webDavDirectoryCache.clear();
   return result.data || {};
+}
+async function organizerListCloudChildren(parentId) {
+  if (!token) throw new Error('请先登录光鸭云盘');
+  const records = [];
+  for (let page = 0; page < 1000; page += 1) {
+    const response = await apiPost('/userres/v1/file/get_file_list', {
+      page,
+      pageSize: 100,
+      parentId: String(parentId || ''),
+      orderBy: 0,
+      sortType: 0,
+      needSubFolderStat: true,
+    });
+    const list = Array.isArray(response.data?.list) ? response.data.list : [];
+    records.push(...list);
+    const total = Number(response.data?.total || records.length);
+    if (!list.length || records.length >= total) break;
+  }
+  return records;
+}
+async function organizerCreateCloudDirectory(parentId, name) {
+  const response = await apiPost('/userres/v1/file/create_dir', {
+    parentId: String(parentId || ''),
+    dirName: validateCloudName(name, '整理目录名称'),
+    failIfNameExist: true,
+  });
+  await waitOperation(response.data?.taskId);
+  remoteCache.clear();
+  remoteCache.set('', '');
+  webDavDirectoryCache.clear();
+  return response.data || {};
+}
+async function organizerUploadBuffer(parentId, name, bytes) {
+  const temporaryRoot = path.join(manualUploadRoot, 'organizer', crypto.randomUUID());
+  const fileName = validateCloudName(name, '刮削文件名');
+  const temporaryFile = path.join(temporaryRoot, fileName);
+  await fsp.mkdir(temporaryRoot, { recursive: true });
+  await fsp.writeFile(temporaryFile, Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes));
+  const stat = await fsp.stat(temporaryFile);
+  const mappingId = `__organizer__:${crypto.randomUUID()}`;
+  const item = {
+    mapping_id: mappingId,
+    file_path: temporaryFile,
+    history_path: temporaryFile,
+    event_path: `云端刮削/${fileName}`,
+    cleanup_path: temporaryRoot,
+    remote_parent_id: String(parentId || ''),
+    remote_dir: '',
+    relative_path: fileName,
+    change_kind: 'added',
+    size: stat.size,
+    mtime: stat.mtimeMs,
+  };
+  let completed = false;
+  try {
+    const outcome = await upload(item);
+    if (outcome?.pending || !outcome?.remoteFileId) throw new Error(outcome?.pendingError || '刮削文件已上传，云端仍在确认入库');
+    const key = queueKey(mappingId, temporaryFile);
+    await finalizeConfirmedUpload(key, item, { taskId: outcome.taskId, remoteFileId: outcome.remoteFileId });
+    completed = true;
+    webDavDirectoryCache.clear();
+    return { fileId: outcome.remoteFileId, id: outcome.remoteFileId };
+  } finally {
+    if (completed) await fsp.rm(temporaryRoot, { recursive: true, force: true });
+  }
 }
 async function renameRemote(fileId, newName) { await apiPost('/userres/v1/file/rename', { fileId, newName }); }
 async function batchRename(renames) {
@@ -3394,6 +3565,70 @@ async function routeApiV2(request, response, url) {
     return;
   }
   if (request.method === 'GET' && url.pathname === '/api/settings') return json(response, 200, settingsState());
+  if (request.method === 'GET' && url.pathname === '/api/settings/network') {
+    return json(response, 200, publicNetworkPreferences(), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/settings/network') {
+    const body = await readBody(request, { maxBytes: 16 * 1024 });
+    return json(response, 200, updateNetworkPreferences(body), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/network/test') {
+    const body = await readBody(request, { maxBytes: 16 * 1024 });
+    const target = String(body.target || '').trim().toLowerCase();
+    const proxyKey = target === 'tmdb' ? 'tmdb_proxy' : target === 'tg' ? 'tg_proxy' : 'github_proxy';
+    const organizerState = organizer.state();
+    const result = await testNetworkTarget(target, {
+      proxyUrl: body.proxy_url ?? body.proxy ?? networkPreferences[proxyKey],
+      tmdbApiBase: body.tmdb_api_base || organizerState.settings.tmdb_api_base,
+      tmdbApiKey: body.tmdb_api_key || '',
+      fetchImpl: fetch,
+    });
+    return json(response, 200, result, { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'GET' && url.pathname === '/api/organizer') {
+    return json(response, 200, organizer.state(), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'PUT' && url.pathname === '/api/organizer/settings') {
+    const body = await readBody(request, { maxBytes: 16 * 1024 });
+    return json(response, 200, organizer.updateSettings(body), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/organizer/test') {
+    const body = await readBody(request, { maxBytes: 16 * 1024 });
+    return json(response, 200, await organizer.testConnection(body), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/organizer/scrape-selected') {
+    const body = await readBody(request, { maxBytes: 128 * 1024 });
+    return json(response, 200, await organizer.scrapeSelected(body), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/organizer/mappings') {
+    const body = await readBody(request, { maxBytes: 32 * 1024 });
+    return json(response, 200, await organizer.addMapping(body));
+  }
+  const organizerMappingMatch = url.pathname.match(/^\/api\/organizer\/mappings\/([^/]+)$/);
+  if (organizerMappingMatch && request.method === 'PATCH') {
+    const body = await readBody(request, { maxBytes: 32 * 1024 });
+    return json(response, 200, await organizer.updateMapping(decodeURIComponent(organizerMappingMatch[1]), body));
+  }
+  if (organizerMappingMatch && request.method === 'DELETE') {
+    return json(response, 200, await organizer.removeMapping(decodeURIComponent(organizerMappingMatch[1])));
+  }
+  const organizerScanMatch = url.pathname.match(/^\/api\/organizer\/mappings\/([^/]+)\/scan$/);
+  if (organizerScanMatch && request.method === 'POST') {
+    return json(response, 200, await organizer.scanMapping(decodeURIComponent(organizerScanMatch[1])));
+  }
+  const organizerJobMatch = url.pathname.match(/^\/api\/organizer\/jobs\/([^/]+)\/(run|retry)$/);
+  if (organizerJobMatch && request.method === 'POST') {
+    const body = await readBody(request, { maxBytes: 16 * 1024 });
+    const jobId = decodeURIComponent(organizerJobMatch[1]);
+    const result = organizerJobMatch[2] === 'run'
+      ? await organizer.runJob(jobId, body)
+      : await organizer.retryJob(jobId, body);
+    return json(response, 200, result);
+  }
+  const organizerJobDeleteMatch = url.pathname.match(/^\/api\/organizer\/jobs\/([^/]+)$/);
+  if (organizerJobDeleteMatch && request.method === 'DELETE') {
+    return json(response, 200, organizer.removeJob(decodeURIComponent(organizerJobDeleteMatch[1])));
+  }
   if (request.method === 'GET' && url.pathname === '/api/mount') {
     return json(response, 200, {
       enabled: true,
@@ -3699,7 +3934,36 @@ async function routeApiV2(request, response, url) {
   if (request.method === 'POST' && /^\/api\/auto-share\/events\/[^/]+\/retry$/.test(url.pathname)) { const body = await readBody(request); const eventId = decodeURIComponent(url.pathname.split('/')[4]); return json(response, 202, await retryAutoShareEvent(eventId, body)); }
   if (request.method === 'POST' && url.pathname === '/api/share-links') { const body = await readBody(request); const value = { id: crypto.randomUUID(), label: String(body.label || '未命名分享').trim() || '未命名分享', url: String(body.url || '').trim(), created_at: Math.floor(Date.now() / 1000) }; if (!/^https?:\/\//i.test(value.url)) throw new Error('分享链接必须以 http:// 或 https:// 开头'); savedShares.unshift(value); await saveConfig(); publishState(); return json(response, 200, value); }
   if (request.method === 'DELETE' && url.pathname.startsWith('/api/share-links/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); savedShares = savedShares.filter((item) => item.id !== id); await saveConfig(); publishState(); return json(response, 200, {}); }
-  if (request.method === 'POST' && url.pathname === '/api/mappings') { const body = await readBody(request); const localPath = allowedPath(body.local_path); const sourcePolicy = ['keep', 'archive', 'delete'].includes(body.source_policy) ? body.source_policy : 'keep'; const archivePath = sourcePolicy === 'archive' ? allowedArchivePath(body.archive_path || archiveRoot) : null; if (archivePath && (archivePath === localPath || archivePath.startsWith(`${localPath}${path.sep}`))) throw new Error('归档目录不能位于被监控目录内部'); if (body.auto_share && (!hdhiveBaseUrl || !hdhiveSecret)) throw new Error('开启自动分享前请先配置 Hdhive 地址和密钥'); const mapping = { id: crypto.randomUUID(), local_path: localPath, remote_path: normalizeRemote(body.remote_path), remote_parent_id: String(body.remote_parent_id || ''), enabled: true, source_policy: sourcePolicy, archive_path: archivePath, scan_existing: body.scan_existing !== false, sync_types: normalizeSyncTypes(body.sync_types), monitor_mode: normalizeMonitorMode(body.monitor_mode), auto_share: body.auto_share === true, watch_error: null }; const stat = await fsp.stat(mapping.local_path); if (!stat.isDirectory()) throw new Error('监控路径不是目录'); mappings.push(mapping); await fsp.mkdir(archiveRoot, { recursive: true }); await saveConfig(); try { await startWatcher(mapping); } catch (error) { mappings = mappings.filter((item) => item.id !== mapping.id); await saveConfig(); throw new Error(`创建目录监控失败：${error.message}`); } publishState(); return json(response, 200, mapping); }
+  if (request.method === 'POST' && url.pathname === '/api/mappings') {
+    const body = await readBody(request);
+    const localPath = allowedPath(body.local_path);
+    const sourcePolicy = ['keep', 'archive', 'delete'].includes(body.source_policy) ? body.source_policy : 'keep';
+    const archivePath = sourcePolicy === 'archive' ? allowedArchivePath(body.archive_path || archiveRoot) : null;
+    if (archivePath && (archivePath === localPath || archivePath.startsWith(`${localPath}${path.sep}`))) throw new Error('归档目录不能位于被监控目录内部');
+    if (body.auto_share && (!hdhiveBaseUrl || !hdhiveSecret)) throw new Error('开启自动分享前请先配置 Hdhive 地址和密钥');
+    const organizerMappingId = String(body.organizer_mapping_id || '').trim();
+    const remoteParentId = String(body.remote_parent_id || '');
+    if (organizerMappingId) {
+      const organizerMapping = organizer.state().mappings.find((item) => item.id === organizerMappingId && item.enabled);
+      if (!organizerMapping) throw new Error('选择的上传后整理任务不存在或未启用');
+      if (organizerMapping.source_dir_id !== remoteParentId) throw new Error('上传目标目录必须与所选整理任务的 A 目录完全一致');
+    }
+    const mapping = {
+      id: crypto.randomUUID(), local_path: localPath, remote_path: normalizeRemote(body.remote_path), remote_parent_id: remoteParentId,
+      enabled: true, source_policy: sourcePolicy, archive_path: archivePath, scan_existing: body.scan_existing !== false,
+      sync_types: normalizeSyncTypes(body.sync_types), monitor_mode: normalizeMonitorMode(body.monitor_mode),
+      auto_share: body.auto_share === true, organizer_mapping_id: organizerMappingId, watch_error: null,
+    };
+    const stat = await fsp.stat(mapping.local_path);
+    if (!stat.isDirectory()) throw new Error('监控路径不是目录');
+    mappings.push(mapping);
+    await fsp.mkdir(archiveRoot, { recursive: true });
+    await saveConfig();
+    try { await startWatcher(mapping); }
+    catch (error) { mappings = mappings.filter((item) => item.id !== mapping.id); await saveConfig(); throw new Error(`创建目录监控失败：${error.message}`); }
+    publishState();
+    return json(response, 200, mapping);
+  }
   if (request.method === 'DELETE' && url.pathname.startsWith('/api/mappings/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); await watchers.get(id)?.close(); watchers.delete(id); mappings = mappings.filter((item) => item.id !== id); for (const [key, item] of queue) if (item.mapping_id === id) queue.delete(key); for (const [key, item] of waitingFiles) if (item.mapping_id === id) waitingFiles.delete(key); for (const key of flashPreflightCache.keys()) if (key.startsWith(`${id}::`)) flashPreflightCache.delete(key); for (const key of history.keys()) if (key.startsWith(`${id}::`)) history.delete(key); for (const key of inflight.keys()) if (key.startsWith(`${id}::`)) inflight.delete(key); deleteMappingTransientUploads(id); await saveConfig(); publishState(); return json(response, 200, {}); }
   if (request.method === 'POST' && /^\/api\/mappings\/[^/]+\/auto-share-backfill$/.test(url.pathname)) { const id = decodeURIComponent(url.pathname.split('/')[3]); return json(response, 202, await backfillAutoShares(id)); }
   if (request.method === 'PATCH' && url.pathname.startsWith('/api/mappings/')) {
@@ -3714,6 +3978,15 @@ async function routeApiV2(request, response, url) {
     }
     if (monitorChanged) mapping.monitor_mode = normalizeMonitorMode(body.monitor_mode);
     if (typeof body.auto_share === 'boolean') { if (body.auto_share && (!hdhiveBaseUrl || !hdhiveSecret)) throw new Error('开启自动分享前请先配置 Hdhive 地址和密钥'); mapping.auto_share = body.auto_share; }
+    if (body.organizer_mapping_id !== undefined) {
+      const organizerMappingId = String(body.organizer_mapping_id || '').trim();
+      if (organizerMappingId) {
+        const organizerMapping = organizer.state().mappings.find((item) => item.id === organizerMappingId && item.enabled);
+        if (!organizerMapping) throw new Error('选择的上传后整理任务不存在或未启用');
+        if (organizerMapping.source_dir_id !== String(mapping.remote_parent_id || '')) throw new Error('上传目标目录必须与所选整理任务的 A 目录完全一致');
+      }
+      mapping.organizer_mapping_id = organizerMappingId;
+    }
     if (typeof body.enabled === 'boolean') {
       mapping.enabled = body.enabled;
       if (!mapping.enabled) {
@@ -3740,9 +4013,10 @@ async function routeApiV2(request, response, url) {
 async function serveStatic(response, url) { const requested = url.pathname === '/' ? '/index.html' : url.pathname; const file = path.resolve(uiRoot, `.${requested}`); if (!file.startsWith(uiRoot + path.sep)) return json(response, 403, { error: 'forbidden' }); try { const content = await fsp.readFile(file); const type = file.endsWith('.html') ? 'text/html; charset=utf-8' : file.endsWith('.js') ? 'text/javascript; charset=utf-8' : file.endsWith('.css') ? 'text/css; charset=utf-8' : file.endsWith('.svg') ? 'image/svg+xml' : 'application/octet-stream'; response.writeHead(200, { 'content-type': type }); response.end(content); } catch { json(response, 404, { error: 'not found' }); } }
 
 await fsp.mkdir(dataDir, { recursive: true }); await fsp.mkdir(manualUploadRoot, { recursive: true }); await cleanupUnreferencedManualUploads(); await fsp.mkdir(watchRoot, { recursive: true }); await fsp.mkdir(archiveRoot, { recursive: true });
-try { const config = JSON.parse(await fsp.readFile(configFile, 'utf8')); mappings = Array.isArray(config.mappings) ? config.mappings.map((item) => ({ source_policy: 'keep', archive_path: null, scan_existing: true, remote_parent_id: '', sync_types: DEFAULT_SYNC_TYPES, monitor_mode: 'native', auto_share: false, watch_error: null, ...item, local_path: allowedPath(item.local_path), archive_path: item.archive_path ? allowedArchivePath(item.archive_path) : null, sync_types: normalizeSyncTypes(item.sync_types), monitor_mode: normalizeMonitorMode(item.monitor_mode), auto_share: item.auto_share === true })) : []; savedShares = Array.isArray(config.saved_shares) ? config.saved_shares : []; } catch { mappings = []; savedShares = []; }
+try { const config = JSON.parse(await fsp.readFile(configFile, 'utf8')); mappings = Array.isArray(config.mappings) ? config.mappings.map((item) => ({ source_policy: 'keep', archive_path: null, scan_existing: true, remote_parent_id: '', sync_types: DEFAULT_SYNC_TYPES, monitor_mode: 'native', auto_share: false, organizer_mapping_id: '', watch_error: null, ...item, local_path: allowedPath(item.local_path), archive_path: item.archive_path ? allowedArchivePath(item.archive_path) : null, sync_types: normalizeSyncTypes(item.sync_types), monitor_mode: normalizeMonitorMode(item.monitor_mode), auto_share: item.auto_share === true, organizer_mapping_id: String(item.organizer_mapping_id || '') })) : []; savedShares = Array.isArray(config.saved_shares) ? config.saved_shares : []; } catch { mappings = []; savedShares = []; }
 restoreUploadCheckpoints();
 await restartWatchers();
+await organizer.initialize();
 restorePendingAutoShares();
 resumeHdhiveReceiptPolling();
 resumeDeveloperTransfers();
@@ -3835,6 +4109,7 @@ server.listen(port, listenHost, async () => {
     await new Promise((resolve) => server.close(resolve));
     await new Promise((resolve) => webdavServer.close(resolve));
     for (const watcher of watchers.values()) await watcher.close();
+    await organizer.close();
     process.exit(0);
   }
 });

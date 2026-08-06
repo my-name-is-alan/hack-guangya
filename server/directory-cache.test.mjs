@@ -40,7 +40,7 @@ test('目录变更会失效子目录缓存，写操作失效可阻止旧请求�
     fileId: 'folder',
     fileName: '资料',
     resType: 2,
-    updateTime: 1,
+    utime: 1,
   }]);
   await cache.get('folder', async () => [{ fileId: 'old-child', fileName: '旧内容' }]);
 
@@ -49,7 +49,7 @@ test('目录变更会失效子目录缓存，写操作失效可阻止旧请求�
     fileId: 'folder',
     fileName: '资料',
     resType: 2,
-    updateTime: 2,
+    utime: 2,
   }], { force: true });
   assert.equal(cache.stats().entries, 1);
 

@@ -1,5 +1,9 @@
-const DEFAULT_FRESH_MS = 60_000;
-const DEFAULT_STALE_MS = 10 * 60_000;
+// WebDAV clients (especially rclone mounts) keep their own directory cache.
+// Keep this server-side cache deliberately short so a change made by another
+// mount/process becomes observable on the next VFS refresh instead of being
+// hidden behind a second minute-long cache.
+const DEFAULT_FRESH_MS = 2_000;
+const DEFAULT_STALE_MS = 15_000;
 const DEFAULT_MAX_ENTRIES = 2_048;
 
 function valueOf(entry, ...keys) {
@@ -18,7 +22,7 @@ function isDirectory(entry) {
 function directoryFingerprint(entry) {
   return [
     String(valueOf(entry, 'fileName', 'name') || ''),
-    String(valueOf(entry, 'updatedAt', 'updateTime', 'modifiedAt', 'modifyTime', 'createdAt', 'createTime') || ''),
+    String(valueOf(entry, 'updatedAt', 'updateTime', 'modifiedAt', 'modifyTime', 'utime', 'createdAt', 'createTime', 'ctime') || ''),
     String(valueOf(entry, 'fileSize', 'size') || 0),
   ].join('\0');
 }

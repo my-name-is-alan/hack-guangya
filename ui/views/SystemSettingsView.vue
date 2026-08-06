@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { shallowRef } from 'vue'
+import { shallowRef, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import {
   CloudServerOutlined,
   DatabaseOutlined,
   FolderOpenOutlined,
+  GlobalOutlined,
   KeyOutlined,
   LockOutlined,
   ReloadOutlined,
@@ -21,8 +23,12 @@ import MountSettingsPanel from '../components/settings/MountSettingsPanel.vue'
 import PreferenceSettingsPanel from '../components/settings/PreferenceSettingsPanel.vue'
 import TransferSettingsPanel from '../components/settings/TransferSettingsPanel.vue'
 import UpdateSettingsPanel from '../components/settings/UpdateSettingsPanel.vue'
+import OrganizerSettingsPanel from '../components/settings/OrganizerSettingsPanel.vue'
+import NetworkSettingsPanel from '../components/settings/NetworkSettingsPanel.vue'
 
 const activeTab = shallowRef('account')
+const route = useRoute()
+watch(() => route.query.tab, (value) => { if (typeof value === 'string' && value) activeTab.value = value }, { immediate: true })
 </script>
 
 <template>
@@ -53,6 +59,16 @@ const activeTab = shallowRef('account')
         <TransferSettingsPanel />
       </a-tab-pane>
 
+      <a-tab-pane key="network">
+        <template #tab><span class="setting-tab"><GlobalOutlined />网络偏好</span></template>
+        <NetworkSettingsPanel />
+      </a-tab-pane>
+
+      <a-tab-pane key="organizer">
+        <template #tab><span class="setting-tab"><FolderOpenOutlined />整理与刮削</span></template>
+        <OrganizerSettingsPanel />
+      </a-tab-pane>
+
       <a-tab-pane key="mount">
         <template #tab><span class="setting-tab"><FolderOpenOutlined />挂载</span></template>
         <MountSettingsPanel />
@@ -77,7 +93,10 @@ const activeTab = shallowRef('account')
 </template>
 
 <style scoped>
-.settings-view { min-height: calc(100vh - 96px); }
-.settings-tabs :deep(.ant-tabs-nav) { width: 154px; }
+.settings-view { min-height: calc(100vh - 96px); min-width: 0; }
+.settings-tabs { display: flex; min-width: 0; }
+.settings-tabs :deep(.ant-tabs-nav) { width: 154px; min-width: 154px; flex: 0 0 154px; }
+.settings-tabs :deep(.ant-tabs-content-holder) { min-width: 0; flex: 1 1 auto; }
+.settings-tabs :deep(.ant-tabs-content) { min-width: 0; }
 .setting-tab { display: inline-flex; align-items: center; gap: 9px; }
 </style>
