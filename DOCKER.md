@@ -1,6 +1,6 @@
 # Docker Web 部署配置
 
-本文档适用于 Docker Hub 镜像 `94xhzy/guangya-sync:0.1.26`。容器提供光鸭云盘 Web 管理界面、服务器目录监控、断点续传、媒体整理、自动分享与 HDHive 投稿。
+本文档适用于 Docker Hub 镜像 `94xhzy/guangya-sync:0.1.27`。容器提供光鸭云盘 Web 管理界面、服务器目录监控、断点续传、媒体整理、自动分享与 HDHive 投稿。
 
 ## 1. 准备目录和配置
 
@@ -23,7 +23,7 @@ openssl rand -hex 24
 把结果写入 `.env`：
 
 ```dotenv
-GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.26
+GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.27
 GUANGYA_HTTP_PORT=8080
 GUANGYA_ADMIN_USERNAME=admin
 GUANGYA_ADMIN_PASSWORD=替换为上面生成的强随机密码

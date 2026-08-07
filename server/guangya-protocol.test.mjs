@@ -7,7 +7,9 @@ import {
   businessResponseCode,
   cloudCollectionResourceType,
   isAuthExpiredBusinessCode,
+  isUploadSecurityTokenExpired,
   resolveGuangyaProfile,
+  uploadCredentialsExpired,
 } from './guangya-protocol.mjs';
 
 test('Windows API profile follows the live Guangya request contract', () => {
@@ -61,6 +63,16 @@ test('all documented authentication expiry codes share one decision', () => {
   assert.equal(isAuthExpiredBusinessCode('117'), true);
   assert.equal(isAuthExpiredBusinessCode(118), true);
   assert.equal(isAuthExpiredBusinessCode(147), false);
+});
+
+test('upload credentials follow the official Web expiration recovery contract', () => {
+  const now = Date.parse('2026-08-07T05:00:00.000Z');
+  assert.equal(uploadCredentialsExpired({ creds: { expiration: '2026-08-07T04:59:59.000Z' } }, now), true);
+  assert.equal(uploadCredentialsExpired({ creds: { expiration: '2026-08-07T05:00:01.000Z' } }, now), false);
+  assert.equal(uploadCredentialsExpired({ creds: {} }, now), true);
+  assert.equal(isUploadSecurityTokenExpired({ code: 'SecurityTokenExpired' }), true);
+  assert.equal(isUploadSecurityTokenExpired({ response: { data: { Code: 'SecurityTokenExpired' } } }), true);
+  assert.equal(isUploadSecurityTokenExpired(new Error('error sending request for url')), false);
 });
 
 test('cloud collection resource types distinguish magnets and ED2K from ordinary links', () => {

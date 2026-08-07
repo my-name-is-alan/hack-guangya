@@ -12,6 +12,7 @@ import {
   LoadingOutlined,
   PauseCircleOutlined,
   PlayCircleOutlined,
+  ReloadOutlined,
 } from '@antdv-next/icons'
 import { bridge } from '../bridge.js'
 import { errorText, formatSize } from '../formatters.js'
@@ -27,8 +28,8 @@ const { orderedUploads, downloads } = storeToRefs(transfers)
 const tab = shallowRef(String(route.query.tab || 'upload'))
 
 const uploadCounts = computed(() => ({
-  active: orderedUploads.value.filter(item => !['done', 'error'].includes(item.state)).length,
-  finished: orderedUploads.value.filter(item => ['done', 'error'].includes(item.state)).length,
+  active: orderedUploads.value.filter(item => !['done', 'error', 'cancelled'].includes(item.state)).length,
+  finished: orderedUploads.value.filter(item => ['done', 'error', 'cancelled'].includes(item.state)).length,
 }))
 const downloadCounts = computed(() => ({
   active: downloads.value.filter(item => ['queued', 'preparing', 'downloading', 'paused'].includes(item.status)).length,
@@ -47,6 +48,16 @@ async function resumeDownload(id: string) {
 
 async function cancelDownload(id: string) {
   try { await transfers.cancelDownload(id) }
+  catch (error) { message.error(errorText(error)) }
+}
+
+async function cancelUpload(filePath: string) {
+  try { await transfers.cancelUpload(filePath) }
+  catch (error) { message.error(errorText(error)) }
+}
+
+async function retryUpload(filePath: string) {
+  try { await transfers.retryUpload(filePath) }
   catch (error) { message.error(errorText(error)) }
 }
 
@@ -89,7 +100,12 @@ watch(tab, value => void router.replace({ query: { ...route.query, tab: value } 
             </span>
             <a-tag v-if="item.state === 'done'" color="success"><CheckCircleOutlined /> 完成</a-tag>
             <a-tag v-else-if="item.state === 'error'" color="error"><CloseCircleOutlined /> 失败</a-tag>
+            <a-tag v-else-if="item.state === 'cancelled'"><CloseCircleOutlined /> 已取消</a-tag>
             <a-tag v-else color="processing"><LoadingOutlined spin /> {{ item.percent }}%</a-tag>
+            <a-button v-if="item.state === 'error'" size="small" type="primary" title="重试上传" @click="retryUpload(item.filePath)"><ReloadOutlined /> 重试</a-button>
+            <a-popconfirm v-if="!['done', 'error', 'cancelled'].includes(item.state)" title="确定取消这个上传任务？未完成的上传断点会被清理。" ok-text="取消上传" cancel-text="返回" @confirm="cancelUpload(item.filePath)">
+              <a-button size="small" danger title="取消上传" aria-label="取消上传"><CloseCircleOutlined /></a-button>
+            </a-popconfirm>
           </div>
         </div>
       </a-tab-pane>

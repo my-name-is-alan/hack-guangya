@@ -144,11 +144,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleGlobalKeydown)
       </header>
 
       <main class="route-content">
-        <RouterView v-slot="{ Component }">
-          <Transition name="route-fade" mode="out-in">
-            <component :is="Component" />
-          </Transition>
-        </RouterView>
+        <RouterView />
       </main>
     </section>
 
@@ -192,9 +188,6 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleGlobalKeydown)
 .quota-bar { display: block; width: 100%; height: 4px; overflow: hidden; border-radius: 999px; background: var(--line-soft, #f5f5f5); }
 .quota-bar i { display: block; height: 100%; border-radius: inherit; background: var(--primary, #262626); transition: width .2s ease; }
 .route-content { min-height: 0; overflow: auto; padding: 14px 18px 18px; }
-.route-fade-enter-active, .route-fade-leave-active { transition: opacity .12s ease, transform .12s ease; }
-.route-fade-enter-from, .route-fade-leave-to { opacity: 0; transform: translateY(3px); }
-@media (prefers-reduced-motion: reduce) { .route-fade-enter-active, .route-fade-leave-active { transition: none; } }
 @media (max-width: 720px) {
   .app-frame { grid-template-columns:64px minmax(0,1fr); }
   .app-topbar { gap: 10px; padding: 0 10px; }

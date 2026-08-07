@@ -1,4 +1,4 @@
-const terminalStates = new Set(['done', 'error']);
+const terminalStates = new Set(['done', 'error', 'cancelled']);
 
 export function nextUploadProgress(previous, payload, updatedAt = Date.now()) {
   const current = previous || {
@@ -51,6 +51,7 @@ export function nextUploadProgress(previous, payload, updatedAt = Date.now()) {
     processing: '已上传，正在等待云端入库',
     done: '上传完成',
     error: '上传失败',
+    cancelled: '已取消',
   }[nextState] || current.stage;
 
   return {
@@ -70,7 +71,7 @@ export function formatUploadSpeed(bytesPerSecond) {
 }
 
 export function uploadProgressStatus(state) {
-  if (state === 'error') return 'exception';
+  if (state === 'error' || state === 'cancelled') return 'exception';
   if (state === 'done') return 'success';
   return 'normal';
 }

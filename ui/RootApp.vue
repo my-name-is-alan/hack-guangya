@@ -14,11 +14,17 @@ const session = useSessionStore()
 const updater = useUpdaterStore()
 const { bootLoading, accessGranted, forceAuth } = storeToRefs(session)
 
+function preventNativeContextMenu(event: MouseEvent) {
+  event.preventDefault()
+}
+
 onMounted(() => {
+  document.addEventListener('contextmenu', preventNativeContextMenu)
   void session.initialize()
   void updater.initialize()
 })
 onBeforeUnmount(() => {
+  document.removeEventListener('contextmenu', preventNativeContextMenu)
   session.dispose()
   updater.dispose()
 })

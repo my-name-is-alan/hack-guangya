@@ -12,6 +12,22 @@ test('a delayed progress event cannot regress a completed upload', () => {
   assert.equal(nextUploadProgress(done, { type: 'progress', percent: 80, stage: '正在上传' }, 20), done);
 });
 
+test('a delayed progress event cannot revive a cancelled upload', () => {
+  const cancelled = { percent: 42, state: 'cancelled', stage: '已取消', updatedAt: 10 };
+  assert.equal(nextUploadProgress(cancelled, { type: 'progress', percent: 60, stage: '正在上传' }, 20), cancelled);
+  assert.equal(uploadProgressStatus('cancelled'), 'exception');
+});
+
+test('a new queued event can restart a cancelled upload', () => {
+  const result = nextUploadProgress(
+    { percent: 42, state: 'cancelled', stage: '已取消', updatedAt: 10 },
+    { type: 'file', state: 'queued' },
+    20,
+  );
+  assert.equal(result.state, 'queued');
+  assert.equal(result.percent, 0);
+});
+
 test('cloud processing is shown as uploaded instead of uploading', () => {
   const result = nextUploadProgress(
     { percent: 100, state: 'processing', stage: '等待云端入库', updatedAt: 10 },

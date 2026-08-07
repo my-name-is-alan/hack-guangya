@@ -1409,6 +1409,7 @@ async function uploadWebFiles(entries) {
   let cursor = 0;
   let queued = 0;
   let skipped = 0;
+  let cancelled = 0;
   try {
     const worker = async () => {
       while (cursor < entries.length) {
@@ -1427,8 +1428,14 @@ async function uploadWebFiles(entries) {
         const payload = await new Promise((resolve, reject) => {
           const request = new XMLHttpRequest();
           const startedAt = performance.now();
+          let unregisterCancellation = () => {};
+          const finish = (callback) => {
+            unregisterCancellation();
+            callback();
+          };
           request.open('POST', `/api/upload?${query}`);
           request.setRequestHeader('content-type', entry.file.type || 'application/octet-stream');
+          unregisterCancellation = transfers.registerUploadCancellation(eventPath, () => request.abort());
           request.upload.onprogress = (event) => {
             const total = event.lengthComputable ? event.total : entry.file.size;
             const elapsed = Math.max((performance.now() - startedAt) / 1000, .001);
@@ -1442,9 +1449,14 @@ async function uploadWebFiles(entries) {
             });
           };
           request.onerror = () => {
-            const error = new Error(`上传接口网络错误：${entry.file.name}`);
+            const error = new Error(`上传接口网络异常：${entry.file.name}（文件未损坏，可点击重试）`);
+            transfers.registerUploadRetry(eventPath, () => uploadWebFiles([entry]));
             transfers.handleSyncEvent({ type: 'file', state: 'error', file_path: eventPath, total_bytes: entry.file.size, error: error.message });
-            reject(error);
+            finish(() => reject(error));
+          };
+          request.onabort = () => {
+            transfers.clearUploadRetry(eventPath);
+            finish(() => resolve({ queued: 0, skipped: 0, cancelled: 1 }));
           };
           request.onload = async () => {
             try {
@@ -1453,23 +1465,27 @@ async function uploadWebFiles(entries) {
                 headers: { 'content-type': request.getResponseHeader('content-type') || 'text/plain' },
               });
               const result = await readJsonResponse(response, `上传接口失败：${entry.file.name}`);
+              transfers.clearUploadRetry(eventPath);
               if (result.skipped) transfers.handleSyncEvent({ type: 'file', state: 'done', file_path: eventPath, uploaded_bytes: entry.file.size, total_bytes: entry.file.size, stage: '文件未变化，已跳过' });
-              resolve(result);
+              finish(() => resolve(result));
             } catch (error) {
+              transfers.registerUploadRetry(eventPath, () => uploadWebFiles([entry]));
               transfers.handleSyncEvent({ type: 'file', state: 'error', file_path: eventPath, total_bytes: entry.file.size, error: error.message });
-              reject(error);
+              finish(() => reject(error));
             }
           };
           request.send(entry.file);
         });
         queued += Number(payload.queued || 0);
         skipped += Number(payload.skipped || 0);
+        cancelled += Number(payload.cancelled || 0);
         if (payload.skipped) transfers.handleSyncEvent({ type: 'file', state: 'done', file_path: eventPath, stage: '文件未变化，已跳过' });
       }
     };
     await Promise.all([worker(), worker()]);
     if (queued) message.success(`已加入上传队列：${queued} 个文件${skipped ? `，跳过 ${skipped} 个` : ''}`);
-    else message.info(`没有需要上传的文件，已跳过 ${skipped} 个`);
+    else if (skipped) message.info(`没有需要上传的文件，已跳过 ${skipped} 个`);
+    else if (cancelled) message.info(`已取消上传：${cancelled} 个文件`);
     await loadCloudFiles();
   } catch (error) {
     message.error(errorText(error));

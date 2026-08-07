@@ -24,6 +24,8 @@ test('developer transfer is wired through the active UI and both runtime bridges
   assert.match(panel, /key="jobs"/);
   assert.match(panel, /Token 配置/);
   assert.match(panel, /任务记录/);
+  assert.match(settingsView, /\.settings-tabs > :deep\(\.ant-tabs-nav\)/);
+  assert.doesNotMatch(settingsView, /\.settings-tabs :deep\(\.ant-tabs-nav\)/);
   assert.doesNotMatch(accountPanel, /vipRights|get_global_config|当前权益规则/);
   assert.match(panel, /update_developer_credentials/);
   assert.match(panel, /update_developer_mode/);

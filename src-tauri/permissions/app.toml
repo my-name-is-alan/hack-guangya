@@ -34,6 +34,8 @@ commands.allow = [
   "select_upload_files",
   "select_upload_folder",
   "queue_upload_paths",
+  "cancel_upload",
+  "retry_upload",
   "copy_files",
   "move_files",
   "delete_files",

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ReloadOutlined, UserOutlined } from '@antdv-next/icons'
 import { errorText, formatSize, pick } from '../../formatters.js'
@@ -34,7 +34,6 @@ async function refreshAccountData() {
   }
 }
 
-onMounted(refreshAccountData)
 </script>
 
 <template>

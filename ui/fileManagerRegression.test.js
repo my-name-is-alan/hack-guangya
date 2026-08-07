@@ -118,6 +118,33 @@ test('active transfer management can pause resume and cancel downloads', async (
   assert.match(desktopAppSource, /task\.segmented && task\.connections > 1/);
 });
 
+test('active transfer management can cancel uploads without reviving cancelled rows', async () => {
+  const [transferStoreSource, transferViewSource, cloudSource] = await Promise.all([transfersSource, transfersViewSource, cloudViewSource]);
+  assert.match(transferStoreSource, /bridge\.invoke\(['"]cancel_upload['"],\s*\{ file_path: key, mapping_id: task\.mappingId \}\)/);
+  assert.match(transferStoreSource, /previous\?\.state === ['"]cancelled['"] && payload\.state !== ['"]cancelled['"] && !restartsCancelled/);
+  assert.match(transferStoreSource, /registerUploadCancellation/);
+  assert.match(transferViewSource, /取消这个上传任务/);
+  assert.match(transferViewSource, /item\.state === ['"]cancelled['"]/);
+  assert.match(cloudSource, /registerUploadCancellation/);
+  assert.match(cloudSource, /request\.abort\(\)/);
+});
+
+test('failed uploads expose a real retry path for browser and backend tasks', async () => {
+  const [transferStoreSource, transferViewSource, cloudSource, bridgeSource] = await Promise.all([
+    transfersSource,
+    transfersViewSource,
+    cloudViewSource,
+    readFile(new URL('./bridge.js', import.meta.url), 'utf8'),
+  ]);
+  assert.match(transferStoreSource, /async function retryUpload\(filePath: string\)/);
+  assert.match(transferStoreSource, /bridge\.invoke\(['"]retry_upload['"],\s*\{ file_path: key, mapping_id: task\.mappingId \}\)/);
+  assert.match(transferStoreSource, /registerUploadRetry/);
+  assert.match(transferViewSource, /item\.state === ['"]error['"].*重试上传/);
+  assert.match(cloudSource, /文件未损坏，可点击重试/);
+  assert.match(cloudSource, /registerUploadRetry\(eventPath/);
+  assert.match(bridgeSource, /command === ['"]retry_upload['"].*\/api\/uploads\/retry/);
+});
+
 test('rename request keeps file identifiers and names in camelCase', async () => {
   const [cloudSource, rulesSource] = await Promise.all([cloudViewSource, renameRulesSource]);
   const submitRenameSource = sourceBetween(

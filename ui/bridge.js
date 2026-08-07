@@ -178,6 +178,8 @@ export const bridge = isTauri ? {
     if (command === 'retry_auto_share_event') return webRequest(`/api/auto-share/events/${encodeURIComponent(args.event_id)}/retry`, { method: 'POST', body: JSON.stringify({ tmdb_id: args.tmdb_id, media_type: args.media_type }) });
     if (command === 'pause_queue') return webRequest('/api/queue/pause', { method: 'POST' });
     if (command === 'resume_queue') return webRequest('/api/queue/resume', { method: 'POST' });
+    if (command === 'cancel_upload') return webRequest('/api/uploads/cancel', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'retry_upload') return webRequest('/api/uploads/retry', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'get_transfer_settings') return webRequest('/api/settings');
     if (command === 'update_transfer_settings') return webRequest('/api/settings/transfer', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'get_network_preferences') return webRequest('/api/settings/network');

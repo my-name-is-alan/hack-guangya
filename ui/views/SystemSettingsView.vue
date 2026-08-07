@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { shallowRef, watch } from 'vue'
+import { defineAsyncComponent, shallowRef, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   CloudServerOutlined,
@@ -14,17 +14,18 @@ import {
   UserOutlined,
 } from '@antdv-next/icons'
 import { isTauri } from '../bridge.js'
-import AccessCodeSettingsPanel from '../components/settings/AccessCodeSettingsPanel.vue'
-import AccountSettingsPanel from '../components/settings/AccountSettingsPanel.vue'
-import CacheSettingsPanel from '../components/settings/CacheSettingsPanel.vue'
-import DeveloperSettingsPanel from '../components/settings/DeveloperSettingsPanel.vue'
-import HdhiveSettingsPanel from '../components/settings/HdhiveSettingsPanel.vue'
-import MountSettingsPanel from '../components/settings/MountSettingsPanel.vue'
-import PreferenceSettingsPanel from '../components/settings/PreferenceSettingsPanel.vue'
-import TransferSettingsPanel from '../components/settings/TransferSettingsPanel.vue'
-import UpdateSettingsPanel from '../components/settings/UpdateSettingsPanel.vue'
-import OrganizerSettingsPanel from '../components/settings/OrganizerSettingsPanel.vue'
-import NetworkSettingsPanel from '../components/settings/NetworkSettingsPanel.vue'
+
+const AccessCodeSettingsPanel = defineAsyncComponent(() => import('../components/settings/AccessCodeSettingsPanel.vue'))
+const AccountSettingsPanel = defineAsyncComponent(() => import('../components/settings/AccountSettingsPanel.vue'))
+const CacheSettingsPanel = defineAsyncComponent(() => import('../components/settings/CacheSettingsPanel.vue'))
+const DeveloperSettingsPanel = defineAsyncComponent(() => import('../components/settings/DeveloperSettingsPanel.vue'))
+const HdhiveSettingsPanel = defineAsyncComponent(() => import('../components/settings/HdhiveSettingsPanel.vue'))
+const MountSettingsPanel = defineAsyncComponent(() => import('../components/settings/MountSettingsPanel.vue'))
+const PreferenceSettingsPanel = defineAsyncComponent(() => import('../components/settings/PreferenceSettingsPanel.vue'))
+const TransferSettingsPanel = defineAsyncComponent(() => import('../components/settings/TransferSettingsPanel.vue'))
+const UpdateSettingsPanel = defineAsyncComponent(() => import('../components/settings/UpdateSettingsPanel.vue'))
+const OrganizerSettingsPanel = defineAsyncComponent(() => import('../components/settings/OrganizerSettingsPanel.vue'))
+const NetworkSettingsPanel = defineAsyncComponent(() => import('../components/settings/NetworkSettingsPanel.vue'))
 
 const activeTab = shallowRef('account')
 const route = useRoute()
@@ -93,10 +94,11 @@ watch(() => route.query.tab, (value) => { if (typeof value === 'string' && value
 </template>
 
 <style scoped>
-.settings-view { min-height: calc(100vh - 96px); min-width: 0; }
-.settings-tabs { display: flex; min-width: 0; }
-.settings-tabs :deep(.ant-tabs-nav) { width: 154px; min-width: 154px; flex: 0 0 154px; }
-.settings-tabs :deep(.ant-tabs-content-holder) { min-width: 0; flex: 1 1 auto; }
-.settings-tabs :deep(.ant-tabs-content) { min-width: 0; }
+.settings-view { width: 100%; min-width: 0; max-width: 100%; min-height: calc(100vh - 96px); overflow: hidden; }
+.settings-tabs { display: flex; width: 100%; min-width: 0; max-width: 100%; }
+.settings-tabs > :deep(.ant-tabs-nav) { width: 154px; min-width: 154px; flex: 0 0 154px; }
+.settings-tabs > :deep(.ant-tabs-body-holder) { min-width: 0; max-width: 100%; flex: 1 1 auto; overflow: hidden; }
+.settings-tabs > :deep(.ant-tabs-body-holder > .ant-tabs-body),
+.settings-tabs > :deep(.ant-tabs-body-holder > .ant-tabs-body > .ant-tabs-content) { min-width: 0; max-width: 100%; }
 .setting-tab { display: inline-flex; align-items: center; gap: 9px; }
 </style>

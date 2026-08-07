@@ -167,11 +167,11 @@ function organizerSettingsInput() {
 }
 
 const jobColumns = [
-  { title: '来源', key: 'source', width: 270 },
-  { title: '识别与目标', key: 'result' },
-  { title: '状态', key: 'status', width: 118 },
-  { title: '更新时间', key: 'time', width: 150 },
-  { title: '操作', key: 'actions', width: 252, fixed: 'right' },
+  { title: '来源', key: 'source', width: 230 },
+  { title: '识别与目标', key: 'result', width: 300 },
+  { title: '状态', key: 'status', width: 108 },
+  { title: '更新时间', key: 'time', width: 142 },
+  { title: '操作', key: 'actions', width: 210 },
 ];
 
 function timeText(value) {
@@ -614,7 +614,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <a-spin :spinning="loading">
+  <a-spin class="organizer-spin" :spinning="loading">
     <section class="organizer-page">
       <header v-if="!props.settingsOnly" class="page-heading">
         <div>
@@ -779,7 +779,7 @@ onBeforeUnmount(() => {
         <div class="section-heading">
           <div><h2>整理任务</h2><p>每次执行前都会校验源文件是否变化；有多个 TMDB 候选时会停下来等待选择。</p></div>
         </div>
-        <a-table :columns="jobColumns" :data-source="organizer.jobs" row-key="id" :pagination="{ pageSize: 12, showSizeChanger: false }" :scroll="{ x: 1080 }" size="middle">
+        <a-table :columns="jobColumns" :data-source="organizer.jobs" row-key="id" :pagination="{ pageSize: 12, showSizeChanger: false }" :scroll="{ x: 990 }" size="middle">
           <template #emptyText><a-empty description="等待目录中出现媒体文件" /></template>
           <template #bodyCell="{ column, record }">
             <template v-if="column.key === 'source'">
@@ -962,6 +962,9 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.organizer-spin, .organizer-page { width: 100%; min-width: 0; max-width: 100%; }
+.organizer-spin { display: block; }
+.organizer-spin :deep(.ant-spin-nested-loading), .organizer-spin :deep(.ant-spin-container) { min-width: 0; max-width: 100%; }
 .organizer-page { display: grid; gap: 14px; max-width: 1500px; margin: 0 auto; }
 .organizer-settings-tabs { margin: 2px 0 -4px; padding: 0 4px; }
 .inner-tab { display: inline-flex; align-items: center; gap: 7px; }
@@ -992,7 +995,7 @@ onBeforeUnmount(() => {
 .metric-grid small, .metric-grid span { color: var(--text-3, #8b8f98); font-size: 10px; }
 .metric-grid strong { margin: 2px 0; font-size: 25px; line-height: 1; font-variant-numeric: tabular-nums; }
 .metric-grid .attention { border-color: #ffd591; background: color-mix(in srgb, #faad14 8%, var(--surface, #fff)); }
-.settings-card, .section-block { border: 1px solid var(--line, #e4e7ec); border-radius: 12px; background: var(--surface, #fff); }
+.settings-card, .section-block { min-width: 0; border: 1px solid var(--line, #e4e7ec); border-radius: 12px; background: var(--surface, #fff); }
 .settings-card :deep(.ant-card-head) { min-height: 48px; }
 .card-title { display: inline-flex; align-items: center; gap: 8px; }
 .settings-alert, .drawer-alert, .review-alert, .preview-alert { margin-bottom: 14px; }
@@ -1019,8 +1022,9 @@ onBeforeUnmount(() => {
 .path-flow { color: var(--text-2, #667085); font-size: 11px; }
 .mapping-meta { display: flex; flex-wrap: wrap; gap: 5px 12px; margin-top: 4px; color: var(--text-3, #8b8f98); font-size: 10px; }
 .mapping-actions { display: flex; align-items: center; gap: 7px; }
-.jobs-block { padding-bottom: 8px; }
-.jobs-block :deep(.ant-table-wrapper) { margin-inline: -8px; }
+.jobs-block { overflow: hidden; padding-bottom: 8px; }
+.jobs-block :deep(.ant-table-wrapper) { width: 100%; min-width: 0; max-width: 100%; margin-inline: 0; }
+.jobs-block :deep(.ant-table), .jobs-block :deep(.ant-table-container) { max-width: 100%; }
 .job-source, .job-result { display: grid; min-width: 0; gap: 2px; }
 .job-source strong, .job-result strong, .job-source span, .job-result span, .job-result small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .job-source span, .job-result span, .job-source small, .job-result small { color: var(--text-3, #8b8f98); font-size: 10px; }

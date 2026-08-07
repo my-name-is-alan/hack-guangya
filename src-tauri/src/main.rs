@@ -85,6 +85,7 @@ const CLOUD_CONFIRM_TIMEOUT_SECS: u64 = 600;
 const PENDING_UPLOAD_RETRY_SECS: u64 = 15;
 const UPLOAD_STATE_OSS_COMPLETE: &str = "oss_complete";
 const UPLOAD_STATE_CLOUD_CONFIRMED: &str = "cloud_confirmed";
+const UPLOAD_CANCELLED_MESSAGE: &str = "上传已取消";
 const AUTO_SHARE_QUIET_SECS: i64 = 30;
 const TOKEN_REFRESH_INTERVAL_SECS: u64 = 20 * 60;
 const DEFAULT_WEBDAV_PORT: u16 = 19_090;
@@ -290,6 +291,8 @@ struct RuntimeState {
     recovering_pending: HashSet<String>,
     inflight: HashMap<String, Stamp>,
     inflight_items: HashMap<String, UploadItem>,
+    failed_uploads: HashMap<String, UploadItem>,
+    cancelled_uploads: HashMap<String, Stamp>,
     remote_cache: HashMap<String, String>,
     watchers: HashMap<String, RecommendedWatcher>,
     event_tx: UnboundedSender<FsEvent>,
@@ -534,6 +537,8 @@ struct UploadCredentials {
     secret_access_key: String,
     #[serde(rename = "sessionToken")]
     session_token: String,
+    #[serde(default)]
+    expiration: Option<String>,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1016,6 +1021,7 @@ fn upload_already_scheduled(
     inflight: &HashMap<String, Stamp>,
     queue: &VecDeque<UploadItem>,
     waiting_files: &HashMap<String, UploadItem>,
+    cancelled_uploads: &HashMap<String, Stamp>,
     item: &UploadItem,
 ) -> bool {
     let key = item_key(&item.mapping_id, &item.file_path);
@@ -1032,6 +1038,32 @@ fn upload_already_scheduled(
                 && queued.modified_ms == item.modified_ms
         })
         || waiting_files.contains_key(&key)
+        || cancelled_uploads
+            .get(&key)
+            .is_some_and(|stamp| stamp_matches(item, stamp))
+}
+
+fn upload_is_cancelled(state: &SharedState, key: &str) -> bool {
+    state
+        .lock()
+        .ok()
+        .is_some_and(|guard| guard.cancelled_uploads.contains_key(key))
+}
+
+async fn wait_for_upload_cancellation(state: &SharedState, key: &str) {
+    while !upload_is_cancelled(state, key) {
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn abortable_upload_step<T, F>(state: &SharedState, key: &str, future: F) -> Result<T, String>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        value = future => Ok(value),
+        _ = wait_for_upload_cancellation(state, key) => Err(UPLOAD_CANCELLED_MESSAGE.to_string()),
+    }
 }
 fn normalize_sync_types(values: &[String]) -> Vec<String> {
     let mut result = Vec::new();
@@ -2206,6 +2238,17 @@ fn delete_pending_upload(path: &Path, pending: &PendingUpload) -> Result<bool, S
         .map_err(|e| format!("清理待确认上传记录失败：{e}"))
 }
 
+fn clear_cancelled_upload_artifacts(path: &Path, item: &UploadItem) -> Result<(), String> {
+    clear_upload_checkpoint(path, item)?;
+    let key = item_key(&item.mapping_id, &item.file_path);
+    for pending in load_pending_uploads(path)? {
+        if item_key(&pending.item.mapping_id, &pending.item.file_path) == key {
+            delete_pending_upload(path, &pending)?;
+        }
+    }
+    Ok(())
+}
+
 fn remove_mapping_transient_uploads(path: &Path, mapping_id: &str) -> Result<(), String> {
     let connection = open_database(path)?;
     connection
@@ -2987,7 +3030,11 @@ async fn api_post_response(
         .json(&body)
         .send()
         .await
-        .map_err(|e| BusinessRequestError::Request(e.to_string()))?;
+        .map_err(|error| {
+            BusinessRequestError::Request(format!(
+                "无法连接光鸭接口 {endpoint}：网络异常，请稍后重试（{error}）"
+            ))
+        })?;
     let http_status = response.status().as_u16();
     let raw = response
         .text()
@@ -5394,6 +5441,98 @@ fn preferred_oss_endpoint(token_data: &UploadToken) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn upload_credentials_expired(token_data: &UploadToken) -> bool {
+    let Some(expiration) = token_data
+        .creds
+        .as_ref()
+        .and_then(|credentials| credentials.expiration.as_deref())
+    else {
+        return true;
+    };
+    match time::OffsetDateTime::parse(expiration, &time::format_description::well_known::Rfc3339) {
+        Ok(value) => value <= time::OffsetDateTime::now_utc(),
+        Err(_) => true,
+    }
+}
+
+fn is_oss_security_token_expired(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("securitytokenexpired")
+}
+
+async fn refresh_upload_token(
+    token: &str,
+    device_id: &str,
+    file_size: u64,
+    current: &UploadToken,
+) -> Result<UploadToken, String> {
+    let object_path = current
+        .object_path
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "上传凭证缺少 OSS 对象路径，无法刷新".to_string())?;
+    let response = api_post(
+        token,
+        device_id,
+        "/userres/v1/get_res_center_resume_token",
+        json!({
+            "capacity": 2,
+            "res": { "fileSize": file_size },
+            "taskId": current.task_id,
+            "object": {
+                "objectPath": object_path,
+                "provider": current.provider
+            }
+        }),
+        &[156],
+    )
+    .await?;
+    let mut refreshed: UploadToken = serde_json::from_value(
+        response
+            .data
+            .ok_or_else(|| "光鸭没有返回续传凭证".to_string())?,
+    )
+    .map_err(|error| format!("续传凭证格式异常：{error}"))?;
+    if refreshed
+        .object_path
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        refreshed.object_path = current.object_path.clone();
+    }
+    if refreshed
+        .bucket_name
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        refreshed.bucket_name = current.bucket_name.clone();
+    }
+    if refreshed
+        .end_point
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+        && refreshed
+            .full_end_point
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+    {
+        refreshed.end_point = current.end_point.clone();
+        refreshed.full_end_point = current.full_end_point.clone();
+    }
+    if refreshed.provider.is_none() {
+        refreshed.provider = current.provider.clone();
+    }
+    if refreshed.creds.is_none() {
+        return Err("光鸭续传接口没有返回新的 OSS 临时凭证".into());
+    }
+    Ok(refreshed)
+}
+
 async fn upload_oss(
     token_data: &UploadToken,
     item: &UploadItem,
@@ -5761,19 +5900,23 @@ async fn requeue_busy_upload(app: tauri::AppHandle, state: SharedState, mut item
                 .any(|mapping| mapping.id == item.mapping_id && mapping.enabled)
         {
             false
-        } else if upload_already_scheduled(
-            &guard.history,
-            &guard.pending_cloud,
-            &guard.inflight,
-            &guard.queue,
-            &guard.waiting_files,
-            &item,
-        ) {
+        } else if guard.cancelled_uploads.contains_key(&key)
+            || upload_already_scheduled(
+                &guard.history,
+                &guard.pending_cloud,
+                &guard.inflight,
+                &guard.queue,
+                &guard.waiting_files,
+                &guard.cancelled_uploads,
+                &item,
+            )
+        {
             false
         } else {
             guard
                 .queue
                 .retain(|queued| item_key(&queued.mapping_id, &queued.file_path) != key);
+            guard.failed_uploads.remove(&key);
             guard.queue.push_back(item.clone());
             true
         }
@@ -5816,12 +5959,14 @@ async fn requeue_resumable_upload(app: tauri::AppHandle, state: SharedState, ite
                 .iter()
                 .any(|mapping| mapping.id == item.mapping_id && mapping.enabled);
         if !mapping_active
+            || guard.cancelled_uploads.contains_key(&key)
             || upload_already_scheduled(
                 &guard.history,
                 &guard.pending_cloud,
                 &guard.inflight,
                 &guard.queue,
                 &guard.waiting_files,
+                &guard.cancelled_uploads,
                 &item,
             )
         {
@@ -5830,6 +5975,7 @@ async fn requeue_resumable_upload(app: tauri::AppHandle, state: SharedState, ite
             guard
                 .queue
                 .retain(|queued| item_key(&queued.mapping_id, &queued.file_path) != key);
+            guard.failed_uploads.remove(&key);
             guard.queue.push_back(item.clone());
             true
         }
@@ -6325,6 +6471,20 @@ async fn upload_item(
         }
     }
     if !instant_upload {
+        if upload_credentials_expired(&data) {
+            emit(
+                app,
+                json!({
+                    "type": "progress",
+                    "file_path": item.file_path.to_string_lossy(),
+                    "uploaded_bytes": persisted.as_ref().map(|checkpoint| checkpoint.uploaded_bytes).unwrap_or(0),
+                    "total_bytes": item.size,
+                    "bytes_per_second": 0,
+                    "stage": "上传凭证已过期，正在刷新后续传"
+                }),
+            );
+            data = refresh_upload_token(&token, &device_id, item.size, &data).await?;
+        }
         let uploaded_bytes = persisted
             .as_ref()
             .map(|checkpoint| checkpoint.uploaded_bytes)
@@ -6338,7 +6498,43 @@ async fn upload_item(
             app,
             json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": if item.size == 0 { 0 } else { uploaded_bytes.saturating_mul(100) / item.size }, "uploaded_bytes": uploaded_bytes, "total_bytes": item.size, "stage": if resumed { "正在从断点继续上传" } else { "正在连接 OSS" } }),
         );
-        upload_oss(&data, item, app, &multipart_part_size, &db_path, persisted).await?;
+        let mut current_checkpoint = persisted;
+        let mut credential_refreshes = 0usize;
+        loop {
+            match upload_oss(
+                &data,
+                item,
+                app,
+                &multipart_part_size,
+                &db_path,
+                current_checkpoint.clone(),
+            )
+            .await
+            {
+                Ok(()) => break,
+                Err(error) if is_oss_security_token_expired(&error) && credential_refreshes < 3 => {
+                    credential_refreshes += 1;
+                    current_checkpoint = load_upload_checkpoint(&db_path, item)?;
+                    let uploaded_bytes = current_checkpoint
+                        .as_ref()
+                        .map(|checkpoint| checkpoint.uploaded_bytes)
+                        .unwrap_or(0);
+                    emit(
+                        app,
+                        json!({
+                            "type": "progress",
+                            "file_path": item.file_path.to_string_lossy(),
+                            "uploaded_bytes": uploaded_bytes,
+                            "total_bytes": item.size,
+                            "bytes_per_second": 0,
+                            "stage": "OSS 上传凭证已过期，正在刷新后续传"
+                        }),
+                    );
+                    data = refresh_upload_token(&token, &device_id, item.size, &data).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     } else {
         clear_upload_checkpoint(&db_path, item)?;
         emit(
@@ -6664,6 +6860,15 @@ async fn finalize_successful_upload(
     item: &UploadItem,
     outcome: &UploadOutcome,
 ) {
+    let key = item_key(&item.mapping_id, &item.file_path);
+    if upload_is_cancelled(state, &key) {
+        if let Ok(guard) = state.lock() {
+            if let Err(message) = clear_cancelled_upload_artifacts(&guard.db_path, item) {
+                status(app, "warning", message);
+            }
+        }
+        return;
+    }
     if resubmit_source_if_changed(state, item) {
         emit(
             app,
@@ -6753,9 +6958,9 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
                 None
             } else {
                 let position = guard.queue.iter().position(|candidate| {
-                    !guard
-                        .inflight
-                        .contains_key(&item_key(&candidate.mapping_id, &candidate.file_path))
+                    let key = item_key(&candidate.mapping_id, &candidate.file_path);
+                    !guard.inflight.contains_key(&key)
+                        && !guard.cancelled_uploads.contains_key(&key)
                         && !flash_preflight_cached(&guard, candidate)
                 });
                 position.and_then(|position| {
@@ -6798,14 +7003,20 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
             let result = match prepare_upload_item(&item).await {
                 Ok(Some(ready)) => {
                     item = ready;
-                    preflight_flash_upload(&app2, &state2, &item)
-                        .await
-                        .map(Some)
+                    abortable_upload_step(
+                        &state2,
+                        &upload_key,
+                        preflight_flash_upload(&app2, &state2, &item),
+                    )
+                    .await
+                    .and_then(|result| result)
+                    .map(Some)
                 }
                 Ok(None) => Ok(None),
                 Err(message) => Err(message),
             };
             let waiting_for_file = result.as_ref().ok().is_some_and(Option::is_none);
+            let cancelled = upload_is_cancelled(&state2, &upload_key);
             let auth_expired = result
                 .as_ref()
                 .err()
@@ -6829,8 +7040,12 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
                         .mappings
                         .iter()
                         .any(|mapping| mapping.id == item.mapping_id && mapping.enabled);
+                if cancelled {
+                    guard.pending_cloud.remove(&upload_key);
+                    guard.flash_preflight_cache.remove(&upload_key);
+                }
                 match &result {
-                    Ok(Some(FlashPreflightOutcome::Miss(_))) if mapping_active => {
+                    Ok(Some(FlashPreflightOutcome::Miss(_))) if mapping_active && !cancelled => {
                         let token = match result.as_ref().ok().and_then(Option::as_ref) {
                             Some(FlashPreflightOutcome::Miss(token)) => Some(token.clone()),
                             _ => None,
@@ -6850,7 +7065,7 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
                         requeued = true;
                     }
                     Ok(Some(FlashPreflightOutcome::Skipped)) | Err(_)
-                        if !cloud_pending && mapping_active =>
+                        if !cloud_pending && mapping_active && !cancelled =>
                     {
                         guard.flash_preflight_cache.insert(
                             upload_key.clone(),
@@ -6870,7 +7085,7 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
                         guard.flash_preflight_cache.remove(&upload_key);
                     }
                 }
-                if waiting_for_file {
+                if waiting_for_file && !cancelled {
                     guard.waiting_files.insert(upload_key.clone(), item.clone());
                 }
             }
@@ -6880,6 +7095,28 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
                         status(&app2, "error", message);
                     }
                 }
+            }
+            if cancelled {
+                if let Some(path) = db_path.as_deref() {
+                    if let Err(message) = clear_cancelled_upload_artifacts(path, &item) {
+                        status(&app2, "warning", message);
+                    }
+                }
+                emit(
+                    &app2,
+                    json!({
+                        "type": "file",
+                        "state": "cancelled",
+                        "file_path": item.file_path.to_string_lossy(),
+                        "mapping_id": item.mapping_id,
+                        "uploaded_bytes": 0,
+                        "total_bytes": item.size,
+                        "stage": "已取消"
+                    }),
+                );
+                emit_state(&app2, &state2);
+                drain_queue(app2, state2);
+                return;
             }
             match result {
                 Ok(Some(FlashPreflightOutcome::Accepted {
@@ -6891,16 +7128,22 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
                     let confirm_state = state2.clone();
                     let confirm_item = item.clone();
                     tauri::async_runtime::spawn(async move {
-                        match wait_upload_task(
-                            &confirm_app,
-                            &token,
-                            &device_id,
-                            &task_id,
-                            &confirm_item.file_path,
+                        let confirm_key =
+                            item_key(&confirm_item.mapping_id, &confirm_item.file_path);
+                        let task_result = abortable_upload_step(
+                            &confirm_state,
+                            &confirm_key,
+                            wait_upload_task(
+                                &confirm_app,
+                                &token,
+                                &device_id,
+                                &task_id,
+                                &confirm_item.file_path,
+                            ),
                         )
-                        .await
-                        {
-                            Ok(task_data) => {
+                        .await;
+                        match task_result {
+                            Ok(Ok(task_data)) => {
                                 let outcome = UploadOutcome {
                                     task_id,
                                     remote_file_id: task_data
@@ -6925,7 +7168,7 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
                                     Err(message) => status(&confirm_app, "warning", message),
                                 }
                             }
-                            Err(error) => status(
+                            Ok(Err(error)) => status(
                                 &confirm_app,
                                 "warning",
                                 format!(
@@ -6933,6 +7176,17 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
                                     error.message()
                                 ),
                             ),
+                            Err(message) if message == UPLOAD_CANCELLED_MESSAGE => {
+                                if let Ok(guard) = confirm_state.lock() {
+                                    if let Err(error) = clear_cancelled_upload_artifacts(
+                                        &guard.db_path,
+                                        &confirm_item,
+                                    ) {
+                                        status(&confirm_app, "warning", error);
+                                    }
+                                }
+                            }
+                            Err(message) => status(&confirm_app, "warning", message),
                         }
                         emit_state(&confirm_app, &confirm_state);
                     });
@@ -7045,9 +7299,9 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                 None
             } else {
                 let position = guard.queue.iter().position(|candidate| {
-                    !guard
-                        .inflight
-                        .contains_key(&item_key(&candidate.mapping_id, &candidate.file_path))
+                    let key = item_key(&candidate.mapping_id, &candidate.file_path);
+                    !guard.inflight.contains_key(&key)
+                        && !guard.cancelled_uploads.contains_key(&key)
                 });
                 let item = position.and_then(|position| guard.queue.remove(position));
                 if let Some(item) = &item {
@@ -7083,12 +7337,16 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
             let result = match prepare_upload_item(&item).await {
                 Ok(Some(ready)) => {
                     item = ready;
-                    upload_item(&app2, &state2, &item).await.map(Some)
+                    abortable_upload_step(&state2, &upload_key, upload_item(&app2, &state2, &item))
+                        .await
+                        .and_then(|result| result)
+                        .map(Some)
                 }
                 Ok(None) => Ok(None),
                 Err(message) => Err(message),
             };
             let waiting_for_file = result.as_ref().ok().is_some_and(Option::is_none);
+            let cancelled = upload_is_cancelled(&state2, &upload_key);
             let auth_expired = result
                 .as_ref()
                 .err()
@@ -7106,7 +7364,11 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                     guard.token = None;
                 }
                 cloud_pending = guard.pending_cloud.contains_key(&upload_key);
-                if waiting_for_file {
+                if cancelled {
+                    guard.pending_cloud.remove(&upload_key);
+                    guard.flash_preflight_cache.remove(&upload_key);
+                }
+                if waiting_for_file && !cancelled {
                     guard.waiting_files.insert(upload_key.clone(), item.clone());
                 }
             }
@@ -7116,6 +7378,28 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                         status(&app2, "error", message);
                     }
                 }
+            }
+            if cancelled {
+                if let Some(path) = db_path.as_deref() {
+                    if let Err(message) = clear_cancelled_upload_artifacts(path, &item) {
+                        status(&app2, "warning", message);
+                    }
+                }
+                emit(
+                    &app2,
+                    json!({
+                        "type": "file",
+                        "state": "cancelled",
+                        "file_path": item.file_path.to_string_lossy(),
+                        "mapping_id": item.mapping_id,
+                        "uploaded_bytes": 0,
+                        "total_bytes": item.size,
+                        "stage": "已取消"
+                    }),
+                );
+                emit_state(&app2, &state2);
+                drain_queue(app2, state2);
+                return;
             }
             if waiting_for_file {
                 emit(
@@ -7179,6 +7463,11 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                     .as_ref()
                     .map(|checkpoint| checkpoint.uploaded_bytes)
                     .unwrap_or(0);
+                if let Ok(mut guard) = state2.lock() {
+                    guard
+                        .failed_uploads
+                        .insert(upload_key.clone(), item.clone());
+                }
                 emit(
                     &app2,
                     json!({ "type": "file", "state": "error", "file_path": item.file_path.to_string_lossy(), "uploaded_bytes": uploaded_bytes, "total_bytes": item.size, "error": message.clone() }),
@@ -7267,6 +7556,7 @@ async fn enqueue_path(app: &tauri::AppHandle, state: &SharedState, event: FsEven
             &guard.inflight,
             &guard.queue,
             &guard.waiting_files,
+            &guard.cancelled_uploads,
             &item,
         ) {
             return;
@@ -7294,10 +7584,13 @@ async fn enqueue_path(app: &tauri::AppHandle, state: &SharedState, event: FsEven
             &guard.inflight,
             &guard.queue,
             &guard.waiting_files,
+            &guard.cancelled_uploads,
             &item,
         ) {
             return;
         }
+        guard.cancelled_uploads.remove(&key);
+        guard.failed_uploads.remove(&key);
         if reused_upload.is_some() {
             guard.history.insert(
                 key,
@@ -7566,14 +7859,17 @@ fn queue_rejected_pending_upload(state: &SharedState, pending: &PendingUpload) -
     {
         return false;
     }
-    if upload_already_scheduled(
-        &guard.history,
-        &guard.pending_cloud,
-        &guard.inflight,
-        &guard.queue,
-        &guard.waiting_files,
-        &item,
-    ) {
+    if guard.cancelled_uploads.contains_key(&key)
+        || upload_already_scheduled(
+            &guard.history,
+            &guard.pending_cloud,
+            &guard.inflight,
+            &guard.queue,
+            &guard.waiting_files,
+            &guard.cancelled_uploads,
+            &item,
+        )
+    {
         return false;
     }
     guard
@@ -7598,7 +7894,31 @@ async fn recover_pending_upload(app: tauri::AppHandle, state: SharedState, pendi
         }
         Err(_) => return,
     };
-    match check_upload_task(&token, &device_id, &pending.task_id).await {
+    let task_result = abortable_upload_step(
+        &state,
+        &key,
+        check_upload_task(&token, &device_id, &pending.task_id),
+    )
+    .await;
+    let task_result = match task_result {
+        Ok(result) => result,
+        Err(message) if message == UPLOAD_CANCELLED_MESSAGE => {
+            if let Err(error) = clear_cancelled_upload_artifacts(&db_path, &pending.item) {
+                status(&app, "warning", error);
+            }
+            if let Ok(mut guard) = state.lock() {
+                guard.recovering_pending.remove(&key);
+                guard.pending_cloud.remove(&key);
+            }
+            emit_state(&app, &state);
+            return;
+        }
+        Err(message) => {
+            status(&app, "warning", message);
+            return;
+        }
+    };
+    match task_result {
         Ok(CloudTaskCheck::Confirmed(task_data)) => {
             let item = hydrate_pending_item(&state, &pending);
             let outcome = UploadOutcome {
@@ -8646,6 +8966,8 @@ fn queue_upload_paths(
                 modified_ms: modified_ms(&metadata),
             };
             let key = item_key(&item.mapping_id, &item.file_path);
+            guard.cancelled_uploads.remove(&key);
+            guard.failed_uploads.remove(&key);
             if guard
                 .inflight
                 .get(&key)
@@ -11504,6 +11826,7 @@ fn remove_mapping(
     guard.mappings.retain(|mapping| mapping.id != id);
     guard.queue.retain(|item| item.mapping_id != id);
     guard.waiting_files.retain(|_, item| item.mapping_id != id);
+    guard.failed_uploads.retain(|_, item| item.mapping_id != id);
     let prefix = format!("{id}::");
     guard.history.retain(|key, _| !key.starts_with(&prefix));
     guard
@@ -11960,6 +12283,150 @@ fn pause_queue(app: tauri::AppHandle, state: tauri::State<'_, SharedState>) {
     }
     emit_state(&app, state.inner());
 }
+
+#[tauri::command]
+fn cancel_upload(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+    file_path: String,
+    mapping_id: Option<String>,
+) -> Result<bool, String> {
+    let target_path = file_path.trim();
+    if target_path.is_empty() {
+        return Err("缺少要取消的上传路径".into());
+    }
+    let target_mapping = mapping_id.unwrap_or_default();
+    let db_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    let pending = load_pending_uploads(&db_path)?;
+    let matches = |item: &UploadItem| {
+        item.file_path.to_string_lossy() == target_path
+            && (target_mapping.is_empty() || item.mapping_id == target_mapping)
+    };
+    let mut matched = HashMap::<String, UploadItem>::new();
+    {
+        let mut guard = state.lock().map_err(|error| error.to_string())?;
+        for item in guard
+            .queue
+            .iter()
+            .chain(guard.waiting_files.values())
+            .chain(guard.inflight_items.values())
+            .chain(guard.failed_uploads.values())
+        {
+            if matches(item) {
+                matched.insert(item_key(&item.mapping_id, &item.file_path), item.clone());
+            }
+        }
+        for value in &pending {
+            if matches(&value.item) {
+                matched.insert(
+                    item_key(&value.item.mapping_id, &value.item.file_path),
+                    value.item.clone(),
+                );
+            }
+        }
+        for (key, item) in &matched {
+            guard.cancelled_uploads.insert(
+                key.clone(),
+                Stamp {
+                    size: item.size,
+                    modified_ms: item.modified_ms,
+                },
+            );
+            guard.waiting_files.remove(key);
+            guard.failed_uploads.remove(key);
+            guard.flash_preflight_cache.remove(key);
+            guard.pending_cloud.remove(key);
+            guard.recovering_pending.remove(key);
+        }
+        guard
+            .queue
+            .retain(|item| !matched.contains_key(&item_key(&item.mapping_id, &item.file_path)));
+    }
+    if matched.is_empty() {
+        return Ok(false);
+    }
+    for item in matched.values() {
+        clear_cancelled_upload_artifacts(&db_path, item)?;
+        emit(
+            &app,
+            json!({
+                "type": "file",
+                "state": "cancelled",
+                "file_path": item.file_path.to_string_lossy(),
+                "mapping_id": item.mapping_id,
+                "uploaded_bytes": 0,
+                "total_bytes": item.size,
+                "stage": "已取消"
+            }),
+        );
+    }
+    emit_state(&app, state.inner());
+    drain_queue(app, state.inner().clone());
+    Ok(true)
+}
+
+#[tauri::command]
+fn retry_upload(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+    file_path: String,
+    mapping_id: Option<String>,
+) -> Result<bool, String> {
+    let target_path = file_path.trim();
+    if target_path.is_empty() {
+        return Err("缺少要重试的上传路径".into());
+    }
+    let target_mapping = mapping_id.unwrap_or_default();
+    let mut guard = state.lock().map_err(|error| error.to_string())?;
+    let matched = guard
+        .failed_uploads
+        .iter()
+        .find(|(_, item)| {
+            item.file_path.to_string_lossy() == target_path
+                && (target_mapping.is_empty() || item.mapping_id == target_mapping)
+        })
+        .map(|(key, item)| (key.clone(), item.clone()));
+    let Some((key, mut item)) = matched else {
+        return Err("失败的上传任务已失效，请重新选择文件上传".into());
+    };
+    let metadata = fs::metadata(&item.file_path)
+        .map_err(|_| "本地源文件已不存在，请重新选择文件上传".to_string())?;
+    if !metadata.is_file() {
+        return Err("本地源文件已不存在，请重新选择文件上传".into());
+    }
+    item.size = metadata.len();
+    item.modified_ms = modified_ms(&metadata);
+    guard.failed_uploads.remove(&key);
+    guard.cancelled_uploads.remove(&key);
+    guard.waiting_files.remove(&key);
+    guard.flash_preflight_cache.remove(&key);
+    guard
+        .queue
+        .retain(|queued| item_key(&queued.mapping_id, &queued.file_path) != key);
+    guard.queue.push_back(item.clone());
+    let waiting_for_login = guard.token.is_none();
+    drop(guard);
+    emit(
+        &app,
+        json!({
+            "type": "file",
+            "state": if waiting_for_login { "waiting-login" } else { "queued" },
+            "file_path": item.file_path.to_string_lossy(),
+            "mapping_id": item.mapping_id,
+            "uploaded_bytes": 0,
+            "total_bytes": item.size,
+            "stage": if waiting_for_login { "等待登录后重试" } else { "已重新加入上传队列" }
+        }),
+    );
+    emit_state(&app, state.inner());
+    drain_queue(app, state.inner().clone());
+    Ok(true)
+}
+
 #[tauri::command]
 async fn get_developer_settings(
     state: tauri::State<'_, SharedState>,
@@ -13261,6 +13728,8 @@ fn run() {
                 recovering_pending: HashSet::new(),
                 inflight: HashMap::new(),
                 inflight_items: HashMap::new(),
+                failed_uploads: HashMap::new(),
+                cancelled_uploads: HashMap::new(),
                 remote_cache,
                 watchers: HashMap::new(),
                 event_tx,
@@ -13411,6 +13880,8 @@ fn run() {
             select_upload_files,
             select_upload_folder,
             queue_upload_paths,
+            cancel_upload,
+            retry_upload,
             copy_files,
             move_files,
             delete_files,
@@ -13553,6 +14024,37 @@ mod tests {
         assert!(business_auth_expired(200, 118));
         assert!(business_auth_expired(401, 0));
         assert!(!business_auth_expired(200, 112));
+    }
+
+    #[test]
+    fn upload_credentials_follow_the_official_web_expiration_contract() {
+        let token = |expiration: Option<&str>| UploadToken {
+            task_id: "task-1".to_string(),
+            object_path: Some("objects/file.bin".to_string()),
+            bucket_name: Some("bucket".to_string()),
+            end_point: Some("oss.example.test".to_string()),
+            full_end_point: None,
+            creds: Some(UploadCredentials {
+                access_key_id: "access".to_string(),
+                secret_access_key: "secret".to_string(),
+                session_token: "session".to_string(),
+                expiration: expiration.map(str::to_string),
+            }),
+            provider: Some(json!(1)),
+        };
+        assert!(upload_credentials_expired(&token(Some(
+            "2000-01-01T00:00:00Z"
+        ))));
+        assert!(!upload_credentials_expired(&token(Some(
+            "2100-01-01T00:00:00Z"
+        ))));
+        assert!(upload_credentials_expired(&token(None)));
+        assert!(is_oss_security_token_expired(
+            "<Code>SecurityTokenExpired</Code>"
+        ));
+        assert!(!is_oss_security_token_expired(
+            "error sending request for url"
+        ));
     }
 
     #[test]
@@ -14052,12 +14554,14 @@ mod tests {
         let mut inflight = HashMap::new();
         let queue = VecDeque::new();
         let mut waiting_files = HashMap::new();
+        let mut cancelled_uploads = HashMap::new();
         assert!(!upload_already_scheduled(
             &history,
             &pending_cloud,
             &inflight,
             &queue,
             &waiting_files,
+            &cancelled_uploads,
             &item
         ));
 
@@ -14074,6 +14578,7 @@ mod tests {
             &inflight,
             &queue,
             &waiting_files,
+            &cancelled_uploads,
             &item
         ));
 
@@ -14085,6 +14590,33 @@ mod tests {
             &inflight,
             &queue,
             &waiting_files,
+            &cancelled_uploads,
+            &changed
+        ));
+
+        cancelled_uploads.insert(
+            item_key(&item.mapping_id, &item.file_path),
+            Stamp {
+                size: item.size,
+                modified_ms: item.modified_ms,
+            },
+        );
+        assert!(upload_already_scheduled(
+            &history,
+            &pending_cloud,
+            &inflight,
+            &queue,
+            &waiting_files,
+            &cancelled_uploads,
+            &item
+        ));
+        assert!(!upload_already_scheduled(
+            &history,
+            &pending_cloud,
+            &inflight,
+            &queue,
+            &waiting_files,
+            &cancelled_uploads,
             &changed
         ));
 
@@ -14102,6 +14634,7 @@ mod tests {
             &inflight,
             &queue,
             &waiting_files,
+            &cancelled_uploads,
             &changed
         ));
         pending_cloud.clear();
@@ -14112,6 +14645,7 @@ mod tests {
             &inflight,
             &queue,
             &waiting_files,
+            &cancelled_uploads,
             &item
         ));
     }

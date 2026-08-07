@@ -9,6 +9,7 @@ import { nextUploadProgress, orderUploadProgress } from '../uploadProgress.js'
 export interface UploadTask {
   filePath: string
   fileName: string
+  mappingId: string
   state: string
   stage: string
   percent: number
@@ -46,9 +47,11 @@ export const useTransfersStore = defineStore('transfers', () => {
   const downloadPaused = ref(false)
   const queue = createConcurrencyQueue(() => downloadConcurrency.value, () => downloadPaused.value)
   const downloadJobs = new Map<string, () => Promise<void>>()
+  const uploadCancelHandlers = new Map<string, () => void>()
+  const uploadRetryHandlers = new Map<string, () => Promise<void> | void>()
 
   const orderedUploads = computed(() => orderUploadProgress(Object.values(uploads.value)) as UploadTask[])
-  const activeUploads = computed(() => orderedUploads.value.filter(item => !['done', 'error'].includes(item.state)))
+  const activeUploads = computed(() => orderedUploads.value.filter(item => !['done', 'error', 'cancelled'].includes(item.state)))
   const uploadSpeed = computed(() => activeUploads.value.reduce((sum, item) => sum + Number(item.bytesPerSecond || 0), 0))
   const activeDownloads = computed(() => downloads.value.filter(item => ['queued', 'preparing', 'downloading', 'paused'].includes(item.status)))
   const overallPercent = computed(() => {
@@ -63,6 +66,9 @@ export const useTransfersStore = defineStore('transfers', () => {
     if ((payload?.type === 'progress' || payload?.type === 'file') && payload.file_path) {
       const key = String(payload.file_path)
       const previous = uploads.value[key]
+      const restartsCancelled = payload.type === 'file'
+        && ['queued', 'waiting-login', 'uploading'].includes(String(payload.state || ''))
+      if (previous?.state === 'cancelled' && payload.state !== 'cancelled' && !restartsCancelled) return
       const next = nextUploadProgress(previous, payload)
       if (next !== previous) {
         uploads.value = {
@@ -70,6 +76,7 @@ export const useTransfersStore = defineStore('transfers', () => {
           [key]: {
             filePath: key,
             fileName: uploadFileName(key),
+            mappingId: String(payload.mapping_id || previous?.mappingId || ''),
             startedAt: previous?.startedAt || next.updatedAt,
             ...next,
           },
@@ -201,6 +208,68 @@ export const useTransfersStore = defineStore('transfers', () => {
     updateDownload(id, { status: 'cancelled', bytesPerSecond: 0, error: '' })
   }
 
+  function registerUploadCancellation(filePath: string, cancel: () => void) {
+    const key = String(filePath || '')
+    if (!key || typeof cancel !== 'function') return () => {}
+    uploadCancelHandlers.set(key, cancel)
+    return () => {
+      if (uploadCancelHandlers.get(key) === cancel) uploadCancelHandlers.delete(key)
+    }
+  }
+
+  function registerUploadRetry(filePath: string, retry: () => Promise<void> | void) {
+    const key = String(filePath || '')
+    if (!key || typeof retry !== 'function') return () => {}
+    uploadRetryHandlers.set(key, retry)
+    return () => {
+      if (uploadRetryHandlers.get(key) === retry) uploadRetryHandlers.delete(key)
+    }
+  }
+
+  function clearUploadRetry(filePath: string) {
+    uploadRetryHandlers.delete(String(filePath || ''))
+  }
+
+  async function retryUpload(filePath: string) {
+    const key = String(filePath || '')
+    const task = uploads.value[key]
+    if (!task || task.state !== 'error') return
+    const localRetry = uploadRetryHandlers.get(key)
+    uploadRetryHandlers.delete(key)
+    handleSyncEvent({
+      type: 'file', state: 'queued', file_path: key, mapping_id: task.mappingId,
+      uploaded_bytes: 0, total_bytes: task.totalBytes, stage: '正在重新上传',
+    })
+    try {
+      if (localRetry) await localRetry()
+      else await bridge.invoke('retry_upload', { file_path: key, mapping_id: task.mappingId })
+    } catch (error) {
+      const text = errorText(error)
+      handleSyncEvent({
+        type: 'file', state: 'error', file_path: key, mapping_id: task.mappingId,
+        uploaded_bytes: task.uploadedBytes, total_bytes: task.totalBytes, error: text,
+      })
+      throw error
+    }
+  }
+
+  async function cancelUpload(filePath: string) {
+    const key = String(filePath || '')
+    const task = uploads.value[key]
+    if (!task || ['done', 'error', 'cancelled'].includes(task.state)) return
+    uploadCancelHandlers.get(key)?.()
+    handleSyncEvent({
+      type: 'file',
+      state: 'cancelled',
+      file_path: key,
+      mapping_id: task.mappingId,
+      uploaded_bytes: task.uploadedBytes,
+      total_bytes: task.totalBytes,
+      stage: '已取消',
+    })
+    await bridge.invoke('cancel_upload', { file_path: key, mapping_id: task.mappingId })
+  }
+
   async function downloadRecords(records: any[]) {
     const targets = (Array.isArray(records) ? records : []).filter(Boolean)
     if (!targets.length) throw new Error('请先选择要下载的文件或文件夹')
@@ -269,7 +338,13 @@ export const useTransfersStore = defineStore('transfers', () => {
 
   function clearFinished(kind: 'upload' | 'download' | 'all' = 'all') {
     if (kind !== 'download') {
-      uploads.value = Object.fromEntries(Object.entries(uploads.value).filter(([, item]) => !['done', 'error'].includes(item.state)))
+      for (const [key, item] of Object.entries(uploads.value)) {
+        if (['done', 'error', 'cancelled'].includes(item.state)) {
+          uploadCancelHandlers.delete(key)
+          uploadRetryHandlers.delete(key)
+        }
+      }
+      uploads.value = Object.fromEntries(Object.entries(uploads.value).filter(([, item]) => !['done', 'error', 'cancelled'].includes(item.state)))
     }
     if (kind !== 'upload') {
       downloads.value = downloads.value.filter(item => !['completed', 'failed', 'cancelled'].includes(item.status))
@@ -294,6 +369,11 @@ export const useTransfersStore = defineStore('transfers', () => {
     handleSyncEvent,
     downloadRecords,
     downloadReceivedShare,
+    cancelUpload,
+    registerUploadCancellation,
+    retryUpload,
+    registerUploadRetry,
+    clearUploadRetry,
     pauseDownload,
     resumeDownload,
     cancelDownload,

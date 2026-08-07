@@ -17,7 +17,9 @@ import {
   buildBusinessHeaders,
   businessResponseCode,
   isAuthExpiredBusinessCode,
+  isUploadSecurityTokenExpired,
   resolveGuangyaProfile,
+  uploadCredentialsExpired,
 } from './guangya-protocol.mjs';
 import { createGuangyaDeveloperClient, DeveloperApiError } from './guangya-developer.mjs';
 import { createNativeMountManager, normalizeNativeMountOptions } from './native-mount.mjs';
@@ -379,6 +381,9 @@ const pendingUploads = new Map(database.prepare("SELECT mapping_id, file_path, s
 const inflight = new Map();
 const inflightItems = new Map();
 const waitingFiles = new Map();
+const failedUploads = new Map();
+const cancelledUploads = new Map();
+const activeUploadClients = new Map();
 const remoteCache = new Map([['', '']]);
 if (cacheEnabled) trimManagedCaches();
 else clearManagedCaches();
@@ -1107,6 +1112,15 @@ function invalidateAuthSession() {
 }
 function uploadHistoryPath(item) { return item.history_path || item.file_path; }
 function uploadEventPath(item) { return item.event_path || item.file_path; }
+class UploadCancelledError extends Error {
+  constructor() {
+    super('上传已取消');
+    this.name = 'UploadCancelledError';
+  }
+}
+function isUploadCancelled(key) { return cancelledUploads.has(key); }
+function assertUploadNotCancelled(key) { if (isUploadCancelled(key)) throw new UploadCancelledError(); }
+function isUploadCancellationError(error) { return error instanceof UploadCancelledError || error?.name === 'cancel' || error?.message === '上传已取消'; }
 function uploadCheckpointIdentity(item) {
   return [item.mapping_id, path.resolve(uploadHistoryPath(item))];
 }
@@ -1232,7 +1246,96 @@ function clearPendingUpload(key) {
   database.prepare("DELETE FROM uploaded_files WHERE mapping_id = ? AND file_path = ? AND status = 'oss_complete'").run(row.mapping_id, row.file_path);
   pendingUploads.delete(key);
 }
-function deleteMappingTransientUploads(mappingId) { database.prepare("DELETE FROM uploaded_files WHERE mapping_id = ? AND status <> 'cloud_confirmed'").run(mappingId); database.prepare('DELETE FROM upload_checkpoints WHERE mapping_id = ?').run(mappingId); for (const key of pendingUploads.keys()) if (key.startsWith(`${mappingId}::`)) pendingUploads.delete(key); }
+function pendingUploadItem(row) {
+  let stored = {};
+  try { stored = JSON.parse(row?.item_json || '{}'); } catch {}
+  return {
+    ...stored,
+    mapping_id: stored.mapping_id || row.mapping_id,
+    file_path: stored.file_path || row.file_path,
+    size: Number(stored.size ?? row.size ?? 0),
+    mtime: Number(stored.mtime ?? row.modified_ms ?? 0),
+  };
+}
+async function cancelUploadTask(filePath, mappingId = '') {
+  const targetPath = String(filePath || '').trim();
+  const targetMapping = String(mappingId || '').trim();
+  if (!targetPath) throw new Error('缺少要取消的上传路径');
+  const matches = (item) => uploadEventPath(item) === targetPath
+    && (!targetMapping || String(item.mapping_id || '') === targetMapping);
+  const matched = new Map();
+  for (const [key, item] of queue) if (matches(item)) matched.set(key, item);
+  for (const [key, item] of waitingFiles) if (matches(item)) matched.set(key, item);
+  for (const [key, item] of inflightItems) if (matches(item)) matched.set(key, item);
+  for (const [key, item] of failedUploads) if (matches(item)) matched.set(key, item);
+  for (const [key, row] of pendingUploads) {
+    const item = pendingUploadItem(row);
+    if (matches(item)) matched.set(key, item);
+  }
+
+  const cleanup = [];
+  for (const [key, item] of matched) {
+    cancelledUploads.set(key, uploadStamp(item));
+    queue.delete(key);
+    waitingFiles.delete(key);
+    failedUploads.delete(key);
+    flashPreflightCache.delete(key);
+    try { activeUploadClients.get(key)?.cancel(); } catch {}
+    clearUploadCheckpoint(item);
+    clearPendingUpload(key);
+    if (!inflightItems.has(key) && item.cleanup_path && isWithinRoot(manualUploadRoot, item.cleanup_path)) {
+      cleanup.push(fsp.rm(item.cleanup_path, { recursive: true, force: true }));
+    }
+    publish({
+      type: 'file',
+      state: 'cancelled',
+      file_path: uploadEventPath(item),
+      mapping_id: item.mapping_id,
+      uploaded_bytes: 0,
+      total_bytes: Number(item.size || 0),
+      stage: '已取消',
+    });
+  }
+  await Promise.allSettled(cleanup);
+  publishState();
+  pump();
+  return { cancelled: matched.size > 0, count: matched.size };
+}
+async function retryUploadTask(filePath, mappingId = '') {
+  const targetPath = String(filePath || '').trim();
+  const targetMapping = String(mappingId || '').trim();
+  if (!targetPath) throw new Error('缺少要重试的上传路径');
+  const matched = [...failedUploads.entries()].filter(([, item]) => uploadEventPath(item) === targetPath
+    && (!targetMapping || String(item.mapping_id || '') === targetMapping));
+  if (!matched.length) throw httpError(404, '失败的上传任务已失效，请重新选择文件上传');
+
+  let retried = 0;
+  for (const [key, item] of matched) {
+    let stat;
+    try { stat = await fsp.stat(item.file_path); }
+    catch { failedUploads.delete(key); continue; }
+    if (!stat.isFile()) { failedUploads.delete(key); continue; }
+    const refreshed = { ...item, size: stat.size, mtime: item.history_path ? item.mtime : stat.mtimeMs };
+    failedUploads.delete(key);
+    cancelledUploads.delete(key);
+    waitingFiles.delete(key);
+    flashPreflightCache.delete(key);
+    queue.delete(key);
+    queue.set(key, refreshed);
+    retried += 1;
+    publish({
+      type: 'file', state: token ? 'queued' : 'waiting-login',
+      file_path: uploadEventPath(refreshed), mapping_id: refreshed.mapping_id,
+      uploaded_bytes: 0, total_bytes: refreshed.size,
+      stage: token ? '已重新加入上传队列' : '等待登录后重试',
+    });
+  }
+  if (!retried) throw httpError(410, '本地源文件已不存在，请重新选择文件上传');
+  publishState();
+  pump();
+  return { retried: true, count: retried };
+}
+function deleteMappingTransientUploads(mappingId) { database.prepare("DELETE FROM uploaded_files WHERE mapping_id = ? AND status <> 'cloud_confirmed'").run(mappingId); database.prepare('DELETE FROM upload_checkpoints WHERE mapping_id = ?').run(mappingId); for (const key of pendingUploads.keys()) if (key.startsWith(`${mappingId}::`)) pendingUploads.delete(key); for (const key of failedUploads.keys()) if (key.startsWith(`${mappingId}::`)) failedUploads.delete(key); }
 function reuseMatchingConfirmedUpload(item) {
   const filePath = path.resolve(uploadHistoryPath(item));
   const candidates = database.prepare(`
@@ -1426,7 +1529,9 @@ async function queueServerUploads(values, parentId) {
     const mappingId = `__manual__:${crypto.createHash('sha256').update(destination).digest('hex').slice(0, 20)}`;
     const item = { mapping_id: mappingId, file_path: file.absolute, remote_parent_id: String(parentId || ''), remote_dir: file.remoteDir, size: stat.size, mtime: stat.mtimeMs };
     const key = queueKey(mappingId, file.absolute);
+    failedUploads.delete(key);
     const stamp = `${item.size}:${item.mtime}`;
+    cancelledUploads.delete(key);
     if (history.get(key) === stamp || pendingUploads.has(key) || inflight.get(key) === stamp || (queue.has(key) && `${queue.get(key).size}:${queue.get(key).mtime}` === stamp) || waitingFiles.has(key)) { skipped += 1; continue; }
     queue.set(key, item);
     queued += 1;
@@ -2255,10 +2360,11 @@ function isExplicitPermanentCloudTaskFailure(error) {
   return CLOUD_TASK_INVALID_CODES.has(code)
     || (error?.retryable === false && (Number.isFinite(code) || Number.isFinite(error?.httpStatus)));
 }
-async function waitTask(taskId, eventPath) {
+async function waitTask(taskId, eventPath, cancelled = () => false) {
   const deadline = Date.now() + cloudConfirmTimeoutMs;
   let attempt = 0;
   while (Date.now() < deadline) {
+    if (cancelled()) throw new UploadCancelledError();
     let transientFailure = false;
     try {
       const response = await apiPost('/userres/v1/file/get_info_by_task_id', { taskId }, [...CLOUD_TASK_PENDING_CODES]);
@@ -2286,6 +2392,7 @@ async function waitTask(taskId, eventPath) {
     const delayMs = Math.min(cloudConfirmPollMs * Math.max(1, Math.ceil(attempt / 5)), 5_000, Math.max(0, deadline - Date.now()));
     if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
+  if (cancelled()) throw new UploadCancelledError();
   const error = new Error(`云端入库超过 ${Math.round(cloudConfirmTimeoutMs / 1000)} 秒仍未完成，请稍后刷新云盘确认`);
   error.retryable = true;
   throw error;
@@ -2376,11 +2483,13 @@ async function prepareUploadItem(item) {
   return { ...item, size: second.size, mtime: item.history_path ? item.mtime : second.mtimeMs, source_dev: second.dev, source_ino: second.ino };
 }
 function scheduleBusyUploadRetry(key, item) {
+  if (isUploadCancelled(key)) return;
   waitingFiles.set(key, item);
   publish({ type: 'file', state: 'waiting-file', file_path: uploadEventPath(item), uploaded_bytes: 0, total_bytes: item.size, stage: '另外的程序正在使用该文件，释放后将自动上传' });
   publishState();
   setTimeout(async () => {
     waitingFiles.delete(key);
+    if (isUploadCancelled(key)) { publishState(); return; }
     try {
       const stat = await fsp.stat(item.file_path);
       if (!stat.isFile()) return;
@@ -2399,20 +2508,25 @@ function scheduleBusyUploadRetry(key, item) {
   }, fileBusyRetryMs);
 }
 async function preflightFlashUpload(item) {
+  const key = queueKey(item.mapping_id, uploadHistoryPath(item));
+  assertUploadNotCancelled(key);
   const source = await validateWatchedSource(item);
   item.file_path = source.absolute;
   const stat = source.stat;
   item.size = stat.size;
   if (!item.history_path) item.mtime = stat.mtimeMs;
   const eventPath = uploadEventPath(item);
+  assertUploadNotCancelled(key);
   if (loadUploadCheckpoint(item)) return { kind: 'skipped' };
 
   publish({ type: 'progress', file_path: eventPath, percent: 0, uploaded_bytes: 0, total_bytes: stat.size, bytes_per_second: 0, stage: '正在后台校验秒传' });
   const parentId = await ensureRemote(item.remote_parent_id || '', item.remote_dir);
+  assertUploadNotCancelled(key);
   const res = { fileSize: stat.size };
   if (stat.size < 1024 * 1024) {
     publish({ type: 'progress', file_path: eventPath, percent: 0, uploaded_bytes: 0, total_bytes: stat.size, bytes_per_second: 0, stage: '正在后台计算秒传 MD5' });
     res.md5 = await calculateFileHash(item.file_path, 'md5');
+    assertUploadNotCancelled(key);
   }
   const response = await apiPost('/userres/v1/get_res_center_token', {
     capacity: 2,
@@ -2420,6 +2534,7 @@ async function preflightFlashUpload(item) {
     res,
     parentId,
   }, [156]);
+  assertUploadNotCancelled(key);
   const data = response.data;
   if (!data?.taskId) throw new Error('光鸭没有返回上传任务 ID');
   let taskId = data.taskId;
@@ -2427,6 +2542,7 @@ async function preflightFlashUpload(item) {
   if (!instantUpload && stat.size >= 1024 * 1024) {
     try {
       const gcid = await calculateFileGcid(item.file_path, stat.size, stat.mtimeMs, eventPath);
+      assertUploadNotCancelled(key);
       const flash = await apiPost('/userres/v1/check_can_flash_upload', { taskId, gcid });
       instantUpload = flash.data?.canFlashUpload === true;
       if (instantUpload && flash.data?.taskId) taskId = String(flash.data.taskId);
@@ -2436,6 +2552,7 @@ async function preflightFlashUpload(item) {
   }
   if (!instantUpload) return { kind: 'miss', data };
 
+  assertUploadNotCancelled(key);
   clearUploadCheckpoint(item);
   publish({ type: 'progress', file_path: eventPath, percent: 100, uploaded_bytes: stat.size, total_bytes: stat.size, bytes_per_second: 0, stage: '已命中秒传' });
   if (item.mapping_id) savePendingUploadRecord(item, { taskId, remoteFileId: null });
@@ -2444,14 +2561,18 @@ async function preflightFlashUpload(item) {
   return { kind: 'accepted' };
 }
 async function upload(item) {
+  const key = queueKey(item.mapping_id, uploadHistoryPath(item));
+  assertUploadNotCancelled(key);
   const source = await validateWatchedSource(item);
   item.file_path = source.absolute;
   const stat = source.stat;
   item.size = stat.size;
   if (!item.history_path) item.mtime = stat.mtimeMs;
   const eventPath = uploadEventPath(item);
+  assertUploadNotCancelled(key);
   publish({ type: 'progress', file_path: eventPath, percent: 0, uploaded_bytes: 0, total_bytes: stat.size, stage: '正在准备云端目录' });
   const parentId = await ensureRemote(item.remote_parent_id || '', item.remote_dir);
+  assertUploadNotCancelled(key);
   publish({ type: 'progress', file_path: eventPath, percent: 0, uploaded_bytes: 0, total_bytes: stat.size, stage: '正在申请上传凭证' });
   let checkpoint = loadUploadCheckpoint(item);
   let response;
@@ -2507,6 +2628,16 @@ async function upload(item) {
     }
   }
   if (!instantUpload) {
+    if (uploadCredentialsExpired(data)) {
+      publish({ type: 'progress', file_path: eventPath, uploaded_bytes: Number(checkpoint?.uploadedBytes || 0), total_bytes: stat.size, bytes_per_second: 0, stage: '上传凭证已过期，正在刷新后续传' });
+      const resumed = await resumeUploadParams(data, stat.size);
+      data = resumed.params;
+      taskId = data.taskId || taskId;
+      if (checkpoint?.checkpoint) {
+        checkpoint.params = data;
+        saveUploadCheckpoint(item, data, checkpoint.checkpoint, checkpoint.uploadedBytes);
+      }
+    }
     if (!data.creds || !data.objectPath) throw new Error('光鸭没有返回完整上传凭证');
     let currentParams = data;
     let multipartCheckpoint = checkpoint?.checkpoint
@@ -2514,6 +2645,7 @@ async function upload(item) {
       : undefined;
     const uploadedAtStart = Math.max(0, Number(checkpoint?.uploadedBytes || 0));
     let lastUploadedBytes = uploadedAtStart;
+    let credentialRefreshes = 0;
     publish({ type: 'file', state: 'uploading', file_path: eventPath, uploaded_bytes: uploadedAtStart, total_bytes: stat.size });
     publish({ type: 'progress', file_path: eventPath, percent: stat.size ? Math.round(uploadedAtStart * 100 / stat.size) : 0, uploaded_bytes: uploadedAtStart, total_bytes: stat.size, stage: checkpoint ? '正在从断点继续上传' : '正在连接 OSS' });
     const uploadStartedAt = Date.now();
@@ -2534,13 +2666,19 @@ async function upload(item) {
           return true;
         },
       });
+      activeUploadClients.set(key, client);
       try {
+        assertUploadNotCancelled(key);
         await client.multipartUpload(currentParams.objectPath, item.file_path, {
           checkpoint: multipartCheckpoint,
           partSize: uploadPartSize(stat.size, multipartMode),
           parallel: ossParallel,
           timeout: ossTimeoutMs,
           progress: (fraction, nextCheckpoint) => {
+            if (isUploadCancelled(key)) {
+              client.cancel();
+              return;
+            }
             const normalized = Math.max(0, Math.min(1, Number(fraction) || 0));
             const uploadedBytes = Math.round(normalized * stat.size);
             lastUploadedBytes = Math.max(lastUploadedBytes, uploadedBytes);
@@ -2553,9 +2691,13 @@ async function upload(item) {
             publish({ type: 'progress', file_path: eventPath, percent: Math.round(normalized * 100), uploaded_bytes: uploadedBytes, total_bytes: stat.size, bytes_per_second: transferredThisRun / elapsedSeconds, stage: checkpoint ? '正在断点续传' : '正在上传' });
           },
         });
+        assertUploadNotCancelled(key);
         break;
       } catch (error) {
-        if (error.code === 'SecurityTokenExpired') {
+        if (isUploadCancelled(key) || isUploadCancellationError(error)) throw new UploadCancelledError();
+        if (isUploadSecurityTokenExpired(error) && credentialRefreshes < 3) {
+          credentialRefreshes += 1;
+          publish({ type: 'progress', file_path: eventPath, uploaded_bytes: lastUploadedBytes, total_bytes: stat.size, bytes_per_second: 0, stage: 'OSS 上传凭证已过期，正在刷新后续传' });
           const resumed = await resumeUploadParams(currentParams, stat.size);
           currentParams = resumed.params;
           taskId = currentParams.taskId || taskId;
@@ -2572,6 +2714,8 @@ async function upload(item) {
         const resumableError = new Error(message);
         resumableError.requeueUpload = Boolean(loadUploadCheckpoint(item));
         throw resumableError;
+      } finally {
+        if (activeUploadClients.get(key) === client) activeUploadClients.delete(key);
       }
     }
     clearUploadCheckpoint(item);
@@ -2580,14 +2724,16 @@ async function upload(item) {
     publish({ type: 'progress', file_path: eventPath, percent: 100, uploaded_bytes: stat.size, total_bytes: stat.size, stage: '已命中秒传' });
   }
   if (item.mapping_id) {
+    assertUploadNotCancelled(key);
     const pendingTask = { taskId, remoteFileId: null };
     savePendingUploadRecord(item, pendingTask);
   }
   publish({ type: 'progress', file_path: eventPath, percent: 100, uploaded_bytes: stat.size, total_bytes: stat.size, bytes_per_second: 0, stage: '已上传，正在等待云端入库' });
   publish({ type: 'file', state: 'processing', file_path: eventPath, uploaded_bytes: stat.size, total_bytes: stat.size, stage: '已上传，正在等待云端入库' });
   let taskData;
-  try { taskData = await waitTask(taskId, eventPath); }
+  try { taskData = await waitTask(taskId, eventPath, () => isUploadCancelled(key)); }
   catch (error) {
+    if (isUploadCancellationError(error)) throw error;
     const key = queueKey(item.mapping_id, uploadHistoryPath(item));
     if (error.permanentCloudTaskFailure) {
       clearPendingUpload(key);
@@ -2680,6 +2826,10 @@ function rebuildPendingItem(row) {
   return { mapping_id: mapping.id, file_path: row.file_path, relative_path: relative, change_kind: 'added', remote_parent_id: mapping.remote_parent_id || '', remote_dir: [mapping.remote_parent_id ? '' : mapping.remote_path, relativeDir].filter(Boolean).join('/'), size: Number(row.size), mtime: Number(row.modified_ms) };
 }
 async function finalizeConfirmedUpload(key, item, taskData, recovered = false) {
+  if (isUploadCancelled(key)) {
+    clearPendingUpload(key);
+    return false;
+  }
   if (!confirmPendingUploadRecord(key, taskData.taskId, taskData.remoteFileId)) return false;
   const mapping = mappings.find((entry) => entry.id === item.mapping_id && entry.enabled);
   if (mapping) {
@@ -2737,6 +2887,7 @@ async function finalizeConfirmedUpload(key, item, taskData, recovered = false) {
   return true;
 }
 function scheduleCloudUploadRetry(key, item, reason) {
+  if (isUploadCancelled(key)) return;
   if (!item?.file_path) {
     status('error', `云端明确拒绝上传任务，且本地源文件信息不足，无法自动重传：${reason}`);
     return;
@@ -2745,6 +2896,7 @@ function scheduleCloudUploadRetry(key, item, reason) {
   publish({ type: 'file', state: 'waiting-file', file_path: uploadEventPath(item), stage: '云端入库失败，稍后将重新上传' });
   setTimeout(async () => {
     waitingFiles.delete(key);
+    if (isUploadCancelled(key)) { publishState(); return; }
     try {
       const stat = await fsp.stat(item.file_path);
       if (!stat.isFile()) throw new Error('本地源文件已不存在');
@@ -2780,7 +2932,7 @@ async function recoverPendingUploads() {
   if (!token || pendingRecoveryPromise) return pendingRecoveryPromise;
   pendingRecoveryPromise = (async () => {
     for (const [key, row] of [...pendingUploads]) {
-      if (!token || inflight.has(key) || !pendingUploads.has(key)) continue;
+      if (!token || inflight.has(key) || !pendingUploads.has(key) || isUploadCancelled(key)) continue;
       const item = rebuildPendingItem(row);
       const eventPath = item ? uploadEventPath(item) : row.file_path;
       if (!row.task_id) {
@@ -2791,7 +2943,7 @@ async function recoverPendingUploads() {
       }
       publish({ type: 'file', state: 'processing', file_path: eventPath, stage: '正在恢复云端入库确认' });
       try {
-        const data = await waitTask(row.task_id, eventPath);
+        const data = await waitTask(row.task_id, eventPath, () => isUploadCancelled(key));
         if (!item) {
           if (!confirmPendingUploadRecord(key, row.task_id, data.fileId)) continue;
           status('warning', `已恢复云端入库确认，但旧记录缺少任务上下文，未执行自动分享和源文件策略：${eventPath}`);
@@ -2799,6 +2951,10 @@ async function recoverPendingUploads() {
           await finalizeConfirmedUpload(key, item, { taskId: row.task_id, remoteFileId: data.fileId }, true);
         }
       } catch (error) {
+        if (isUploadCancellationError(error) || isUploadCancelled(key)) {
+          clearPendingUpload(key);
+          continue;
+        }
         if (error.permanentCloudTaskFailure) {
           clearPendingUpload(key);
           if (item) scheduleCloudUploadRetry(key, item, error.message);
@@ -2832,7 +2988,7 @@ async function cleanupUnreferencedManualUploads() {
 }
 function pumpFlashPreflight() {
   if (paused || !token || active === 0 || activeFlashPreflights >= flashPreflightConcurrency) return;
-  const candidate = [...queue.entries()].find(([key, item]) => !inflight.has(key) && !flashPreflightCached(key, item));
+  const candidate = [...queue.entries()].find(([key, item]) => !inflight.has(key) && !isUploadCancelled(key) && !flashPreflightCached(key, item));
   if (!candidate) return;
   const [key, item] = candidate;
   queue.delete(key);
@@ -2843,8 +2999,10 @@ function pumpFlashPreflight() {
   let preserveSource = true;
   prepareUploadItem(item).then((ready) => {
     Object.assign(item, ready);
+    assertUploadNotCancelled(key);
     return preflightFlashUpload(item);
   }).then(async (result) => {
+    assertUploadNotCancelled(key);
     if (result.kind === 'miss') {
       if (!mappingAcceptsUpload(item)) {
         flashPreflightCache.delete(key);
@@ -2868,6 +3026,12 @@ function pumpFlashPreflight() {
     flashPreflightCache.delete(key);
     if (result.kind === 'accepted') return;
   }).catch((error) => {
+    if (isUploadCancellationError(error) || isUploadCancelled(key)) {
+      preserveSource = false;
+      clearUploadCheckpoint(item);
+      publish({ type: 'file', state: 'cancelled', file_path: uploadEventPath(item), mapping_id: item.mapping_id, total_bytes: item.size, stage: '已取消' });
+      return;
+    }
     if (isFileBusyError(error)) {
       scheduleBusyUploadRetry(key, item);
       return;
@@ -2896,10 +3060,11 @@ function pumpFlashPreflight() {
 function pump() {
   if (paused || !token) { publishState(); return; }
   while (active < uploadConcurrency && queue.size) {
-    const candidate = [...queue.entries()].find(([key]) => !inflight.has(key));
+    const candidate = [...queue.entries()].find(([key]) => !inflight.has(key) && !isUploadCancelled(key));
     if (!candidate) break;
     const [key, item] = candidate;
     queue.delete(key);
+    failedUploads.delete(key);
     inflight.set(key, `${item.size}:${item.mtime}`);
     inflightItems.set(key, item);
     active += 1;
@@ -2907,8 +3072,10 @@ function pump() {
     let preserveSource = false;
     prepareUploadItem(item).then((ready) => {
       Object.assign(item, ready);
+      assertUploadNotCancelled(key);
       return upload(item);
     }).then(async (taskData) => {
+      assertUploadNotCancelled(key);
       if (taskData.pending) {
         preserveSource = true;
         status('warning', `文件已上传到 OSS，云端尚未确认入库；已保留记录并会自动重试：${uploadEventPath(item)}：${taskData.pendingError}`);
@@ -2917,6 +3084,12 @@ function pump() {
       }
       await finalizeConfirmedUpload(key, item, taskData);
     }).catch((error) => {
+      if (isUploadCancellationError(error) || isUploadCancelled(key)) {
+        clearUploadCheckpoint(item);
+        clearPendingUpload(key);
+        publish({ type: 'file', state: 'cancelled', file_path: uploadEventPath(item), mapping_id: item.mapping_id, total_bytes: item.size, stage: '已取消' });
+        return;
+      }
       if (isFileBusyError(error)) {
         preserveSource = true;
         scheduleBusyUploadRetry(key, item);
@@ -2929,6 +3102,8 @@ function pump() {
       }
       recordAutoShareFailure(item, error);
       console.error(`上传失败：${item.file_path}：${error.stack || error.message}`);
+      preserveSource = true;
+      failedUploads.set(key, item);
       publish({ type: 'file', state: 'error', file_path: uploadEventPath(item), total_bytes: item.size, error: error.message });
     }).finally(async () => {
       if (!preserveSource && item.cleanup_path && isWithinRoot(manualUploadRoot, item.cleanup_path)) await fsp.rm(item.cleanup_path, { recursive: true, force: true });
@@ -2950,7 +3125,10 @@ async function enqueue(mapping, file) {
   const stat = source.stat;
   if (ignore(filePath) || !shouldSync(filePath, mapping.sync_types)) return;
   const key = queueKey(mapping.id, filePath);
+  failedUploads.delete(key);
   const mark = `${stat.size}:${stat.mtimeMs}`;
+  if (cancelledUploads.get(key) === mark) return;
+  if (cancelledUploads.has(key)) cancelledUploads.delete(key);
   if (history.get(key) === mark || pendingUploads.has(key) || inflight.get(key) === mark) return;
   if (waitingFiles.has(key)) return;
   const queued = queue.get(key);
@@ -3546,7 +3724,9 @@ async function handleWebUpload(request, response, url) {
     const mappingId = `__browser__:${crypto.createHash('sha256').update(`${parentId}::${remoteDir}`).digest('hex').slice(0, 20)}`;
     const item = { mapping_id: mappingId, file_path: temporaryFile, history_path: path.join(dataDir, 'browser-history', relativePath), event_path: `[浏览器]/${relativePath}`, remote_parent_id: parentId, remote_dir: remoteDir, size: stat.size, mtime: modified, cleanup_path: temporaryRoot };
     const historyKey = queueKey(mappingId, uploadHistoryPath(item));
+    failedUploads.delete(historyKey);
     const stamp = `${item.size}:${item.mtime}`;
+    cancelledUploads.delete(historyKey);
     const waiting = queue.get(historyKey);
     if (history.get(historyKey) === stamp || pendingUploads.has(historyKey) || inflight.get(historyKey) === stamp || (waiting && `${waiting.size}:${waiting.mtime}` === stamp) || waitingFiles.has(historyKey)) return json(response, 200, { queued: 0, skipped: 1, fileName });
     queue.set(historyKey, item);
@@ -3793,6 +3973,14 @@ async function routeApiV2(request, response, url) {
     if (!token) throw new Error('请先登录光鸭云盘');
     const body = await readBody(request, { maxBytes: 1024 * 1024 });
     return json(response, 200, await queueServerUploads(body.paths, body.parent_id));
+  }
+  if (request.method === 'POST' && url.pathname === '/api/uploads/cancel') {
+    const body = await readBody(request, { maxBytes: 16 * 1024 });
+    return json(response, 200, await cancelUploadTask(body.file_path ?? body.filePath, body.mapping_id ?? body.mappingId));
+  }
+  if (request.method === 'POST' && url.pathname === '/api/uploads/retry') {
+    const body = await readBody(request, { maxBytes: 16 * 1024 });
+    return json(response, 200, await retryUploadTask(body.file_path ?? body.filePath, body.mapping_id ?? body.mappingId));
   }
   if (request.method === 'POST' && url.pathname === '/api/files/create-folder') {
     const body = await readBody(request);

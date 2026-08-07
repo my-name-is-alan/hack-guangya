@@ -101,6 +101,70 @@ test('Docker 自动续期确认失效后清空会话并回到未登录状态', a
   }
 });
 
+test('上传失败后可以从服务端队列手动重试', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-upload-retry-test-'));
+  const dataDir = path.join(root, 'data');
+  const watchRoot = path.join(root, 'watch');
+  const archiveRoot = path.join(root, 'archive');
+  await Promise.all([
+    fsp.mkdir(dataDir, { recursive: true }),
+    fsp.mkdir(watchRoot, { recursive: true }),
+    fsp.mkdir(archiveRoot, { recursive: true }),
+  ]);
+
+  const apiServer = http.createServer(async (request, response) => {
+    for await (const _ of request) {}
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ code: 999, msg: '模拟上传凭证失败', data: {} }));
+  });
+  apiServer.listen(0, '127.0.0.1');
+  await once(apiServer, 'listening');
+
+  const port = await freePort();
+  const child = spawn(process.execPath, [path.join(here, 'server.mjs')], {
+    cwd: path.resolve(here, '..'),
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DATA_DIR: dataDir,
+      GUANGYA_WATCH_ROOT: watchRoot,
+      GUANGYA_ARCHIVE_ROOT: archiveRoot,
+      GUANGYA_API_BASE: `http://127.0.0.1:${apiServer.address().port}`,
+      GUANGYA_TOKEN: 'upload-retry-token',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+
+  try {
+    await waitUntil(() => output.includes('Guangya Web listening'));
+    const uploadResponse = await fetch(`http://127.0.0.1:${port}/api/upload?fileName=retry.bin&relativePath=retry.bin`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: Buffer.from('retry upload'),
+    });
+    assert.equal(uploadResponse.status, 202, await uploadResponse.text());
+
+    const retryResult = await waitUntil(async () => {
+      const response = await fetch(`http://127.0.0.1:${port}/api/uploads/retry`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ file_path: '[浏览器]/retry.bin' }),
+      });
+      if (response.status !== 200) return null;
+      return response.json();
+    });
+    assert.deepEqual(retryResult, { retried: true, count: 1 });
+  } finally {
+    child.kill();
+    await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 2_000))]);
+    await new Promise((resolve) => apiServer.close(resolve));
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('备份任务扫描已有文件并只监控所选类型', async () => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-sync-test-'));
   const watchRoot = path.join(root, 'watch');
@@ -197,6 +261,16 @@ test('备份任务扫描已有文件并只监控所选类型', async () => {
       return state.pending === 3 ? state : null;
     }, 12_000);
     assert.equal(afterPolling.mappings[0].monitor_mode, 'polling');
+
+    const cancelResponse = await fetch(`http://127.0.0.1:${port}/api/uploads/cancel`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ file_path: path.join(watchRoot, 'polled.pdf'), mapping_id: mappingId }),
+    });
+    assert.equal(cancelResponse.status, 200);
+    assert.deepEqual(await cancelResponse.json(), { cancelled: true, count: 1 });
+    const afterCancel = await fetch(`http://127.0.0.1:${port}/api/state`).then((value) => value.json());
+    assert.equal(afterCancel.pending, 2);
   } finally {
     child.kill();
     await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 2_000))]);

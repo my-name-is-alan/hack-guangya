@@ -93,6 +93,24 @@ export function isAuthExpiredBusinessCode(value) {
   return AUTH_EXPIRED_CODES.includes(Number(value));
 }
 
+export function uploadCredentialsExpired(params, now = Date.now()) {
+  const expiration = Date.parse(String(params?.creds?.expiration || ''));
+  return !Number.isFinite(expiration) || expiration <= Number(now);
+}
+
+export function isUploadSecurityTokenExpired(error) {
+  const values = [
+    error?.code,
+    error?.name,
+    error?.message,
+    error?.cause?.code,
+    error?.cause?.message,
+    error?.data?.Code,
+    error?.response?.data?.Code,
+  ];
+  return values.some((value) => String(value || '').includes('SecurityTokenExpired'));
+}
+
 export function cloudCollectionResourceType(value) {
   const source = String(value || '').trim().toLowerCase();
   if (source.startsWith('magnet:')) return 1;
