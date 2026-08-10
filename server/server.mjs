@@ -31,6 +31,7 @@ import {
 } from './network-preferences.mjs';
 import { createOrganizerService } from './organizer.mjs';
 import { uploadPartSize } from './upload-parts.mjs';
+import { createVirtualLibraryService } from './virtual-library.mjs';
 import { createWebDavHandler, normalizeWebDavEntry, WebDavError } from './webdav.mjs';
 import { parseGuangyaShareLink } from '../ui/shareLink.js';
 
@@ -55,10 +56,23 @@ if (!loopbackHosts.has(requestedWebDavHost.toLowerCase()) && !allowWebDavNonLoop
 }
 const webdavHost = requestedWebDavHost;
 const webdavEndpoint = `http://127.0.0.1:${webdavPublicPort}/dav/`;
+const defaultEmbyProxyPort = process.env.NODE_TEST_CONTEXT ? 0 : 18096;
+const embyProxyPort = Number(process.env.GUANGYA_EMBY_PROXY_PORT ?? defaultEmbyProxyPort);
+if (!Number.isInteger(embyProxyPort) || embyProxyPort < 0 || embyProxyPort > 65535) throw new Error('GUANGYA_EMBY_PROXY_PORT 必须是 0 到 65535 的整数');
+const embyProxyPublicPort = Number(process.env.GUANGYA_EMBY_PROXY_PUBLIC_PORT || embyProxyPort);
+if (!Number.isInteger(embyProxyPublicPort) || embyProxyPublicPort < 0 || embyProxyPublicPort > 65535) throw new Error('GUANGYA_EMBY_PROXY_PUBLIC_PORT 必须是 0 到 65535 的整数');
+const requestedEmbyProxyHost = String(process.env.GUANGYA_EMBY_PROXY_HOST || '127.0.0.1').trim();
+const allowEmbyProxyNonLoopback = process.env.GUANGYA_EMBY_PROXY_ALLOW_NON_LOOPBACK === '1';
+if (!loopbackHosts.has(requestedEmbyProxyHost.toLowerCase()) && !allowEmbyProxyNonLoopback) {
+  throw new Error('Emby 代理端口默认只允许监听回环地址；容器内部监听需显式设置 GUANGYA_EMBY_PROXY_ALLOW_NON_LOOPBACK=1');
+}
+const embyProxyHost = requestedEmbyProxyHost;
+const embyUpstream = String(process.env.GUANGYA_EMBY_UPSTREAM || 'http://127.0.0.1:8096').trim();
 const configuredDataDir = path.resolve(process.env.DATA_DIR || path.join(here, '..', '.web-data'));
 const configuredWatchRoot = path.resolve(process.env.GUANGYA_WATCH_ROOT || path.join(here, '..', 'watch'));
 const configuredArchiveRoot = path.resolve(process.env.GUANGYA_ARCHIVE_ROOT || path.join(here, '..', 'archive'));
-for (const directory of [configuredDataDir, configuredWatchRoot, configuredArchiveRoot]) fs.mkdirSync(directory, { recursive: true });
+const configuredVirtualLibraryRoot = path.resolve(process.env.GUANGYA_VIRTUAL_LIBRARY_ROOT || path.join(here, '..', 'virtual-library'));
+for (const directory of [configuredDataDir, configuredWatchRoot, configuredArchiveRoot, configuredVirtualLibraryRoot]) fs.mkdirSync(directory, { recursive: true });
 function canonicalizePathSync(value) {
   const resolved = path.resolve(String(value));
   let existing = resolved;
@@ -73,6 +87,7 @@ function canonicalizePathSync(value) {
 const dataDir = canonicalizePathSync(configuredDataDir);
 const watchRoot = canonicalizePathSync(configuredWatchRoot);
 const archiveRoot = canonicalizePathSync(configuredArchiveRoot);
+const virtualLibraryRoot = canonicalizePathSync(configuredVirtualLibraryRoot);
 const fileRoots = (process.env.GUANGYA_FILE_ROOTS || watchRoot).split(',').map((value) => value.trim()).filter(Boolean).map(canonicalizePathSync);
 const configFile = path.join(dataDir, 'config.json');
 const databaseFile = path.join(dataDir, 'state.sqlite3');
@@ -383,6 +398,8 @@ const inflightItems = new Map();
 const waitingFiles = new Map();
 const failedUploads = new Map();
 const cancelledUploads = new Map();
+const pausedUploads = new Set();
+const queuePauseRequests = new Set();
 const activeUploadClients = new Map();
 const remoteCache = new Map([['', '']]);
 if (cacheEnabled) trimManagedCaches();
@@ -1118,9 +1135,21 @@ class UploadCancelledError extends Error {
     this.name = 'UploadCancelledError';
   }
 }
+class UploadPausedError extends Error {
+  constructor() {
+    super('上传已暂停');
+    this.name = 'UploadPausedError';
+  }
+}
 function isUploadCancelled(key) { return cancelledUploads.has(key); }
 function assertUploadNotCancelled(key) { if (isUploadCancelled(key)) throw new UploadCancelledError(); }
 function isUploadCancellationError(error) { return error instanceof UploadCancelledError || error?.name === 'cancel' || error?.message === '上传已取消'; }
+function isUploadPauseRequested(key) { return pausedUploads.has(key) || queuePauseRequests.has(key); }
+function assertUploadRunnable(key) {
+  assertUploadNotCancelled(key);
+  if (isUploadPauseRequested(key)) throw new UploadPausedError();
+}
+function isUploadPauseError(error) { return error instanceof UploadPausedError || error?.message === '上传已暂停'; }
 function uploadCheckpointIdentity(item) {
   return [item.mapping_id, path.resolve(uploadHistoryPath(item))];
 }
@@ -1276,6 +1305,8 @@ async function cancelUploadTask(filePath, mappingId = '') {
   const cleanup = [];
   for (const [key, item] of matched) {
     cancelledUploads.set(key, uploadStamp(item));
+    pausedUploads.delete(key);
+    queuePauseRequests.delete(key);
     queue.delete(key);
     waitingFiles.delete(key);
     failedUploads.delete(key);
@@ -1318,6 +1349,8 @@ async function retryUploadTask(filePath, mappingId = '') {
     const refreshed = { ...item, size: stat.size, mtime: item.history_path ? item.mtime : stat.mtimeMs };
     failedUploads.delete(key);
     cancelledUploads.delete(key);
+    pausedUploads.delete(key);
+    queuePauseRequests.delete(key);
     waitingFiles.delete(key);
     flashPreflightCache.delete(key);
     queue.delete(key);
@@ -1334,6 +1367,71 @@ async function retryUploadTask(filePath, mappingId = '') {
   publishState();
   pump();
   return { retried: true, count: retried };
+}
+
+async function pauseUploadTask(filePath, mappingId = '') {
+  const targetPath = String(filePath || '').trim();
+  const targetMapping = String(mappingId || '').trim();
+  if (!targetPath) throw new Error('缺少要暂停的上传路径');
+  const matches = (item) => uploadEventPath(item) === targetPath
+    && (!targetMapping || String(item.mapping_id || '') === targetMapping);
+  const matched = new Map();
+  for (const [key, item] of queue) if (matches(item)) matched.set(key, item);
+  for (const [key, item] of waitingFiles) if (matches(item)) matched.set(key, item);
+  for (const [key, item] of inflightItems) if (matches(item)) matched.set(key, item);
+  if (!matched.size) return { paused: false, count: 0 };
+
+  for (const [key, item] of matched) {
+    pausedUploads.add(key);
+    const checkpoint = loadUploadCheckpoint(item);
+    if (inflightItems.has(key)) {
+      try { activeUploadClients.get(key)?.cancel(); } catch {}
+      publish({
+        type: 'file', state: 'pausing', file_path: uploadEventPath(item), mapping_id: item.mapping_id,
+        uploaded_bytes: Number(checkpoint?.uploadedBytes || 0), total_bytes: Number(item.size || 0),
+        stage: '正在暂停并保存上传断点',
+      });
+      continue;
+    }
+    publish({
+      type: 'file', state: 'paused', file_path: uploadEventPath(item), mapping_id: item.mapping_id,
+      uploaded_bytes: Number(checkpoint?.uploadedBytes || 0), total_bytes: Number(item.size || 0),
+      stage: '已暂停，可从当前断点继续',
+    });
+  }
+  publishState();
+  return { paused: true, count: matched.size };
+}
+
+async function resumeUploadTask(filePath, mappingId = '') {
+  const targetPath = String(filePath || '').trim();
+  const targetMapping = String(mappingId || '').trim();
+  if (!targetPath) throw new Error('缺少要继续的上传路径');
+  if (paused) throw httpError(409, '上传队列已暂停，请先恢复队列');
+  const matches = (item) => uploadEventPath(item) === targetPath
+    && (!targetMapping || String(item.mapping_id || '') === targetMapping);
+  const matched = new Map();
+  for (const [key, item] of queue) if (pausedUploads.has(key) && matches(item)) matched.set(key, item);
+  for (const [key, item] of waitingFiles) if (pausedUploads.has(key) && matches(item)) matched.set(key, item);
+  for (const [key, item] of inflightItems) if (pausedUploads.has(key) && matches(item)) matched.set(key, item);
+  if (!matched.size) return { resumed: false, count: 0 };
+  if ([...matched.keys()].some((key) => inflightItems.has(key))) {
+    throw httpError(409, '上传任务正在进入暂停状态，请稍后继续');
+  }
+
+  for (const [key, item] of matched) {
+    pausedUploads.delete(key);
+    const waiting = waitingFiles.has(key);
+    publish({
+      type: 'file', state: waiting ? 'waiting-file' : token ? 'queued' : 'waiting-login',
+      file_path: uploadEventPath(item), mapping_id: item.mapping_id,
+      uploaded_bytes: 0, total_bytes: Number(item.size || 0),
+      stage: waiting ? '另外的程序正在使用该文件，释放后将自动上传' : token ? '已恢复，等待上传通道' : '等待登录后继续上传',
+    });
+  }
+  publishState();
+  pump();
+  return { resumed: true, count: matched.size };
 }
 function deleteMappingTransientUploads(mappingId) { database.prepare("DELETE FROM uploaded_files WHERE mapping_id = ? AND status <> 'cloud_confirmed'").run(mappingId); database.prepare('DELETE FROM upload_checkpoints WHERE mapping_id = ?').run(mappingId); for (const key of pendingUploads.keys()) if (key.startsWith(`${mappingId}::`)) pendingUploads.delete(key); for (const key of failedUploads.keys()) if (key.startsWith(`${mappingId}::`)) failedUploads.delete(key); }
 function reuseMatchingConfirmedUpload(item) {
@@ -1427,7 +1525,20 @@ const organizer = createOrganizerService({
     renameEntry: (fileId, name) => renameRemote(String(fileId), String(name)),
     deleteEntry: (fileId) => executeFileTask('/userres/v1/file/delete_file', { fileIds: [String(fileId)] }),
     uploadBuffer: organizerUploadBuffer,
+    getDownloadUrl: async (fileId) => (await getCloudDownload({ file_ids: [String(fileId)], packaged: false })).download_url,
     shareAfterOrganize: createOrganizerShare,
+  },
+});
+const virtualLibrary = createVirtualLibraryService({
+  database,
+  publish,
+  root: virtualLibraryRoot,
+  proxyPort: embyProxyPublicPort,
+  embyUpstream,
+  fetchImpl: (...args) => createProxiedFetch(networkPreferences.proxy_url, undiciFetch)(...args),
+  cloud: {
+    listChildren: organizerListCloudChildren,
+    getDownloadUrl: async (fileId) => (await getCloudDownload({ file_ids: [String(fileId)], packaged: false })).download_url,
   },
 });
 async function resolveMappingPath(mapping, value, expectedType = null) {
@@ -1709,7 +1820,8 @@ async function getCloudDownload(body) {
   if (!packaged && fileIds.length !== 1) throw new Error('单文件下载只能选择一个文件');
   if (!packaged) {
     const response = await apiPost('/userres/v1/get_res_download_url', { fileId: fileIds[0] });
-    const downloadUrl = String(response.data?.signedURL || response.data?.signedUrl || '');
+    const downloadUrl = String(response.data?.signedURL || response.data?.signedUrl
+      || response.data?.downloadUrl || response.data?.downloadURL || response.data?.url || '');
     if (!downloadUrl) throw new Error('光鸭没有返回文件下载地址');
     return { download_url: downloadUrl, mode: 'single' };
   }
@@ -2498,7 +2610,8 @@ function scheduleBusyUploadRetry(key, item) {
       const stamp = `${refreshed.size}:${refreshed.mtime}`;
       if (history.get(key) === stamp || pendingUploads.has(key) || inflight.get(key) === stamp || (queue.has(key) && `${queue.get(key).size}:${queue.get(key).mtime}` === stamp)) return;
       queue.set(key, refreshed);
-      publish({ type: 'file', state: 'waiting-file', file_path: uploadEventPath(refreshed), uploaded_bytes: 0, total_bytes: refreshed.size, stage: '另外的程序正在使用该文件，释放后将自动上传' });
+      const uploadPaused = pausedUploads.has(key);
+      publish({ type: 'file', state: uploadPaused ? 'paused' : 'waiting-file', file_path: uploadEventPath(refreshed), uploaded_bytes: 0, total_bytes: refreshed.size, stage: uploadPaused ? '已暂停，可从当前断点继续' : '另外的程序正在使用该文件，释放后将自动上传' });
     } catch {
       // 文件暂时消失时等待后续文件系统事件重新入队。
     } finally {
@@ -2509,24 +2622,24 @@ function scheduleBusyUploadRetry(key, item) {
 }
 async function preflightFlashUpload(item) {
   const key = queueKey(item.mapping_id, uploadHistoryPath(item));
-  assertUploadNotCancelled(key);
+  assertUploadRunnable(key);
   const source = await validateWatchedSource(item);
   item.file_path = source.absolute;
   const stat = source.stat;
   item.size = stat.size;
   if (!item.history_path) item.mtime = stat.mtimeMs;
   const eventPath = uploadEventPath(item);
-  assertUploadNotCancelled(key);
+  assertUploadRunnable(key);
   if (loadUploadCheckpoint(item)) return { kind: 'skipped' };
 
   publish({ type: 'progress', file_path: eventPath, percent: 0, uploaded_bytes: 0, total_bytes: stat.size, bytes_per_second: 0, stage: '正在后台校验秒传' });
   const parentId = await ensureRemote(item.remote_parent_id || '', item.remote_dir);
-  assertUploadNotCancelled(key);
+  assertUploadRunnable(key);
   const res = { fileSize: stat.size };
   if (stat.size < 1024 * 1024) {
     publish({ type: 'progress', file_path: eventPath, percent: 0, uploaded_bytes: 0, total_bytes: stat.size, bytes_per_second: 0, stage: '正在后台计算秒传 MD5' });
     res.md5 = await calculateFileHash(item.file_path, 'md5');
-    assertUploadNotCancelled(key);
+    assertUploadRunnable(key);
   }
   const response = await apiPost('/userres/v1/get_res_center_token', {
     capacity: 2,
@@ -2534,7 +2647,7 @@ async function preflightFlashUpload(item) {
     res,
     parentId,
   }, [156]);
-  assertUploadNotCancelled(key);
+  assertUploadRunnable(key);
   const data = response.data;
   if (!data?.taskId) throw new Error('光鸭没有返回上传任务 ID');
   let taskId = data.taskId;
@@ -2542,7 +2655,7 @@ async function preflightFlashUpload(item) {
   if (!instantUpload && stat.size >= 1024 * 1024) {
     try {
       const gcid = await calculateFileGcid(item.file_path, stat.size, stat.mtimeMs, eventPath);
-      assertUploadNotCancelled(key);
+      assertUploadRunnable(key);
       const flash = await apiPost('/userres/v1/check_can_flash_upload', { taskId, gcid });
       instantUpload = flash.data?.canFlashUpload === true;
       if (instantUpload && flash.data?.taskId) taskId = String(flash.data.taskId);
@@ -2562,17 +2675,17 @@ async function preflightFlashUpload(item) {
 }
 async function upload(item) {
   const key = queueKey(item.mapping_id, uploadHistoryPath(item));
-  assertUploadNotCancelled(key);
+  assertUploadRunnable(key);
   const source = await validateWatchedSource(item);
   item.file_path = source.absolute;
   const stat = source.stat;
   item.size = stat.size;
   if (!item.history_path) item.mtime = stat.mtimeMs;
   const eventPath = uploadEventPath(item);
-  assertUploadNotCancelled(key);
+  assertUploadRunnable(key);
   publish({ type: 'progress', file_path: eventPath, percent: 0, uploaded_bytes: 0, total_bytes: stat.size, stage: '正在准备云端目录' });
   const parentId = await ensureRemote(item.remote_parent_id || '', item.remote_dir);
-  assertUploadNotCancelled(key);
+  assertUploadRunnable(key);
   publish({ type: 'progress', file_path: eventPath, percent: 0, uploaded_bytes: 0, total_bytes: stat.size, stage: '正在申请上传凭证' });
   let checkpoint = loadUploadCheckpoint(item);
   let response;
@@ -2668,14 +2781,14 @@ async function upload(item) {
       });
       activeUploadClients.set(key, client);
       try {
-        assertUploadNotCancelled(key);
+        assertUploadRunnable(key);
         await client.multipartUpload(currentParams.objectPath, item.file_path, {
           checkpoint: multipartCheckpoint,
           partSize: uploadPartSize(stat.size, multipartMode),
           parallel: ossParallel,
           timeout: ossTimeoutMs,
           progress: (fraction, nextCheckpoint) => {
-            if (isUploadCancelled(key)) {
+            if (isUploadCancelled(key) || isUploadPauseRequested(key)) {
               client.cancel();
               return;
             }
@@ -2694,6 +2807,7 @@ async function upload(item) {
         assertUploadNotCancelled(key);
         break;
       } catch (error) {
+        if (isUploadPauseRequested(key)) throw new UploadPausedError();
         if (isUploadCancelled(key) || isUploadCancellationError(error)) throw new UploadCancelledError();
         if (isUploadSecurityTokenExpired(error) && credentialRefreshes < 3) {
           credentialRefreshes += 1;
@@ -2988,7 +3102,7 @@ async function cleanupUnreferencedManualUploads() {
 }
 function pumpFlashPreflight() {
   if (paused || !token || active === 0 || activeFlashPreflights >= flashPreflightConcurrency) return;
-  const candidate = [...queue.entries()].find(([key, item]) => !inflight.has(key) && !isUploadCancelled(key) && !flashPreflightCached(key, item));
+  const candidate = [...queue.entries()].find(([key, item]) => !inflight.has(key) && !isUploadCancelled(key) && !pausedUploads.has(key) && !flashPreflightCached(key, item));
   if (!candidate) return;
   const [key, item] = candidate;
   queue.delete(key);
@@ -2999,7 +3113,7 @@ function pumpFlashPreflight() {
   let preserveSource = true;
   prepareUploadItem(item).then((ready) => {
     Object.assign(item, ready);
-    assertUploadNotCancelled(key);
+    assertUploadRunnable(key);
     return preflightFlashUpload(item);
   }).then(async (result) => {
     assertUploadNotCancelled(key);
@@ -3010,7 +3124,7 @@ function pumpFlashPreflight() {
       }
       flashPreflightCache.set(key, { stamp: uploadStamp(item), data: result.data, createdAt: Date.now() });
       prependQueuedItem(key, item);
-      publish({ type: 'file', state: 'queued', file_path: uploadEventPath(item), uploaded_bytes: 0, total_bytes: item.size, stage: '秒传未命中，等待上传通道' });
+      publish({ type: 'file', state: isUploadPauseRequested(key) ? 'paused' : 'queued', file_path: uploadEventPath(item), uploaded_bytes: 0, total_bytes: item.size, stage: isUploadPauseRequested(key) ? '已暂停，可从当前断点继续' : '秒传未命中，等待上传通道' });
       return;
     }
     if (result.kind === 'skipped') {
@@ -3020,13 +3134,29 @@ function pumpFlashPreflight() {
       }
       flashPreflightCache.set(key, { stamp: uploadStamp(item), data: null, createdAt: Date.now() });
       prependQueuedItem(key, item);
-      publish({ type: 'file', state: 'queued', file_path: uploadEventPath(item), uploaded_bytes: 0, total_bytes: item.size, stage: '已有上传断点，等待上传通道' });
+      publish({ type: 'file', state: isUploadPauseRequested(key) ? 'paused' : 'queued', file_path: uploadEventPath(item), uploaded_bytes: 0, total_bytes: item.size, stage: isUploadPauseRequested(key) ? '已暂停，可从当前断点继续' : '已有上传断点，等待上传通道' });
       return;
     }
     flashPreflightCache.delete(key);
-    if (result.kind === 'accepted') return;
+    if (result.kind === 'accepted') {
+      pausedUploads.delete(key);
+      queuePauseRequests.delete(key);
+      return;
+    }
   }).catch((error) => {
-    if (isUploadCancellationError(error) || isUploadCancelled(key)) {
+    if (isUploadCancelled(key)) {
+      preserveSource = false;
+      clearUploadCheckpoint(item);
+      publish({ type: 'file', state: 'cancelled', file_path: uploadEventPath(item), mapping_id: item.mapping_id, total_bytes: item.size, stage: '已取消' });
+      return;
+    }
+    if (isUploadPauseError(error) || isUploadPauseRequested(key)) {
+      if (mappingAcceptsUpload(item)) prependQueuedItem(key, item);
+      const checkpoint = loadUploadCheckpoint(item);
+      publish({ type: 'file', state: 'paused', file_path: uploadEventPath(item), mapping_id: item.mapping_id, uploaded_bytes: Number(checkpoint?.uploadedBytes || 0), total_bytes: item.size, stage: pausedUploads.has(key) ? '已暂停，可从当前断点继续' : '队列已暂停，可从当前断点继续' });
+      return;
+    }
+    if (isUploadCancellationError(error)) {
       preserveSource = false;
       clearUploadCheckpoint(item);
       publish({ type: 'file', state: 'cancelled', file_path: uploadEventPath(item), mapping_id: item.mapping_id, total_bytes: item.size, stage: '已取消' });
@@ -3052,6 +3182,7 @@ function pumpFlashPreflight() {
     if (!preserveSource && item.cleanup_path && isWithinRoot(manualUploadRoot, item.cleanup_path)) await fsp.rm(item.cleanup_path, { recursive: true, force: true });
     inflight.delete(key);
     inflightItems.delete(key);
+    queuePauseRequests.delete(key);
     activeFlashPreflights = Math.max(0, activeFlashPreflights - 1);
     publishState();
     pump();
@@ -3060,7 +3191,7 @@ function pumpFlashPreflight() {
 function pump() {
   if (paused || !token) { publishState(); return; }
   while (active < uploadConcurrency && queue.size) {
-    const candidate = [...queue.entries()].find(([key]) => !inflight.has(key) && !isUploadCancelled(key));
+    const candidate = [...queue.entries()].find(([key]) => !inflight.has(key) && !isUploadCancelled(key) && !pausedUploads.has(key));
     if (!candidate) break;
     const [key, item] = candidate;
     queue.delete(key);
@@ -3072,10 +3203,12 @@ function pump() {
     let preserveSource = false;
     prepareUploadItem(item).then((ready) => {
       Object.assign(item, ready);
-      assertUploadNotCancelled(key);
+      assertUploadRunnable(key);
       return upload(item);
     }).then(async (taskData) => {
       assertUploadNotCancelled(key);
+      pausedUploads.delete(key);
+      queuePauseRequests.delete(key);
       if (taskData.pending) {
         preserveSource = true;
         status('warning', `文件已上传到 OSS，云端尚未确认入库；已保留记录并会自动重试：${uploadEventPath(item)}：${taskData.pendingError}`);
@@ -3084,7 +3217,20 @@ function pump() {
       }
       await finalizeConfirmedUpload(key, item, taskData);
     }).catch((error) => {
-      if (isUploadCancellationError(error) || isUploadCancelled(key)) {
+      if (isUploadCancelled(key)) {
+        clearUploadCheckpoint(item);
+        clearPendingUpload(key);
+        publish({ type: 'file', state: 'cancelled', file_path: uploadEventPath(item), mapping_id: item.mapping_id, total_bytes: item.size, stage: '已取消' });
+        return;
+      }
+      if (isUploadPauseError(error) || isUploadPauseRequested(key)) {
+        preserveSource = true;
+        if (mappingAcceptsUpload(item)) prependQueuedItem(key, item);
+        const checkpoint = loadUploadCheckpoint(item);
+        publish({ type: 'file', state: 'paused', file_path: uploadEventPath(item), mapping_id: item.mapping_id, uploaded_bytes: Number(checkpoint?.uploadedBytes || 0), total_bytes: item.size, stage: pausedUploads.has(key) ? '已暂停，可从当前断点继续' : '队列已暂停，可从当前断点继续' });
+        return;
+      }
+      if (isUploadCancellationError(error)) {
         clearUploadCheckpoint(item);
         clearPendingUpload(key);
         publish({ type: 'file', state: 'cancelled', file_path: uploadEventPath(item), mapping_id: item.mapping_id, total_bytes: item.size, stage: '已取消' });
@@ -3109,6 +3255,7 @@ function pump() {
       if (!preserveSource && item.cleanup_path && isWithinRoot(manualUploadRoot, item.cleanup_path)) await fsp.rm(item.cleanup_path, { recursive: true, force: true });
       inflight.delete(key);
       inflightItems.delete(key);
+      queuePauseRequests.delete(key);
       active -= 1;
       publishState();
       pump();
@@ -3803,18 +3950,40 @@ async function routeApiV2(request, response, url) {
   if (organizerScanMatch && request.method === 'POST') {
     return json(response, 200, await organizer.scanMapping(decodeURIComponent(organizerScanMatch[1])));
   }
-  const organizerJobMatch = url.pathname.match(/^\/api\/organizer\/jobs\/([^/]+)\/(run|retry)$/);
+  const organizerJobMatch = url.pathname.match(/^\/api\/organizer\/jobs\/([^/]+)\/(run|retry|rearchive)$/);
   if (organizerJobMatch && request.method === 'POST') {
     const body = await readBody(request, { maxBytes: 16 * 1024 });
     const jobId = decodeURIComponent(organizerJobMatch[1]);
     const result = organizerJobMatch[2] === 'run'
       ? await organizer.runJob(jobId, body)
-      : await organizer.retryJob(jobId, body);
+      : organizerJobMatch[2] === 'rearchive'
+        ? await organizer.rearchiveJob(jobId, body)
+        : await organizer.retryJob(jobId, body);
     return json(response, 200, result);
   }
   const organizerJobDeleteMatch = url.pathname.match(/^\/api\/organizer\/jobs\/([^/]+)$/);
   if (organizerJobDeleteMatch && request.method === 'DELETE') {
-    return json(response, 200, organizer.removeJob(decodeURIComponent(organizerJobDeleteMatch[1])));
+    const body = await readBody(request, { maxBytes: 4 * 1024 });
+    return json(response, 200, await organizer.removeJob(decodeURIComponent(organizerJobDeleteMatch[1]), body));
+  }
+  if (request.method === 'GET' && url.pathname === '/api/virtual-library') {
+    return json(response, 200, virtualLibrary.info(), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/virtual-library/settings') {
+    const body = await readBody(request, { maxBytes: 4 * 1024 });
+    return json(response, 200, virtualLibrary.updateSettings(body), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/virtual-library/mappings') {
+    const body = await readBody(request, { maxBytes: 16 * 1024 });
+    return json(response, 200, virtualLibrary.upsert(body), { 'cache-control': 'no-store' });
+  }
+  const virtualLibrarySyncMatch = url.pathname.match(/^\/api\/virtual-library\/mappings\/([^/]+)\/sync$/);
+  if (virtualLibrarySyncMatch && request.method === 'POST') {
+    return json(response, 200, virtualLibrary.sync(decodeURIComponent(virtualLibrarySyncMatch[1])), { 'cache-control': 'no-store' });
+  }
+  const virtualLibraryMappingMatch = url.pathname.match(/^\/api\/virtual-library\/mappings\/([^/]+)$/);
+  if (virtualLibraryMappingMatch && request.method === 'DELETE') {
+    return json(response, 200, virtualLibrary.remove(decodeURIComponent(virtualLibraryMappingMatch[1])), { 'cache-control': 'no-store' });
   }
   if (request.method === 'GET' && url.pathname === '/api/mount') {
     return json(response, 200, {
@@ -3977,6 +4146,14 @@ async function routeApiV2(request, response, url) {
   if (request.method === 'POST' && url.pathname === '/api/uploads/cancel') {
     const body = await readBody(request, { maxBytes: 16 * 1024 });
     return json(response, 200, await cancelUploadTask(body.file_path ?? body.filePath, body.mapping_id ?? body.mappingId));
+  }
+  if (request.method === 'POST' && url.pathname === '/api/uploads/pause') {
+    const body = await readBody(request, { maxBytes: 16 * 1024 });
+    return json(response, 200, await pauseUploadTask(body.file_path ?? body.filePath, body.mapping_id ?? body.mappingId));
+  }
+  if (request.method === 'POST' && url.pathname === '/api/uploads/resume') {
+    const body = await readBody(request, { maxBytes: 16 * 1024 });
+    return json(response, 200, await resumeUploadTask(body.file_path ?? body.filePath, body.mapping_id ?? body.mappingId));
   }
   if (request.method === 'POST' && url.pathname === '/api/uploads/retry') {
     const body = await readBody(request, { maxBytes: 16 * 1024 });
@@ -4159,7 +4336,7 @@ async function routeApiV2(request, response, url) {
     publishState();
     return json(response, 200, mapping);
   }
-  if (request.method === 'DELETE' && url.pathname.startsWith('/api/mappings/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); await watchers.get(id)?.close(); watchers.delete(id); mappings = mappings.filter((item) => item.id !== id); for (const [key, item] of queue) if (item.mapping_id === id) queue.delete(key); for (const [key, item] of waitingFiles) if (item.mapping_id === id) waitingFiles.delete(key); for (const key of flashPreflightCache.keys()) if (key.startsWith(`${id}::`)) flashPreflightCache.delete(key); for (const key of history.keys()) if (key.startsWith(`${id}::`)) history.delete(key); for (const key of inflight.keys()) if (key.startsWith(`${id}::`)) inflight.delete(key); deleteMappingTransientUploads(id); await saveConfig(); publishState(); return json(response, 200, {}); }
+  if (request.method === 'DELETE' && url.pathname.startsWith('/api/mappings/')) { const id = decodeURIComponent(url.pathname.split('/').pop()); await watchers.get(id)?.close(); watchers.delete(id); mappings = mappings.filter((item) => item.id !== id); for (const [key, item] of queue) if (item.mapping_id === id) queue.delete(key); for (const [key, item] of waitingFiles) if (item.mapping_id === id) waitingFiles.delete(key); for (const key of flashPreflightCache.keys()) if (key.startsWith(`${id}::`)) flashPreflightCache.delete(key); for (const key of history.keys()) if (key.startsWith(`${id}::`)) history.delete(key); for (const key of inflight.keys()) if (key.startsWith(`${id}::`)) inflight.delete(key); for (const key of pausedUploads) if (key.startsWith(`${id}::`)) pausedUploads.delete(key); for (const key of queuePauseRequests) if (key.startsWith(`${id}::`)) queuePauseRequests.delete(key); deleteMappingTransientUploads(id); await saveConfig(); publishState(); return json(response, 200, {}); }
   if (request.method === 'POST' && /^\/api\/mappings\/[^/]+\/auto-share-backfill$/.test(url.pathname)) { const id = decodeURIComponent(url.pathname.split('/')[3]); return json(response, 202, await backfillAutoShares(id)); }
   if (request.method === 'PATCH' && url.pathname.startsWith('/api/mappings/')) {
     const id = decodeURIComponent(url.pathname.split('/').pop());
@@ -4201,7 +4378,15 @@ async function routeApiV2(request, response, url) {
     publishState();
     return json(response, 200, mapping);
   }
-  if (request.method === 'POST' && url.pathname === '/api/queue/pause') { paused = true; publishState(); return json(response, 200, state()); }
+  if (request.method === 'POST' && url.pathname === '/api/queue/pause') {
+    paused = true;
+    for (const key of inflightItems.keys()) queuePauseRequests.add(key);
+    for (const client of activeUploadClients.values()) {
+      try { client.cancel(); } catch {}
+    }
+    publishState();
+    return json(response, 200, state());
+  }
   if (request.method === 'POST' && url.pathname === '/api/queue/resume') { paused = false; pump(); return json(response, 200, state()); }
   json(response, 404, { error: 'not found' });
 }
@@ -4212,6 +4397,7 @@ try { const config = JSON.parse(await fsp.readFile(configFile, 'utf8')); mapping
 restoreUploadCheckpoints();
 await restartWatchers();
 await organizer.initialize();
+virtualLibrary.start();
 restorePendingAutoShares();
 resumeHdhiveReceiptPolling();
 resumeDeveloperTransfers();
@@ -4283,6 +4469,31 @@ const webdavServer = http.createServer(async (request, response) => {
 });
 webdavServer.requestTimeout = Math.max(requestTimeoutMs, ossTimeoutMs);
 webdavServer.headersTimeout = Math.min(requestTimeoutMs, 15_000);
+
+const embyProxyServer = http.createServer(async (request, response) => {
+  const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+  try {
+    await virtualLibrary.handleProxy(request, response, url);
+  } catch (error) {
+    response.writeHead(502, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+    response.end(`Emby 代理请求失败：${error.message}`);
+  }
+});
+embyProxyServer.requestTimeout = 0;
+embyProxyServer.headersTimeout = Math.min(requestTimeoutMs, 15_000);
+embyProxyServer.on('upgrade', (request, socket, head) => virtualLibrary.proxyUpgrade(request, socket, head));
+embyProxyServer.once('error', (error) => {
+  virtualLibrary.setProxyStatus({ running: false, error: error.message });
+  console.error(`Guangya Emby proxy failed: ${error.message}`);
+});
+embyProxyServer.listen(embyProxyPort, embyProxyHost, () => {
+  const actualPort = Number(embyProxyServer.address()?.port || embyProxyPort);
+  const publicPort = embyProxyPublicPort || actualPort;
+  virtualLibrary.setProxyStatus({ running: true, error: null, port: publicPort });
+  const displayHost = embyProxyHost.includes(':') ? `[${embyProxyHost}]` : embyProxyHost;
+  console.log(`Guangya Emby proxy listening on http://${displayHost}:${actualPort}/ -> ${virtualLibrary.info().emby_upstream}`);
+});
+
 webdavServer.listen(webdavPort, webdavHost, () => {
   const displayHost = webdavHost.includes(':') ? `[${webdavHost}]` : webdavHost;
   console.log(`Guangya WebDAV listening on http://${displayHost}:${webdavPort}/dav/, auth: ${webdavAccessControl.required() ? `enabled (${webdavUsername})` : 'not configured'}`);
@@ -4301,15 +4512,20 @@ server.listen(port, listenHost, async () => {
     const response = await fetch(`http://127.0.0.1:${port}/api/state`, { headers: selfTestHeaders });
     console.log(`SELF_TEST ${response.status} ${await response.text()}`);
     nativeMountManager.shutdown();
+    virtualLibrary.close();
     await new Promise((resolve) => server.close(resolve));
     await new Promise((resolve) => webdavServer.close(resolve));
+    await new Promise((resolve) => embyProxyServer.close(resolve));
     for (const watcher of watchers.values()) await watcher.close();
     await organizer.close();
     process.exit(0);
   }
 });
 
-process.once('exit', () => nativeMountManager.shutdown());
+process.once('exit', () => {
+  nativeMountManager.shutdown();
+  virtualLibrary.close();
+});
 
 setInterval(() => {
   if (!refreshToken) return;

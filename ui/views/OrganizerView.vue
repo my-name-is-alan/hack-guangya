@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref, toRaw } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, toRaw } from 'vue';
 import { message, Modal } from 'antdv-next';
 import {
   ArrowLeftOutlined,
@@ -26,12 +26,17 @@ import {
   organizerItemKindLabel,
   organizerMatchedTitle,
   organizerMediaLabel,
+  normalizeOrganizerCategoryFormRules,
   organizerPreviewItems,
   organizerPreviewTarget,
   organizerStatus,
   organizerTemplateExamples,
   organizerTransferLabel,
+  ORGANIZER_MOVIE_TEMPLATE_TOKENS,
+  ORGANIZER_TV_TEMPLATE_TOKENS,
+  validateOrganizerRuleBlock,
 } from '../organizer.js';
+import { COUNTRY_OPTIONS_ZH } from '../countries.js';
 
 const props = defineProps({ settingsOnly: { type: Boolean, default: false } });
 
@@ -41,6 +46,13 @@ const DEFAULT_SETTINGS = Object.freeze({
   image_language: 'zh,null,en',
   include_adult: false,
   minimum_match_score: 0.72,
+  word_segment_search: true,
+  similarity_match: true,
+  recognition_words: '',
+  release_groups: '',
+  render_words: '',
+  capture_groups: '',
+  include_media_info: true,
   movie_path_template: '{category}/{country}/{year}/{title} ({year}) [tmdb-{tmdb_id}]/{title} ({year}){edition}{quality}{part}.{ext}',
   tv_path_template: '{category}/{country}/{year}/{title} ({year}) [tmdb-{tmdb_id}]/Season {season:02}/{title}.S{season:02}E{episode:02}{episode_end}.{ext}',
   movie_category: '电影',
@@ -64,15 +76,38 @@ const TMDB_GENRE_OPTIONS = [
   ['10763', '新闻（剧集）'], ['10764', '真人秀（剧集）'], ['10765', '科幻奇幻（剧集）'], ['10766', '肥皂剧（剧集）'], ['10767', '脱口秀（剧集）'], ['10768', '战争政治（剧集）'],
 ].map(([value, label]) => ({ value, label: `${label} · TMDB ${value}` }));
 
+const REFERENCE_CATEGORY_RULES = [
+  { name: '电影/演唱会', media_type: 'movie', genres: ['10402'] },
+  { name: '电影/动画电影', media_type: 'movie', genres: ['16'] },
+  { name: '电影/华语电影', media_type: 'movie', original_languages: ['zh', 'cn', 'bo', 'za'] },
+  { name: '电影/日韩电影', media_type: 'movie', original_languages: ['ja', 'ko', 'th'] },
+  { name: '电影/欧美电影', media_type: 'movie', origin_countries: ['US', 'GB', 'CA', 'AU', 'NZ', 'IE', 'FR', 'DE', 'ES', 'IT', 'NL', 'BE', 'SE', 'NO', 'DK', 'FI', 'IS', 'AT', 'CH', 'PT', 'GR', 'PL', 'CZ', 'SK', 'HU', 'RO', 'BG', 'HR', 'SI', 'RS', 'ME', 'MK', 'AL', 'BA', 'EE', 'LV', 'LT', 'LU', 'MT', 'CY'] },
+  { name: '电视剧/动漫/儿童', media_type: 'tv', genres: ['10762'] },
+  { name: '电视剧/动漫/国漫', media_type: 'tv', genres: ['16'], origin_countries: ['CN', 'TW', 'HK'] },
+  { name: '电视剧/动漫/日番', media_type: 'tv', genres: ['16'], origin_countries: ['JP'] },
+  { name: '电视剧/动漫/欧美动漫', media_type: 'tv', genres: ['16'], origin_countries: ['US', 'GB', 'CA', 'AU', 'FR', 'DE', 'IT', 'ES', 'NL', 'BE', 'SE', 'NO', 'DK', 'FI'] },
+  { name: '电视剧/动漫/其他', media_type: 'tv', genres: ['16', '10762'] },
+  { name: '电视剧/纪录片', media_type: 'tv', genres: ['99'] },
+  { name: '电视剧/综艺', media_type: 'tv', genres: ['10764', '10767'] },
+  { name: '电视剧/亚洲剧/国产剧', media_type: 'tv', origin_countries: ['CN'] },
+  { name: '电视剧/亚洲剧/港台剧集', media_type: 'tv', origin_countries: ['TW', 'HK'] },
+  { name: '电视剧/亚洲剧/日韩剧', media_type: 'tv', origin_countries: ['JP', 'KR', 'KP', 'TH', 'IN', 'SG'] },
+  { name: '电视剧/欧美剧', media_type: 'tv', origin_countries: ['US', 'GB', 'CA', 'AU', 'NZ', 'IE', 'FR', 'DE', 'ES', 'IT', 'NL', 'BE', 'SE', 'NO', 'DK', 'FI', 'IS', 'AT', 'CH', 'PT', 'GR', 'PL', 'CZ', 'SK', 'HU', 'RO', 'BG', 'HR', 'SI', 'RS', 'ME', 'MK', 'AL', 'BA', 'EE', 'LV', 'LT', 'LU', 'MT', 'CY'] },
+].map((rule, index) => ({ id: `reference-category-${index + 1}`, genres: [], original_languages: [], origin_countries: [], enabled: true, ...rule }));
+
 const loading = ref(true);
 const refreshing = ref(false);
 const settingsSaving = ref(false);
 const settingsTesting = ref(false);
 const mappingSubmitting = ref(false);
 const settingsPanels = ref([]);
+const movieTemplateInput = ref(null);
+const tvTemplateInput = ref(null);
+const recognitionSection = ref('recognition_words');
 const settingsSection = ref('directories');
 const targetModal = reactive({ open: false, editingId: '', name: '', dir_id: '', path: '/' });
 const jobBusy = reactive({});
+const deleteDialog = reactive({ open: false, job: null });
 const organizer = reactive({ settings: { ...DEFAULT_SETTINGS }, mappings: [], jobs: [], counts: {} });
 const settingsForm = reactive({ ...DEFAULT_SETTINGS, api_key: '' });
 const mappingDrawer = reactive({ open: false, editingId: '' });
@@ -110,6 +145,7 @@ const cloudFolderColumns = [
 ];
 const review = reactive({
   open: false,
+  mode: 'review',
   job: null,
   media_type: '',
   tmdb_id: '',
@@ -138,6 +174,7 @@ const templateExamples = computed(() => organizerTemplateExamples(
   settingsForm.tv_path_template,
   settingsForm.movie_category,
   settingsForm.tv_category,
+  settingsForm.include_media_info,
 ));
 
 function cloneSerializable(value) {
@@ -147,13 +184,20 @@ function cloneSerializable(value) {
   return JSON.parse(JSON.stringify(raw));
 }
 
-function organizerSettingsInput() {
-  return {
+function organizerSettingsInput({ validate = false } = {}) {
+  const input = {
     api_key: String(settingsForm.api_key || ''),
     language: String(settingsForm.language || ''),
     image_language: String(settingsForm.image_language || ''),
     include_adult: Boolean(settingsForm.include_adult),
     minimum_match_score: Number(settingsForm.minimum_match_score ?? DEFAULT_SETTINGS.minimum_match_score),
+    word_segment_search: Boolean(settingsForm.word_segment_search),
+    similarity_match: Boolean(settingsForm.similarity_match),
+    recognition_words: String(settingsForm.recognition_words || ''),
+    release_groups: String(settingsForm.release_groups || ''),
+    render_words: String(settingsForm.render_words || ''),
+    capture_groups: String(settingsForm.capture_groups || ''),
+    include_media_info: Boolean(settingsForm.include_media_info),
     movie_path_template: String(settingsForm.movie_path_template || ''),
     tv_path_template: String(settingsForm.tv_path_template || ''),
     movie_category: String(settingsForm.movie_category || ''),
@@ -164,6 +208,13 @@ function organizerSettingsInput() {
     scrape_targets: cloneSerializable(settingsForm.scrape_targets),
     default_scrape_types: cloneSerializable(settingsForm.default_scrape_types || []),
   };
+  if (validate) {
+    input.recognition_words = validateOrganizerRuleBlock(input.recognition_words, '自定义识别词');
+    input.render_words = validateOrganizerRuleBlock(input.render_words, '自定义渲染词');
+    input.capture_groups = validateOrganizerRuleBlock(input.capture_groups, '自定义捕获组', { replacement: false });
+    input.category_rules = normalizeOrganizerCategoryFormRules(input.category_rules);
+  }
+  return input;
 }
 
 const jobColumns = [
@@ -173,6 +224,13 @@ const jobColumns = [
   { title: '更新时间', key: 'time', width: 142 },
   { title: '操作', key: 'actions', width: 210 },
 ];
+
+const JOB_DELETE_ACTIONS = Object.freeze([
+  { key: 'history', label: '仅删除历史记录', delete_source: false, delete_target: false },
+  { key: 'source', label: '删除历史记录和源文件', delete_source: true, delete_target: false },
+  { key: 'target', label: '删除历史记录和媒体库文件', delete_source: false, delete_target: true },
+  { key: 'all', label: '删除历史记录、源文件和媒体库文件', delete_source: true, delete_target: true },
+]);
 
 function timeText(value) {
   const timestamp = Number(value || 0);
@@ -192,13 +250,28 @@ function hydrateSettings(settings, force = false) {
     image_language: settings.image_language || DEFAULT_SETTINGS.image_language,
     include_adult: Boolean(settings.include_adult),
     minimum_match_score: Number(settings.minimum_match_score ?? DEFAULT_SETTINGS.minimum_match_score),
+    word_segment_search: settings.word_segment_search !== false,
+    similarity_match: settings.similarity_match !== false,
+    recognition_words: String(settings.recognition_words || ''),
+    release_groups: String(settings.release_groups || ''),
+    render_words: String(settings.render_words || ''),
+    capture_groups: String(settings.capture_groups || ''),
+    include_media_info: settings.include_media_info !== false,
     movie_path_template: settings.movie_path_template || DEFAULT_SETTINGS.movie_path_template,
     tv_path_template: settings.tv_path_template || DEFAULT_SETTINGS.tv_path_template,
     movie_category: settings.movie_category || DEFAULT_SETTINGS.movie_category,
     tv_category: settings.tv_category || DEFAULT_SETTINGS.tv_category,
     tmdb_api_base: settings.tmdb_api_base || DEFAULT_SETTINGS.tmdb_api_base,
     tmdb_image_base: settings.tmdb_image_base || DEFAULT_SETTINGS.tmdb_image_base,
-    category_rules: Array.isArray(settings.category_rules) ? cloneSerializable(settings.category_rules) : [],
+    category_rules: Array.isArray(settings.category_rules) ? cloneSerializable(settings.category_rules).map((rule, index) => ({
+      id: rule.id || `category-${index + 1}`,
+      name: rule.name || '',
+      media_type: rule.media_type || 'all',
+      genres: Array.isArray(rule.genres) ? rule.genres.map(String) : [],
+      original_languages: Array.isArray(rule.original_languages) ? rule.original_languages.map(String) : [],
+      origin_countries: Array.isArray(rule.origin_countries) ? rule.origin_countries.map((value) => String(value).toUpperCase()) : [],
+      enabled: rule.enabled !== false,
+    })) : [],
     scrape_targets: Array.isArray(settings.scrape_targets) ? cloneSerializable(settings.scrape_targets) : [],
     default_scrape_types: Array.isArray(settings.default_scrape_types) ? [...settings.default_scrape_types] : [...DEFAULT_SETTINGS.default_scrape_types],
   });
@@ -234,7 +307,7 @@ async function loadState({ silent = false } = {}) {
 async function saveSettings() {
   settingsSaving.value = true;
   try {
-    const input = organizerSettingsInput();
+    const input = organizerSettingsInput({ validate: true });
     const saved = await bridge.invoke('update_organizer_settings', { input });
     organizer.settings = { ...DEFAULT_SETTINGS, ...(saved || {}) };
     hydrateSettings(organizer.settings, true);
@@ -317,6 +390,73 @@ function applyPathPreset(value) {
   if (!preset) return;
   settingsForm.movie_path_template = preset.movie;
   settingsForm.tv_path_template = preset.tv;
+}
+
+function insertTemplateToken(kind, token) {
+  const field = kind === 'tv' ? 'tv_path_template' : 'movie_path_template';
+  const component = kind === 'tv' ? tvTemplateInput.value : movieTemplateInput.value;
+  const textarea = component?.resizableTextArea?.textArea || component?.$el?.querySelector?.('textarea');
+  const current = String(settingsForm[field] || '');
+  const start = Number.isInteger(textarea?.selectionStart) ? textarea.selectionStart : current.length;
+  const end = Number.isInteger(textarea?.selectionEnd) ? textarea.selectionEnd : start;
+  settingsForm[field] = `${current.slice(0, start)}${token}${current.slice(end)}`;
+  void nextTick(() => {
+    textarea?.focus();
+    textarea?.setSelectionRange(start + token.length, start + token.length);
+  });
+}
+
+function addCategoryRule() {
+  settingsForm.category_rules.push({
+    id: `category-${Date.now()}-${settingsForm.category_rules.length + 1}`,
+    name: '',
+    media_type: 'all',
+    genres: [],
+    original_languages: [],
+    origin_countries: [],
+    enabled: true,
+  });
+}
+
+function removeCategoryRule(rule) {
+  settingsForm.category_rules = settingsForm.category_rules.filter((item) => item.id !== rule.id);
+}
+
+function moveCategoryRule(index, offset) {
+  const target = index + offset;
+  if (target < 0 || target >= settingsForm.category_rules.length) return;
+  const [rule] = settingsForm.category_rules.splice(index, 1);
+  settingsForm.category_rules.splice(target, 0, rule);
+}
+
+function applyReferenceCategoryRules() {
+  const replace = async () => {
+    settingsSaving.value = true;
+    try {
+      const categoryRules = normalizeOrganizerCategoryFormRules(cloneSerializable(REFERENCE_CATEGORY_RULES));
+      const saved = await bridge.invoke('update_organizer_settings', { input: { category_rules: categoryRules } });
+      organizer.settings = { ...DEFAULT_SETTINGS, ...(saved || {}) };
+      hydrateSettings(organizer.settings, true);
+      await loadState({ silent: true });
+      message.success('默认二级分类已恢复并保存');
+    } catch (error) {
+      message.error(errorText(error));
+      throw error;
+    } finally {
+      settingsSaving.value = false;
+    }
+  };
+  if (!settingsForm.category_rules.length) {
+    void replace().catch(() => {});
+    return;
+  }
+  Modal.confirm({
+    title: '恢复默认二级分类',
+    content: '这会立即替换并保存当前分类规则；目录监控、命名配置和刮削目标不会变化。',
+    okText: '恢复并保存',
+    cancelText: '取消',
+    onOk: replace,
+  });
 }
 
 function openNewTarget() {
@@ -498,25 +638,55 @@ function removeMapping(mapping) {
   });
 }
 
-function removeJob(job) {
+function removeJob(job, actionKey = 'history') {
+  const action = JOB_DELETE_ACTIONS.find((item) => item.key === actionKey) || JOB_DELETE_ACTIONS[0];
+  const affected = action.delete_source && action.delete_target
+    ? '源文件和本次整理生成的媒体库文件都会永久删除，已有分享可能失效。'
+    : action.delete_source
+      ? '源文件会永久删除，引用该源文件的已有分享可能失效；媒体库文件不受影响。'
+      : action.delete_target
+        ? '本次整理生成的媒体库文件会永久删除，媒体库分享可能失效；源文件不受影响。'
+        : '源文件和媒体库文件都不会被删除。';
   Modal.confirm({
-    title: '删除整理记录',
-    content: `确定删除「${fileName(job.source_path)}」的任务记录吗？源文件和媒体库文件都不会被删除。`,
-    okText: '删除记录',
+    title: action.label,
+    content: `确定处理「${fileName(job.source_path)}」吗？${affected}`,
+    okText: action.label,
     okButtonProps: { danger: true },
     cancelText: '取消',
     async onOk() {
+      jobBusy[job.id] = true;
       try {
-        await bridge.invoke('remove_organizer_job', { id: job.id });
+        const result = await bridge.invoke('remove_organizer_job', {
+          id: job.id,
+          input: { delete_source: action.delete_source, delete_target: action.delete_target },
+        });
         if (review.job?.id === job.id) review.open = false;
         if (preview.job?.id === job.id) preview.open = false;
         await loadState({ silent: true });
-        message.success('整理记录已删除');
+        const deletedSource = Number(result?.deleted_source || 0);
+        const deletedTarget = Number(result?.deleted_target || 0);
+        const summary = [deletedSource ? `源文件 ${deletedSource} 项` : '', deletedTarget ? `媒体库文件 ${deletedTarget} 项` : ''].filter(Boolean).join('、');
+        if (Array.isArray(result?.warnings) && result.warnings.length) message.warning(result.warnings.join('；'));
+        else message.success(summary ? `整理记录及${summary}已删除` : '整理记录已删除');
       } catch (error) {
         message.error(errorText(error));
+        throw error;
+      } finally {
+        jobBusy[job.id] = false;
       }
     },
   });
+}
+
+function openDeleteActions(job) {
+  deleteDialog.job = job;
+  deleteDialog.open = true;
+}
+
+function chooseDeleteAction(actionKey) {
+  const job = deleteDialog.job;
+  deleteDialog.open = false;
+  if (job) removeJob(job, actionKey);
 }
 
 async function runJob(job) {
@@ -534,7 +704,8 @@ async function runJob(job) {
   }
 }
 
-function openReview(job) {
+function openReview(job, mode = 'review') {
+  review.mode = mode;
   review.job = job;
   review.media_type = job.media_type || job.preview?.query?.media_type || '';
   review.tmdb_id = job.tmdb_id ?? '';
@@ -544,6 +715,10 @@ function openReview(job) {
   review.episode = job.episode ?? '';
   review.episode_end = job.episode_end ?? '';
   review.open = true;
+}
+
+function openReorganize(job) {
+  openReview(job, 'rearchive');
 }
 
 function chooseCandidate(candidate) {
@@ -577,12 +752,16 @@ async function submitReview(execute) {
       clear_episode: optionalNumber(review.episode) === undefined,
       clear_episode_end: optionalNumber(review.episode_end) === undefined,
     };
-    const result = await bridge.invoke(execute ? 'run_organizer_job' : 'retry_organizer_job', { id: job.id, input });
+    const command = execute
+      ? (review.mode === 'rearchive' ? 'rearchive_organizer_job' : 'run_organizer_job')
+      : 'retry_organizer_job';
+    const result = await bridge.invoke(command, { id: job.id, input });
     review.open = false;
     await loadState({ silent: true });
-    if (result?.status === 'failed' || result?.status === 'needs_review') message.warning(result.message || '仍需人工确认');
+    if (review.mode === 'rearchive' && result?.status === 'recognizing') message.success('重新归档已提交，正在后台处理');
+    else if (result?.status === 'failed' || result?.status === 'needs_review') message.warning(result.message || '仍需人工确认');
     else if (result?.status === 'completed_warning') message.warning(result.message || '整理完成，但有非阻断提示');
-    else message.success(execute && result?.status === 'completed' ? '整理完成' : '重新识别完成');
+    else message.success(execute && result?.status === 'completed' ? (review.mode === 'rearchive' ? '重新归档完成' : '整理完成') : '重新识别完成');
   } catch (error) {
     message.error(errorText(error));
   } finally {
@@ -628,19 +807,28 @@ onBeforeUnmount(() => {
       </header>
 
       <a-tabs v-if="props.settingsOnly" v-model:active-key="settingsSection" class="organizer-settings-tabs">
-        <a-tab-pane key="directories">
-          <template #tab><span class="inner-tab"><FolderOpenOutlined />目录设置</span></template>
+        <a-tab-pane key="general">
+          <template #tab><span class="inner-tab"><SettingOutlined />通用配置</span></template>
         </a-tab-pane>
-        <a-tab-pane key="tmdb">
-          <template #tab><span class="inner-tab"><SettingOutlined />TMDB 配置</span></template>
+        <a-tab-pane key="recognition">
+          <template #tab><span class="inner-tab"><SearchOutlined />辅助识别</span></template>
+        </a-tab-pane>
+        <a-tab-pane key="categories">
+          <template #tab><span class="inner-tab"><FolderOutlined />二级分类</span></template>
+        </a-tab-pane>
+        <a-tab-pane key="search">
+          <template #tab><span class="inner-tab"><EyeOutlined />搜索设置</span></template>
+        </a-tab-pane>
+        <a-tab-pane key="directories">
+          <template #tab><span class="inner-tab"><FolderOpenOutlined />归档规则</span></template>
         </a-tab-pane>
         <a-tab-pane key="scrape">
-          <template #tab><span class="inner-tab"><EyeOutlined />刮削偏好</span></template>
+          <template #tab><span class="inner-tab"><PlayCircleOutlined />刮削输出</span></template>
         </a-tab-pane>
       </a-tabs>
 
-      <a-card v-if="props.settingsOnly && settingsSection === 'tmdb'" class="settings-card" :bordered="false">
-        <template #title><span class="card-title"><SettingOutlined />原生识别设置</span></template>
+      <a-card v-if="props.settingsOnly && settingsSection === 'general'" class="settings-card" :bordered="false">
+        <template #title><span class="card-title"><SettingOutlined />通用配置</span></template>
         <template #extra>
           <a-space>
             <a-tag color="blue">内置引擎</a-tag>
@@ -674,32 +862,121 @@ onBeforeUnmount(() => {
           <a-form-item label="TMDB 图片镜像">
             <a-input v-model:value="settingsForm.tmdb_image_base" :disabled="organizer.settings.tmdb_image_base_managed_by_environment" placeholder="https://image.tmdb.org/t/p" />
           </a-form-item>
-          <a-form-item label="自动匹配阈值">
-            <a-input-number v-model:value="settingsForm.minimum_match_score" :min="0.4" :max="0.98" :step="0.01" :precision="2" style="width: 100%" />
-          </a-form-item>
           <div class="settings-actions">
             <a-button :loading="settingsTesting" @click="testSettings">测试 TMDB</a-button>
             <a-button type="primary" :loading="settingsSaving" @click="saveSettings">保存设置</a-button>
           </div>
         </div>
         <a-collapse v-model:activeKey="settingsPanels" ghost class="naming-collapse">
-          <a-collapse-panel key="naming" header="命名模板与匹配选项">
+          <a-collapse-panel key="naming" header="全局电影 / 电视剧命名规则">
             <div class="template-grid">
               <a-form-item label="套用模板预设" class="template-wide"><a-select placeholder="选择后仍可自由修改" :options="pathPresetOptions" @change="applyPathPreset" /></a-form-item>
               <a-form-item label="电影分类值"><a-input v-model:value="settingsForm.movie_category" /></a-form-item>
               <a-form-item label="电视剧分类值"><a-input v-model:value="settingsForm.tv_category" /></a-form-item>
-              <a-form-item label="电影完整相对路径" class="template-wide"><a-textarea v-model:value="settingsForm.movie_path_template" :auto-size="{ minRows: 2, maxRows: 4 }" /></a-form-item>
-              <a-form-item label="电视剧完整相对路径" class="template-wide"><a-textarea v-model:value="settingsForm.tv_path_template" :auto-size="{ minRows: 2, maxRows: 4 }" /></a-form-item>
-              <label class="adult-setting template-wide"><span><strong>允许成人内容候选</strong><small>仅影响 TMDB 搜索结果，不改变云盘文件扫描。</small></span><a-switch v-model:checked="settingsForm.include_adult" /></label>
+              <a-form-item label="电影完整相对路径" class="template-wide">
+                <a-textarea ref="movieTemplateInput" v-model:value="settingsForm.movie_path_template" :auto-size="{ minRows: 2, maxRows: 4 }" />
+                <div class="template-inline-preview" aria-live="polite">
+                  <small>实时文件名</small><code>{{ templateExamples.movie.filename || '模板为空' }}</code>
+                  <small>完整路径</small><span>{{ templateExamples.movie.path || '模板为空' }}</span>
+                </div>
+              </a-form-item>
+              <a-form-item label="电视剧完整相对路径" class="template-wide">
+                <a-textarea ref="tvTemplateInput" v-model:value="settingsForm.tv_path_template" :auto-size="{ minRows: 2, maxRows: 4 }" />
+                <div class="template-inline-preview" aria-live="polite">
+                  <small>实时文件名</small><code>{{ templateExamples.tv.filename || '模板为空' }}</code>
+                  <small>完整路径</small><span>{{ templateExamples.tv.path || '模板为空' }}</span>
+                </div>
+              </a-form-item>
+              <label class="media-info-setting template-wide"><span><strong>携带媒体信息（FFprobe）</strong><small>识别时读取真实分辨率、编解码、声道、帧率、色深、HDR / 杜比视界；模板未写技术标签时，自动拼到扩展名前。</small></span><a-switch v-model:checked="settingsForm.include_media_info" aria-label="使用 FFprobe 携带媒体信息" /></label>
             </div>
-              <p class="template-help">可用字段：{category}（兼容 {catgroy}）、{country}、{year}、{title}、{original_title}、{tmdb_id}（兼容 {tmdbid}）、{season:02}、{episode:02}、{season_tag}、{episode_tag}、{Season x}、{Expose n}、{episode_end}、{episode_title}、{edition}、{quality}、{part}、{ext}。{ext} 可选；不使用时可直接写固定后缀（例如 .mkv）。模板必须同时包含目录与文件名。</p>
-             <div class="template-preview-grid">
-                <article><small>电影标准文件名预览</small><code>{{ templateExamples.movie.filename || '示例电影 (2024) [tmdb-12345].mkv' }}</code><span>{{ templateExamples.movie.path || '电影/US/2024/示例电影 (2024) [tmdb-12345]/示例电影 (2024).mkv' }}</span></article>
-                <article><small>电视剧标准文件名预览</small><code>{{ templateExamples.tv.filename || '示例剧集.S01E02.mkv' }}</code><span>{{ templateExamples.tv.path || '电视剧/CN/2024/示例剧集 (2024) [tmdb-67890]/Season 01/示例剧集.S01E02.mkv' }}</span></article>
-             </div>
+              <p class="template-help">支持单/双花括号和条件片段，例如 <code v-pre>{{@if@}}-{{releaseGroup}}{{@endif@}}</code> 仅在发布组存在时输出；也可使用 <code>{ } [ ] ( ) - .</code>。国家默认输出中文，需 ISO 代码时使用 <code>{country_code}</code>；<code>{category}</code> 可输出多级目录。</p>
+              <div class="template-token-groups">
+                <details open><summary>电影可用标签（{{ ORGANIZER_MOVIE_TEMPLATE_TOKENS.length }}，点击插入）</summary><div class="template-token-list"><button v-for="item in ORGANIZER_MOVIE_TEMPLATE_TOKENS" :key="`movie-${item.key}`" type="button" class="template-token-button" title="插入标签并实时预览" @click="insertTemplateToken('movie', item.token)"><code>{{ item.token }}</code>{{ item.label }}</button></div></details>
+                <details><summary>电视剧可用标签（{{ ORGANIZER_TV_TEMPLATE_TOKENS.length }}，点击插入）</summary><div class="template-token-list"><button v-for="item in ORGANIZER_TV_TEMPLATE_TOKENS" :key="`tv-${item.key}`" type="button" class="template-token-button" title="插入标签并实时预览" @click="insertTemplateToken('tv', item.token)"><code>{{ item.token }}</code>{{ item.label }}</button></div></details>
+              </div>
            </a-collapse-panel>
         </a-collapse>
       </a-card>
+
+      <section v-if="props.settingsOnly && settingsSection === 'recognition'" class="section-block recognition-settings-block">
+        <div class="section-heading">
+          <div><h2>辅助识别</h2><p>在解析片名、季集和技术参数前按顺序处理规则；注释行不会执行。</p></div>
+          <a-button type="primary" :loading="settingsSaving" @click="saveSettings">保存识别规则</a-button>
+        </div>
+        <a-alert type="info" show-icon class="settings-alert">
+          <template #message>每行一条规则：<code>正则 =&gt; 替换</code>；只有正则表示删除。支持 <code>\1</code> 捕获、<code>\1@-12</code> 集数运算，以及 <code>{[tmdbid=123;type=tv;s=1;e=2]}</code> 强制识别。规则使用原生 Rust regex 语法，不支持前后查找、正则内反向引用、命名捕获和 <code>@?</code> 条件行。</template>
+        </a-alert>
+        <a-card :bordered="false" class="rule-editor-card">
+          <a-tabs v-model:active-key="recognitionSection" class="recognition-tabs">
+            <a-tab-pane key="recognition_words" tab="自定义识别词">
+              <a-textarea v-model:value="settingsForm.recognition_words" aria-label="自定义识别词规则" :auto-size="{ minRows: 14, maxRows: 28 }" :spellcheck="false" placeholder="# 示例：(?i)^Some\.Show => Some Show{[tmdbid=123;type=tv]}" />
+              <p class="field-help">用于改名、去除干扰词、校正季集或固定 TMDB 条目，按从上到下的顺序执行。</p>
+            </a-tab-pane>
+            <a-tab-pane key="release_groups" tab="自定义制作组">
+              <a-textarea v-model:value="settingsForm.release_groups" aria-label="自定义制作组列表" :auto-size="{ minRows: 14, maxRows: 28 }" :spellcheck="false" placeholder="# 每行一个制作组，例如&#10;WiKi&#10;MTeam&#10;ADE" />
+              <p class="field-help">已知制作组优先于文件名末尾推断，用于稳定生成 {releaseGroup}。</p>
+            </a-tab-pane>
+            <a-tab-pane key="render_words" tab="自定义渲染词">
+              <a-textarea v-model:value="settingsForm.render_words" aria-label="自定义渲染词规则" :auto-size="{ minRows: 14, maxRows: 28 }" :spellcheck="false" placeholder="(?i)H\.264 => AVC&#10;(?i)H\.265 => HEVC&#10;(?i)4K => 2160p" />
+              <p class="field-help">在识别词之后统一画质、编码、来源等写法，再提取命名变量。</p>
+            </a-tab-pane>
+            <a-tab-pane key="capture_groups" tab="自定义捕获组">
+              <a-textarea v-model:value="settingsForm.capture_groups" aria-label="自定义制作组捕获正则" :auto-size="{ minRows: 14, maxRows: 28 }" :spellcheck="false" placeholder="# 每行一个含捕获组的正则，例如&#10;-([A-Za-z0-9@._-]+)$" />
+              <p class="field-help">第一个非空捕获组会作为制作组；未命中时仍会尝试文件名末尾的 <code>-Group</code>。</p>
+            </a-tab-pane>
+          </a-tabs>
+        </a-card>
+      </section>
+
+      <section v-if="props.settingsOnly && settingsSection === 'categories'" class="section-block category-settings-block">
+        <div class="section-heading">
+          <div><h2>二级分类</h2><p>类型、原始语言、来源地区按组同时满足；同组内任一值命中即可，第一条命中的规则优先。</p></div>
+          <a-space><a-button :loading="settingsSaving" @click="applyReferenceCategoryRules">恢复默认分类</a-button><a-button type="primary" :loading="settingsSaving" @click="saveSettings">保存分类</a-button></a-space>
+        </div>
+        <div class="category-toolbar">
+          <div><strong>规则顺序</strong><span>名称允许使用 <code>/</code> 输出多级目录，例如“电视剧/动漫/国漫”。</span></div>
+          <a-button size="small" @click="addCategoryRule"><PlusOutlined />添加规则</a-button>
+        </div>
+        <a-empty v-if="!settingsForm.category_rules.length" description="未配置分类规则；未命中时使用通用配置中的默认分类" />
+        <div v-else class="category-rule-list category-rule-list--expanded">
+          <article v-for="(rule, index) in settingsForm.category_rules" :key="rule.id" class="category-rule-card">
+            <header>
+              <span class="rule-index">{{ String(index + 1).padStart(2, '0') }}</span>
+              <a-input v-model:value="rule.name" aria-label="分类目录" placeholder="分类目录，例如：电视剧/动漫/国漫" />
+              <a-select v-model:value="rule.media_type" aria-label="媒体类型" :options="[{ label: '全部', value: 'all' }, { label: '电影', value: 'movie' }, { label: '电视剧', value: 'tv' }]" />
+              <a-switch v-model:checked="rule.enabled" :aria-label="`启用分类规则 ${index + 1}`" checked-children="开" un-checked-children="停" />
+            </header>
+            <div class="category-condition-grid">
+              <a-form-item label="TMDB 类型 / ID"><a-select v-model:value="rule.genres" :aria-label="`分类规则 ${index + 1} 的 TMDB 类型或 ID`" mode="tags" :options="TMDB_GENRE_OPTIONS" placeholder="例如 16、动画" /></a-form-item>
+              <a-form-item label="原始语言"><a-select v-model:value="rule.original_languages" :aria-label="`分类规则 ${index + 1} 的原始语言`" mode="tags" placeholder="例如 zh、ja、ko" /></a-form-item>
+              <a-form-item label="来源地区"><a-select v-model:value="rule.origin_countries" :aria-label="`分类规则 ${index + 1} 的来源地区`" mode="multiple" show-search :options="COUNTRY_OPTIONS_ZH" :filter-option="(input, option) => String(option.label).toLowerCase().includes(String(input).toLowerCase())" placeholder="选择国家或地区（中文显示）" /></a-form-item>
+            </div>
+            <footer>
+              <span>三个条件组均为空时不能保存</span>
+              <a-space :size="4">
+                <a-button size="small" :disabled="index === 0" :aria-label="`上移规则 ${index + 1}`" @click="moveCategoryRule(index, -1)">上移</a-button>
+                <a-button size="small" :disabled="index === settingsForm.category_rules.length - 1" :aria-label="`下移规则 ${index + 1}`" @click="moveCategoryRule(index, 1)">下移</a-button>
+                <a-button type="text" danger size="small" :aria-label="`删除规则 ${index + 1}`" @click="removeCategoryRule(rule)"><DeleteOutlined />删除</a-button>
+              </a-space>
+            </footer>
+          </article>
+        </div>
+      </section>
+
+      <section v-if="props.settingsOnly && settingsSection === 'search'" class="section-block search-settings-block">
+        <div class="section-heading">
+          <div><h2>搜索设置</h2><p>控制 TMDB 无结果时的回退与自动选择边界；关闭相似度匹配后只会自动接受同名、同年份结果。</p></div>
+          <a-button type="primary" :loading="settingsSaving" @click="saveSettings">保存搜索设置</a-button>
+        </div>
+        <div class="search-setting-grid">
+          <label class="search-setting-card"><span><strong>分词搜索</strong><small>首次查询无结果时，尝试括号外标题、别名分段等最多三个安全变体。</small></span><a-switch v-model:checked="settingsForm.word_segment_search" aria-label="启用分词搜索" /></label>
+          <label class="search-setting-card"><span><strong>相似度匹配</strong><small>按标题、年份和候选差距自动选择；关闭后所有非精确结果进入人工确认。</small></span><a-switch v-model:checked="settingsForm.similarity_match" aria-label="启用相似度匹配" /></label>
+          <label class="search-setting-card"><span><strong>允许成人内容候选</strong><small>只影响 TMDB 返回候选，不改变云盘扫描或分类。</small></span><a-switch v-model:checked="settingsForm.include_adult" aria-label="允许成人内容候选" /></label>
+          <a-form-item label="自动匹配阈值" class="search-score-card" :extra="settingsForm.similarity_match ? '候选分数低于阈值时转人工确认。' : '相似度匹配关闭时，此阈值不参与自动选择。'">
+            <a-input-number v-model:value="settingsForm.minimum_match_score" :disabled="!settingsForm.similarity_match" :min="0.4" :max="0.98" :step="0.01" :precision="2" style="width: 100%" />
+          </a-form-item>
+        </div>
+      </section>
 
       <section v-if="props.settingsOnly && settingsSection === 'directories'" class="section-block">
         <div class="section-heading">
@@ -732,10 +1009,10 @@ onBeforeUnmount(() => {
               <a-alert v-if="mapping.watch_error" type="error" :message="mapping.watch_error" show-icon />
             </div>
             <div class="mapping-actions">
-              <a-switch :checked="mapping.enabled" :disabled="mappingLocked(mapping)" checked-children="开" un-checked-children="停" @change="(value) => toggleMapping(mapping, value)" />
-              <a-tooltip :title="mappingLocked(mapping) ? '目录正在识别或整理' : '立即扫描'"><a-button shape="circle" :disabled="!mapping.enabled || mappingLocked(mapping)" :loading="jobBusy[`mapping:${mapping.id}`]" @click="scanMapping(mapping)"><ReloadOutlined /></a-button></a-tooltip>
-              <a-tooltip :title="mappingLocked(mapping) ? '完成当前任务后才能编辑' : '编辑'"><a-button shape="circle" :disabled="mappingLocked(mapping)" @click="openEditMapping(mapping)"><EditOutlined /></a-button></a-tooltip>
-              <a-tooltip :title="mappingLocked(mapping) ? '完成当前任务后才能删除' : '删除'"><a-button danger shape="circle" :disabled="mappingLocked(mapping)" @click="removeMapping(mapping)"><DeleteOutlined /></a-button></a-tooltip>
+              <a-switch :checked="mapping.enabled" :aria-label="`启用归档规则 ${mapping.source_path}`" :disabled="mappingLocked(mapping)" checked-children="开" un-checked-children="停" @change="(value) => toggleMapping(mapping, value)" />
+              <a-tooltip :title="mappingLocked(mapping) ? '目录正在识别或整理' : '立即扫描'"><a-button shape="circle" :aria-label="`立即扫描 ${mapping.source_path}`" :disabled="!mapping.enabled || mappingLocked(mapping)" :loading="jobBusy[`mapping:${mapping.id}`]" @click="scanMapping(mapping)"><ReloadOutlined /></a-button></a-tooltip>
+              <a-tooltip :title="mappingLocked(mapping) ? '完成当前任务后才能编辑' : '编辑'"><a-button shape="circle" :aria-label="`编辑归档规则 ${mapping.source_path}`" :disabled="mappingLocked(mapping)" @click="openEditMapping(mapping)"><EditOutlined /></a-button></a-tooltip>
+              <a-tooltip :title="mappingLocked(mapping) ? '完成当前任务后才能删除' : '删除'"><a-button danger shape="circle" :aria-label="`删除归档规则 ${mapping.source_path}`" :disabled="mappingLocked(mapping)" @click="removeMapping(mapping)"><DeleteOutlined /></a-button></a-tooltip>
             </div>
           </article>
         </div>
@@ -743,8 +1020,8 @@ onBeforeUnmount(() => {
 
       <section v-if="props.settingsOnly && settingsSection === 'scrape'" class="section-block scrape-settings-block">
         <div class="section-heading">
-          <div><h2>刮削偏好</h2><p>默认只刮削常用元数据；可按 TMDB 类型把媒体归入自定义分类，并配置多个媒体库目标。</p></div>
-          <a-button type="primary" @click="saveSettings" :loading="settingsSaving">保存刮削偏好</a-button>
+          <div><h2>刮削输出</h2><p>配置默认生成的 NFO 与图片类型，以及手动刮削时可选的云盘媒体库目标。</p></div>
+          <a-button type="primary" @click="saveSettings" :loading="settingsSaving">保存刮削输出</a-button>
         </div>
         <div class="scrape-preference-grid">
           <a-form-item label="默认刮削类型" class="template-wide">
@@ -755,21 +1032,8 @@ onBeforeUnmount(() => {
             <a-empty v-if="!settingsForm.scrape_targets.length" description="尚未配置刮削目标" />
             <div v-else class="scrape-target-list">
               <article v-for="target in settingsForm.scrape_targets" :key="target.id" class="scrape-target-card">
-                <FolderOpenOutlined /><div><strong>{{ target.name }}</strong><small>{{ target.path }} · {{ target.dir_id }}</small></div><a-space><a-button type="text" size="small" @click="openEditTarget(target)"><EditOutlined /></a-button><a-button type="text" danger size="small" @click="removeTarget(target)"><DeleteOutlined /></a-button></a-space>
+                <FolderOpenOutlined /><div><strong>{{ target.name }}</strong><small>{{ target.path }} · {{ target.dir_id }}</small></div><a-space><a-button type="text" size="small" :aria-label="`编辑刮削目标 ${target.name}`" @click="openEditTarget(target)"><EditOutlined /></a-button><a-button type="text" danger size="small" :aria-label="`删除刮削目标 ${target.name}`" @click="removeTarget(target)"><DeleteOutlined /></a-button></a-space>
               </article>
-            </div>
-          </div>
-          <div class="category-rule-panel template-wide">
-            <div class="target-panel-head"><div><strong>媒体分类规则</strong><small>按 TMDB 类型名称或 genre id 匹配，第一条命中优先；未命中使用电影/电视剧默认分类。</small></div><a-button size="small" @click="settingsForm.category_rules.push({ id: `category-${Date.now()}`, name: '', media_type: 'all', genres: [], enabled: true })"><PlusOutlined />添加规则</a-button></div>
-            <a-empty v-if="!settingsForm.category_rules.length" description="未配置自定义分类规则" />
-            <div v-else class="category-rule-list">
-              <div v-for="rule in settingsForm.category_rules" :key="rule.id" class="category-rule-row">
-                <a-switch v-model:checked="rule.enabled" />
-                <a-input v-model:value="rule.name" placeholder="分类名称，例如：儿童" />
-                <a-select v-model:value="rule.media_type" :options="[{ label: '全部', value: 'all' }, { label: '电影', value: 'movie' }, { label: '电视剧', value: 'tv' }]" />
-                <a-select v-model:value="rule.genres" mode="tags" :options="TMDB_GENRE_OPTIONS" placeholder="选择或输入 TMDB 类型名 / ID" />
-                <a-button type="text" danger @click="settingsForm.category_rules = settingsForm.category_rules.filter((item) => item.id !== rule.id)"><DeleteOutlined /></a-button>
-              </div>
             </div>
           </div>
         </div>
@@ -800,8 +1064,9 @@ onBeforeUnmount(() => {
               <a-space :size="2">
                 <a-button v-if="record.preview" type="text" size="small" @click="openPreview(record)"><EyeOutlined />预览</a-button>
                 <a-button v-if="record.status === 'ready'" type="primary" size="small" :loading="jobBusy[record.id]" @click="runJob(record)"><PlayCircleOutlined />执行</a-button>
-                <a-button v-else-if="['needs_review', 'failed'].includes(record.status)" type="link" size="small" :loading="jobBusy[record.id]" @click="openReview(record)"><SearchOutlined />人工确认</a-button>
-                <a-tooltip title="仅删除任务记录"><a-button v-if="record.status !== 'running'" type="text" danger size="small" @click="removeJob(record)"><DeleteOutlined /></a-button></a-tooltip>
+                <a-button v-else-if="record.status === 'needs_review'" type="link" size="small" :loading="jobBusy[record.id]" @click="openReview(record)"><SearchOutlined />人工确认</a-button>
+                <a-button v-if="['failed', 'completed', 'completed_warning'].includes(record.status)" type="link" size="small" :loading="jobBusy[record.id]" @click="openReorganize(record)"><ReloadOutlined />重新归档</a-button>
+                <a-button v-if="!['recognizing', 'running'].includes(record.status)" type="text" danger size="small" :loading="jobBusy[record.id]" :aria-label="`删除整理记录 ${fileName(record.source_path)}`" @click="openDeleteActions(record)"><DeleteOutlined />删除</a-button>
               </a-space>
             </template>
           </template>
@@ -830,6 +1095,11 @@ onBeforeUnmount(() => {
           <a-button style="width: 92px" @click="openCloudFolderPicker('target')"><FolderOpenOutlined />选择</a-button>
         </a-input-group>
       </a-form-item>
+      <div class="mapping-template-preview" aria-label="当前命名规则预览">
+        <span><strong>电影命名</strong><code>{{ templateExamples.movie.path || '尚无预览' }}</code></span>
+        <span><strong>电视剧命名</strong><code>{{ templateExamples.tv.path || '尚无预览' }}</code></span>
+        <small>当前归档规则使用“通用配置”中的全局命名模板和“二级分类”中的首条命中规则。</small>
+      </div>
       <div class="form-grid">
         <a-form-item label="云端静默等待">
           <a-input-number v-model:value="mappingForm.settle_seconds" :min="5" :max="3600" :step="5" style="width: 100%" addon-after="秒" />
@@ -893,7 +1163,7 @@ onBeforeUnmount(() => {
     <p class="picker-current">当前选择：/{{ cloudFolderPicker.path.slice(1).map((item) => item.name).join('/') }}</p>
   </a-modal>
 
-  <a-modal v-model:open="review.open" title="人工确认媒体信息" width="min(820px, 94vw)" :closable="!jobBusy[review.job?.id]" :mask-closable="false">
+  <a-modal v-model:open="review.open" :title="review.mode === 'rearchive' ? '重新归档' : '人工确认媒体信息'" width="min(820px, 94vw)" :closable="!jobBusy[review.job?.id]" :mask-closable="false">
     <a-alert v-if="review.job?.message" type="warning" show-icon :message="review.job.message" class="review-alert" />
     <section v-if="reviewCandidates.length" class="candidate-section">
       <div class="candidate-heading"><strong>TMDB 候选</strong><span>选择后仍可修改下方季集信息</span></div>
@@ -927,9 +1197,18 @@ onBeforeUnmount(() => {
     </a-form>
     <template #footer>
       <a-button @click="review.open = false">取消</a-button>
-      <a-button :loading="jobBusy[review.job?.id]" @click="submitReview(false)">仅重新识别</a-button>
-      <a-button type="primary" :loading="jobBusy[review.job?.id]" @click="submitReview(true)">识别并整理</a-button>
+      <a-button v-if="review.mode !== 'rearchive'" :loading="jobBusy[review.job?.id]" @click="submitReview(false)">仅重新识别</a-button>
+      <a-button type="primary" :loading="jobBusy[review.job?.id]" @click="submitReview(true)">{{ review.mode === 'rearchive' ? '重新归档' : '识别并整理' }}</a-button>
     </template>
+  </a-modal>
+
+  <a-modal v-model:open="deleteDialog.open" title="操作选项" width="min(520px, 92vw)" :footer="null" :destroy-on-close="true">
+    <p class="delete-dialog-title">{{ fileName(deleteDialog.job?.source_path) }}</p>
+    <div class="delete-option-list">
+      <a-button v-for="action in JOB_DELETE_ACTIONS" :key="action.key" block danger @click="chooseDeleteAction(action.key)">
+        <DeleteOutlined />{{ action.label }}
+      </a-button>
+    </div>
   </a-modal>
 
   <a-modal v-model:open="preview.open" title="光鸭原生整理预览" width="min(960px, 96vw)" :footer="null">
@@ -944,6 +1223,7 @@ onBeforeUnmount(() => {
       <span><small>提示</small><strong>{{ previewSummary.warnings || 0 }}</strong></span>
     </div>
     <a-alert v-if="preview.job?.preview?.message" :type="preview.job.preview.success ? 'info' : 'warning'" show-icon :message="preview.job.preview.message" class="preview-alert" />
+    <a-alert v-if="preview.job?.preview?.media_probe_warnings?.length" type="warning" show-icon message="部分文件未取得 FFprobe 媒体信息" :description="preview.job.preview.media_probe_warnings.join('\n')" class="preview-alert probe-warning-alert" />
     <a-empty v-if="!previewItems.length" description="没有文件目标；请进入人工确认选择 TMDB 候选" />
     <div v-else class="preview-list">
       <article v-for="(item, index) in previewItems" :key="`${item.target || item.source || ''}:${index}`" :class="{ failed: !item.success, skipped: item.action === 'skip' }">
@@ -968,10 +1248,9 @@ onBeforeUnmount(() => {
 .organizer-page { display: grid; gap: 14px; max-width: 1500px; margin: 0 auto; }
 .organizer-settings-tabs { margin: 2px 0 -4px; padding: 0 4px; }
 .inner-tab { display: inline-flex; align-items: center; gap: 7px; }
-.template-preview-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
-.template-preview-grid article { display: grid; min-width: 0; gap: 5px; padding: 10px 12px; border: 1px solid var(--line, #e5e7eb); border-radius: 9px; background: var(--surface-muted, #f8f9fa); }
-.template-preview-grid small, .template-preview-grid span { color: var(--text-3, #667085); font-size: 11px; line-height: 1.45; }
-.template-preview-grid code { overflow-wrap: anywhere; color: var(--text-1, #20242c); font-size: 12px; }
+.template-inline-preview { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 5px 10px; margin-top: 8px; padding: 9px 10px; border: 1px solid var(--line-soft, #edf0f3); border-radius: 8px; background: var(--surface-muted, #fafbfc); }
+.template-inline-preview small { color: var(--text-3, #8b8f98); font-size: 10px; }
+.template-inline-preview code, .template-inline-preview span { min-width: 0; overflow-wrap: anywhere; color: var(--text-1, #20242c); font-size: 11px; }
 .scrape-preference-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .template-wide { grid-column: 1 / -1; }
 .target-panel, .category-rule-panel { padding: 14px; border: 1px solid var(--line, #e5e7eb); border-radius: 10px; }
@@ -985,6 +1264,31 @@ onBeforeUnmount(() => {
 .scrape-target-card small { margin-top: 3px; color: var(--text-3, #98a2b3); font-size: 11px; }
 .category-rule-row { display: grid; grid-template-columns: auto minmax(110px, .8fr) 110px minmax(180px, 1.5fr) auto; align-items: center; gap: 8px; }
 .field-help { color: var(--text-3, #98a2b3); font-size: 11px; }
+.rule-editor-card { overflow: hidden; background: var(--surface-muted, #fafbfc); }
+.rule-editor-card :deep(.ant-card-body) { padding: 0 16px 14px; }
+.recognition-tabs :deep(.ant-tabs-nav) { margin-bottom: 12px; }
+.recognition-tabs :deep(textarea) { font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace; font-size: 12px; line-height: 1.65; }
+.recognition-tabs .field-help { display: block; margin: 8px 2px 0; }
+.category-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; padding: 11px 12px; border: 1px solid var(--line-soft, #edf0f3); border-radius: 9px; background: var(--surface-muted, #fafbfc); }
+.category-toolbar > div { display: grid; gap: 2px; }
+.category-toolbar span { color: var(--text-3, #8b8f98); font-size: 11px; }
+.category-rule-list--expanded { gap: 10px; }
+.category-rule-card { display: grid; gap: 12px; padding: 12px; border: 1px solid var(--line, #e4e7ec); border-radius: 10px; background: var(--surface-muted, #fafbfc); }
+.category-rule-card header { display: grid; grid-template-columns: 34px minmax(220px, 1fr) 118px auto; align-items: center; gap: 9px; }
+.rule-index { color: var(--text-3, #98a2b3); font: 700 11px/1 "Cascadia Code", monospace; letter-spacing: .08em; }
+.category-condition-grid { display: grid; grid-template-columns: 1.35fr 1fr 1fr; gap: 10px; }
+.category-condition-grid :deep(.ant-form-item) { margin: 0; }
+.category-rule-card footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 9px; border-top: 1px solid var(--line-soft, #edf0f3); }
+.category-rule-card footer > span { color: var(--text-3, #98a2b3); font-size: 10px; }
+.search-setting-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.search-setting-card, .search-score-card { min-height: 88px; margin: 0 !important; padding: 14px; border: 1px solid var(--line-soft, #edf0f3); border-radius: 10px; background: var(--surface-muted, #fafbfc); }
+.search-setting-card { display: flex; align-items: center; justify-content: space-between; gap: 22px; cursor: pointer; }
+.search-setting-card span { display: grid; gap: 4px; }
+.search-setting-card small { color: var(--text-3, #8b8f98); font-size: 11px; line-height: 1.45; }
+.mapping-template-preview { display: grid; gap: 7px; margin: -2px 0 14px; padding: 11px 12px; border: 1px solid var(--line-soft, #edf0f3); border-radius: 9px; background: var(--surface-muted, #fafbfc); }
+.mapping-template-preview > span { display: grid; grid-template-columns: 78px minmax(0, 1fr); align-items: baseline; gap: 8px; }
+.mapping-template-preview code { overflow-wrap: anywhere; color: var(--text-2, #667085); font-size: 10px; }
+.mapping-template-preview small { color: var(--text-3, #98a2b3); font-size: 10px; }
 .page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; padding: 12px 4px 6px; }
 .eyebrow { color: var(--text-3, #8b8f98); font-size: 10px; font-weight: 700; letter-spacing: .16em; }
 .page-heading h1 { margin: 3px 0 2px; font-size: 27px; line-height: 1.2; letter-spacing: -.035em; }
@@ -999,6 +1303,10 @@ onBeforeUnmount(() => {
 .settings-card :deep(.ant-card-head) { min-height: 48px; }
 .card-title { display: inline-flex; align-items: center; gap: 8px; }
 .settings-alert, .drawer-alert, .review-alert, .preview-alert { margin-bottom: 14px; }
+.delete-dialog-title { margin: 0 0 12px; overflow: hidden; color: var(--text-2, #667085); text-overflow: ellipsis; white-space: nowrap; }
+.delete-option-list { display: grid; gap: 10px; }
+.delete-option-list :deep(.ant-btn) { height: 42px; justify-content: flex-start; }
+.probe-warning-alert :deep(.ant-alert-description) { white-space: pre-line; }
 .settings-primary { display: grid; grid-template-columns: minmax(260px, 1.35fr) minmax(150px, .7fr) minmax(170px, .8fr) 150px auto; align-items: end; gap: 12px; }
 .settings-primary :deep(.ant-form-item), .template-grid :deep(.ant-form-item) { margin: 0; }
 .naming-collapse { margin-top: 10px; border-top: 1px solid var(--line-soft, #edf0f3); }
@@ -1006,7 +1314,17 @@ onBeforeUnmount(() => {
 .naming-collapse :deep(.ant-collapse-content-box) { padding: 2px 0 0 !important; }
 .template-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .template-wide { grid-column: 1 / -1; }
+.media-info-setting { display: flex; align-items: center; justify-content: space-between; gap: 24px; min-height: 62px; padding: 11px 12px; border: 1px solid var(--line-soft, #edf0f3); border-radius: 9px; background: var(--surface-muted, #fafbfc); }
+.media-info-setting span { display: grid; gap: 3px; }
+.media-info-setting small { color: var(--text-3, #8b8f98); font-size: 10px; line-height: 1.5; }
 .template-help { margin: 10px 0 0; color: var(--text-3, #8b8f98); font-size: 10px; word-break: break-all; }
+.template-token-groups { display: grid; gap: 6px; margin-top: 10px; }
+.template-token-groups details { padding: 8px 10px; border: 1px solid var(--line-soft, #edf0f3); border-radius: 8px; }
+.template-token-groups summary { color: var(--text-2, #667085); font-size: 11px; cursor: pointer; }
+.template-token-list { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+.template-token-button { display: inline-flex; align-items: center; gap: 5px; margin: 0; padding: 2px 7px; border: 1px solid var(--line, #d9d9d9); border-radius: 5px; background: var(--surface, #fff); color: var(--text-2, #667085); font: inherit; font-size: 10px; cursor: pointer; }
+.template-token-button:hover, .template-token-button:focus-visible { border-color: #1677ff; color: #1677ff; outline: none; }
+.template-token-button code { color: #1677ff; }
 .adult-setting { display: flex; align-items: center; justify-content: space-between; gap: 20px; min-height: 54px; padding: 0 2px; }
 .adult-setting span { display: grid; gap: 2px; }
 .adult-setting small { color: var(--text-3, #8b8f98); font-size: 10px; }
@@ -1085,9 +1403,11 @@ onBeforeUnmount(() => {
   .mapping-actions { grid-column: 2; justify-content: flex-end; }
   .review-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .review-title { grid-column: span 2; }
-  .scrape-preference-grid, .template-preview-grid { grid-template-columns: 1fr; }
+  .scrape-preference-grid { grid-template-columns: 1fr; }
   .category-rule-row { grid-template-columns: auto minmax(0, 1fr) auto; }
   .category-rule-row .ant-select, .category-rule-row .ant-input { grid-column: span 2; }
+  .category-rule-card header { grid-template-columns: 30px minmax(0, 1fr) 110px auto; }
+  .category-condition-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 640px) {
   .page-heading { align-items: flex-start; flex-direction: column; }
@@ -1101,5 +1421,10 @@ onBeforeUnmount(() => {
   .preview-summary { grid-template-columns: repeat(2, 1fr); }
   .matched-media { grid-template-columns: 58px minmax(0, 1fr); }
   .matched-media img { width: 58px; height: 84px; }
+  .section-heading, .category-toolbar, .category-rule-card footer { align-items: stretch; flex-direction: column; }
+  .search-setting-grid { grid-template-columns: 1fr; }
+  .category-rule-card header { grid-template-columns: 28px minmax(0, 1fr) auto; }
+  .category-rule-card header > :deep(.ant-select) { grid-column: 2 / -1; }
+  .mapping-template-preview > span { grid-template-columns: 1fr; }
 }
 </style>

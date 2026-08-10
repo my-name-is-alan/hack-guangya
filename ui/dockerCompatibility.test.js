@@ -21,7 +21,7 @@ test('Docker 备份默认使用更适合挂载卷的轮询监听', () => {
   assert.match(backupSource, /monitor_mode:\s*isTauri\s*\?\s*'native'\s*:\s*'polling'/);
   assert.match(dockerfile, /GUANGYA_DEFAULT_MONITOR_MODE=polling/);
   assert.match(composeSource, /GUANGYA_DEFAULT_MONITOR_MODE:\s*polling/);
-  assert.match(dockerfile, /VOLUME\s*\["\/data",\s*"\/watch",\s*"\/archive",\s*"\/media"\]/);
+  assert.match(dockerfile, /VOLUME\s*\["\/data",\s*"\/watch",\s*"\/archive",\s*"\/media",\s*"\/virtual-library"\]/);
 });
 
 test('Docker 不支持的桥接命令明确报错，登录失效有统一通知', () => {

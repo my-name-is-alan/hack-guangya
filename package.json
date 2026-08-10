@@ -1,6 +1,6 @@
 {
   "name": "guangya-folder-sync",
-  "version": "0.1.27",
+  "version": "0.1.28",
   "type": "module",
   "packageManager": "pnpm@11.15.1",
   "engines": {
@@ -13,6 +13,7 @@
     "dev": "tauri dev",
     "build": "tauri build",
     "prepare:rclone": "node scripts/prepare-rclone.mjs",
+    "prepare:ffprobe": "node scripts/prepare-ffprobe.mjs",
     "ui:dev": "vite --host 127.0.0.1 --port 1420",
     "ui:build": "vite build",
     "ui:test": "node --test ui/*.test.js",
@@ -33,6 +34,7 @@
     "vue-router": "^4.6.4"
   },
   "devDependencies": {
+    "@ffprobe-installer/ffprobe": "2.1.2",
     "@tauri-apps/cli": "^2.5.0",
     "@types/node": "^24.13.3",
     "@vitejs/plugin-vue": "^6.0.8",

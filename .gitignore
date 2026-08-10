@@ -9,6 +9,9 @@ src-tauri/resources/rclone
 src-tauri/resources/rclone.exe
 src-tauri/resources/rclone.version.json
 src-tauri/resources/rclone-COPYING.txt
+src-tauri/resources/ffprobe
+src-tauri/resources/ffprobe.exe
+src-tauri/resources/ffprobe.version.json
 
 # Runtime data and user-selected folders
 docker-data/
@@ -17,6 +20,7 @@ docker-data/
 watch/
 archive/
 media/
+virtual-library/
 *.sqlite
 *.sqlite3
 *.db
@@ -37,6 +41,7 @@ media/
 Thumbs.db
 .idea/
 .vscode/
+/undefined/
 *.swp
 *.swo
 

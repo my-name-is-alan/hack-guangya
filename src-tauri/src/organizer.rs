@@ -1,8 +1,8 @@
 use crate::organizer_core::{
-    parse_media_name, render_nfo, resolve_tmdb_match, sanitize_component, AnalyzedSidecar,
-    AnalyzedVideo, CandidateAnalysis, GeneratorSpec, MatchResolution, MediaMetadata, MediaQuery,
-    NativeSettings, RecognitionOverrides, TmdbCandidate, TmdbClient, NATIVE_ENGINE_VERSION,
-    VIDEO_EXTENSIONS,
+    parse_media_name_with_settings, render_nfo, resolve_tmdb_match, sanitize_component,
+    validate_auxiliary_rule_block, AnalyzedSidecar, AnalyzedVideo, CandidateAnalysis,
+    GeneratorSpec, MatchResolution, MediaMetadata, MediaQuery, NativeSettings,
+    RecognitionOverrides, TmdbCandidate, TmdbClient, NATIVE_ENGINE_VERSION, VIDEO_EXTENSIONS,
 };
 use crate::{
     api_post, finish_operation_response, hdhive_request, load_global_network_proxy,
@@ -18,11 +18,14 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{Emitter, Manager};
-use tokio::time::sleep;
+use tokio::{
+    process::Command,
+    time::{sleep, timeout},
+};
 use uuid::Uuid;
 
 const POLL_INTERVAL_SECONDS: u64 = 15;
@@ -66,6 +69,7 @@ struct OrganizerSecrets {
     category_rules: Vec<Value>,
     scrape_targets: Vec<Value>,
     default_scrape_types: Vec<String>,
+    include_media_info: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,6 +87,13 @@ pub struct OrganizerPublicSettings {
     image_language: String,
     include_adult: bool,
     minimum_match_score: f64,
+    word_segment_search: bool,
+    similarity_match: bool,
+    recognition_words: String,
+    release_groups: String,
+    render_words: String,
+    capture_groups: String,
+    include_media_info: bool,
     movie_path_template: String,
     tv_path_template: String,
     movie_category: String,
@@ -107,12 +118,18 @@ fn standard_template_examples(secrets: &OrganizerSecrets) -> Value {
     movie.countries = vec!["US".to_string()];
     let mut movie_parsed = crate::organizer_core::ParsedMediaName::default();
     movie_parsed.quality = "1080p".to_string();
+    movie_parsed.video_format = "1080p".to_string();
+    movie_parsed.resource_type = "WEB-DL".to_string();
+    movie_parsed.video_codec = "HEVC".to_string();
+    movie_parsed.audio_codec = "DDP".to_string();
+    movie_parsed.audio_info = "5.1".to_string();
+    movie_parsed.release_group = "Example".to_string();
+    movie_parsed.media_probed = true;
     let movie_category = resolve_media_category(&movie, secrets);
     let movie_context = template_context(&movie, &movie_parsed, "", &movie_category, "mkv");
     let movie_path = render_path_template(&secrets.movie_path_template, &movie_context)
-        .unwrap_or_else(|_| {
-            format!("电影/US/2024/示例电影 (2024) [tmdb-12345]/示例电影 (2024).mkv")
-        });
+        .map(|path| append_media_info_suffix(path, &secrets.movie_path_template, &movie_context, secrets.include_media_info))
+        .unwrap_or_else(|_| "电影/美国/2024/示例电影 (2024) [tmdb-12345]/示例电影 (2024).1080p.WEB-DL.5.1.HEVC.DDP-Example.mkv".to_string());
 
     let mut tv = MediaMetadata::default();
     tv.media_type = "tv".to_string();
@@ -125,12 +142,21 @@ fn standard_template_examples(secrets: &OrganizerSecrets) -> Value {
     tv_parsed.season = Some(1);
     tv_parsed.episode = Some(2);
     tv_parsed.quality = "1080p".to_string();
+    tv_parsed.video_format = "2160p".to_string();
+    tv_parsed.source = "Netflix".to_string();
+    tv_parsed.release_type = "WEB-DL".to_string();
+    tv_parsed.dynamic_range = "HDR".to_string();
+    tv_parsed.frame_rate = "60fps".to_string();
+    tv_parsed.color_depth = "10bit".to_string();
+    tv_parsed.video_codec = "HEVC".to_string();
+    tv_parsed.audio_codec = "DDP".to_string();
+    tv_parsed.release_group = "Example".to_string();
+    tv_parsed.media_probed = true;
     let tv_category = resolve_media_category(&tv, secrets);
     let tv_context = template_context(&tv, &tv_parsed, "第二集", &tv_category, "mkv");
-    let tv_path =
-        render_path_template(&secrets.tv_path_template, &tv_context).unwrap_or_else(|_| {
-            format!("电视剧/CN/2024/示例剧集 (2024) [tmdb-67890]/Season 01/示例剧集.S01E02.mkv")
-        });
+    let tv_path = render_path_template(&secrets.tv_path_template, &tv_context)
+        .map(|path| append_media_info_suffix(path, &secrets.tv_path_template, &tv_context, secrets.include_media_info))
+        .unwrap_or_else(|_| "电视剧/中国/2024/示例剧集 (2024) [tmdb-67890]/Season 01/示例剧集.S01E02.2160p.Netflix.WEB-DL.HDR.60fps.10bit.HEVC.DDP-Example.mkv".to_string());
 
     json!({
         "movie": {
@@ -170,6 +196,13 @@ impl OrganizerSecrets {
             image_language: self.native.image_language.clone(),
             include_adult: self.native.include_adult,
             minimum_match_score: self.native.minimum_match_score,
+            word_segment_search: self.native.word_segment_search,
+            similarity_match: self.native.similarity_match,
+            recognition_words: self.native.recognition_words.clone(),
+            release_groups: self.native.release_groups.clone(),
+            render_words: self.native.render_words.clone(),
+            capture_groups: self.native.capture_groups.clone(),
+            include_media_info: self.include_media_info,
             movie_path_template: self.movie_path_template.clone(),
             tv_path_template: self.tv_path_template.clone(),
             movie_category: self.movie_category.clone(),
@@ -181,6 +214,7 @@ impl OrganizerSecrets {
             default_scrape_types: self.default_scrape_types.clone(),
             template_examples: standard_template_examples(self),
             path_presets: vec![
+                json!({ "id": "reference-media-info", "name": "参考完整命名（媒体信息后缀）", "movie": "{category}/{country}/{title} ({year}) {tmdb-{tmdbid}}/{en_title}.{year}.{videoFormat}.{resourceType}.{effect}.{audioInfo}.{videoCodec}.{audioCodec}-{releaseGroup}{fileExt}", "tv": "{category}/{country}/{title} ({year}) {tmdb-{tmdbid}}/Season {season}/{en_title}.{year}.{season_episode}.{videoFormat}.{source}.{release_type}.{high_quality}.{dolby_vision}.{dynamic_range}.{frame_rate}.{color_depth}.{video_codec}.{audioCodec}-{releaseGroup}{fileExt}" }),
                 json!({ "id": "category-country-year", "name": "分类 / 国家 / 年份", "movie": MOVIE_PATH_TEMPLATE, "tv": TV_PATH_TEMPLATE }),
                 json!({ "id": "media-server", "name": "媒体服务器常用", "movie": "{category}/{title} ({year}) [tmdb-{tmdb_id}]/{title} ({year}){edition}{quality}{part}.{ext}", "tv": "{category}/{title} ({year}) [tmdb-{tmdb_id}]/Season {season:02}/{title}.S{season:02}E{episode:02}{episode_end}.{ext}" }),
                 json!({ "id": "compact", "name": "精简目录", "movie": "{category}/{title} ({year})/{title}.{year}.{quality}.{ext}", "tv": "{category}/{title} ({year})/S{season:02}/{title}.S{season:02}E{episode:02}{episode_end}.{ext}" }),
@@ -294,6 +328,8 @@ struct CloudPreview {
     error_code: Option<String>,
     message: String,
     ignored_samples: Vec<String>,
+    #[serde(default)]
+    media_probe_warnings: Vec<String>,
     data: CloudPreviewData,
 }
 
@@ -353,6 +389,13 @@ pub struct OrganizerSettingsInput {
     image_language: Option<String>,
     include_adult: Option<bool>,
     minimum_match_score: Option<f64>,
+    word_segment_search: Option<bool>,
+    similarity_match: Option<bool>,
+    recognition_words: Option<String>,
+    release_groups: Option<String>,
+    render_words: Option<String>,
+    capture_groups: Option<String>,
+    include_media_info: Option<bool>,
     movie_path_template: Option<String>,
     tv_path_template: Option<String>,
     movie_category: Option<String>,
@@ -410,11 +453,21 @@ pub struct OrganizerJobInput {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+pub struct OrganizerJobDeleteInput {
+    #[serde(default)]
+    delete_source: bool,
+    #[serde(default)]
+    delete_target: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 struct SelectedScrapeFile {
     #[serde(alias = "file_id", alias = "fileId")]
     id: String,
     #[serde(alias = "parentId")]
     parent_id: String,
+    #[serde(default, alias = "fileName", alias = "file_name")]
+    name: Option<String>,
     #[serde(default, alias = "parentPath")]
     parent_path: Option<String>,
     #[serde(default)]
@@ -517,6 +570,10 @@ pub fn init_database(path: &Path) -> Result<(), String> {
                id INTEGER PRIMARY KEY CHECK (id = 1), tmdb_api_key TEXT NOT NULL DEFAULT '',
                language TEXT NOT NULL DEFAULT 'zh-CN', image_language TEXT NOT NULL DEFAULT 'zh,null,en',
                include_adult INTEGER NOT NULL DEFAULT 0, minimum_match_score REAL NOT NULL DEFAULT 0.72,
+               word_segment_search INTEGER NOT NULL DEFAULT 1, similarity_match INTEGER NOT NULL DEFAULT 1,
+               recognition_words TEXT NOT NULL DEFAULT '', release_groups TEXT NOT NULL DEFAULT '',
+               render_words TEXT NOT NULL DEFAULT '', capture_groups TEXT NOT NULL DEFAULT '',
+               include_media_info INTEGER NOT NULL DEFAULT 1,
                movie_path_template TEXT NOT NULL DEFAULT '', tv_path_template TEXT NOT NULL DEFAULT '',
                movie_category TEXT NOT NULL DEFAULT '电影', tv_category TEXT NOT NULL DEFAULT '电视剧',
                tmdb_api_base TEXT NOT NULL DEFAULT '', tmdb_image_base TEXT NOT NULL DEFAULT '',
@@ -549,6 +606,13 @@ pub fn init_database(path: &Path) -> Result<(), String> {
         )
         .map_err(|error| format!("初始化云盘原生整理数据表失败：{error}"))?;
     for (column, definition) in [
+        ("word_segment_search", "INTEGER NOT NULL DEFAULT 1"),
+        ("similarity_match", "INTEGER NOT NULL DEFAULT 1"),
+        ("recognition_words", "TEXT NOT NULL DEFAULT ''"),
+        ("release_groups", "TEXT NOT NULL DEFAULT ''"),
+        ("render_words", "TEXT NOT NULL DEFAULT ''"),
+        ("capture_groups", "TEXT NOT NULL DEFAULT ''"),
+        ("include_media_info", "INTEGER NOT NULL DEFAULT 1"),
         ("movie_path_template", "TEXT NOT NULL DEFAULT ''"),
         ("tv_path_template", "TEXT NOT NULL DEFAULT ''"),
         ("movie_category", "TEXT NOT NULL DEFAULT '电影'"),
@@ -646,6 +710,21 @@ fn normalize_match_score(value: f64) -> Result<f64, String> {
     Ok((value * 100.0).round() / 100.0)
 }
 
+fn normalize_rule_text(value: &str, label: &str) -> Result<String, String> {
+    let normalized = value
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim()
+        .to_string();
+    if normalized.chars().count() > 100_000 {
+        return Err(format!("{label}不能超过 100000 个字符"));
+    }
+    if normalized.lines().count() > 2_000 {
+        return Err(format!("{label}不能超过 2000 行"));
+    }
+    Ok(normalized)
+}
+
 fn normalize_cloud_path(value: &str) -> String {
     let normalized = value.replace('\\', "/");
     let parts = normalized
@@ -687,40 +766,66 @@ fn normalize_mirror_url(value: &str, fallback: &str, label: &str) -> Result<Stri
     Ok(value.trim_end_matches('/').to_string())
 }
 
+fn category_rule_terms(rule: &Value, keys: &[&str]) -> Vec<Value> {
+    let source = keys
+        .iter()
+        .find_map(|key| rule.get(*key))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let values = source.as_array().cloned().unwrap_or_else(|| vec![source]);
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
+        .flat_map(|item| {
+            if let Some(value) = item.as_str() {
+                value
+                    .split([',', '，', '\n'])
+                    .map(|term| term.trim().to_lowercase())
+                    .collect::<Vec<_>>()
+            } else if let Some(value) = item.as_i64() {
+                vec![value.to_string()]
+            } else {
+                Vec::new()
+            }
+        })
+        .filter(|term| !term.is_empty() && seen.insert(term.clone()))
+        .take(80)
+        .map(Value::String)
+        .collect()
+}
+
 fn normalize_category_rules(value: Option<Vec<Value>>) -> Result<Vec<Value>, String> {
     let mut result = Vec::new();
     for (index, rule) in value.unwrap_or_default().into_iter().take(100).enumerate() {
-        let name = rule
+        let raw_name = rule
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or_default()
-            .trim();
-        if name.is_empty() || name.len() > 80 || name.contains(['/', '\\']) {
+            .trim()
+            .replace('\\', "/");
+        let name_parts = raw_name
+            .split('/')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if name_parts.is_empty()
+            || name_parts.len() > 8
+            || name_parts
+                .iter()
+                .any(|part| matches!(*part, "." | "..") || part.chars().count() > 80)
+        {
             return Err(format!("第 {} 条媒体分类名称无效", index + 1));
         }
-        let genres = rule
-            .get("genres")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .flat_map(|item| {
-                if let Some(value) = item.as_str() {
-                    value
-                        .split([',', '，', '\n'])
-                        .map(|term| json!(term.trim().to_lowercase()))
-                        .collect::<Vec<_>>()
-                } else if let Some(value) = item.as_i64() {
-                    vec![json!(value.to_string())]
-                } else {
-                    Vec::new()
-                }
-            })
-            .filter(|item| item.as_str().is_some_and(|value| !value.is_empty()))
-            .take(50)
-            .collect::<Vec<_>>();
-        if genres.is_empty() {
-            return Err(format!("第 {} 条媒体分类至少配置一个 TMDB 类型", index + 1));
+        let name = name_parts.join("/");
+        let genres = category_rule_terms(&rule, &["genres", "genre_ids", "genre_text"]);
+        let original_languages =
+            category_rule_terms(&rule, &["original_languages", "original_language"]);
+        let origin_countries = category_rule_terms(&rule, &["origin_countries", "origin_country"]);
+        if genres.is_empty() && original_languages.is_empty() && origin_countries.is_empty() {
+            return Err(format!(
+                "第 {} 条媒体分类至少配置一个类型、原始语言或来源地区",
+                index + 1
+            ));
         }
         let media_type = rule
             .get("media_type")
@@ -744,6 +849,8 @@ fn normalize_category_rules(value: Option<Vec<Value>>) -> Result<Vec<Value>, Str
             "name": name,
             "media_type": media_type,
             "genres": genres,
+            "original_languages": original_languages,
+            "origin_countries": origin_countries,
             "enabled": rule.get("enabled").and_then(Value::as_bool).unwrap_or(true),
         }));
     }
@@ -801,12 +908,17 @@ fn resolve_media_category(metadata: &MediaMetadata, secrets: &OrganizerSecrets) 
     } else {
         "movie"
     };
-    let mut terms = metadata
+    let genre_names = metadata
         .genres
         .iter()
         .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let genre_ids = metadata
+        .genre_ids
+        .iter()
+        .map(ToString::to_string)
         .collect::<HashSet<_>>();
-    terms.extend(metadata.genre_ids.iter().map(ToString::to_string));
     for rule in &secrets.category_rules {
         if rule.get("enabled").and_then(Value::as_bool) == Some(false) {
             continue;
@@ -818,20 +930,56 @@ fn resolve_media_category(metadata: &MediaMetadata, secrets: &OrganizerSecrets) 
         if rule_type != "all" && rule_type != media_type {
             continue;
         }
-        let matches = rule
+        let genre_matches = rule
             .get("genres")
             .and_then(Value::as_array)
             .map(|items| {
-                items.iter().any(|item| {
-                    let term = item
-                        .as_str()
-                        .map(str::to_lowercase)
-                        .or_else(|| item.as_i64().map(|value| value.to_string()));
-                    term.map(|value| terms.contains(&value)).unwrap_or(false)
-                })
+                items.is_empty()
+                    || items.iter().any(|item| {
+                        let term = item
+                            .as_str()
+                            .map(str::to_lowercase)
+                            .or_else(|| item.as_i64().map(|value| value.to_string()));
+                        term.map(|value| {
+                            genre_ids.contains(&value)
+                                || genre_names.iter().any(|name| {
+                                    name == &value || name.contains(&value) || value.contains(name)
+                                })
+                        })
+                        .unwrap_or(false)
+                    })
             })
-            .unwrap_or(false);
-        if matches {
+            .unwrap_or(true);
+        let language_matches = rule
+            .get("original_languages")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items.is_empty()
+                    || items.iter().any(|item| {
+                        item.as_str().is_some_and(|value| {
+                            value.eq_ignore_ascii_case(&metadata.original_language)
+                        })
+                    })
+            })
+            .unwrap_or(true);
+        let countries = metadata
+            .origin_countries
+            .iter()
+            .chain(metadata.countries.iter())
+            .map(|value| value.to_lowercase())
+            .collect::<HashSet<_>>();
+        let country_matches = rule
+            .get("origin_countries")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items.is_empty()
+                    || items.iter().any(|item| {
+                        item.as_str()
+                            .is_some_and(|value| countries.contains(&value.to_lowercase()))
+                    })
+            })
+            .unwrap_or(true);
+        if genre_matches && language_matches && country_matches {
             if let Some(name) = rule
                 .get("name")
                 .and_then(Value::as_str)
@@ -979,8 +1127,20 @@ fn normalize_path_template(value: &str, fallback: &str, label: &str) -> Result<S
         ("quality", ""),
         ("part", ""),
         ("ext", "mkv"),
+        ("fileext", ".mkv"),
         ("season_tag", "S01"),
         ("episode_tag", "E01"),
+        ("season_episode", "S01E01"),
+        ("video_format", "2160p"),
+        ("videoformat", "2160p"),
+        ("resource_type", "WEB-DL"),
+        ("resourcetype", "WEB-DL"),
+        ("video_codec", "HEVC"),
+        ("videocodec", "HEVC"),
+        ("audio_codec", "DDP"),
+        ("audiocodec", "DDP"),
+        ("release_group", "Example"),
+        ("releasegroup", "Example"),
     ] {
         context.insert(key.to_string(), value.to_string());
     }
@@ -993,8 +1153,9 @@ fn load_secrets(path: &Path) -> Result<OrganizerSecrets, String> {
     let stored = connection
         .query_row(
             "SELECT tmdb_api_key, language, image_language, include_adult, minimum_match_score,
+                    word_segment_search, similarity_match, recognition_words, release_groups, render_words, capture_groups,
                     movie_path_template, tv_path_template, movie_category, tv_category,
-                    tmdb_api_base, tmdb_image_base, category_rules, scrape_targets, default_scrape_types
+                    tmdb_api_base, tmdb_image_base, category_rules, scrape_targets, default_scrape_types, include_media_info
              FROM organizer_settings WHERE id=1",
             [],
             |row| {
@@ -1004,8 +1165,8 @@ fn load_secrets(path: &Path) -> Result<OrganizerSecrets, String> {
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)? != 0,
                     row.get::<_, f64>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(5)? != 0,
+                    row.get::<_, i64>(6)? != 0,
                     row.get::<_, String>(7)?,
                     row.get::<_, String>(8)?,
                     row.get::<_, String>(9)?,
@@ -1013,6 +1174,13 @@ fn load_secrets(path: &Path) -> Result<OrganizerSecrets, String> {
                     row.get::<_, String>(11)?,
                     row.get::<_, String>(12)?,
                     row.get::<_, String>(13)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, String>(15)?,
+                    row.get::<_, String>(16)?,
+                    row.get::<_, String>(17)?,
+                    row.get::<_, String>(18)?,
+                    row.get::<_, String>(19)?,
+                    row.get::<_, i64>(20)? != 0,
                 ))
             },
         )
@@ -1025,6 +1193,12 @@ fn load_secrets(path: &Path) -> Result<OrganizerSecrets, String> {
                 "zh,null,en".to_string(),
                 false,
                 0.72,
+                true,
+                true,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
                 String::new(),
                 String::new(),
                 "电影".to_string(),
@@ -1034,6 +1208,7 @@ fn load_secrets(path: &Path) -> Result<OrganizerSecrets, String> {
                 "[]".to_string(),
                 "[]".to_string(),
                 "[\"movie_nfo\",\"tvshow_nfo\",\"poster\",\"fanart\"]".to_string(),
+                true,
             )
         });
     let environment_key = std::env::var("TMDB_API_KEY")
@@ -1059,18 +1234,24 @@ fn load_secrets(path: &Path) -> Result<OrganizerSecrets, String> {
         normalize_image_language(environment_image_language.as_deref().unwrap_or(&stored.2))?;
     native.include_adult = stored.3;
     native.minimum_match_score = normalize_match_score(stored.4)?;
+    native.word_segment_search = stored.5;
+    native.similarity_match = stored.6;
+    native.recognition_words = normalize_rule_text(&stored.7, "自定义识别词")?;
+    native.release_groups = normalize_rule_text(&stored.8, "自定义制作组")?;
+    native.render_words = normalize_rule_text(&stored.9, "自定义渲染词")?;
+    native.capture_groups = normalize_rule_text(&stored.10, "自定义捕获组")?;
     let stored_api_base =
-        normalize_mirror_url(&stored.9, "https://api.themoviedb.org/3", "TMDB API 镜像")?;
+        normalize_mirror_url(&stored.15, "https://api.themoviedb.org/3", "TMDB API 镜像")?;
     let stored_image_base =
-        normalize_mirror_url(&stored.10, "https://image.tmdb.org/t/p", "TMDB 图片镜像")?;
+        normalize_mirror_url(&stored.16, "https://image.tmdb.org/t/p", "TMDB 图片镜像")?;
     let category_rules =
-        normalize_category_rules(parse_json::<Vec<Value>>(Some(stored.11.clone())))
+        normalize_category_rules(parse_json::<Vec<Value>>(Some(stored.17.clone())))
             .unwrap_or_default();
     let scrape_targets =
-        normalize_scrape_targets(parse_json::<Vec<Value>>(Some(stored.12.clone())))
+        normalize_scrape_targets(parse_json::<Vec<Value>>(Some(stored.18.clone())))
             .unwrap_or_default();
     let stored_scrape_types =
-        parse_json::<Vec<String>>(Some(stored.13.clone())).unwrap_or_default();
+        parse_json::<Vec<String>>(Some(stored.19.clone())).unwrap_or_default();
     let default_scrape_types =
         normalize_scrape_types(&stored_scrape_types, true).unwrap_or_else(|_| {
             DEFAULT_SCRAPE_TYPES
@@ -1082,25 +1263,25 @@ fn load_secrets(path: &Path) -> Result<OrganizerSecrets, String> {
     Ok(OrganizerSecrets {
         api_key: environment_key.clone().unwrap_or(stored.0),
         native,
-        movie_path_template: if stored.5.trim().is_empty() {
+        movie_path_template: if stored.11.trim().is_empty() {
             MOVIE_PATH_TEMPLATE.to_string()
         } else {
-            stored.5
+            stored.11
         },
-        tv_path_template: if stored.6.trim().is_empty() {
+        tv_path_template: if stored.12.trim().is_empty() {
             TV_PATH_TEMPLATE.to_string()
         } else {
-            stored.6
+            stored.12
         },
-        movie_category: if stored.7.trim().is_empty() {
+        movie_category: if stored.13.trim().is_empty() {
             "电影".to_string()
         } else {
-            stored.7
+            stored.13
         },
-        tv_category: if stored.8.trim().is_empty() {
+        tv_category: if stored.14.trim().is_empty() {
             "电视剧".to_string()
         } else {
-            stored.8
+            stored.14
         },
         api_key_from_environment: environment_key.is_some(),
         language_from_environment: environment_language.is_some(),
@@ -1117,6 +1298,7 @@ fn load_secrets(path: &Path) -> Result<OrganizerSecrets, String> {
         category_rules,
         scrape_targets,
         default_scrape_types,
+        include_media_info: stored.20,
     })
 }
 
@@ -1408,6 +1590,420 @@ async fn list_cloud_children(
     Ok(result)
 }
 
+async fn cloud_download_url(app: &tauri::AppHandle, file_id: &str) -> Result<String, String> {
+    let (token, device_id) = auth_context(app)?;
+    let response = api_post(
+        &token,
+        &device_id,
+        "/userres/v1/get_res_download_url",
+        json!({ "fileId": file_id }),
+        &[],
+    )
+    .await?;
+    let data = response.data.unwrap_or(Value::Null);
+    [
+        "signedURL",
+        "signedUrl",
+        "downloadUrl",
+        "downloadURL",
+        "url",
+    ]
+    .iter()
+    .find_map(|key| data.get(*key).and_then(Value::as_str))
+    .map(str::to_string)
+    .filter(|value| !value.is_empty())
+    .ok_or_else(|| "光鸭没有返回媒体读取地址".to_string())
+}
+
+fn ffprobe_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
+    let executable = if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    };
+    let mut candidates = Vec::new();
+    if let Ok(value) = std::env::var("FFPROBE_PATH") {
+        if !value.trim().is_empty() {
+            candidates.push(PathBuf::from(value));
+        }
+    }
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("resources").join(executable));
+        candidates.push(resource_dir.join(executable));
+    }
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(executable),
+    );
+    candidates.push(PathBuf::from(executable));
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
+fn probe_string<'a>(value: &'a Value, key: &str) -> &'a str {
+    value.get(key).and_then(Value::as_str).unwrap_or_default()
+}
+
+fn normalized_probe_video_format(height: i64, width: i64) -> String {
+    if height >= 4000 || width >= 7600 {
+        "4320p".to_string()
+    } else if height >= 2000 || width >= 3800 {
+        "2160p".to_string()
+    } else if height >= 1350 {
+        "1440p".to_string()
+    } else if height >= 1000 {
+        "1080p".to_string()
+    } else if height >= 700 {
+        "720p".to_string()
+    } else if height >= 540 {
+        "576p".to_string()
+    } else if height >= 460 {
+        "480p".to_string()
+    } else if height > 0 {
+        format!("{height}p")
+    } else {
+        String::new()
+    }
+}
+
+fn normalized_probe_video_codec(value: &str) -> String {
+    match value.trim().to_lowercase().as_str() {
+        "h264" | "avc" => "AVC".to_string(),
+        "hevc" | "h265" => "HEVC".to_string(),
+        "av1" => "AV1".to_string(),
+        "vp9" => "VP9".to_string(),
+        "mpeg2video" => "MPEG2".to_string(),
+        other => other.to_uppercase(),
+    }
+}
+
+fn normalized_probe_audio_codec(value: &str, profile: &str) -> String {
+    match value.trim().to_lowercase().as_str() {
+        "eac3" => "DDP".to_string(),
+        "ac3" => "DD".to_string(),
+        "truehd" => "TrueHD".to_string(),
+        "dts" if profile.to_lowercase().contains("master") => "DTS-HD MA".to_string(),
+        "dts" => "DTS".to_string(),
+        "aac" => "AAC".to_string(),
+        "flac" => "FLAC".to_string(),
+        "opus" => "OPUS".to_string(),
+        value if value.starts_with("pcm_") => "LPCM".to_string(),
+        other => other.to_uppercase(),
+    }
+}
+
+fn normalized_probe_frame_rate(value: &str) -> String {
+    let mut parts = value.split('/');
+    let numerator = parts
+        .next()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let denominator = parts
+        .next()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(1.0);
+    if numerator <= 0.0 || denominator <= 0.0 {
+        return String::new();
+    }
+    let rate = numerator / denominator;
+    let common = [
+        23.976, 24.0, 25.0, 29.97, 30.0, 48.0, 50.0, 59.94, 60.0, 120.0,
+    ]
+    .into_iter()
+    .find(|candidate| (candidate - rate).abs() < 0.02)
+    .unwrap_or(rate);
+    if common.fract().abs() < 0.001 {
+        format!("{}fps", common as i64)
+    } else {
+        let formatted = format!("{common:.3}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string();
+        format!("{formatted}fps")
+    }
+}
+
+fn normalized_probe_audio_layout(audio: &Value) -> String {
+    let layout = probe_string(audio, "channel_layout").to_lowercase();
+    let channels = audio.get("channels").and_then(Value::as_i64).unwrap_or(0);
+    if layout.contains("7.1") || channels == 8 {
+        "7.1"
+    } else if layout.contains("6.1") || channels == 7 {
+        "6.1"
+    } else if layout.contains("5.1") || channels == 6 {
+        "5.1"
+    } else if layout.contains("stereo") || channels == 2 {
+        "2.0"
+    } else if layout.contains("mono") || channels == 1 {
+        "1.0"
+    } else {
+        return if channels > 0 {
+            format!("{channels}.0")
+        } else {
+            String::new()
+        };
+    }
+    .to_string()
+}
+
+fn parse_ffprobe_technical_data(payload: &Value) -> HashMap<String, String> {
+    let streams = payload
+        .get("streams")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let video = streams
+        .iter()
+        .find(|stream| probe_string(stream, "codec_type") == "video")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let audio = streams
+        .iter()
+        .find(|stream| probe_string(stream, "codec_type") == "audio")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let video_text = serde_json::to_string(&video)
+        .unwrap_or_default()
+        .to_lowercase();
+    let audio_text = serde_json::to_string(&audio)
+        .unwrap_or_default()
+        .to_lowercase();
+    let dolby_vision = if video_text.contains("dolby vision") || video_text.contains("dovi") {
+        "DV"
+    } else {
+        ""
+    };
+    let transfer = probe_string(&video, "color_transfer").to_lowercase();
+    let dynamic_range = if video_text.contains("hdr10+") || video_text.contains("smpte2094") {
+        "HDR10+"
+    } else if transfer == "smpte2084" {
+        "HDR10"
+    } else if transfer == "arib-std-b67" {
+        "HLG"
+    } else {
+        ""
+    };
+    let explicit_depth = video
+        .get("bits_per_raw_sample")
+        .or_else(|| video.get("bits_per_sample"))
+        .and_then(|value| {
+            value
+                .as_str()
+                .and_then(|value| value.parse::<i64>().ok())
+                .or_else(|| value.as_i64())
+        })
+        .unwrap_or(0);
+    let color_depth = if explicit_depth >= 8 {
+        format!("{explicit_depth}bit")
+    } else {
+        Regex::new(r"(?i)(?:p|le|be)(10|12|16)(?:le|be)?$")
+            .expect("pixel depth regex")
+            .captures(probe_string(&video, "pix_fmt"))
+            .and_then(|capture| capture.get(1))
+            .map(|value| format!("{}bit", value.as_str()))
+            .unwrap_or_default()
+    };
+    let audio_layout = normalized_probe_audio_layout(&audio);
+    let audio_info = [
+        if audio_text.contains("atmos") || audio_text.contains("joc") {
+            "Atmos"
+        } else {
+            ""
+        },
+        &audio_layout,
+    ]
+    .into_iter()
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>()
+    .join(" ");
+    let effect = [dolby_vision, dynamic_range]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut result = HashMap::new();
+    for (key, value) in [
+        (
+            "video_format",
+            normalized_probe_video_format(
+                video.get("height").and_then(Value::as_i64).unwrap_or(0),
+                video.get("width").and_then(Value::as_i64).unwrap_or(0),
+            ),
+        ),
+        (
+            "video_codec",
+            normalized_probe_video_codec(probe_string(&video, "codec_name")),
+        ),
+        (
+            "frame_rate",
+            normalized_probe_frame_rate(if probe_string(&video, "avg_frame_rate").is_empty() {
+                probe_string(&video, "r_frame_rate")
+            } else {
+                probe_string(&video, "avg_frame_rate")
+            }),
+        ),
+        ("color_depth", color_depth),
+        ("dolby_vision", dolby_vision.to_string()),
+        ("dynamic_range", dynamic_range.to_string()),
+        ("effect", effect),
+        (
+            "audio_codec",
+            normalized_probe_audio_codec(
+                probe_string(&audio, "codec_name"),
+                probe_string(&audio, "profile"),
+            ),
+        ),
+        ("audio_info", audio_info),
+    ] {
+        if !value.is_empty() {
+            result.insert(key.to_string(), value);
+        }
+    }
+    result
+}
+
+async fn probe_media_url(
+    app: &tauri::AppHandle,
+    input: &str,
+) -> Result<HashMap<String, String>, String> {
+    let mut available = false;
+    let mut timed_out = false;
+    for executable in ffprobe_candidates(app) {
+        let has_explicit_parent = executable
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty());
+        if has_explicit_parent && !executable.is_file() {
+            continue;
+        }
+        let mut command = Command::new(&executable);
+        command.args([
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+            input,
+        ]);
+        command.kill_on_drop(true);
+        match timeout(Duration::from_secs(45), command.output()).await {
+            Ok(Ok(output)) => {
+                available = true;
+                if !output.status.success() {
+                    continue;
+                }
+                let payload: Value = serde_json::from_slice(&output.stdout)
+                    .map_err(|_| "FFprobe 返回的媒体信息无效".to_string())?;
+                return Ok(parse_ffprobe_technical_data(&payload));
+            }
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Ok(Err(_)) => available = true,
+            Err(_) => {
+                available = true;
+                timed_out = true;
+            }
+        }
+    }
+    if timed_out {
+        Err("FFprobe 获取媒体信息超时".to_string())
+    } else if available {
+        Err("FFprobe 无法读取该媒体文件".to_string())
+    } else {
+        Err("未找到 FFprobe，请重新执行安装或打包准备".to_string())
+    }
+}
+
+fn apply_probe_metadata(
+    parsed: &mut crate::organizer_core::ParsedMediaName,
+    values: HashMap<String, String>,
+) {
+    if let Some(value) = values.get("video_format") {
+        parsed.video_format = value.clone();
+    }
+    if let Some(value) = values.get("video_codec") {
+        parsed.video_codec = value.clone();
+    }
+    if let Some(value) = values.get("frame_rate") {
+        parsed.frame_rate = value.clone();
+    }
+    if let Some(value) = values.get("color_depth") {
+        parsed.color_depth = value.clone();
+    }
+    if let Some(value) = values.get("dolby_vision") {
+        parsed.dolby_vision = value.clone();
+    }
+    if let Some(value) = values.get("dynamic_range") {
+        parsed.dynamic_range = value.clone();
+    }
+    if let Some(value) = values.get("effect") {
+        parsed.effect = value.clone();
+    }
+    if let Some(value) = values.get("audio_codec") {
+        parsed.audio_codec = value.clone();
+    }
+    if let Some(value) = values.get("audio_info") {
+        parsed.audio_info = value.clone();
+    }
+    parsed.media_probed = true;
+}
+
+async fn enrich_analysis_with_media_info(
+    app: &tauri::AppHandle,
+    loaded: &LoadedCandidate,
+    analysis: &mut CandidateAnalysis,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for video in &mut analysis.videos {
+        let Some(entry) = loaded_entry(loaded, &video.source) else {
+            continue;
+        };
+        let result = async {
+            let url = cloud_download_url(app, &entry.id).await?;
+            probe_media_url(app, &url).await
+        }
+        .await;
+        match result {
+            Ok(values) => apply_probe_metadata(&mut video.parsed, values),
+            Err(error) => warnings.push(format!("{}：{error}", entry.name)),
+        }
+    }
+    warnings
+}
+
+#[cfg(test)]
+mod media_probe_tests {
+    use super::{country_name_zh, parse_ffprobe_technical_data};
+    use serde_json::json;
+
+    #[test]
+    fn ffprobe_streams_fill_real_technical_suffix_fields() {
+        let parsed = parse_ffprobe_technical_data(&json!({ "streams": [
+            { "codec_type": "video", "codec_name": "hevc", "width": 3840, "height": 2160, "avg_frame_rate": "60000/1001", "pix_fmt": "yuv420p10le", "color_transfer": "smpte2084" },
+            { "codec_type": "audio", "codec_name": "eac3", "channels": 6, "channel_layout": "5.1(side)", "tags": { "title": "Dolby Atmos JOC" } }
+        ] }));
+        assert_eq!(
+            parsed.get("video_format").map(String::as_str),
+            Some("2160p")
+        );
+        assert_eq!(parsed.get("video_codec").map(String::as_str), Some("HEVC"));
+        assert_eq!(
+            parsed.get("frame_rate").map(String::as_str),
+            Some("59.94fps")
+        );
+        assert_eq!(parsed.get("color_depth").map(String::as_str), Some("10bit"));
+        assert_eq!(
+            parsed.get("audio_info").map(String::as_str),
+            Some("Atmos 5.1")
+        );
+        assert_eq!(country_name_zh("US"), "美国");
+        assert_eq!(country_name_zh("CN"), "中国");
+    }
+}
+
 async fn create_cloud_directory(
     app: &tauri::AppHandle,
     parent_id: &str,
@@ -1625,23 +2221,200 @@ fn sidecar_kind(value: &str) -> Option<&'static str> {
     }
 }
 
+fn cloud_parent_season(file_path: &str, candidate_path: &str) -> Option<i64> {
+    let directory = path_parent(file_path);
+    let relative = directory
+        .strip_prefix(candidate_path.trim_matches('/'))
+        .unwrap_or(&directory)
+        .trim_matches('/');
+    Regex::new(r"(?i)(?:^|/)(?:Season|S)[ ._\-]?(\d{1,3})(?:$|/)")
+        .expect("cloud season folder regex")
+        .captures(relative)
+        .or_else(|| {
+            Regex::new(r"(?:^|/)第\s*(\d{1,3})\s*季(?:$|/)")
+                .expect("cloud Chinese season folder regex")
+                .captures(relative)
+        })
+        .and_then(|captures| captures.get(1))
+        .and_then(|value| value.as_str().parse::<i64>().ok())
+}
+
+fn most_useful_cloud_title(
+    parsed: &[crate::organizer_core::ParsedMediaName],
+    fallback: &str,
+) -> String {
+    let mut counts: HashMap<String, (String, usize)> = HashMap::new();
+    for item in parsed {
+        let title = item.title.trim();
+        if title.is_empty() {
+            continue;
+        }
+        let key = crate::organizer_core::normalize_search_title(title);
+        let entry = counts.entry(key).or_insert((title.to_string(), 0));
+        entry.1 += 1;
+        if title.chars().count() > entry.0.chars().count() {
+            entry.0 = title.to_string();
+        }
+    }
+    counts
+        .into_values()
+        .max_by(|left, right| {
+            left.1
+                .cmp(&right.1)
+                .then_with(|| left.0.chars().count().cmp(&right.0.chars().count()))
+        })
+        .map(|value| value.0)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 fn best_sidecar_video<'a>(
     sidecar: &CloudEntry,
     videos: &'a [CloudEntry],
+    analyzed_videos: &[AnalyzedVideo],
+    settings: &NativeSettings,
 ) -> Option<&'a CloudEntry> {
-    let stem = path_stem(&sidecar.logical_path).to_lowercase();
-    videos.iter().max_by_key(|video| {
-        let other = path_stem(&video.logical_path).to_lowercase();
-        stem.chars()
-            .zip(other.chars())
-            .take_while(|(left, right)| left == right)
-            .count()
-    })
+    if videos.is_empty() {
+        return None;
+    }
+    let sidecar_name = path_stem(&sidecar.logical_path);
+    let stripped = Regex::new(
+        r"(?i)(?:chs|cht|chi|eng|jpn|kor|zh[-_.]?(?:cn|tw)|简体|繁体|繁體|字幕|forced|sdh|default)",
+    )
+    .expect("sidecar language regex")
+    .replace_all(&sidecar_name, "");
+    let sidecar_stem = crate::organizer_core::normalize_search_title(&stripped);
+    if let Some(index) = videos.iter().position(|video| {
+        sidecar_stem
+            == crate::organizer_core::normalize_search_title(&path_stem(&video.logical_path))
+    }) {
+        return videos.get(index);
+    }
+    let parsed = parse_media_name_with_settings(
+        &sidecar.logical_path,
+        &RecognitionOverrides {
+            media_type: Some("tv".to_string()),
+            ..Default::default()
+        },
+        settings,
+    );
+    if let Some(episode) = parsed.episode {
+        if let Some(index) = analyzed_videos.iter().position(|video| {
+            video.parsed.episode == Some(episode)
+                && (parsed.season.is_none() || video.parsed.season == parsed.season)
+        }) {
+            return videos.get(index);
+        }
+    }
+    let sidecar_parent = path_parent(&sidecar.logical_path);
+    let same_directory = videos
+        .iter()
+        .enumerate()
+        .filter(|(_, video)| path_parent(&video.logical_path) == sidecar_parent)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if same_directory.len() == 1 {
+        return videos.get(same_directory[0]);
+    }
+    (videos.len() == 1).then(|| &videos[0])
+}
+
+#[cfg(test)]
+mod cloud_sidecar_tests {
+    use super::*;
+
+    #[test]
+    fn ambiguous_sidecar_is_not_attached_to_an_unrelated_video() {
+        let videos = vec![
+            CloudEntry {
+                name: "Show.S01E01.mkv".to_string(),
+                logical_path: "Library/Show.S01E01.mkv".to_string(),
+                ..Default::default()
+            },
+            CloudEntry {
+                name: "Other.S01E02.mkv".to_string(),
+                logical_path: "Library/Other.S01E02.mkv".to_string(),
+                ..Default::default()
+            },
+        ];
+        let analyzed = videos
+            .iter()
+            .map(|video| AnalyzedVideo {
+                source: video.logical_path.clone(),
+                parsed: crate::organizer_core::ParsedMediaName::default(),
+                extra_kind: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let unrelated = CloudEntry {
+            name: "Unrelated.srt".to_string(),
+            logical_path: "Library/Unrelated.srt".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            best_sidecar_video(&unrelated, &videos, &analyzed, &NativeSettings::default())
+                .is_none()
+        );
+
+        let exact = CloudEntry {
+            name: "Show.S01E01.zh-CN.srt".to_string(),
+            logical_path: "Library/Show.S01E01.zh-CN.srt".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            best_sidecar_video(&exact, &videos, &analyzed, &NativeSettings::default())
+                .map(|video| video.name.as_str()),
+            Some("Show.S01E01.mkv")
+        );
+    }
+
+    #[test]
+    fn cloud_analysis_uses_season_folder_and_video_titles_instead_of_generic_root() {
+        let root = CloudEntry {
+            id: "root".to_string(),
+            name: "Unhelpful.Collection".to_string(),
+            logical_path: "Root/Unhelpful.Collection".to_string(),
+            is_directory: true,
+            ..Default::default()
+        };
+        let entries = [1, 2]
+            .into_iter()
+            .map(|episode| CloudEntry {
+                id: format!("video-{episode}"),
+                parent_id: "season-2".to_string(),
+                name: format!("Actual.Show.E{episode:02}.mkv"),
+                logical_path: format!(
+                    "Root/Unhelpful.Collection/Season 02/Actual.Show.E{episode:02}.mkv"
+                ),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let loaded = LoadedCandidate {
+            candidate: root,
+            entries,
+            fingerprint: CandidateFingerprint::default(),
+        };
+        let (analysis, _) = analyze_cloud_candidate(
+            &loaded,
+            &RecognitionOverrides {
+                media_type: Some("tv".to_string()),
+                ..Default::default()
+            },
+            &NativeSettings::default(),
+        )
+        .expect("cloud analysis");
+        assert_eq!(analysis.title, "Actual Show");
+        assert!(analysis
+            .videos
+            .iter()
+            .all(|video| video.parsed.season == Some(2)));
+        assert_eq!(analysis.videos[0].parsed.episode, Some(1));
+        assert_eq!(analysis.videos[1].parsed.episode, Some(2));
+    }
 }
 
 fn analyze_cloud_candidate(
     loaded: &LoadedCandidate,
     overrides: &RecognitionOverrides,
+    settings: &NativeSettings,
 ) -> Result<(CandidateAnalysis, HashMap<String, CloudEntry>), String> {
     let files = if loaded.candidate.is_directory {
         loaded
@@ -1667,7 +2440,7 @@ fn analyze_cloud_candidate(
     } else {
         path_stem(&loaded.candidate.name)
     };
-    let group = parse_media_name(&candidate_name, overrides);
+    let group = parse_media_name_with_settings(&candidate_name, overrides, settings);
     let mut preliminary = videos
         .iter()
         .map(|entry| {
@@ -1675,7 +2448,11 @@ fn analyze_cloud_candidate(
             if options.media_type.as_deref().unwrap_or_default().is_empty() {
                 options.media_type = Some(group.media_type.clone());
             }
-            let mut parsed = parse_media_name(&entry.logical_path, &options);
+            options.season = overrides.season.or_else(|| {
+                cloud_parent_season(&entry.logical_path, &loaded.candidate.logical_path)
+            });
+            let mut parsed =
+                parse_media_name_with_settings(&entry.logical_path, &options, settings);
             if parsed.title.is_empty() {
                 parsed.title = group.title.clone();
             }
@@ -1703,14 +2480,7 @@ fn analyze_cloud_candidate(
         .title
         .clone()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| (!group.title.is_empty()).then(|| group.title.clone()))
-        .or_else(|| {
-            preliminary
-                .iter()
-                .find(|item| !item.title.is_empty())
-                .map(|item| item.title.clone())
-        })
-        .unwrap_or_default();
+        .unwrap_or_else(|| most_useful_cloud_title(&preliminary, &group.title));
     let year = overrides
         .year
         .or(group.year)
@@ -1741,7 +2511,7 @@ fn analyze_cloud_candidate(
         .iter()
         .filter_map(|entry| sidecar_kind(&entry.name).map(|kind| (entry, kind)))
         .filter_map(|(entry, kind)| {
-            let video = best_sidecar_video(entry, &videos)?;
+            let video = best_sidecar_video(entry, &videos, &analyzed_videos, settings)?;
             Some(AnalyzedSidecar {
                 source: entry.logical_path.clone(),
                 kind: kind.to_string(),
@@ -1769,6 +2539,9 @@ fn analyze_cloud_candidate(
             media_type: media_type.clone(),
             title: title.clone(),
             year,
+            tmdb_id: group
+                .tmdb_id
+                .or_else(|| analyzed_videos.iter().find_map(|item| item.parsed.tmdb_id)),
             videos: analyzed_videos,
             sidecars,
             ignored_samples,
@@ -1776,6 +2549,7 @@ fn analyze_cloud_candidate(
                 title,
                 year,
                 media_type,
+                tmdb_id: group.tmdb_id,
             },
         },
         source_map,
@@ -1788,9 +2562,38 @@ fn render_path_template(
 ) -> Result<String, String> {
     // Keep the aliases accepted by the web engine, including the common
     // mixed-case forms users copy from MoviePilot-style templates.
+    let conditional_pattern =
+        Regex::new(r"(?is)\{\{@if@\}\}(.*?)\{\{@endif@\}\}").expect("conditional template regex");
+    let conditional_variable =
+        Regex::new(r"(?i)\{\{\s*([a-z_][a-z0-9_]*)\s*\}\}").expect("conditional variable regex");
+    let conditional = conditional_pattern
+        .replace_all(template, |captures: &regex::Captures| {
+            let body = captures
+                .get(1)
+                .map(|value| value.as_str())
+                .unwrap_or_default();
+            let keys = conditional_variable
+                .captures_iter(body)
+                .filter_map(|capture| capture.get(1).map(|value| value.as_str().to_lowercase()))
+                .collect::<Vec<_>>();
+            if !keys.is_empty()
+                && keys
+                    .iter()
+                    .all(|key| context.get(key).is_some_and(|value| !value.is_empty()))
+            {
+                body.to_string()
+            } else {
+                String::new()
+            }
+        })
+        .to_string();
+    let aliases = Regex::new(r"(?i)\{\{\s*([a-z_][a-z0-9_]*)\s*\}\}")
+        .expect("double brace template regex")
+        .replace_all(&conditional, "{$1}")
+        .to_string();
     let aliases = Regex::new(r"(?i)\{catgroy\}")
         .expect("category alias regex")
-        .replace_all(template, "{category}")
+        .replace_all(&aliases, "{category}")
         .to_string();
     let aliases = Regex::new(r"(?i)\{tmdbid\}")
         .expect("tmdb alias regex")
@@ -1870,16 +2673,71 @@ fn template_context(
         .filter(|value| Some(*value) != parsed.episode)
         .map(|value| format!("-E{value:02}"))
         .unwrap_or_default();
+    let season_tag = parsed
+        .season
+        .map(|value| format!("S{value:02}"))
+        .unwrap_or_default();
+    let episode_tag = parsed
+        .episode
+        .map(|value| format!("E{value:02}"))
+        .unwrap_or_default();
+    let mut country_codes = Vec::new();
+    let mut seen_countries = HashSet::new();
+    for code in metadata
+        .countries
+        .iter()
+        .chain(metadata.origin_countries.iter())
+    {
+        let normalized = code.trim().to_uppercase();
+        if !normalized.is_empty() && seen_countries.insert(normalized.clone()) {
+            country_codes.push(normalized);
+        }
+    }
+    let country_names = country_codes
+        .iter()
+        .map(|code| country_name_zh(code))
+        .collect::<Vec<_>>();
+    let source_platform = [parsed.resource_type.clone(), parsed.source.clone()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let effect_version = [parsed.effect.clone(), parsed.edition.clone()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let video_codec_frame_rate_high_quality = [
+        parsed.video_codec.clone(),
+        parsed.frame_rate.clone(),
+        parsed.high_quality.clone(),
+    ]
+    .into_iter()
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>()
+    .join(" ");
+    let media_info = compose_media_info(&metadata.media_type, parsed);
     let mut context = HashMap::new();
     context.insert("category".to_string(), category.to_string());
     context.insert("catgroy".to_string(), category.to_string());
     context.insert(
         "country".to_string(),
-        metadata
-            .countries
+        country_names
             .first()
             .cloned()
             .unwrap_or_else(|| "未知地区".to_string()),
+    );
+    context.insert(
+        "country_code".to_string(),
+        country_codes.first().cloned().unwrap_or_default(),
+    );
+    context.insert(
+        "release_country".to_string(),
+        if country_names.is_empty() {
+            "未知地区".to_string()
+        } else {
+            country_names.join("、")
+        },
     );
     context.insert(
         "year".to_string(),
@@ -1890,13 +2748,39 @@ fn template_context(
     );
     context.insert("title".to_string(), metadata.title.clone());
     context.insert(
+        "en_title".to_string(),
+        if metadata.original_title.is_empty() {
+            metadata.title.clone()
+        } else {
+            metadata.original_title.clone()
+        },
+    );
+    context.insert(
         "original_title".to_string(),
         metadata.original_title.clone(),
     );
+    context.insert("original_filename".to_string(), parsed.original.clone());
+    context.insert("original_name".to_string(), parsed.original.clone());
+    context.insert(
+        "segment".to_string(),
+        parsed.part.clone().unwrap_or_default(),
+    );
+    context.insert(
+        "season_year".to_string(),
+        metadata
+            .year
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    );
     context.insert("tmdb_id".to_string(), metadata.tmdb_id.to_string());
+    context.insert("tmdbid".to_string(), metadata.tmdb_id.to_string());
     context.insert("season".to_string(), season.clone());
     context.insert("episode".to_string(), episode.clone());
-    context.insert("episode_end".to_string(), episode_end);
+    context.insert("episode_end".to_string(), episode_end.clone());
+    context.insert(
+        "season_episode".to_string(),
+        format!("{season_tag}{episode_tag}{episode_end}"),
+    );
     context.insert("episode_title".to_string(), episode_title.to_string());
     context.insert(
         "edition".to_string(),
@@ -1927,20 +2811,154 @@ fn template_context(
         extension.trim_start_matches('.').to_lowercase(),
     );
     context.insert(
-        "season_tag".to_string(),
-        parsed
-            .season
-            .map(|value| format!("S{value:02}"))
-            .unwrap_or_default(),
+        "fileext".to_string(),
+        if extension.is_empty() {
+            String::new()
+        } else {
+            format!(".{}", extension.trim_start_matches('.').to_lowercase())
+        },
     );
-    context.insert(
-        "episode_tag".to_string(),
-        parsed
-            .episode
-            .map(|value| format!("E{value:02}"))
-            .unwrap_or_default(),
-    );
+    context.insert("season_tag".to_string(), season_tag);
+    context.insert("episode_tag".to_string(), episode_tag);
+    for (key, value) in [
+        ("video_format", parsed.video_format.clone()),
+        ("videoformat", parsed.video_format.clone()),
+        ("resource_type", parsed.resource_type.clone()),
+        ("resourcetype", parsed.resource_type.clone()),
+        ("source", parsed.source.clone()),
+        ("effect", parsed.effect.clone()),
+        ("audio_info", parsed.audio_info.clone()),
+        ("audioinfo", parsed.audio_info.clone()),
+        ("video_codec", parsed.video_codec.clone()),
+        ("videocodec", parsed.video_codec.clone()),
+        ("audio_codec", parsed.audio_codec.clone()),
+        ("audiocodec", parsed.audio_codec.clone()),
+        ("release_group", parsed.release_group.clone()),
+        ("releasegroup", parsed.release_group.clone()),
+        ("release_type", parsed.release_type.clone()),
+        ("high_quality", parsed.high_quality.clone()),
+        ("dolby_vision", parsed.dolby_vision.clone()),
+        ("dynamic_range", parsed.dynamic_range.clone()),
+        ("frame_rate", parsed.frame_rate.clone()),
+        ("color_depth", parsed.color_depth.clone()),
+        ("source_platform", source_platform),
+        ("version", parsed.edition.clone()),
+        ("effect_version", effect_version),
+        (
+            "remux",
+            if parsed.resource_type.eq_ignore_ascii_case("remux")
+                || parsed.release_type.eq_ignore_ascii_case("remux")
+            {
+                "REMUX".to_string()
+            } else {
+                String::new()
+            },
+        ),
+        ("version_number", parsed.part.clone().unwrap_or_default()),
+        (
+            "video_codec_frame_rate_high_quality",
+            video_codec_frame_rate_high_quality,
+        ),
+        ("media_info", media_info),
+        (
+            "media_probed",
+            if parsed.media_probed {
+                "1".to_string()
+            } else {
+                String::new()
+            },
+        ),
+    ] {
+        context.insert(key.to_string(), value);
+    }
     context
+}
+
+fn country_name_zh(code: &str) -> String {
+    static COUNTRY_NAMES: OnceLock<HashMap<String, String>> = OnceLock::new();
+    let names = COUNTRY_NAMES.get_or_init(|| {
+        serde_json::from_str(include_str!("../../shared/countries-zh.json")).unwrap_or_default()
+    });
+    names
+        .get(&code.trim().to_uppercase())
+        .cloned()
+        .unwrap_or_else(|| code.trim().to_uppercase())
+}
+
+fn compose_media_info(media_type: &str, parsed: &crate::organizer_core::ParsedMediaName) -> String {
+    let values = if media_type == "tv" {
+        vec![
+            parsed.video_format.clone(),
+            parsed.source.clone(),
+            if parsed.release_type.is_empty() {
+                parsed.resource_type.clone()
+            } else {
+                parsed.release_type.clone()
+            },
+            parsed.high_quality.clone(),
+            parsed.dolby_vision.clone(),
+            parsed.dynamic_range.clone(),
+            parsed.frame_rate.clone(),
+            parsed.color_depth.clone(),
+            parsed.video_codec.clone(),
+            parsed.audio_codec.clone(),
+        ]
+    } else {
+        vec![
+            parsed.video_format.clone(),
+            if parsed.resource_type.is_empty() {
+                parsed.release_type.clone()
+            } else {
+                parsed.resource_type.clone()
+            },
+            parsed.effect.clone(),
+            parsed.audio_info.clone(),
+            parsed.video_codec.clone(),
+            parsed.audio_codec.clone(),
+        ]
+    };
+    let mut body = Vec::new();
+    for value in values.into_iter().filter(|value| !value.trim().is_empty()) {
+        if body.last() != Some(&value) {
+            body.push(value);
+        }
+    }
+    let body = body.join(".");
+    if parsed.release_group.is_empty() {
+        body
+    } else if body.is_empty() {
+        parsed.release_group.clone()
+    } else {
+        format!("{body}-{}", parsed.release_group)
+    }
+}
+
+fn append_media_info_suffix(
+    relative: String,
+    template: &str,
+    context: &HashMap<String, String>,
+    enabled: bool,
+) -> String {
+    let token = Regex::new(r"(?i)\{\{?\s*(?:media_info|video_?format|resource_?type|source|effect|audio_?info|video_?codec|audio_?codec|release_?group|release_?type|high_?quality|dolby_?vision|dynamic_?range|frame_?rate|color_?depth)\s*\}?\}").expect("technical template token regex");
+    let media_info = context.get("media_info").cloned().unwrap_or_default();
+    let probed = context
+        .get("media_probed")
+        .is_some_and(|value| !value.is_empty());
+    if !enabled || !probed || media_info.is_empty() || token.is_match(template) {
+        return relative;
+    }
+    match relative
+        .rfind('.')
+        .filter(|index| *index > relative.rfind('/').unwrap_or(0))
+    {
+        Some(index) => format!(
+            "{}.{}{}",
+            &relative[..index],
+            media_info,
+            &relative[index..]
+        ),
+        None => format!("{relative}.{media_info}"),
+    }
 }
 
 fn cloud_target(mapping: &OrganizerMapping, relative: &str) -> String {
@@ -2220,6 +3238,13 @@ fn mapping_signature(mapping: &OrganizerMapping, secrets: &OrganizerSecrets) -> 
         mapping.share_after_organize,
         secrets.native.language,
         secrets.native.image_language,
+        secrets.native.word_segment_search,
+        secrets.native.similarity_match,
+        secrets.native.recognition_words,
+        secrets.native.release_groups,
+        secrets.native.render_words,
+        secrets.native.capture_groups,
+        secrets.include_media_info,
         secrets.movie_path_template,
         secrets.tv_path_template,
         secrets.movie_category,
@@ -2257,6 +3282,7 @@ async fn build_preview(
     match_result: &MatchResolution,
     mapping: &OrganizerMapping,
     secrets: &OrganizerSecrets,
+    media_probe_warnings: &[String],
 ) -> Result<CloudPreview, String> {
     let mapping_signature = mapping_signature(mapping, secrets);
     if !match_result.ready || match_result.metadata.is_none() {
@@ -2317,6 +3343,8 @@ async fn build_preview(
             &path_extension(&source_entry.name),
         );
         let mut relative = render_path_template(template, &context)?;
+        relative =
+            append_media_info_suffix(relative, template, &context, secrets.include_media_info);
         if !video.extra_kind.is_empty() {
             let extra_directory = if video.extra_kind == "trailer" {
                 "trailers"
@@ -2561,7 +3589,7 @@ async fn build_preview(
     }
     let skipped = items.iter().filter(|item| item.action == "skip").count();
     let failed_items = items.iter().filter(|item| !item.success).count();
-    let warnings = skipped + analysis.ignored_samples.len();
+    let warnings = skipped + analysis.ignored_samples.len() + media_probe_warnings.len();
     let share_title = format!(
         "{}{}",
         metadata.title,
@@ -2604,6 +3632,7 @@ async fn build_preview(
             )
         },
         ignored_samples: analysis.ignored_samples.clone(),
+        media_probe_warnings: media_probe_warnings.to_vec(),
         data: CloudPreviewData {
             summary: PreviewSummary {
                 total: items.len(),
@@ -3188,6 +4217,46 @@ fn update_settings(
             .minimum_match_score
             .unwrap_or(current.native.minimum_match_score),
     )?;
+    let word_segment_search = input
+        .word_segment_search
+        .unwrap_or(current.native.word_segment_search);
+    let similarity_match = input
+        .similarity_match
+        .unwrap_or(current.native.similarity_match);
+    let recognition_words = normalize_rule_text(
+        input
+            .recognition_words
+            .as_deref()
+            .unwrap_or(&current.native.recognition_words),
+        "自定义识别词",
+    )?;
+    let release_groups = normalize_rule_text(
+        input
+            .release_groups
+            .as_deref()
+            .unwrap_or(&current.native.release_groups),
+        "自定义制作组",
+    )?;
+    let render_words = normalize_rule_text(
+        input
+            .render_words
+            .as_deref()
+            .unwrap_or(&current.native.render_words),
+        "自定义渲染词",
+    )?;
+    let capture_groups = normalize_rule_text(
+        input
+            .capture_groups
+            .as_deref()
+            .unwrap_or(&current.native.capture_groups),
+        "自定义捕获组",
+    )?;
+    let include_media_info = input
+        .include_media_info
+        .unwrap_or(current.include_media_info);
+    validate_auxiliary_rule_block(&recognition_words, "自定义识别词", true)?;
+    validate_auxiliary_rule_block(&render_words, "自定义渲染词", true)?;
+    validate_auxiliary_rule_block(&capture_groups, "自定义捕获组", false)?;
     let movie_path_template = normalize_path_template(
         input
             .movie_path_template
@@ -3252,17 +4321,21 @@ fn update_settings(
         .execute(
             "INSERT INTO organizer_settings
              (id, tmdb_api_key, language, image_language, include_adult, minimum_match_score,
+              word_segment_search, similarity_match, recognition_words, release_groups, render_words, capture_groups,
               movie_path_template, tv_path_template, movie_category, tv_category,
-              tmdb_api_base, tmdb_image_base, category_rules, scrape_targets, default_scrape_types, updated_at)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+              tmdb_api_base, tmdb_image_base, category_rules, scrape_targets, default_scrape_types, include_media_info, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
              ON CONFLICT(id) DO UPDATE SET tmdb_api_key=excluded.tmdb_api_key,
               language=excluded.language, image_language=excluded.image_language,
               include_adult=excluded.include_adult, minimum_match_score=excluded.minimum_match_score,
+              word_segment_search=excluded.word_segment_search, similarity_match=excluded.similarity_match,
+              recognition_words=excluded.recognition_words, release_groups=excluded.release_groups,
+              render_words=excluded.render_words, capture_groups=excluded.capture_groups,
               movie_path_template=excluded.movie_path_template, tv_path_template=excluded.tv_path_template,
                movie_category=excluded.movie_category, tv_category=excluded.tv_category,
                tmdb_api_base=excluded.tmdb_api_base, tmdb_image_base=excluded.tmdb_image_base,
                category_rules=excluded.category_rules, scrape_targets=excluded.scrape_targets,
-               default_scrape_types=excluded.default_scrape_types,
+               default_scrape_types=excluded.default_scrape_types, include_media_info=excluded.include_media_info,
               updated_at=excluded.updated_at",
             params![
                 api_key,
@@ -3270,6 +4343,12 @@ fn update_settings(
                 image_language,
                 i64::from(input.include_adult.unwrap_or(current.native.include_adult)),
                 minimum_match_score,
+                i64::from(word_segment_search),
+                i64::from(similarity_match),
+                recognition_words,
+                release_groups,
+                render_words,
+                capture_groups,
                 movie_path_template,
                 tv_path_template,
                 movie_category,
@@ -3279,6 +4358,7 @@ fn update_settings(
                 serde_json::to_string(&category_rules).map_err(|error| format!("序列化媒体分类失败：{error}"))?,
                 serde_json::to_string(&scrape_targets).map_err(|error| format!("序列化刮削目标失败：{error}"))?,
                 serde_json::to_string(&default_scrape_types).map_err(|error| format!("序列化默认刮削类型失败：{error}"))?,
+                i64::from(include_media_info),
                 now_seconds()
             ],
         )
@@ -3616,7 +4696,12 @@ async fn recognize_job(
         return get_job(&path, id)?.ok_or_else(|| "整理任务不存在".to_string());
     }
     let recognition = async {
-        let (analysis, _) = analyze_cloud_candidate(&loaded, &overrides)?;
+        let (mut analysis, _) = analyze_cloud_candidate(&loaded, &overrides, &secrets.native)?;
+        let media_probe_warnings = if secrets.include_media_info {
+            enrich_analysis_with_media_info(app, &loaded, &mut analysis).await
+        } else {
+            Vec::new()
+        };
         let mut resolved = overrides.clone();
         if resolved.title.is_none() {
             resolved.title = Some(analysis.title.clone());
@@ -3627,10 +4712,21 @@ async fn recognize_job(
         if resolved.media_type.is_none() {
             resolved.media_type = Some(analysis.media_type.clone());
         }
+        if resolved.tmdb_id.is_none() {
+            resolved.tmdb_id = analysis.tmdb_id;
+        }
         let match_result =
             resolve_tmdb_match(&analysis, &secrets.client()?, &secrets.native, &resolved).await?;
-        let preview =
-            build_preview(app, &loaded, &analysis, &match_result, &mapping, &secrets).await?;
+        let preview = build_preview(
+            app,
+            &loaded,
+            &analysis,
+            &match_result,
+            &mapping,
+            &secrets,
+            &media_probe_warnings,
+        )
+        .await?;
         Ok::<_, String>((match_result, preview))
     }
     .await;
@@ -4277,8 +5373,10 @@ pub async fn scrape_selected_files(
     let share_risk_acknowledged = input.share_risk_acknowledged;
     let mut jobs = Vec::new();
     let mut failures = Vec::new();
+    let mut queued = Vec::new();
     for source in input.files.into_iter().take(100) {
-        let result = async {
+        let submitted_id = source.id.clone();
+        let result = (|| {
             let source_id = source.id.trim().to_string();
             let source_parent_id = source.parent_id.trim().to_string();
             if source_id.is_empty() || source_parent_id.is_empty() {
@@ -4325,35 +5423,112 @@ pub async fn scrape_selected_files(
                 created_at: now_seconds(),
                 updated_at: now_seconds(),
             };
-            let loaded = load_candidate(&app, &mapping, &source_id)
-                .await?
-                .ok_or_else(|| "待整理云端项目不存在或不在来源目录中".to_string())?;
-            if loaded.fingerprint.video_count < 1 {
-                return Err("选中项中没有可识别的视频文件".to_string());
-            }
             save_mapping(&path, &mapping)?;
-            let job_id = insert_job(
-                &path,
-                &mapping,
-                &loaded.candidate,
-                &loaded.fingerprint,
-                false,
-            )?;
-            let job = recognize_job(
+            let job_id = Uuid::new_v4().to_string();
+            let source_name = source
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    source.path.as_deref().and_then(|value| {
+                        value
+                            .replace('\\', "/")
+                            .rsplit('/')
+                            .next()
+                            .map(str::trim)
+                            .filter(|item| !item.is_empty())
+                            .map(str::to_string)
+                    })
+                })
+                .unwrap_or_else(|| source_id.clone());
+            let source_display_path = join_relative(&[&mapping.source_path, &source_name]);
+            let timestamp = now_seconds();
+            open_database(&path)?
+                .execute(
+                    "INSERT INTO organizer_jobs
+                     (id, mapping_id, source_path, source_id, source_parent_id, source_size,
+                      source_modified_ms, source_file_count, source_signature, share_after_requested,
+                      status, media_type, message, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0, '0', 0, '', 0, 'recognizing', ?6,
+                             '刮削已提交，等待后台识别', ?7, ?7)",
+                    params![
+                        job_id,
+                        mapping.id,
+                        source_display_path,
+                        source_id,
+                        mapping.source_dir_id,
+                        if mapping.media_type.is_empty() {
+                            None::<String>
+                        } else {
+                            Some(mapping.media_type.clone())
+                        },
+                        timestamp,
+                    ],
+                )
+                .map_err(|error| format!("创建刮削任务失败：{error}"))?;
+            emit(
                 &app,
-                state.inner(),
-                &job_id,
-                OrganizerJobInput::default(),
-                true,
-            )
-            .await?;
-            Ok::<OrganizerJob, String>(job)
-        }
-        .await;
+                "job-updated",
+                json!({ "job_id": job_id.clone(), "mapping_id": mapping.id.clone(), "status": "recognizing" }),
+            );
+            let job =
+                get_job(&path, &job_id)?.ok_or_else(|| "刮削任务创建后无法读取".to_string())?;
+            Ok::<(OrganizerJob, String, String), String>((job, job_id, mapping.id))
+        })();
         match result {
-            Ok(job) => jobs.push(job),
-            Err(error) => failures.push(json!({ "id": source.id, "message": error })),
+            Ok((job, job_id, mapping_id)) => {
+                jobs.push(job);
+                queued.push((job_id, mapping_id));
+            }
+            Err(error) => failures.push(json!({ "id": submitted_id, "message": error })),
         }
+    }
+    if !queued.is_empty() {
+        let task_app = app.clone();
+        let task_state = state.inner().clone();
+        let task_path = path.clone();
+        tauri::async_runtime::spawn(async move {
+            for (job_id, mapping_id) in queued {
+                let result = async {
+                    let recognized = recognize_job(
+                        &task_app,
+                        &task_state,
+                        &job_id,
+                        OrganizerJobInput::default(),
+                        false,
+                    )
+                    .await?;
+                    if recognized.status == "ready" {
+                        let _ = execute_job(&task_app, &task_state, &job_id).await?;
+                    }
+                    Ok::<(), String>(())
+                }
+                .await;
+                if let Err(error) = result {
+                    let _ = update_job_fields(
+                        &task_path,
+                        &job_id,
+                        &[
+                            ("status", json!("failed")),
+                            ("error_code", json!("scrape_failed")),
+                            ("message", json!(error.clone())),
+                        ],
+                    );
+                    emit(
+                        &task_app,
+                        "job-updated",
+                        json!({
+                            "job_id": job_id,
+                            "mapping_id": mapping_id,
+                            "status": "failed",
+                            "message": error,
+                        }),
+                    );
+                }
+            }
+        });
     }
     Ok(json!({ "jobs": jobs, "failures": failures }))
 }
@@ -4450,15 +5625,57 @@ pub fn remove_organizer_mapping(
 }
 
 #[tauri::command]
-pub fn remove_organizer_job(
+pub async fn remove_organizer_job(
     app: tauri::AppHandle,
     state: tauri::State<'_, OrganizerSharedState>,
     id: String,
+    input: Option<OrganizerJobDeleteInput>,
 ) -> Result<Value, String> {
     let path = database_path(state.inner())?;
     let job = get_job(&path, &id)?.ok_or_else(|| "整理任务不存在".to_string())?;
-    if job.status == "running" {
+    if matches!(job.status.as_str(), "recognizing" | "running") {
         return Err("任务正在整理，不能删除".to_string());
+    }
+    let input = input.unwrap_or_default();
+    let mut deleted_source = 0usize;
+    let mut deleted_target = 0usize;
+    let mut warnings = Vec::new();
+    if input.delete_target {
+        let target_ids = job
+            .result
+            .as_ref()
+            .map(|result| {
+                result
+                    .targets
+                    .iter()
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        for target_id in &target_ids {
+            cloud_delete(&app, target_id)
+                .await
+                .map_err(|error| format!("删除媒体库文件失败：{error}"))?;
+            deleted_target += 1;
+        }
+        if target_ids.is_empty() {
+            warnings.push("该记录没有可安全定位的媒体库文件，未删除媒体库内容".to_string());
+        }
+    }
+    if input.delete_source {
+        let source = list_cloud_children(&app, &job.source_parent_id)
+            .await?
+            .into_iter()
+            .find(|entry| entry.id == job.source_id);
+        if let Some(source) = source {
+            cloud_delete(&app, &source.id)
+                .await
+                .map_err(|error| format!("删除源文件失败：{error}"))?;
+            deleted_source = 1;
+        } else {
+            warnings.push("源文件已移动或不存在，未重复删除".to_string());
+        }
     }
     let connection = open_database(&path)?;
     connection
@@ -4473,9 +5690,11 @@ pub fn remove_organizer_job(
     emit(
         &app,
         "job-removed",
-        json!({ "job_id": id, "mapping_id": job.mapping_id }),
+        json!({ "job_id": id, "mapping_id": job.mapping_id, "deleted_source": deleted_source, "deleted_target": deleted_target }),
     );
-    Ok(json!({}))
+    Ok(
+        json!({ "deleted_source": deleted_source, "deleted_target": deleted_target, "warnings": warnings }),
+    )
 }
 
 #[tauri::command]
@@ -4525,4 +5744,90 @@ pub async fn retry_organizer_job(
     input: OrganizerJobInput,
 ) -> Result<OrganizerJob, String> {
     recognize_job(&app, state.inner(), &id, input, false).await
+}
+
+#[tauri::command]
+pub async fn rearchive_organizer_job(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, OrganizerSharedState>,
+    id: String,
+    input: OrganizerJobInput,
+) -> Result<OrganizerJob, String> {
+    let path = database_path(state.inner())?;
+    let job = get_job(&path, &id)?.ok_or_else(|| "整理任务不存在".to_string())?;
+    if matches!(job.status.as_str(), "recognizing" | "running") {
+        return Err("该任务正在整理，请等待完成".to_string());
+    }
+    let mapping =
+        get_mapping(&path, &job.mapping_id)?.ok_or_else(|| "整理监控不存在".to_string())?;
+    let connection = open_database(&path)?;
+    let active = connection
+        .query_row(
+            "SELECT id FROM organizer_jobs WHERE mapping_id=?1 AND source_id=?2 AND id<>?3
+             AND status IN ('recognizing','ready','running','needs_review') ORDER BY updated_at DESC LIMIT 1",
+            params![job.mapping_id, job.source_id, id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("检查重复归档任务失败：{error}"))?;
+    if active.is_some() {
+        return Err("该源文件已有待处理的归档任务，请先处理后再重新归档".to_string());
+    }
+    drop(connection);
+    update_job_fields(
+        &path,
+        &id,
+        &[
+            ("status", json!("recognizing")),
+            ("error_code", Value::Null),
+            ("message", json!("重新归档已提交，正在后台识别")),
+        ],
+    )?;
+    let task_mapping_id = mapping.id.clone();
+    emit(
+        &app,
+        "job-updated",
+        json!({
+            "job_id": id.clone(),
+            "mapping_id": task_mapping_id.clone(),
+            "status": "recognizing",
+            "rearchive": true,
+        }),
+    );
+    let task_app = app.clone();
+    let task_state = state.inner().clone();
+    let task_id = id.clone();
+    let task_path = path.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = async {
+            let recognized = recognize_job(&task_app, &task_state, &task_id, input, false).await?;
+            if recognized.status == "ready" {
+                let _ = execute_job(&task_app, &task_state, &task_id).await?;
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = update_job_fields(
+                &task_path,
+                &task_id,
+                &[
+                    ("status", json!("failed")),
+                    ("error_code", json!("rearchive_failed")),
+                    ("message", json!(error.clone())),
+                ],
+            );
+            emit(
+                &task_app,
+                "job-updated",
+                json!({
+                    "job_id": task_id,
+                    "mapping_id": task_mapping_id,
+                    "status": "failed",
+                    "message": error,
+                }),
+            );
+        }
+    });
+    get_job(&path, &id)?.ok_or_else(|| "整理任务不存在".to_string())
 }

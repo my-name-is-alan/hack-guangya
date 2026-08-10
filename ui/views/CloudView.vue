@@ -647,7 +647,7 @@ async function submitScrapeSelected() {
     const failures = Array.isArray(result?.failures) ? result.failures.length : 0;
     scrapeDialog.open = false;
     clearSelection();
-    message.success(`已提交 ${jobs} 个刮削任务${failures ? `，${failures} 项未提交` : ''}`);
+    message.success(`已提交 ${jobs} 个刮削任务，正在后台识别整理${failures ? `，${failures} 项未提交` : ''}`);
   } catch (error) {
     message.error(errorText(error));
   } finally {
@@ -1410,6 +1410,7 @@ async function uploadWebFiles(entries) {
   let queued = 0;
   let skipped = 0;
   let cancelled = 0;
+  let paused = 0;
   try {
     const worker = async () => {
       while (cursor < entries.length) {
@@ -1435,6 +1436,7 @@ async function uploadWebFiles(entries) {
           };
           request.open('POST', `/api/upload?${query}`);
           request.setRequestHeader('content-type', entry.file.type || 'application/octet-stream');
+          transfers.registerUploadRetry(eventPath, () => uploadWebFiles([entry]));
           unregisterCancellation = transfers.registerUploadCancellation(eventPath, () => request.abort());
           request.upload.onprogress = (event) => {
             const total = event.lengthComputable ? event.total : entry.file.size;
@@ -1455,8 +1457,9 @@ async function uploadWebFiles(entries) {
             finish(() => reject(error));
           };
           request.onabort = () => {
-            transfers.clearUploadRetry(eventPath);
-            finish(() => resolve({ queued: 0, skipped: 0, cancelled: 1 }));
+            const uploadPaused = transfers.isUploadPaused(eventPath);
+            if (!uploadPaused) transfers.clearUploadRetry(eventPath);
+            finish(() => resolve({ queued: 0, skipped: 0, cancelled: uploadPaused ? 0 : 1, paused: uploadPaused ? 1 : 0 }));
           };
           request.onload = async () => {
             try {
@@ -1479,12 +1482,14 @@ async function uploadWebFiles(entries) {
         queued += Number(payload.queued || 0);
         skipped += Number(payload.skipped || 0);
         cancelled += Number(payload.cancelled || 0);
+        paused += Number(payload.paused || 0);
         if (payload.skipped) transfers.handleSyncEvent({ type: 'file', state: 'done', file_path: eventPath, stage: '文件未变化，已跳过' });
       }
     };
     await Promise.all([worker(), worker()]);
     if (queued) message.success(`已加入上传队列：${queued} 个文件${skipped ? `，跳过 ${skipped} 个` : ''}`);
     else if (skipped) message.info(`没有需要上传的文件，已跳过 ${skipped} 个`);
+    else if (paused) message.info(`已暂停上传：${paused} 个文件`);
     else if (cancelled) message.info(`已取消上传：${cancelled} 个文件`);
     await loadCloudFiles();
   } catch (error) {

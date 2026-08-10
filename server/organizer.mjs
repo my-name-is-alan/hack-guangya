@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fetch as undiciFetch } from 'undici';
 import {
@@ -19,6 +21,7 @@ import {
   renderOrganizerPathTemplate,
   normalizeCategoryRules,
   resolveTmdbMatch,
+  validateAuxiliaryRuleBlock,
 } from './organizer-core.mjs';
 import { createProxiedFetch, normalizeProxyUrl } from './network-preferences.mjs';
 
@@ -80,6 +83,13 @@ function normalizeMatchScore(value) {
   return Number(parsed.toFixed(2));
 }
 
+function normalizeRuleText(value, label) {
+  const normalized = String(value ?? '').replace(/\r\n?/g, '\n').trim();
+  if (normalized.length > 100_000) throw new Error(`${label}不能超过 100000 个字符`);
+  if (normalized && normalized.split('\n').length > 2_000) throw new Error(`${label}不能超过 2000 行`);
+  return normalized;
+}
+
 function normalizeLanguage(value, fallback = 'zh-CN') {
   const normalized = cleanText(value) || fallback;
   if (!/^[a-z]{2}(?:-[A-Z]{2})?$/.test(normalized)) throw new Error('TMDB 语言格式不正确，例如 zh-CN 或 en-US');
@@ -99,7 +109,10 @@ function normalizePathTemplate(value, fallback, label) {
   renderOrganizerPathTemplate(normalized, {
     category: '分类', country: 'CN', year: 2026, title: '示例', original_title: 'Example', tmdb_id: 1,
     season: 1, episode: 1, episode_end: '', episode_title: '第一集', edition: '', quality: '', part: '', ext: 'mkv',
-    season_tag: 'S01', episode_tag: 'E01',
+    fileExt: '.mkv', season_tag: 'S01', episode_tag: 'E01', season_episode: 'S01E01',
+    video_format: '2160p', videoFormat: '2160p', resource_type: 'WEB-DL', resourceType: 'WEB-DL',
+    source: 'Netflix', effect: 'HDR', audio_info: '5.1', audioInfo: '5.1', video_codec: 'HEVC', videoCodec: 'HEVC',
+    audio_codec: 'DDP', audioCodec: 'DDP', release_group: 'Example', releaseGroup: 'Example', release_type: 'WEB-DL',
   });
   return normalized;
 }
@@ -199,6 +212,13 @@ function initializeSchema(database) {
       image_language TEXT NOT NULL DEFAULT 'zh,null,en',
       include_adult INTEGER NOT NULL DEFAULT 0,
       minimum_match_score REAL NOT NULL DEFAULT 0.72,
+      word_segment_search INTEGER NOT NULL DEFAULT 1,
+      similarity_match INTEGER NOT NULL DEFAULT 1,
+      recognition_words TEXT NOT NULL DEFAULT '',
+      release_groups TEXT NOT NULL DEFAULT '',
+      render_words TEXT NOT NULL DEFAULT '',
+      capture_groups TEXT NOT NULL DEFAULT '',
+      include_media_info INTEGER NOT NULL DEFAULT 1,
       movie_path_template TEXT NOT NULL DEFAULT '',
       tv_path_template TEXT NOT NULL DEFAULT '',
       movie_category TEXT NOT NULL DEFAULT '电影',
@@ -263,6 +283,13 @@ function initializeSchema(database) {
     CREATE INDEX IF NOT EXISTS organizer_jobs_source_id ON organizer_jobs(mapping_id, source_id, updated_at);
   `);
   for (const [column, definition] of Object.entries({
+    word_segment_search: 'INTEGER NOT NULL DEFAULT 1',
+    similarity_match: 'INTEGER NOT NULL DEFAULT 1',
+    recognition_words: "TEXT NOT NULL DEFAULT ''",
+    release_groups: "TEXT NOT NULL DEFAULT ''",
+    render_words: "TEXT NOT NULL DEFAULT ''",
+    capture_groups: "TEXT NOT NULL DEFAULT ''",
+    include_media_info: 'INTEGER NOT NULL DEFAULT 1',
     movie_path_template: "TEXT NOT NULL DEFAULT ''",
     tv_path_template: "TEXT NOT NULL DEFAULT ''",
     movie_category: "TEXT NOT NULL DEFAULT '电影'",
@@ -359,6 +386,146 @@ function jobSelect() {
     episode_end, query_title, query_year, preview_json, result_json, error_code, message, created_at, updated_at FROM organizer_jobs`;
 }
 
+function ffprobeExecutableCandidates(env = process.env) {
+  const executable = process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe';
+  return [...new Set([
+    cleanText(env.FFPROBE_PATH),
+    path.resolve('src-tauri/resources', executable),
+    path.resolve('resources', executable),
+    executable,
+  ].filter(Boolean))];
+}
+
+function runFfprobe(executable, input, timeoutMs = 45_000) {
+  return new Promise((resolve, reject) => {
+    const child = execFile(executable, ['-v', 'error', '-show_streams', '-show_format', '-of', 'json', input], {
+      windowsHide: true,
+      timeout: timeoutMs,
+      maxBuffer: 4 * 1024 * 1024,
+    }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout);
+    });
+    child.stdin?.end();
+  });
+}
+
+function rationalFrameRate(value) {
+  const [rawNumerator, rawDenominator = '1'] = cleanText(value).split('/');
+  const numerator = Number(rawNumerator);
+  const denominator = Number(rawDenominator);
+  if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator <= 0 || numerator <= 0) return '';
+  const rate = numerator / denominator;
+  const common = [23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60, 120].find((item) => Math.abs(item - rate) < 0.02);
+  return `${common ?? Number(rate.toFixed(3))}fps`;
+}
+
+function normalizedVideoFormat(height, width) {
+  const value = Number(height || 0);
+  if (value >= 4000 || Number(width || 0) >= 7600) return '4320p';
+  if (value >= 2000 || Number(width || 0) >= 3800) return '2160p';
+  if (value >= 1350) return '1440p';
+  if (value >= 1000) return '1080p';
+  if (value >= 700) return '720p';
+  if (value >= 540) return '576p';
+  if (value >= 460) return '480p';
+  return value > 0 ? `${value}p` : '';
+}
+
+function normalizedVideoCodec(value) {
+  return ({ h264: 'AVC', avc: 'AVC', hevc: 'HEVC', h265: 'HEVC', av1: 'AV1', vp9: 'VP9', mpeg2video: 'MPEG2' })[cleanText(value).toLowerCase()] || cleanText(value).toUpperCase();
+}
+
+function normalizedAudioCodec(value, profile = '') {
+  const codec = cleanText(value).toLowerCase();
+  if (codec === 'eac3') return 'DDP';
+  if (codec === 'ac3') return 'DD';
+  if (codec === 'truehd') return 'TrueHD';
+  if (codec === 'dts' && /master|ma/i.test(profile)) return 'DTS-HD MA';
+  return ({ dts: 'DTS', aac: 'AAC', flac: 'FLAC', opus: 'OPUS', mp3: 'MP3', pcm_s16le: 'LPCM', pcm_s24le: 'LPCM' })[codec] || cleanText(value).toUpperCase();
+}
+
+function normalizedAudioLayout(stream = {}) {
+  const layout = cleanText(stream.channel_layout).toLowerCase();
+  const channels = Number(stream.channels || 0);
+  if (/7\.1/.test(layout) || channels === 8) return '7.1';
+  if (/6\.1/.test(layout) || channels === 7) return '6.1';
+  if (/5\.1/.test(layout) || channels === 6) return '5.1';
+  if (/stereo/.test(layout) || channels === 2) return '2.0';
+  if (/mono/.test(layout) || channels === 1) return '1.0';
+  return channels > 0 ? `${channels}.0` : '';
+}
+
+function colorDepth(stream = {}) {
+  const explicit = Number(stream.bits_per_raw_sample || stream.bits_per_sample || 0);
+  if (explicit >= 8) return `${explicit}bit`;
+  const match = cleanText(stream.pix_fmt).match(/(?:p|le|be)(10|12|16)(?:le|be)?$/i);
+  return match ? `${match[1]}bit` : '';
+}
+
+function sideDataText(stream = {}) {
+  return JSON.stringify([stream.side_data_list, stream.tags, stream.profile].filter(Boolean)).toLowerCase();
+}
+
+export function parseFfprobeTechnicalData(payload = {}) {
+  const streams = Array.isArray(payload.streams) ? payload.streams : [];
+  const video = streams.find((stream) => stream.codec_type === 'video') || {};
+  const audio = streams.find((stream) => stream.codec_type === 'audio') || {};
+  const videoText = sideDataText(video);
+  const audioText = sideDataText(audio);
+  const dolbyVision = /dolby.?vision|dovi/.test(videoText) ? 'DV' : '';
+  const transfer = cleanText(video.color_transfer).toLowerCase();
+  const dynamicRange = /hdr10\+|dynamic hdr|smpte2094/.test(videoText) ? 'HDR10+'
+    : transfer === 'smpte2084' ? 'HDR10' : transfer === 'arib-std-b67' ? 'HLG' : '';
+  const layout = normalizedAudioLayout(audio);
+  const atmos = /atmos|joc/.test(audioText);
+  const result = {
+    video_format: normalizedVideoFormat(video.height, video.width),
+    video_codec: normalizedVideoCodec(video.codec_name),
+    frame_rate: rationalFrameRate(video.avg_frame_rate || video.r_frame_rate),
+    color_depth: colorDepth(video),
+    dolby_vision: dolbyVision,
+    dynamic_range: dynamicRange,
+    audio_codec: normalizedAudioCodec(audio.codec_name, audio.profile),
+    audio_info: [atmos ? 'Atmos' : '', layout].filter(Boolean).join(' '),
+  };
+  result.effect = [result.dolby_vision, result.dynamic_range].filter(Boolean).join(' ');
+  return Object.fromEntries(Object.entries(result).filter(([, value]) => value));
+}
+
+async function probeTechnicalData(input, env = process.env) {
+  let unavailable = true;
+  let lastError = null;
+  for (const executable of ffprobeExecutableCandidates(env)) {
+    if (executable.includes(path.sep) && !fs.existsSync(executable)) continue;
+    try {
+      const stdout = await runFfprobe(executable, input);
+      return parseFfprobeTechnicalData(JSON.parse(stdout));
+    } catch (error) {
+      lastError = error;
+      if (error?.code !== 'ENOENT') unavailable = false;
+    }
+  }
+  if (unavailable) throw new Error('未找到 FFprobe，请重新执行安装或打包准备');
+  throw new Error(lastError?.killed ? 'FFprobe 获取媒体信息超时' : 'FFprobe 无法读取该媒体文件');
+}
+
+async function enrichAnalysisWithMediaInfo(analysis, cloud, env) {
+  const warnings = [];
+  for (const video of analysis.videos) {
+    try {
+      if (typeof cloud.getDownloadUrl !== 'function') throw new Error('当前运行环境没有提供媒体读取地址');
+      const downloadUrl = await cloud.getDownloadUrl(video.source_id);
+      Object.assign(video.parsed, await probeTechnicalData(downloadUrl, env));
+      video.parsed.media_probed = true;
+    } catch (error) {
+      warnings.push(`${video.source_name || video.source}：${error.message}`);
+    }
+  }
+  analysis.media_probe_warnings = warnings;
+  return analysis;
+}
+
 export function createOrganizerService({ database, cloud, publish = () => {}, env = process.env, fetchImpl = undiciFetch, getNetworkPreferences = () => ({}) }) {
   initializeSchema(database);
   const envApiKey = cleanText(env.TMDB_API_KEY || env.TMDB_READ_ACCESS_TOKEN);
@@ -380,6 +547,7 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
 
   function storedSettings() {
     return database.prepare(`SELECT tmdb_api_key, language, image_language, include_adult, minimum_match_score,
+      word_segment_search, similarity_match, recognition_words, release_groups, render_words, capture_groups, include_media_info,
       movie_path_template, tv_path_template, movie_category, tv_category, tmdb_api_base, tmdb_image_base,
       category_rules, scrape_targets, default_scrape_types, updated_at FROM organizer_settings WHERE id = 1`).get()
       || { tmdb_api_key: '', ...DEFAULT_ORGANIZER_SETTINGS, updated_at: 0 };
@@ -399,6 +567,13 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
       image_language: normalizeImageLanguage(envImageLanguage || stored.image_language),
       include_adult: Boolean(stored.include_adult),
       minimum_match_score: normalizeMatchScore(stored.minimum_match_score),
+      word_segment_search: stored.word_segment_search !== 0,
+      similarity_match: stored.similarity_match !== 0,
+      recognition_words: normalizeRuleText(stored.recognition_words, '自定义识别词'),
+      release_groups: normalizeRuleText(stored.release_groups, '自定义制作组'),
+      render_words: normalizeRuleText(stored.render_words, '自定义渲染词'),
+      capture_groups: normalizeRuleText(stored.capture_groups, '自定义捕获组'),
+      include_media_info: stored.include_media_info !== 0,
       movie_path_template: cleanText(stored.movie_path_template) || DEFAULT_ORGANIZER_SETTINGS.movie_path_template,
       tv_path_template: cleanText(stored.tv_path_template) || DEFAULT_ORGANIZER_SETTINGS.tv_path_template,
       movie_category: cleanText(stored.movie_category) || DEFAULT_ORGANIZER_SETTINGS.movie_category,
@@ -426,7 +601,11 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
       language_managed_by_environment: settings.language_managed_by_environment,
       image_language_managed_by_environment: settings.image_language_managed_by_environment,
       language: settings.language, image_language: settings.image_language, include_adult: settings.include_adult,
-      minimum_match_score: settings.minimum_match_score, movie_path_template: settings.movie_path_template,
+      minimum_match_score: settings.minimum_match_score, word_segment_search: settings.word_segment_search,
+      similarity_match: settings.similarity_match, recognition_words: settings.recognition_words,
+      release_groups: settings.release_groups, render_words: settings.render_words, capture_groups: settings.capture_groups,
+      include_media_info: settings.include_media_info,
+      movie_path_template: settings.movie_path_template,
       tv_path_template: settings.tv_path_template, movie_category: settings.movie_category, tv_category: settings.tv_category,
       tmdb_api_base: settings.tmdb_api_base, tmdb_image_base: settings.tmdb_image_base,
       tmdb_api_base_managed_by_environment: settings.tmdb_api_base_managed_by_environment,
@@ -501,6 +680,16 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     const imageLanguage = normalizeImageLanguage(input.image_language ?? stored.image_language);
     const includeAdult = booleanValue(input.include_adult, Boolean(stored.include_adult));
     const minimumMatchScore = normalizeMatchScore(input.minimum_match_score ?? stored.minimum_match_score);
+    const wordSegmentSearch = booleanValue(input.word_segment_search, stored.word_segment_search !== 0);
+    const similarityMatch = booleanValue(input.similarity_match, stored.similarity_match !== 0);
+    const recognitionWords = normalizeRuleText(input.recognition_words ?? stored.recognition_words, '自定义识别词');
+    const releaseGroups = normalizeRuleText(input.release_groups ?? stored.release_groups, '自定义制作组');
+    const renderWords = normalizeRuleText(input.render_words ?? stored.render_words, '自定义渲染词');
+    const captureGroups = normalizeRuleText(input.capture_groups ?? stored.capture_groups, '自定义捕获组');
+    const includeMediaInfo = booleanValue(input.include_media_info, stored.include_media_info !== 0);
+    validateAuxiliaryRuleBlock(recognitionWords, '自定义识别词');
+    validateAuxiliaryRuleBlock(renderWords, '自定义渲染词');
+    validateAuxiliaryRuleBlock(captureGroups, '自定义捕获组', { replacement: false });
     const moviePathTemplate = normalizePathTemplate(input.movie_path_template, stored.movie_path_template || DEFAULT_ORGANIZER_SETTINGS.movie_path_template, '电影路径模板');
     const tvPathTemplate = normalizePathTemplate(input.tv_path_template, stored.tv_path_template || DEFAULT_ORGANIZER_SETTINGS.tv_path_template, '电视剧路径模板');
     const movieCategory = normalizeCategory(input.movie_category, stored.movie_category || DEFAULT_ORGANIZER_SETTINGS.movie_category, '电影分类名');
@@ -511,16 +700,22 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     const scrapeTargets = normalizeScrapeTargets(input.scrape_targets ?? parseJson(stored.scrape_targets, []));
     const defaultScrapeTypes = normalizeScrapeTypes(input.default_scrape_types ?? parseJson(stored.default_scrape_types, DEFAULT_SCRAPE_TYPES), true);
     database.prepare(`INSERT INTO organizer_settings
-      (id, tmdb_api_key, language, image_language, include_adult, minimum_match_score, movie_path_template, tv_path_template, movie_category, tv_category,
+      (id, tmdb_api_key, language, image_language, include_adult, minimum_match_score, word_segment_search, similarity_match,
+       recognition_words, release_groups, render_words, capture_groups, include_media_info, movie_path_template, tv_path_template, movie_category, tv_category,
        tmdb_api_base, tmdb_image_base, category_rules, scrape_targets, default_scrape_types, updated_at)
-      VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET tmdb_api_key=excluded.tmdb_api_key, language=excluded.language,
         image_language=excluded.image_language, include_adult=excluded.include_adult,
-        minimum_match_score=excluded.minimum_match_score, movie_path_template=excluded.movie_path_template,
+        minimum_match_score=excluded.minimum_match_score, word_segment_search=excluded.word_segment_search,
+        similarity_match=excluded.similarity_match, recognition_words=excluded.recognition_words,
+        release_groups=excluded.release_groups, render_words=excluded.render_words, capture_groups=excluded.capture_groups,
+        include_media_info=excluded.include_media_info,
+        movie_path_template=excluded.movie_path_template,
         tv_path_template=excluded.tv_path_template, movie_category=excluded.movie_category,
         tv_category=excluded.tv_category, tmdb_api_base=excluded.tmdb_api_base, tmdb_image_base=excluded.tmdb_image_base,
         category_rules=excluded.category_rules, scrape_targets=excluded.scrape_targets, default_scrape_types=excluded.default_scrape_types, updated_at=excluded.updated_at`)
-      .run(apiKey, language, imageLanguage, Number(includeAdult), minimumMatchScore, moviePathTemplate, tvPathTemplate, movieCategory, tvCategory,
+      .run(apiKey, language, imageLanguage, Number(includeAdult), minimumMatchScore, Number(wordSegmentSearch), Number(similarityMatch),
+        recognitionWords, releaseGroups, renderWords, captureGroups, Number(includeMediaInfo), moviePathTemplate, tvPathTemplate, movieCategory, tvCategory,
         apiBase, imageBase, JSON.stringify(categoryRules), JSON.stringify(scrapeTargets), JSON.stringify(defaultScrapeTypes), nowSeconds());
     emit('settings-updated');
     return publicSettings();
@@ -624,17 +819,40 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     });
   }
 
-  function removeJob(id) {
+  async function removeJob(id, input = {}) {
     const job = getJob(id);
     if (!job) throw new Error('整理任务不存在');
-    if (job.status === 'running' || executingJobs.has(id)) throw new Error('任务正在整理，不能删除');
+    if (['recognizing', 'running'].includes(job.status) || executingJobs.has(id)) throw new Error('任务正在整理，不能删除');
+    const deleteSource = input.delete_source === true;
+    const deleteTarget = input.delete_target === true;
+    let deletedSource = 0;
+    let deletedTarget = 0;
+    const warnings = [];
+    if (deleteTarget) {
+      const targetIds = [...new Set((Array.isArray(job.result?.targets) ? job.result.targets : []).map(cleanText).filter(Boolean))];
+      for (const targetId of targetIds) {
+        await cloud.deleteEntry(targetId);
+        deletedTarget += 1;
+      }
+      if (!targetIds.length) warnings.push('该记录没有可安全定位的媒体库文件，未删除媒体库内容');
+    }
+    if (deleteSource) {
+      const sourceEntries = await listCloudChildren(job.source_parent_id);
+      const source = sourceEntries.find((entry) => entry.id === job.source_id);
+      if (source) {
+        await cloud.deleteEntry(source.id);
+        deletedSource = 1;
+      } else {
+        warnings.push('源文件已移动或不存在，未重复删除');
+      }
+    }
     database.prepare('DELETE FROM organizer_jobs WHERE id = ?').run(id);
     if (String(job.mapping_id).startsWith('manual:')) {
       database.prepare("DELETE FROM organizer_mappings WHERE id = ? AND NOT EXISTS (SELECT 1 FROM organizer_jobs WHERE mapping_id = ?)")
         .run(job.mapping_id, job.mapping_id);
     }
-    emit('job-removed', { job_id: id, mapping_id: job.mapping_id });
-    return {};
+    emit('job-removed', { job_id: id, mapping_id: job.mapping_id, deleted_source: deletedSource, deleted_target: deletedTarget });
+    return { deleted_source: deletedSource, deleted_target: deletedTarget, warnings };
   }
 
   function manualMappingFor(target, source) {
@@ -679,6 +897,7 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     if (!target) throw new Error(targets.length ? '请选择一个已配置的刮削目标目录' : '请先在设置 > 整理 > 刮削偏好中配置媒体库目标');
     const jobs = [];
     const failures = [];
+    const queued = [];
     for (const source of selected.slice(0, 100)) {
       try {
         const normalizedSource = {
@@ -693,28 +912,35 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
         };
         if (!normalizedSource.id) throw new Error('选中项缺少文件 ID');
         const mapping = manualMappingFor(target, normalizedSource);
-        await validateMapping(mapping);
-        const loaded = await loadCloudCandidate(mapping, normalizedSource.id);
-        if (!loaded || loaded.fingerprint.video_count < 1) throw new Error('选中项中没有可识别的视频文件');
-        // 只在来源目录和候选文件都校验通过后持久化一次性映射，避免
-        // 识别失败时在数据库留下无法从任务列表回收的 manual:* 记录。
         saveMapping(mapping);
         const id = crypto.randomUUID();
         const timestamp = nowSeconds();
+        const sourceName = cleanText(normalizedSource.name || normalizedSource.file_name || normalizedSource.fileName) || normalizedSource.id;
         database.prepare(`INSERT INTO organizer_jobs
           (id, mapping_id, source_path, source_id, source_parent_id, source_size, source_modified_ms, source_file_count,
            source_signature, share_after_requested, status, media_type, message, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'recognizing', ?, '等待 TMDB 识别', ?, ?)`)
-          .run(id, mapping.id, `${mapping.source_path.replace(/\/$/, '')}/${loaded.candidate.name}`, normalizedSource.id,
-            mapping.source_dir_id, loaded.fingerprint.size, loaded.fingerprint.modified_ms, loaded.fingerprint.file_count,
-            loaded.fingerprint.signature, mapping.media_type || null, timestamp, timestamp);
+          VALUES (?, ?, ?, ?, ?, 0, '0', 0, '', 0, 'recognizing', ?, '刮削已提交，等待后台识别', ?, ?)`)
+          .run(id, mapping.id, `${mapping.source_path.replace(/\/$/, '')}/${sourceName}`, normalizedSource.id,
+            mapping.source_dir_id, mapping.media_type || null, timestamp, timestamp);
         emit('job-updated', { job_id: id, mapping_id: mapping.id, status: 'recognizing' });
-        const result = await previewJob(id, {}, true);
-        jobs.push(result);
+        jobs.push(getJob(id));
+        queued.push({ id, mapping });
       } catch (error) {
         failures.push({ id: cleanText(source.id || source.file_id), message: error.message });
       }
     }
+    void (async () => {
+      for (const task of queued) {
+        try {
+          await validateMapping(task.mapping);
+          const result = await previewJob(task.id, {}, false);
+          if (result?.status === 'ready') await executeJob(task.id);
+        } catch (error) {
+          updateJob(task.id, { status: 'failed', error_code: 'scrape_failed', message: error.message });
+          emit('job-updated', { job_id: task.id, mapping_id: task.mapping.id, status: 'failed', message: error.message });
+        }
+      }
+    })();
     return { jobs, failures, state: state() };
   }
 
@@ -807,6 +1033,9 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
       mapping.scrape, mapping.scrape_types, mapping.sync_extras, mapping.share_after_organize,
       settings.language, settings.image_language, settings.movie_path_template, settings.tv_path_template,
       settings.movie_category, settings.tv_category, settings.tmdb_api_base, settings.tmdb_image_base,
+      settings.word_segment_search, settings.similarity_match, settings.recognition_words,
+      settings.release_groups, settings.render_words, settings.capture_groups,
+      settings.include_media_info,
       settings.category_rules, settings.scrape_targets, settings.default_scrape_types,
     ])).digest('hex');
   }
@@ -889,7 +1118,8 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     emit('job-updated', { job_id: id, mapping_id: job.mapping_id, status: 'recognizing' });
     try {
       const settings = effectiveSettings();
-      const analysis = analyzeCloudMediaCandidate(loaded, overrides);
+      const analysis = analyzeCloudMediaCandidate(loaded, overrides, settings);
+      if (settings.include_media_info) await enrichAnalysisWithMediaInfo(analysis, cloud, env);
       if (!overrides.title) overrides.title = analysis.title;
       if (!overrides.year) overrides.year = analysis.year;
       if (!overrides.media_type) overrides.media_type = analysis.media_type;
@@ -1108,6 +1338,35 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     return previewJob(id, input, false);
   }
 
+  async function rearchiveJob(id, input = {}) {
+    const job = getJob(id);
+    if (!job) throw new Error('整理任务不存在');
+    if (['recognizing', 'running'].includes(job.status) || executingJobs.has(id)) throw new Error('该任务正在整理，请等待完成');
+    const mapping = getMapping(job.mapping_id);
+    if (!mapping) throw new Error('整理监控不存在');
+    const active = database.prepare(`${jobSelect()} WHERE mapping_id = ? AND source_id = ? AND id <> ?
+      AND status IN ('recognizing','ready','running','needs_review') ORDER BY updated_at DESC LIMIT 1`)
+      .get(job.mapping_id, job.source_id, id);
+    if (active) throw new Error('该源文件已有待处理的归档任务，请先处理后再重新归档');
+    updateJob(id, { status: 'recognizing', error_code: null, message: '重新归档已提交，正在后台识别' });
+    emit('job-updated', {
+      job_id: id,
+      mapping_id: job.mapping_id,
+      status: 'recognizing',
+      rearchive: true,
+    });
+    void (async () => {
+      try {
+        const recognized = await previewJob(id, input, false);
+        if (recognized?.status === 'ready') await executeJob(id);
+      } catch (error) {
+        updateJob(id, { status: 'failed', error_code: 'rearchive_failed', message: error.message });
+        emit('job-updated', { job_id: id, mapping_id: job.mapping_id, status: 'failed', message: error.message });
+      }
+    })();
+    return getJob(id);
+  }
+
   async function processCandidate(mappingId, candidateId, shareAfterOverride = null) {
     if (mutatingMappings.has(mappingId)) return null;
     const mapping = getMapping(mappingId);
@@ -1178,7 +1437,7 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     pendingTimers.clear();
   }
 
-  return { state, updateSettings, testConnection, addMapping, updateMapping, removeMapping, removeJob, scanMapping, runJob, retryJob, notifyUpload, scrapeSelected, initialize, close };
+  return { state, updateSettings, testConnection, addMapping, updateMapping, removeMapping, removeJob, scanMapping, runJob, retryJob, rearchiveJob, notifyUpload, scrapeSelected, initialize, close };
 }
 
 export const organizerInternals = {
@@ -1191,4 +1450,5 @@ export const organizerInternals = {
   normalizeScrapeTypes,
   normalizeSettleSeconds,
   normalizeTransferType,
+  parseFfprobeTechnicalData,
 };

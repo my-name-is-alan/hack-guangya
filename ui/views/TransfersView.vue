@@ -26,6 +26,7 @@ const session = useSessionStore()
 const transfers = useTransfersStore()
 const { orderedUploads, downloads } = storeToRefs(transfers)
 const tab = shallowRef(String(route.query.tab || 'upload'))
+const queueToggling = shallowRef(false)
 
 const uploadCounts = computed(() => ({
   active: orderedUploads.value.filter(item => !['done', 'error', 'cancelled'].includes(item.state)).length,
@@ -56,14 +57,32 @@ async function cancelUpload(filePath: string) {
   catch (error) { message.error(errorText(error)) }
 }
 
+async function pauseUpload(filePath: string) {
+  try { await transfers.pauseUpload(filePath) }
+  catch (error) { message.error(errorText(error)) }
+}
+
+async function resumeUpload(filePath: string) {
+  try { await transfers.resumeUpload(filePath) }
+  catch (error) { message.error(errorText(error)) }
+}
+
 async function retryUpload(filePath: string) {
   try { await transfers.retryUpload(filePath) }
   catch (error) { message.error(errorText(error)) }
 }
 
 async function toggleQueue() {
-  await bridge.invoke(session.state.paused ? 'resume_queue' : 'pause_queue')
-  await session.refreshState()
+  if (queueToggling.value) return
+  queueToggling.value = true
+  const resume = session.state.paused
+  try {
+    await bridge.invoke(resume ? 'resume_queue' : 'pause_queue')
+    await session.refreshState()
+    message.success(resume ? '传输队列已恢复' : '传输队列已暂停')
+  }
+  catch (error) { message.error(errorText(error)) }
+  finally { queueToggling.value = false }
 }
 
 watch(() => route.query.tab, value => {
@@ -77,7 +96,7 @@ watch(tab, value => void router.replace({ query: { ...route.query, tab: value } 
     <a-tabs v-model:active-key="tab" class="page-tabs">
       <template #rightExtra>
         <a-space>
-          <a-button @click="toggleQueue">
+          <a-button :loading="queueToggling" @click="toggleQueue">
             <template #icon><PlayCircleOutlined v-if="session.state.paused" /><PauseCircleOutlined v-else /></template>
             {{ session.state.paused ? '恢复队列' : '暂停队列' }}
           </a-button>
@@ -101,11 +120,16 @@ watch(tab, value => void router.replace({ query: { ...route.query, tab: value } 
             <a-tag v-if="item.state === 'done'" color="success"><CheckCircleOutlined /> 完成</a-tag>
             <a-tag v-else-if="item.state === 'error'" color="error"><CloseCircleOutlined /> 失败</a-tag>
             <a-tag v-else-if="item.state === 'cancelled'"><CloseCircleOutlined /> 已取消</a-tag>
+            <a-tag v-else-if="item.state === 'paused'" color="warning"><PauseCircleOutlined /> 已暂停</a-tag>
             <a-tag v-else color="processing"><LoadingOutlined spin /> {{ item.percent }}%</a-tag>
-            <a-button v-if="item.state === 'error'" size="small" type="primary" title="重试上传" @click="retryUpload(item.filePath)"><ReloadOutlined /> 重试</a-button>
-            <a-popconfirm v-if="!['done', 'error', 'cancelled'].includes(item.state)" title="确定取消这个上传任务？未完成的上传断点会被清理。" ok-text="取消上传" cancel-text="返回" @confirm="cancelUpload(item.filePath)">
-              <a-button size="small" danger title="取消上传" aria-label="取消上传"><CloseCircleOutlined /></a-button>
-            </a-popconfirm>
+            <a-space class="transfer-actions" size="small">
+              <a-button v-if="['queued', 'waiting-login', 'waiting-file', 'preparing', 'uploading'].includes(item.state)" size="small" title="暂停上传" @click="pauseUpload(item.filePath)"><PauseCircleOutlined /></a-button>
+              <a-button v-if="item.state === 'paused'" size="small" title="继续上传" @click="resumeUpload(item.filePath)"><PlayCircleOutlined /></a-button>
+              <a-button v-if="item.state === 'error'" size="small" type="primary" title="重试上传" @click="retryUpload(item.filePath)"><ReloadOutlined /> 重试</a-button>
+              <a-popconfirm v-if="!['done', 'error', 'cancelled'].includes(item.state)" title="确定取消这个上传任务？未完成的上传断点会被清理。" ok-text="取消上传" cancel-text="返回" @confirm="cancelUpload(item.filePath)">
+                <a-button size="small" danger title="取消上传" aria-label="取消上传"><CloseCircleOutlined /></a-button>
+              </a-popconfirm>
+            </a-space>
           </div>
         </div>
       </a-tab-pane>

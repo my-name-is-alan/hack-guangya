@@ -1,4 +1,4 @@
-use regex::Regex;
+use regex::{Captures, Regex, RegexBuilder};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,12 +8,13 @@ use std::{
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
 use tokio::fs as async_fs;
 use uuid::Uuid;
 
-pub const NATIVE_ENGINE_VERSION: &str = "guangya-cloud-native-v2";
+pub const NATIVE_ENGINE_VERSION: &str = "guangya-cloud-native-v3";
 pub const VIDEO_EXTENSIONS: &[&str] = &[
     "3gp", "asf", "avi", "f4v", "flv", "iso", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg",
     "mts", "rm", "rmvb", "strm", "tp", "ts", "vob", "webm", "wmv",
@@ -29,11 +30,27 @@ pub struct NativeSettings {
     pub image_language: String,
     pub include_adult: bool,
     pub minimum_match_score: f64,
+    #[serde(default = "default_true")]
+    pub word_segment_search: bool,
+    #[serde(default = "default_true")]
+    pub similarity_match: bool,
+    #[serde(default)]
+    pub recognition_words: String,
+    #[serde(default)]
+    pub release_groups: String,
+    #[serde(default)]
+    pub render_words: String,
+    #[serde(default)]
+    pub capture_groups: String,
     pub movie_folder_format: String,
     pub movie_file_format: String,
     pub tv_folder_format: String,
     pub season_folder_format: String,
     pub episode_file_format: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for NativeSettings {
@@ -43,6 +60,12 @@ impl Default for NativeSettings {
             image_language: "zh,null,en".to_string(),
             include_adult: false,
             minimum_match_score: 0.72,
+            word_segment_search: true,
+            similarity_match: true,
+            recognition_words: String::new(),
+            release_groups: String::new(),
+            render_words: String::new(),
+            capture_groups: String::new(),
             movie_folder_format: "{title} ({year})".to_string(),
             movie_file_format: "{title} ({year}){edition}{quality}{part}".to_string(),
             tv_folder_format: "{title} ({year})".to_string(),
@@ -73,9 +96,26 @@ pub struct ParsedMediaName {
     pub season: Option<i64>,
     pub episode: Option<i64>,
     pub episode_end: Option<i64>,
+    pub tmdb_id: Option<i64>,
     pub edition: String,
     pub quality: String,
     pub part: Option<String>,
+    pub video_format: String,
+    pub resource_type: String,
+    pub source: String,
+    pub effect: String,
+    pub audio_info: String,
+    pub video_codec: String,
+    pub audio_codec: String,
+    pub release_group: String,
+    pub release_type: String,
+    pub high_quality: String,
+    pub dolby_vision: String,
+    pub dynamic_range: String,
+    pub frame_rate: String,
+    pub color_depth: String,
+    #[serde(default)]
+    pub media_probed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +137,8 @@ pub struct MediaQuery {
     pub title: String,
     pub year: Option<i64>,
     pub media_type: String,
+    #[serde(default)]
+    pub tmdb_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +148,8 @@ pub struct CandidateAnalysis {
     pub media_type: String,
     pub title: String,
     pub year: Option<i64>,
+    #[serde(default)]
+    pub tmdb_id: Option<i64>,
     pub videos: Vec<AnalyzedVideo>,
     pub sidecars: Vec<AnalyzedSidecar>,
     pub ignored_samples: Vec<String>,
@@ -182,6 +226,10 @@ pub struct MediaMetadata {
     pub genre_ids: Vec<i64>,
     pub studios: Vec<String>,
     pub countries: Vec<String>,
+    #[serde(default)]
+    pub original_language: String,
+    #[serde(default)]
+    pub origin_countries: Vec<String>,
     pub directors: Vec<String>,
     pub actors: Vec<MediaActor>,
     pub poster_path: String,
@@ -544,8 +592,271 @@ fn clean_title(value: &str) -> String {
     normalize_spaces(&retained.join(" "))
 }
 
-pub fn parse_media_name(value: &str, options: &RecognitionOverrides) -> ParsedMediaName {
-    let original = stem_text(value);
+#[derive(Default)]
+struct RecognitionDirectives {
+    tmdb_id: Option<i64>,
+    media_type: Option<String>,
+    season: Option<i64>,
+    episode: Option<i64>,
+}
+
+fn rule_lines(value: &str) -> Vec<&str> {
+    value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .take(2_000)
+        .collect()
+}
+
+fn user_pattern_source(value: &str) -> (&str, bool) {
+    let mut source = value.trim();
+    let insensitive = source.starts_with("(?i)");
+    if insensitive {
+        source = &source[4..];
+    }
+    (source, insensitive)
+}
+
+fn compile_user_pattern(value: &str) -> Regex {
+    static CACHE: OnceLock<Mutex<HashMap<String, Regex>>> = OnceLock::new();
+    let (source, insensitive) = user_pattern_source(value);
+    let cache_key = format!("{}\0{source}", if insensitive { "i" } else { "" });
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock() {
+        if let Some(pattern) = cache.get(&cache_key) {
+            return pattern.clone();
+        }
+    }
+    let pattern = RegexBuilder::new(source)
+        .case_insensitive(insensitive)
+        .unicode(true)
+        .build()
+        .unwrap_or_else(|_| {
+            RegexBuilder::new(&regex::escape(source))
+                .case_insensitive(true)
+                .unicode(true)
+                .build()
+                .expect("escaped organizer user regex")
+        });
+    if let Ok(mut cache) = cache.lock() {
+        if cache.len() >= 4_096 {
+            cache.clear();
+        }
+        cache.insert(cache_key, pattern.clone());
+    }
+    pattern
+}
+
+pub fn validate_auxiliary_rule_block(
+    value: &str,
+    label: &str,
+    replacement: bool,
+) -> Result<(), String> {
+    for (index, raw_line) in value.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let pattern_text = if replacement {
+            line.split_once("=>")
+                .map(|(pattern, _)| pattern.trim())
+                .unwrap_or(line)
+        } else {
+            line
+        };
+        if pattern_text.is_empty() {
+            return Err(format!("{label}第 {} 行缺少正则表达式", index + 1));
+        }
+        if pattern_text.starts_with("@?{") {
+            return Err(format!(
+                "{label}第 {} 行使用了尚未支持的 @? 条件规则",
+                index + 1
+            ));
+        }
+        let (source, insensitive) = user_pattern_source(pattern_text);
+        if source.contains("(?P<") || source.contains("(?<") {
+            return Err(format!(
+                "{label}第 {} 行使用了统一规则语法不支持的命名捕获",
+                index + 1
+            ));
+        }
+        RegexBuilder::new(source)
+            .case_insensitive(insensitive)
+            .unicode(true)
+            .build()
+            .map_err(|error| format!("{label}第 {} 行正则无效：{error}", index + 1))?;
+    }
+    Ok(())
+}
+
+fn calculate_captured_number(value: &str, expression: &str) -> String {
+    let Ok(mut result) = value.parse::<f64>() else {
+        return value.to_string();
+    };
+    for captures in regex(r"([+\-*/])\s*(\d+(?:\.\d+)?)").captures_iter(expression) {
+        let number = captures
+            .get(2)
+            .and_then(|item| item.as_str().parse::<f64>().ok())
+            .unwrap_or(0.0);
+        match captures.get(1).map(|item| item.as_str()) {
+            Some("+") => result += number,
+            Some("-") => result -= number,
+            Some("*") => result *= number,
+            Some("/") if number != 0.0 => result /= number,
+            _ => {}
+        }
+    }
+    if result.fract().abs() < f64::EPSILON {
+        format!("{}", result as i64)
+    } else {
+        format!("{result:.4}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    }
+}
+
+fn expand_rule_replacement(template: &str, captures: &Captures<'_>) -> String {
+    regex(r"\\(\d+)(?:@([+\-*/\d.\s]+))?")
+        .replace_all(template, |reference: &Captures<'_>| {
+            let index = reference
+                .get(1)
+                .and_then(|item| item.as_str().parse::<usize>().ok())
+                .unwrap_or(0);
+            let value = captures
+                .get(index)
+                .map(|item| item.as_str())
+                .unwrap_or_default();
+            reference
+                .get(2)
+                .map(|expression| calculate_captured_number(value, expression.as_str()))
+                .unwrap_or_else(|| value.to_string())
+        })
+        .to_string()
+}
+
+fn extract_recognition_directives(value: &str, directives: &mut RecognitionDirectives) -> String {
+    let directive_regex = regex(r"\{\[([^\]]+)\]\}");
+    for captures in directive_regex.captures_iter(value) {
+        let body = captures
+            .get(1)
+            .map(|item| item.as_str())
+            .unwrap_or_default();
+        for entry in body.split(';') {
+            let mut parts = entry.splitn(2, '=');
+            let key = parts.next().unwrap_or_default().trim().to_lowercase();
+            let raw = parts.next().unwrap_or_default().trim();
+            match key.as_str() {
+                "tmdbid" | "tmdb_id" => {
+                    directives.tmdb_id = raw.parse::<i64>().ok().filter(|id| *id > 0)
+                }
+                "type" if matches!(raw.to_lowercase().as_str(), "movie" | "tv") => {
+                    directives.media_type = Some(raw.to_lowercase())
+                }
+                "s" | "season" => {
+                    directives.season = raw.parse::<i64>().ok().filter(|number| *number >= 0)
+                }
+                "e" | "episode" => {
+                    directives.episode = raw.parse::<i64>().ok().filter(|number| *number >= 0)
+                }
+                _ => {}
+            }
+        }
+    }
+    directive_regex.replace_all(value, "").to_string()
+}
+
+fn apply_rule_block(value: &str, block: &str, directives: &mut RecognitionDirectives) -> String {
+    let mut current = value.to_string();
+    for line in rule_lines(block) {
+        let (pattern_text, replacement) = line
+            .split_once("=>")
+            .map(|(left, right)| (left.trim(), right.trim()))
+            .unwrap_or((line, ""));
+        if pattern_text.is_empty() || pattern_text.starts_with("@?{") {
+            continue;
+        }
+        let pattern = compile_user_pattern(pattern_text);
+        current = pattern
+            .replace_all(&current, |captures: &Captures<'_>| {
+                let expanded = expand_rule_replacement(replacement, captures);
+                extract_recognition_directives(&expanded, directives)
+            })
+            .to_string();
+    }
+    current
+}
+
+fn apply_auxiliary_recognition(
+    value: &str,
+    settings: &NativeSettings,
+) -> (String, RecognitionDirectives) {
+    let mut directives = RecognitionDirectives::default();
+    let recognized = apply_rule_block(value, &settings.recognition_words, &mut directives);
+    let rendered = apply_rule_block(&recognized, &settings.render_words, &mut directives);
+    (
+        regex(r"\s{2,}")
+            .replace_all(rendered.trim(), " ")
+            .to_string(),
+        directives,
+    )
+}
+
+fn technical_capture(value: &str, pattern: &str) -> String {
+    regex(pattern)
+        .captures(value)
+        .and_then(|captures| captures.get(1).or_else(|| captures.get(0)))
+        .map(|item| item.as_str().to_string())
+        .unwrap_or_default()
+}
+
+fn known_release_group(value: &str, settings: &NativeSettings) -> String {
+    let lower = value.to_lowercase();
+    let mut groups = rule_lines(&settings.release_groups);
+    groups.sort_by_key(|group| std::cmp::Reverse(group.len()));
+    if let Some(group) = groups
+        .into_iter()
+        .find(|group| lower.contains(&group.to_lowercase()))
+    {
+        return group.to_string();
+    }
+    for rule in rule_lines(&settings.capture_groups) {
+        if let Some(captures) = compile_user_pattern(rule).captures(value) {
+            return captures
+                .iter()
+                .skip(1)
+                .flatten()
+                .next()
+                .or_else(|| captures.get(0))
+                .map(|item| item.as_str().trim().to_string())
+                .unwrap_or_default();
+        }
+    }
+    regex(r"-([A-Za-z0-9][A-Za-z0-9@._-]{1,48})$")
+        .captures(value)
+        .and_then(|captures| captures.get(1))
+        .or_else(|| {
+            regex(r"^\[([^\]]{2,48})\]")
+                .captures(value)
+                .and_then(|captures| captures.get(1))
+        })
+        .map(|item| item.as_str().trim().to_string())
+        .unwrap_or_default()
+}
+
+pub fn parse_media_name_with_settings(
+    value: &str,
+    options: &RecognitionOverrides,
+    settings: &NativeSettings,
+) -> ParsedMediaName {
+    let raw_original = stem_text(value);
+    let (recognized, directives) = apply_auxiliary_recognition(&raw_original, settings);
+    let original = if recognized.is_empty() {
+        raw_original
+    } else {
+        recognized
+    };
     let hint = options
         .media_type
         .clone()
@@ -554,7 +865,7 @@ pub fn parse_media_name(value: &str, options: &RecognitionOverrides) -> ParsedMe
     let technical = strip_technical_brackets(&original);
     let numbers = tv_numbers(&technical, &hint);
     let year_capture =
-        regex(r"(?:^|[^0-9])(19\d{2}|20\d{2}|21\d{2})(?:$|[^0-9])").captures(&technical);
+        regex(r"(?:^|[^0-9])(19\d{2}|20\d{2}|21\d{2})(?:$|[^0-9pP])").captures(&technical);
     let parsed_year = year_capture
         .as_ref()
         .and_then(|capture| capture.get(1))
@@ -577,16 +888,75 @@ pub fn parse_media_name(value: &str, options: &RecognitionOverrides) -> ParsedMe
     {
         title = options.title.clone().unwrap_or_default();
     }
-    let season = options.season.or(numbers.season);
-    let episode = options.episode.or(numbers.episode);
+    let season = options.season.or(directives.season).or(numbers.season);
+    let episode = options.episode.or(directives.episode).or(numbers.episode);
     let episode_end = options.episode_end.or(numbers.episode_end);
     let media_type = if !hint.is_empty() {
         hint
+    } else if let Some(media_type) = directives.media_type {
+        media_type
     } else if episode.is_some() || season.is_some() {
         "tv".to_string()
     } else {
         "movie".to_string()
     };
+    let video_format = technical_capture(
+        &original,
+        r"(?i)(?:^|[ ._\-])(2160p|1080p|720p|480p|4k|uhd)(?:$|[ ._\-])",
+    )
+    .to_lowercase()
+    .replace("4k", "2160p")
+    .replace("uhd", "2160p");
+    let resource_type = technical_capture(&original, r"(?i)(?:^|[ ._\-])(REMUX|WEB[ ._\-]?DL|WEBRip|Blu[ ._\-]?Ray|BDRip|HDTV|DVDRip|UHDRip)(?:$|[ ._\-])")
+        .replace([' ', '_'], "-");
+    let raw_video_codec = technical_capture(
+        &original,
+        r"(?i)(?:^|[ ._\-])(AV1|HEVC|H[ .]?265|x265|AVC|H[ .]?264|x264)(?:$|[ ._\-])",
+    );
+    let video_codec = if regex(r"(?i)(?:265|hevc)").is_match(&raw_video_codec) {
+        "HEVC"
+    } else if regex(r"(?i)(?:264|avc)").is_match(&raw_video_codec) {
+        "AVC"
+    } else if raw_video_codec.is_empty() {
+        ""
+    } else {
+        "AV1"
+    }
+    .to_string();
+    let audio_codec = technical_capture(&original, r"(?i)(?:^|[ ._\-])(Atmos[ ._\-]*TrueHD|TrueHD|DTS[ ._\-]*HD(?:[ ._\-]*MA)?|DTS|DDP|EAC3|AC3|AAC|FLAC|LPCM|OPUS)(?:[ ._\-]?(?:7\.1|5\.1|2\.0|1\.0))?(?:$|[ ._\-])").replace([' ', '_'], "-");
+    let audio_info = technical_capture(
+        &original,
+        r"(?i)(?:^|[ ._\-])(?:(?:Atmos[ ._\-]*TrueHD|TrueHD|DTS[ ._\-]*HD(?:[ ._\-]*MA)?|DTS|DDP|EAC3|AC3|AAC|FLAC|LPCM|OPUS)[ ._\-]*)?((?:Atmos[ ._\-]*)?(?:7\.1|5\.1|2\.0|1\.0))(?:$|[ ._\-])",
+    )
+    .replace('_', " ");
+    let dolby_vision = regex(r"(?i)(?:^|[ ._\-])(?:DV|DoVi|Dolby[ ._\-]*Vision)(?:$|[ ._\-])")
+        .is_match(&original)
+        .then(|| "DV".to_string())
+        .unwrap_or_default();
+    let dynamic_range = technical_capture(
+        &original,
+        r"(?i)(?:^|[ ._\-])(HDR10\+|HDR10|HDR|HLG|SDR)(?:$|[ ._\-])",
+    )
+    .to_uppercase();
+    let effect = [dolby_vision.clone(), dynamic_range.clone()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let source = technical_capture(
+        &original,
+        r"(?i)(?:^|[ ._\-])(AMZN|Amazon|NF|Netflix|ATVP|AppleTV|DSNP|Disney\+|HMAX|HBO|Hulu|Bilibili|CR|TVING|Viu)(?:$|[ ._\-])",
+    );
+    let frame_rate = technical_capture(
+        &original,
+        r"(?i)(?:^|[ ._\-])((?:23\.976|24|25|29\.97|30|50|59\.94|60|120)(?:fps|p))(?:$|[ ._\-])",
+    )
+    .to_lowercase();
+    let color_depth = technical_capture(
+        &original,
+        r"(?i)(?:^|[ ._\-])(8bit|10bit|12bit)(?:$|[ ._\-])",
+    )
+    .to_lowercase();
     ParsedMediaName {
         original: original.clone(),
         title,
@@ -595,10 +965,33 @@ pub fn parse_media_name(value: &str, options: &RecognitionOverrides) -> ParsedMe
         season,
         episode,
         episode_end,
+        tmdb_id: directives.tmdb_id,
         edition: release_edition(&original),
         quality: release_quality(&original),
         part: release_part(&original),
+        video_format,
+        resource_type: resource_type.clone(),
+        source,
+        effect,
+        audio_info,
+        video_codec,
+        audio_codec,
+        release_group: known_release_group(&original, settings),
+        release_type: resource_type.clone(),
+        high_quality: regex(r"(?i)(?:^|[ ._\-])HQ(?:$|[ ._\-])")
+            .is_match(&original)
+            .then(|| "HQ".to_string())
+            .unwrap_or_default(),
+        dolby_vision,
+        dynamic_range,
+        frame_rate,
+        color_depth,
+        media_probed: false,
     }
+}
+
+pub fn parse_media_name(value: &str, options: &RecognitionOverrides) -> ParsedMediaName {
+    parse_media_name_with_settings(value, options, &NativeSettings::default())
 }
 
 pub fn normalize_search_title(value: &str) -> String {
@@ -972,6 +1365,9 @@ pub fn analyze_candidate(
         media_type: media_type.clone(),
         title: title.clone(),
         year,
+        tmdb_id: group
+            .tmdb_id
+            .or_else(|| preliminary.iter().find_map(|item| item.tmdb_id)),
         videos,
         sidecars,
         ignored_samples: samples
@@ -982,6 +1378,7 @@ pub fn analyze_candidate(
             title,
             year,
             media_type,
+            tmdb_id: group.tmdb_id,
         },
     })
 }
@@ -1400,6 +1797,22 @@ impl TmdbClient {
                 .unwrap_or_default(),
             studios: string_list("production_companies", "name"),
             countries: string_list("production_countries", "iso_3166_1"),
+            original_language: item
+                .get("original_language")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_lowercase(),
+            origin_countries: item
+                .get("origin_country")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|value| value.to_uppercase())
+                        .collect()
+                })
+                .unwrap_or_else(|| string_list("production_countries", "iso_3166_1")),
             directors,
             actors,
             poster_url: self.image_url(&poster_path, "original"),
@@ -1499,6 +1912,52 @@ impl TmdbClient {
     }
 }
 
+fn segmented_search_titles(value: &str) -> Vec<String> {
+    let original = value.trim();
+    let original_key = normalize_search_title(original);
+    let mut values = Vec::new();
+    let mut add = |candidate: &str| {
+        let candidate = candidate.trim_matches(|character: char| {
+            character.is_whitespace() || ":：·-".contains(character)
+        });
+        let key = normalize_search_title(candidate);
+        if candidate.chars().count() >= 2
+            && key != original_key
+            && !values
+                .iter()
+                .any(|item: &String| normalize_search_title(item) == key)
+        {
+            values.push(candidate.to_string());
+        }
+    };
+    for part in original.split(['/', '|', '｜']) {
+        add(part);
+    }
+    let without_brackets = regex(r"[（(【\[].*?[）)】\]]").replace_all(original, " ");
+    add(&without_brackets);
+    let cjk = regex(r"[\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}]{2,}")
+        .find_iter(original)
+        .map(|item| item.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    add(&cjk);
+    let latin = regex(r"[A-Za-z][A-Za-z0-9'’:&+\-]*(?:\s+[A-Za-z0-9][A-Za-z0-9'’:&+\-]*)*")
+        .find_iter(original)
+        .map(|item| item.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    add(&latin);
+    values.truncate(3);
+    values
+}
+
+fn exact_tmdb_candidate(candidate: &TmdbCandidate, query: &MediaQuery) -> bool {
+    [candidate.title.as_str(), candidate.original_title.as_str()]
+        .into_iter()
+        .any(|title| normalize_search_title(title) == normalize_search_title(&query.title))
+        && (query.year.is_none() || candidate.year.is_none() || query.year == candidate.year)
+}
+
 pub async fn resolve_tmdb_match(
     analysis: &CandidateAnalysis,
     client: &TmdbClient,
@@ -1519,8 +1978,9 @@ pub async fn resolve_tmdb_match(
             .unwrap_or_else(|| analysis.title.clone()),
         year: overrides.year.or(analysis.year),
         media_type: media_type.to_string(),
+        tmdb_id: overrides.tmdb_id.or(analysis.tmdb_id),
     };
-    if query.title.is_empty() && overrides.tmdb_id.is_none() {
+    if query.title.is_empty() && query.tmdb_id.is_none() {
         return Ok(MatchResolution {
             ready: false,
             error_code: Some("title_required".to_string()),
@@ -1531,10 +1991,10 @@ pub async fn resolve_tmdb_match(
             metadata: None,
         });
     }
-    let candidates;
+    let mut candidates;
     let selected;
     let metadata;
-    if let Some(tmdb_id) = overrides.tmdb_id {
+    if let Some(tmdb_id) = query.tmdb_id {
         metadata = client.details(media_type, tmdb_id).await?;
         selected = TmdbCandidate {
             tmdb_id: metadata.tmdb_id,
@@ -1554,19 +2014,56 @@ pub async fn resolve_tmdb_match(
         candidates = vec![selected.clone()];
     } else {
         candidates = client.search(&query).await?;
+        if candidates.is_empty() && settings.word_segment_search {
+            let mut seen = HashSet::new();
+            for title in segmented_search_titles(&query.title) {
+                let mut segmented_query = query.clone();
+                segmented_query.title = title;
+                for candidate in client.search(&segmented_query).await? {
+                    if seen.insert((candidate.media_type.clone(), candidate.tmdb_id)) {
+                        candidates.push(candidate);
+                    }
+                }
+                if candidates.len() >= 20 {
+                    break;
+                }
+            }
+            candidates.sort_by(|left, right| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        right
+                            .popularity
+                            .partial_cmp(&left.popularity)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            });
+            candidates.truncate(20);
+        }
         let first = candidates.first().cloned();
         let second = candidates.get(1);
-        let exact = first.as_ref().map(|item| {
-            normalize_search_title(&item.title) == normalize_search_title(&query.title)
-                && (query.year.is_none() || item.year.is_none() || query.year == item.year)
-        }) == Some(true);
-        let selectable = first.as_ref().map(|item| {
-            item.score >= settings.minimum_match_score
-                && (exact
-                    || second.is_none()
-                    || item.score - second.map(|value| value.score).unwrap_or(0.0) >= 0.06)
-        }) == Some(true);
-        if !selectable {
+        let exact = first
+            .as_ref()
+            .is_some_and(|item| exact_tmdb_candidate(item, &query));
+        let automatic = if settings.similarity_match {
+            first
+                .as_ref()
+                .filter(|item| {
+                    item.score >= settings.minimum_match_score
+                        && (exact
+                            || second.is_none()
+                            || item.score - second.map(|value| value.score).unwrap_or(0.0) >= 0.06)
+                })
+                .cloned()
+        } else {
+            candidates
+                .iter()
+                .find(|item| exact_tmdb_candidate(item, &query))
+                .cloned()
+        };
+        let Some(automatic) = automatic else {
             return Ok(MatchResolution {
                 ready: false,
                 error_code: Some(
@@ -1587,8 +2084,8 @@ pub async fn resolve_tmdb_match(
                 selected: None,
                 metadata: None,
             });
-        }
-        selected = first.expect("selectable candidate");
+        };
+        selected = automatic;
         metadata = client.details(media_type, selected.tmdb_id).await?;
     }
     let mut metadata = metadata;
@@ -2965,6 +3462,56 @@ mod tests {
         assert_eq!(movie.title, "Blade Runner");
         assert_eq!(movie.year, Some(1982));
         assert_eq!(movie.edition, "Director’s Cut");
+    }
+
+    #[test]
+    fn auxiliary_rules_apply_capture_math_forced_tmdb_and_rich_metadata() {
+        let mut settings = NativeSettings::default();
+        settings.recognition_words =
+            r"(?i)^Alias\.(\d+) => Example.Show.S01E\1@-12{[tmdbid=93740;type=tv]}".to_string();
+        settings.release_groups = "WiKi".to_string();
+        settings.render_words = r"(?i)H[ .]?265 => HEVC".to_string();
+        let parsed = parse_media_name_with_settings(
+            "Alias.24.2160p.WEB-DL.H.265.DDP5.1-WiKi.mkv",
+            &RecognitionOverrides {
+                media_type: Some("tv".to_string()),
+                ..Default::default()
+            },
+            &settings,
+        );
+        assert_eq!(parsed.title, "Example Show");
+        assert_eq!(parsed.season, Some(1));
+        assert_eq!(parsed.episode, Some(12));
+        assert_eq!(parsed.tmdb_id, Some(93740));
+        assert_eq!(parsed.year, None);
+        assert_eq!(parsed.video_format, "2160p");
+        assert_eq!(parsed.resource_type, "WEB-DL");
+        assert_eq!(parsed.release_type, "WEB-DL");
+        assert_eq!(parsed.video_codec, "HEVC");
+        assert_eq!(parsed.audio_codec, "DDP");
+        assert_eq!(parsed.audio_info, "5.1");
+        assert_eq!(parsed.release_group, "WiKi");
+    }
+
+    #[test]
+    fn auxiliary_rule_validation_rejects_unsupported_regex_instead_of_literal_fallback() {
+        let error =
+            validate_auxiliary_rule_block(r"Show(?=\.S\d+) => Series", "自定义识别词", true)
+                .expect_err("look-around is unsupported by the native regex engine");
+        assert!(error.contains("第 1 行正则无效"));
+        assert!(validate_auxiliary_rule_block(
+            r"(?i)^Alias\.(\d+) => Show.S01E\1@-12",
+            "自定义识别词",
+            true,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn segmented_search_keeps_cjk_and_latin_title_variants_in_parity_with_web() {
+        let values = segmented_search_titles("流浪地球 The Wandering Earth (2019)");
+        assert!(values.iter().any(|value| value == "流浪地球"));
+        assert!(values.iter().any(|value| value == "The Wandering Earth"));
     }
 
     #[test]

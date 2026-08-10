@@ -49,6 +49,9 @@ export const useTransfersStore = defineStore('transfers', () => {
   const downloadJobs = new Map<string, () => Promise<void>>()
   const uploadCancelHandlers = new Map<string, () => void>()
   const uploadRetryHandlers = new Map<string, () => Promise<void> | void>()
+  const queuePausedBrowserUploads = new Set<string>()
+  const queuePausedDownloads = new Set<string>()
+  const queueDownloadPausePromises = new Map<string, Promise<void>>()
 
   const orderedUploads = computed(() => orderUploadProgress(Object.values(uploads.value)) as UploadTask[])
   const activeUploads = computed(() => orderedUploads.value.filter(item => !['done', 'error', 'cancelled'].includes(item.state)))
@@ -98,6 +101,10 @@ export const useTransfersStore = defineStore('transfers', () => {
             : payload.state === 'cancelled'
               ? 'cancelled'
               : 'downloading'
+      if (['completed', 'failed', 'cancelled'].includes(status)) {
+        queuePausedDownloads.delete(downloadId)
+        queueDownloadPausePromises.delete(downloadId)
+      }
       updateDownload(downloadId, {
         status,
         progress: payload.percent == null ? undefined : Number(payload.percent),
@@ -185,6 +192,7 @@ export const useTransfersStore = defineStore('transfers', () => {
   async function resumeDownload(id: string) {
     const task = downloads.value.find(item => item.id === id)
     if (!task || task.status !== 'paused') return
+    if (downloadPaused.value) throw new Error('传输队列已暂停，请先恢复队列')
     if (!task.started) {
       const run = downloadJobs.get(id)
       if (!run) throw new Error('下载任务已经失效，请重新添加')
@@ -199,6 +207,8 @@ export const useTransfersStore = defineStore('transfers', () => {
   async function cancelDownload(id: string) {
     const task = downloads.value.find(item => item.id === id)
     if (!task || ['completed', 'failed', 'cancelled'].includes(task.status)) return
+    queuePausedDownloads.delete(id)
+    queueDownloadPausePromises.delete(id)
     if ((task.status === 'queued' && queue.cancel(id)) || (task.status === 'paused' && !task.started)) {
       downloadJobs.delete(id)
       updateDownload(id, { status: 'cancelled', bytesPerSecond: 0, error: '' })
@@ -212,6 +222,18 @@ export const useTransfersStore = defineStore('transfers', () => {
     const key = String(filePath || '')
     if (!key || typeof cancel !== 'function') return () => {}
     uploadCancelHandlers.set(key, cancel)
+    if (downloadPaused.value && uploads.value[key]?.state === 'uploading' && uploadRetryHandlers.has(key)) {
+      queuePausedBrowserUploads.add(key)
+      handleSyncEvent({
+        type: 'file', state: 'paused', file_path: key,
+        uploaded_bytes: uploads.value[key]?.uploadedBytes || 0,
+        total_bytes: uploads.value[key]?.totalBytes || 0,
+        stage: '队列已暂停，恢复后将重新传到服务器',
+      })
+      queueMicrotask(() => {
+        if (uploadCancelHandlers.get(key) === cancel) cancel()
+      })
+    }
     return () => {
       if (uploadCancelHandlers.get(key) === cancel) uploadCancelHandlers.delete(key)
     }
@@ -228,6 +250,49 @@ export const useTransfersStore = defineStore('transfers', () => {
 
   function clearUploadRetry(filePath: string) {
     uploadRetryHandlers.delete(String(filePath || ''))
+  }
+
+  function isUploadPaused(filePath: string) {
+    return uploads.value[String(filePath || '')]?.state === 'paused'
+  }
+
+  async function pauseUpload(filePath: string) {
+    const key = String(filePath || '')
+    const task = uploads.value[key]
+    if (!task || !['queued', 'waiting-login', 'waiting-file', 'preparing', 'uploading'].includes(task.state)) return
+    const localPause = uploadCancelHandlers.get(key)
+    if (localPause) {
+      handleSyncEvent({
+        type: 'file', state: 'paused', file_path: key, mapping_id: task.mappingId,
+        uploaded_bytes: task.uploadedBytes, total_bytes: task.totalBytes,
+        stage: '已暂停，继续时将重新传到服务器',
+      })
+      localPause()
+      return
+    }
+    const response = await bridge.invoke('pause_upload', { file_path: key, mapping_id: task.mappingId })
+    const result = response && typeof response === 'object' && 'data' in response ? response.data : response
+    if (result === false || result?.paused === false) throw new Error('上传任务已经结束或已失效')
+  }
+
+  async function resumeUpload(filePath: string) {
+    const key = String(filePath || '')
+    const task = uploads.value[key]
+    if (!task || task.state !== 'paused') return
+    if (downloadPaused.value) throw new Error('传输队列已暂停，请先恢复队列')
+    const localRetry = uploadRetryHandlers.get(key)
+    if (localRetry) {
+      uploadRetryHandlers.delete(key)
+      handleSyncEvent({
+        type: 'file', state: 'queued', file_path: key, mapping_id: task.mappingId,
+        uploaded_bytes: 0, total_bytes: task.totalBytes, stage: '正在恢复上传',
+      })
+      await localRetry()
+      return
+    }
+    const response = await bridge.invoke('resume_upload', { file_path: key, mapping_id: task.mappingId })
+    const result = response && typeof response === 'object' && 'data' in response ? response.data : response
+    if (result === false || result?.resumed === false) throw new Error('暂停的上传任务已经失效')
   }
 
   async function retryUpload(filePath: string) {
@@ -267,6 +332,8 @@ export const useTransfersStore = defineStore('transfers', () => {
       total_bytes: task.totalBytes,
       stage: '已取消',
     })
+    queuePausedBrowserUploads.delete(key)
+    uploadRetryHandlers.delete(key)
     await bridge.invoke('cancel_upload', { file_path: key, mapping_id: task.mappingId })
   }
 
@@ -352,8 +419,51 @@ export const useTransfersStore = defineStore('transfers', () => {
   }
 
   function setPaused(paused: boolean) {
+    const wasPaused = downloadPaused.value
     downloadPaused.value = Boolean(paused)
+    if (!wasPaused && downloadPaused.value) {
+      for (const task of downloads.value) {
+        if (!['queued', 'preparing', 'downloading'].includes(task.status)) continue
+        queuePausedDownloads.add(task.id)
+        const pausePromise = pauseDownload(task.id).catch(error => {
+          queuePausedDownloads.delete(task.id)
+          queueDownloadPausePromises.delete(task.id)
+          message.error(errorText(error))
+        })
+        queueDownloadPausePromises.set(task.id, pausePromise)
+      }
+      for (const [key, cancel] of uploadCancelHandlers) {
+        const task = uploads.value[key]
+        if (!task || task.state !== 'uploading' || !uploadRetryHandlers.has(key)) continue
+        queuePausedBrowserUploads.add(key)
+        handleSyncEvent({
+          type: 'file', state: 'paused', file_path: key, mapping_id: task.mappingId,
+          uploaded_bytes: task.uploadedBytes, total_bytes: task.totalBytes,
+          stage: '队列已暂停，恢复后将重新传到服务器',
+        })
+        cancel()
+      }
+    }
     if (!downloadPaused.value) queue.pump()
+    if (wasPaused && !downloadPaused.value) {
+      const resumable = [...queuePausedBrowserUploads]
+      queuePausedBrowserUploads.clear()
+      void (async () => {
+        for (const key of resumable) {
+          try { await resumeUpload(key) }
+          catch (error) { message.error(errorText(error)) }
+        }
+      })()
+      const downloadsToResume = [...queuePausedDownloads]
+      queuePausedDownloads.clear()
+      for (const id of downloadsToResume) {
+        const pausePromise = queueDownloadPausePromises.get(id) || Promise.resolve()
+        queueDownloadPausePromises.delete(id)
+        void pausePromise
+          .then(() => resumeDownload(id))
+          .catch(error => message.error(errorText(error)))
+      }
+    }
   }
 
   return {
@@ -370,6 +480,9 @@ export const useTransfersStore = defineStore('transfers', () => {
     downloadRecords,
     downloadReceivedShare,
     cancelUpload,
+    pauseUpload,
+    resumeUpload,
+    isUploadPaused,
     registerUploadCancellation,
     retryUpload,
     registerUploadRetry,

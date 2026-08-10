@@ -89,6 +89,12 @@ export const bridge = isTauri ? {
     if (command === 'start_native_mount') return webRequest('/api/mount/native/start', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'stop_native_mount') return webRequest('/api/mount/native/stop', { method: 'POST', body: '{}' });
     if (command === 'select_native_mount_target' || command === 'select_rclone_binary') return null;
+    if (command === 'get_virtual_library_info') return webRequest('/api/virtual-library');
+    if (command === 'update_virtual_library_settings') return webRequest('/api/virtual-library/settings', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'upsert_virtual_library_mapping') return webRequest('/api/virtual-library/mappings', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'remove_virtual_library_mapping') return webRequest(`/api/virtual-library/mappings/${encodeURIComponent(args.id)}`, { method: 'DELETE' });
+    if (command === 'sync_virtual_library') return webRequest(`/api/virtual-library/mappings/${encodeURIComponent(args.id)}/sync`, { method: 'POST', body: '{}' });
+    if (command === 'select_virtual_library_target') return null;
     if (command === 'get_access_status') return webRequest('/api/access/status');
     if (command === 'unlock_access') return webRequest('/api/access/unlock', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'update_access_code') return webRequest('/api/access/code', { method: 'POST', body: JSON.stringify(args) });
@@ -178,6 +184,8 @@ export const bridge = isTauri ? {
     if (command === 'retry_auto_share_event') return webRequest(`/api/auto-share/events/${encodeURIComponent(args.event_id)}/retry`, { method: 'POST', body: JSON.stringify({ tmdb_id: args.tmdb_id, media_type: args.media_type }) });
     if (command === 'pause_queue') return webRequest('/api/queue/pause', { method: 'POST' });
     if (command === 'resume_queue') return webRequest('/api/queue/resume', { method: 'POST' });
+    if (command === 'pause_upload') return webRequest('/api/uploads/pause', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'resume_upload') return webRequest('/api/uploads/resume', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'cancel_upload') return webRequest('/api/uploads/cancel', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'retry_upload') return webRequest('/api/uploads/retry', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'get_transfer_settings') return webRequest('/api/settings');
@@ -206,10 +214,11 @@ export const bridge = isTauri ? {
     if (command === 'add_organizer_mapping') return webRequest('/api/organizer/mappings', { method: 'POST', body: JSON.stringify(args.input || args) });
     if (command === 'update_organizer_mapping') return webRequest(`/api/organizer/mappings/${encodeURIComponent(args.id)}`, { method: 'PATCH', body: JSON.stringify(args.input || {}) });
     if (command === 'remove_organizer_mapping') return webRequest(`/api/organizer/mappings/${encodeURIComponent(args.id)}`, { method: 'DELETE' });
-    if (command === 'remove_organizer_job') return webRequest(`/api/organizer/jobs/${encodeURIComponent(args.id)}`, { method: 'DELETE' });
+    if (command === 'remove_organizer_job') return webRequest(`/api/organizer/jobs/${encodeURIComponent(args.id)}`, { method: 'DELETE', body: JSON.stringify(args.input || {}) });
     if (command === 'scan_organizer_mapping') return webRequest(`/api/organizer/mappings/${encodeURIComponent(args.id)}/scan`, { method: 'POST', body: '{}' });
     if (command === 'run_organizer_job') return webRequest(`/api/organizer/jobs/${encodeURIComponent(args.id)}/run`, { method: 'POST', body: JSON.stringify(args.input || {}) });
     if (command === 'retry_organizer_job') return webRequest(`/api/organizer/jobs/${encodeURIComponent(args.id)}/retry`, { method: 'POST', body: JSON.stringify(args.input || {}) });
+    if (command === 'rearchive_organizer_job') return webRequest(`/api/organizer/jobs/${encodeURIComponent(args.id)}/rearchive`, { method: 'POST', body: JSON.stringify(args.input || {}) });
     if (command === 'scrape_selected_files') return webRequest('/api/organizer/scrape-selected', { method: 'POST', body: JSON.stringify(args.input || args) });
     if (command === 'get_app_version') return { version: 'Docker Web' };
     if (command === 'fetch_app_update' || command === 'install_app_update') {

@@ -90,6 +90,14 @@ test('cancelled desktop folder selection does not report a queued download', asy
   assert.match(downloadSource, /if \(isTauri && queued\) message\.success\(['"]已加入下载队列['"]\)/);
 });
 
+test('manual scrape closes after queueing and tells the user work continues in background', async () => {
+  const source = await cloudViewSource;
+  const submit = sourceBetween(source, 'async function submitScrapeSelected()', 'async function');
+  assert.match(submit, /await bridge\.invoke\('scrape_selected_files'/);
+  assert.match(submit, /scrapeDialog\.open = false/);
+  assert.match(submit, /正在后台识别整理/);
+});
+
 test('desktop download progress exposes concurrent range mode', async () => {
   const [transferStoreSource, transferViewSource] = await Promise.all([transfersSource, transfersViewSource]);
   assert.match(transferStoreSource, /segmented:\s*payload\.segmented == null \? undefined : Boolean\(payload\.segmented\)/);
@@ -106,6 +114,8 @@ test('active transfer management can pause resume and cancel downloads', async (
   assert.match(transferStoreSource, /queue\.cancel\(id\)/);
   assert.match(transferStoreSource, /current\?\.status === 'cancelled' && payload\.state !== 'cancelled'/);
   assert.match(transferStoreSource, /current\?\.status === 'paused' && payload\.state === 'downloading'/);
+  assert.match(transferStoreSource, /queuePausedDownloads\.add\(task\.id\)/);
+  assert.match(transferStoreSource, /\.then\(\(\) => resumeDownload\(id\)\)/);
   assert.match(transferViewSource, /暂停下载/);
   assert.match(transferViewSource, /继续下载/);
   assert.match(transferViewSource, /临时分片会被清理/);
@@ -127,6 +137,33 @@ test('active transfer management can cancel uploads without reviving cancelled r
   assert.match(transferViewSource, /item\.state === ['"]cancelled['"]/);
   assert.match(cloudSource, /registerUploadCancellation/);
   assert.match(cloudSource, /request\.abort\(\)/);
+});
+
+test('active uploads expose pause and checkpoint resume across both runtimes', async () => {
+  const [transferStoreSource, transferViewSource, cloudSource, bridgeSource, serverSource, rustSource] = await Promise.all([
+    transfersSource,
+    transfersViewSource,
+    cloudViewSource,
+    readFile(new URL('./bridge.js', import.meta.url), 'utf8'),
+    readFile(new URL('../server/server.mjs', import.meta.url), 'utf8'),
+    readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8'),
+  ]);
+  assert.match(transferStoreSource, /async function pauseUpload\(filePath: string\)/);
+  assert.match(transferStoreSource, /async function resumeUpload\(filePath: string\)/);
+  assert.match(transferStoreSource, /bridge\.invoke\(['"]pause_upload['"],\s*\{ file_path: key, mapping_id: task\.mappingId \}\)/);
+  assert.match(transferStoreSource, /bridge\.invoke\(['"]resume_upload['"],\s*\{ file_path: key, mapping_id: task\.mappingId \}\)/);
+  assert.match(transferViewSource, /title="暂停上传"/);
+  assert.match(transferViewSource, /title="继续上传"/);
+  assert.match(transferViewSource, /item\.state === 'paused'/);
+  assert.match(cloudSource, /isUploadPaused\(eventPath\)/);
+  assert.match(bridgeSource, /command === ['"]pause_upload['"].*\/api\/uploads\/pause/);
+  assert.match(bridgeSource, /command === ['"]resume_upload['"].*\/api\/uploads\/resume/);
+  assert.match(serverSource, /class UploadPausedError/);
+  assert.match(serverSource, /activeUploadClients\.get\(key\)\?\.cancel\(\)/);
+  assert.match(serverSource, /loadUploadCheckpoint\(item\)/);
+  assert.match(rustSource, /const UPLOAD_PAUSED_MESSAGE/);
+  assert.match(rustSource, /interruptible_upload_step/);
+  assert.match(rustSource, /load_upload_checkpoint\(path, &item\)/);
 });
 
 test('failed uploads expose a real retry path for browser and backend tasks', async () => {

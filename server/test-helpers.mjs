@@ -29,10 +29,12 @@ export async function waitUntil(check, timeout = 10_000) {
 export async function startTestServer(root, extraEnv = {}) {
   const watchRoot = path.join(root, 'watch');
   const archiveRoot = path.join(root, 'archive');
+  const virtualLibraryRoot = path.join(root, 'virtual-library');
   const dataDir = path.join(root, 'data');
   await Promise.all([
     fsp.mkdir(watchRoot, { recursive: true }),
     fsp.mkdir(archiveRoot, { recursive: true }),
+    fsp.mkdir(virtualLibraryRoot, { recursive: true }),
     fsp.mkdir(dataDir, { recursive: true }),
   ]);
   const port = await freePort();
@@ -45,6 +47,7 @@ export async function startTestServer(root, extraEnv = {}) {
       DATA_DIR: dataDir,
       GUANGYA_WATCH_ROOT: watchRoot,
       GUANGYA_ARCHIVE_ROOT: archiveRoot,
+      GUANGYA_VIRTUAL_LIBRARY_ROOT: virtualLibraryRoot,
       GUANGYA_FILE_ROOTS: watchRoot,
       GUANGYA_ADMIN_PASSWORD: '',
       LISTEN_HOST: '127.0.0.1',
@@ -62,7 +65,7 @@ export async function startTestServer(root, extraEnv = {}) {
     if (child.exitCode != null) throw new Error(`测试服务器提前退出：\n${output}`);
     return false;
   });
-  return { child, port, webdavPort, dataDir, watchRoot, archiveRoot, output: () => output };
+  return { child, port, webdavPort, dataDir, watchRoot, archiveRoot, virtualLibraryRoot, output: () => output };
 }
 
 export async function stopTestServer(instance) {

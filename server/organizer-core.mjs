@@ -3,8 +3,9 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { fetch as undiciFetch } from 'undici';
+import COUNTRY_NAMES_ZH from '../shared/countries-zh.json' with { type: 'json' };
 
-export const NATIVE_ENGINE_VERSION = 'guangya-cloud-native-v2';
+export const NATIVE_ENGINE_VERSION = 'guangya-cloud-native-v3';
 
 export const VIDEO_EXTENSIONS = new Set([
   '.3gp', '.asf', '.avi', '.f4v', '.flv', '.iso', '.m2ts', '.m4v', '.mkv', '.mov', '.mp4', '.mpeg', '.mpg', '.mts', '.rm', '.rmvb', '.strm', '.tp', '.ts', '.vob', '.webm', '.wmv',
@@ -36,6 +37,13 @@ export const DEFAULT_ORGANIZER_SETTINGS = Object.freeze({
   image_language: 'zh,null,en',
   include_adult: false,
   minimum_match_score: 0.72,
+  word_segment_search: true,
+  similarity_match: true,
+  recognition_words: '',
+  release_groups: '',
+  render_words: '',
+  capture_groups: '',
+  include_media_info: true,
   movie_folder_format: '{title} ({year})',
   movie_file_format: '{title} ({year}){edition}{quality}{part}',
   tv_folder_format: '{title} ({year})',
@@ -60,6 +68,19 @@ function normalizeCategoryTerm(value) {
   return cleanText(value).normalize('NFKC').toLocaleLowerCase();
 }
 
+function normalizeCategoryTerms(value) {
+  const source = Array.isArray(value) ? value : String(value || '').split(/[,，\n]/);
+  return [...new Set(source.map(normalizeCategoryTerm).filter(Boolean))].slice(0, 80);
+}
+
+function normalizeCategoryPath(value, index) {
+  const parts = cleanText(value).replaceAll('\\', '/').split('/').map((part) => part.trim()).filter(Boolean);
+  if (!parts.length || parts.length > 8 || parts.some((part) => part === '.' || part === '..' || part.length > 80)) {
+    throw new Error(`第 ${index + 1} 条媒体分类名称无效`);
+  }
+  return parts.join('/');
+}
+
 /**
  * User-defined category rules are deliberately small and deterministic: the
  * first enabled rule whose TMDB genre name or id matches wins.
@@ -67,20 +88,22 @@ function normalizeCategoryTerm(value) {
 export function normalizeCategoryRules(value) {
   const source = Array.isArray(value) ? value : [];
   return source.slice(0, 100).map((rule, index) => {
-    const name = cleanText(rule?.name);
-    if (!name || name.length > 80 || /[\\/]/.test(name)) throw new Error(`第 ${index + 1} 条媒体分类名称无效`);
+    const name = normalizeCategoryPath(rule?.name, index);
     const mediaType = ['movie', 'tv', 'all', ''].includes(cleanText(rule?.media_type).toLowerCase())
       ? (cleanText(rule?.media_type).toLowerCase() || 'all') : 'all';
-    const rawTerms = Array.isArray(rule?.genres)
-      ? rule.genres
-      : String(rule?.genre_text || '').split(/[,，\n]/);
-    const genres = [...new Set(rawTerms.map(normalizeCategoryTerm).filter(Boolean))].slice(0, 50);
-    if (!genres.length) throw new Error(`第 ${index + 1} 条媒体分类至少配置一个 TMDB 类型`);
+    const genres = normalizeCategoryTerms(rule?.genres ?? rule?.genre_ids ?? rule?.genre_text);
+    const originalLanguages = normalizeCategoryTerms(rule?.original_languages ?? rule?.original_language);
+    const originCountries = normalizeCategoryTerms(rule?.origin_countries ?? rule?.origin_country);
+    if (!genres.length && !originalLanguages.length && !originCountries.length) {
+      throw new Error(`第 ${index + 1} 条媒体分类至少配置一个类型、原始语言或来源地区`);
+    }
     return {
       id: cleanText(rule?.id) || `category-${index + 1}`,
       name,
       media_type: mediaType,
       genres,
+      original_languages: originalLanguages,
+      origin_countries: originCountries,
       enabled: rule?.enabled !== false,
     };
   });
@@ -91,10 +114,16 @@ export function resolveMediaCategory(metadata = {}, settings = DEFAULT_ORGANIZER
   const genreNames = (metadata.genres || []).map(normalizeCategoryTerm);
   const genreIds = (metadata.genre_ids || []).map((value) => normalizeCategoryTerm(value));
   const available = new Set([...genreNames, ...genreIds]);
+  const originalLanguage = normalizeCategoryTerm(metadata.original_language);
+  const originCountries = new Set((metadata.origin_countries || metadata.countries || []).map(normalizeCategoryTerm));
   const rules = normalizeCategoryRules(settings.category_rules || []);
   for (const rule of rules) {
     if (!rule.enabled || (rule.media_type !== 'all' && rule.media_type !== mediaType)) continue;
-    if (rule.genres.some((term) => available.has(term) || genreNames.some((name) => name.includes(term) || term.includes(name)))) return rule.name;
+    const genreMatches = !rule.genres.length
+      || rule.genres.some((term) => available.has(term) || genreNames.some((name) => name.includes(term) || term.includes(name)));
+    const languageMatches = !rule.original_languages.length || rule.original_languages.includes(originalLanguage);
+    const countryMatches = !rule.origin_countries.length || rule.origin_countries.some((country) => originCountries.has(country));
+    if (genreMatches && languageMatches && countryMatches) return rule.name;
   }
   return mediaType === 'tv'
     ? (cleanText(settings.tv_category) || DEFAULT_ORGANIZER_SETTINGS.tv_category)
@@ -106,10 +135,12 @@ export function buildStandardTemplateExamples(settings = DEFAULT_ORGANIZER_SETTI
   const tvMetadata = { media_type: 'tv', title: '示例剧集', original_title: 'Example Series', year: 2024, tmdb_id: 67890, countries: ['CN'], genres: [] };
   const movieCategory = resolveMediaCategory(movieMetadata, settings);
   const tvCategory = resolveMediaCategory(tvMetadata, settings);
-  const movieContext = { ...templateContext(movieMetadata, { edition: '', quality: '1080p', part: '' }), category: movieCategory, catgroy: movieCategory, ext: 'mkv' };
-  const tvContext = { ...templateContext(tvMetadata, { season: 1, episode: 2, episode_end: null }, { name: '第二集' }), category: tvCategory, catgroy: tvCategory, ext: 'mkv' };
-  const moviePath = renderOrganizerPathTemplate(settings.movie_path_template || DEFAULT_ORGANIZER_SETTINGS.movie_path_template, movieContext);
-  const tvPath = renderOrganizerPathTemplate(settings.tv_path_template || DEFAULT_ORGANIZER_SETTINGS.tv_path_template, tvContext);
+  const movieContext = { ...templateContext(movieMetadata, { original: 'Example.Movie.2024.1080p.WEB-DL', media_probed: true, edition: '', quality: '1080p', video_format: '1080p', resource_type: 'WEB-DL', audio_info: '5.1', video_codec: 'HEVC', audio_codec: 'DDP', release_group: 'Example', part: '' }), category: movieCategory, catgroy: movieCategory, ext: 'mkv', fileExt: '.mkv' };
+  const tvContext = { ...templateContext(tvMetadata, { original: 'Example.Series.S01E02.2160p.WEB-DL', media_probed: true, season: 1, episode: 2, episode_end: null, video_format: '2160p', source: 'Netflix', release_type: 'WEB-DL', dynamic_range: 'HDR', frame_rate: '60fps', color_depth: '10bit', video_codec: 'HEVC', audio_codec: 'DDP', release_group: 'Example' }, { name: '第二集' }), category: tvCategory, catgroy: tvCategory, ext: 'mkv', fileExt: '.mkv' };
+  const movieTemplate = settings.movie_path_template || DEFAULT_ORGANIZER_SETTINGS.movie_path_template;
+  const tvTemplate = settings.tv_path_template || DEFAULT_ORGANIZER_SETTINGS.tv_path_template;
+  const moviePath = appendMediaInfoSuffix(renderOrganizerPathTemplate(movieTemplate, movieContext), movieTemplate, movieContext, settings.include_media_info !== false);
+  const tvPath = appendMediaInfoSuffix(renderOrganizerPathTemplate(tvTemplate, tvContext), tvTemplate, tvContext, settings.include_media_info !== false);
   return {
     movie: { input: '示例电影.2024.1080p.WEB-DL.mkv', path: moviePath, directory: moviePath.split('/').slice(0, -1).join('/'), filename: moviePath.split('/').at(-1) },
     tv: { input: '示例剧集.S01E02.1080p.WEB-DL.mkv', path: tvPath, directory: tvPath.split('/').slice(0, -1).join('/'), filename: tvPath.split('/').at(-1) },
@@ -117,6 +148,12 @@ export function buildStandardTemplateExamples(settings = DEFAULT_ORGANIZER_SETTI
 }
 
 export const ORGANIZER_PATH_PRESETS = Object.freeze([
+  {
+    id: 'reference-media-info',
+    name: '参考完整命名（媒体信息后缀）',
+    movie: '{category}/{country}/{title} ({year}) {tmdb-{tmdbid}}/{en_title}.{year}.{videoFormat}.{resourceType}.{effect}.{audioInfo}.{videoCodec}.{audioCodec}-{releaseGroup}{fileExt}',
+    tv: '{category}/{country}/{title} ({year}) {tmdb-{tmdbid}}/Season {season}/{en_title}.{year}.{season_episode}.{videoFormat}.{source}.{release_type}.{high_quality}.{dolby_vision}.{dynamic_range}.{frame_rate}.{color_depth}.{video_codec}.{audioCodec}-{releaseGroup}{fileExt}',
+  },
   {
     id: 'category-country-year',
     name: '分类 / 国家 / 年份',
@@ -187,6 +224,180 @@ function releasePart(value) {
   return `${kind}${Number(match[2])}`;
 }
 
+function userRuleLines(value) {
+  return String(value || '').split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#')).slice(0, 2_000);
+}
+
+const USER_PATTERN_CACHE = new Map();
+
+function userPatternSource(value) {
+  let source = cleanText(value);
+  let insensitive = false;
+  if (source.startsWith('(?i)')) {
+    source = source.slice(4);
+    insensitive = true;
+  }
+  return { source, insensitive };
+}
+
+function compileUserPattern(value, global = true) {
+  const { source, insensitive } = userPatternSource(value);
+  const flags = `${global ? 'g' : ''}${insensitive ? 'i' : ''}u`;
+  const cacheKey = `${flags}\u0000${source}`;
+  const cached = USER_PATTERN_CACHE.get(cacheKey);
+  if (cached) {
+    cached.lastIndex = 0;
+    return cached;
+  }
+  let pattern;
+  try {
+    pattern = new RegExp(source, flags);
+  } catch {
+    const escaped = source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    pattern = new RegExp(escaped, `${global ? 'g' : ''}iu`);
+  }
+  if (USER_PATTERN_CACHE.size >= 4_096) USER_PATTERN_CACHE.clear();
+  USER_PATTERN_CACHE.set(cacheKey, pattern);
+  return pattern;
+}
+
+export function validateAuxiliaryRuleBlock(value, label, { replacement = true } = {}) {
+  const lines = String(value || '').split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim();
+    if (!line || line.startsWith('#')) continue;
+    const arrow = replacement ? line.indexOf('=>') : -1;
+    const patternText = arrow >= 0 ? line.slice(0, arrow).trim() : line;
+    if (!patternText) throw new Error(`${label}第 ${index + 1} 行缺少正则表达式`);
+    if (patternText.startsWith('@?{')) throw new Error(`${label}第 ${index + 1} 行使用了尚未支持的 @? 条件规则`);
+    const { source, insensitive } = userPatternSource(patternText);
+    if (/\\[1-9]|\\k<|\(\?(?:[=!]|<[=!]|P?<)/.test(source)) {
+      throw new Error(`${label}第 ${index + 1} 行使用了统一规则语法不支持的前后查找、正则内反向引用或命名捕获`);
+    }
+    try {
+      new RegExp(source, `${insensitive ? 'i' : ''}u`);
+    } catch (error) {
+      throw new Error(`${label}第 ${index + 1} 行正则无效：${error.message}`);
+    }
+  }
+}
+
+function calculateCapturedNumber(value, expression) {
+  let result = Number(value);
+  if (!Number.isFinite(result)) return value;
+  const operations = String(expression || '').matchAll(/([+\-*/])\s*(\d+(?:\.\d+)?)/g);
+  for (const [, operator, rawNumber] of operations) {
+    const number = Number(rawNumber);
+    if (operator === '+') result += number;
+    else if (operator === '-') result -= number;
+    else if (operator === '*') result *= number;
+    else if (operator === '/' && number !== 0) result /= number;
+  }
+  return Number.isInteger(result) ? String(result) : String(Number(result.toFixed(4)));
+}
+
+function expandRuleReplacement(template, captures) {
+  return String(template || '').replace(/\\(\d+)(?:@([+\-*/\d.\s]+))?/g, (_, rawIndex, expression) => {
+    const captured = captures[Number(rawIndex)] ?? '';
+    return expression ? calculateCapturedNumber(captured, expression) : String(captured);
+  });
+}
+
+function extractRecognitionDirectives(value, directives) {
+  return String(value || '').replace(/\{\[([^\]]+)\]\}/g, (_, body) => {
+    for (const entry of String(body).split(';')) {
+      const [rawKey, ...rest] = entry.split('=');
+      const key = cleanText(rawKey).toLowerCase();
+      const rawValue = cleanText(rest.join('='));
+      if (!rawValue) continue;
+      if (key === 'tmdbid' || key === 'tmdb_id') {
+        const parsed = Number(rawValue);
+        if (Number.isInteger(parsed) && parsed > 0) directives.tmdb_id = parsed;
+      } else if (key === 'type' && ['movie', 'tv'].includes(rawValue.toLowerCase())) directives.media_type = rawValue.toLowerCase();
+      else if (key === 's' || key === 'season') {
+        const parsed = Number(rawValue);
+        if (Number.isInteger(parsed) && parsed >= 0) directives.season = parsed;
+      } else if (key === 'e' || key === 'episode') {
+        const parsed = Number(rawValue);
+        if (Number.isInteger(parsed) && parsed >= 0) directives.episode = parsed;
+      }
+    }
+    return '';
+  });
+}
+
+function applyRuleBlock(value, block, directives) {
+  let current = String(value || '');
+  for (const line of userRuleLines(block)) {
+    const arrow = line.indexOf('=>');
+    const patternText = arrow >= 0 ? line.slice(0, arrow).trim() : line;
+    const replacementText = arrow >= 0 ? line.slice(arrow + 2).trim() : '';
+    if (!patternText || patternText.startsWith('@?{')) continue;
+    const pattern = compileUserPattern(patternText);
+    current = current.replace(pattern, (...args) => {
+      const expanded = expandRuleReplacement(replacementText, args);
+      return extractRecognitionDirectives(expanded, directives);
+    });
+  }
+  return current;
+}
+
+export function applyAuxiliaryRecognition(value, settings = {}) {
+  const directives = {};
+  let normalized = applyRuleBlock(value, settings.recognition_words, directives);
+  normalized = applyRuleBlock(normalized, settings.render_words, directives);
+  return { value: normalized.replace(/\s{2,}/g, ' ').trim(), directives };
+}
+
+function matchTechnical(value, pattern, normalize = (item) => item) {
+  const match = pattern.exec(value);
+  return match ? normalize(match[1] || match[0]) : '';
+}
+
+function knownReleaseGroup(value, settings = {}) {
+  const source = String(value || '');
+  const groups = userRuleLines(settings.release_groups).sort((left, right) => right.length - left.length);
+  const matched = groups.find((group) => source.toLocaleLowerCase().includes(group.toLocaleLowerCase()));
+  if (matched) return matched;
+  for (const rule of userRuleLines(settings.capture_groups)) {
+    const capture = compileUserPattern(rule, false).exec(source);
+    if (capture) return cleanText(capture.slice(1).find(Boolean) || capture[0]);
+  }
+  const trailing = /-([A-Za-z0-9][A-Za-z0-9@._-]{1,48})$/.exec(source)?.[1];
+  if (trailing && !RELEASE_WORDS.has(trailing.toLowerCase())) return trailing;
+  const leading = /^\[([^\]]{2,48})\]/.exec(source)?.[1];
+  return cleanText(leading);
+}
+
+function technicalMetadata(value, settings = {}) {
+  const videoFormat = matchTechnical(value, /(?:^|[ ._\-])(2160p|1080p|720p|480p|4k|uhd)(?:$|[ ._\-])/i, (item) => /^(?:4k|uhd)$/i.test(item) ? '2160p' : item.toLowerCase().replace('p', 'p'));
+  const resourceType = matchTechnical(value, /(?:^|[ ._\-])(REMUX|WEB[ ._\-]?DL|WEBRip|Blu[ ._\-]?Ray|BDRip|HDTV|DVDRip|UHDRip)(?:$|[ ._\-])/i, (item) => item.replace(/[ ._]+/g, '-').replace(/^bluray$/i, 'BluRay'));
+  const videoCodec = matchTechnical(value, /(?:^|[ ._\-])(AV1|HEVC|H[ .]?265|x265|AVC|H[ .]?264|x264)(?:$|[ ._\-])/i, (item) => /(?:265|hevc)/i.test(item) ? 'HEVC' : /(?:264|avc)/i.test(item) ? 'AVC' : 'AV1');
+  const audioCodec = matchTechnical(value, /(?:^|[ ._\-])(Atmos[ ._\-]*TrueHD|TrueHD|DTS[ ._\-]*HD(?:[ ._\-]*MA)?|DTS|DDP|EAC3|AC3|AAC|FLAC|LPCM|OPUS)(?:[ ._\-]?(?:7\.1|5\.1|2\.0|1\.0))?(?:$|[ ._\-])/i, (item) => item.replace(/[ ._]+/g, '-'));
+  const audioInfo = matchTechnical(value, /(?:^|[ ._\-])(?:(?:Atmos[ ._\-]*TrueHD|TrueHD|DTS[ ._\-]*HD(?:[ ._\-]*MA)?|DTS|DDP|EAC3|AC3|AAC|FLAC|LPCM|OPUS)[ ._\-]*)?((?:Atmos[ ._\-]*)?(?:7\.1|5\.1|2\.0|1\.0))(?:$|[ ._\-])/i, (item) => item.replace(/[ _]+/g, ' ').trim());
+  const dolbyVision = /(?:^|[ ._\-])(?:DV|DoVi|Dolby[ ._\-]*Vision)(?:$|[ ._\-])/i.test(value) ? 'DV' : '';
+  const dynamicRange = matchTechnical(value, /(?:^|[ ._\-])(HDR10\+|HDR10|HDR|HLG|SDR)(?:$|[ ._\-])/i, (item) => item.toUpperCase());
+  const frameRate = matchTechnical(value, /(?:^|[ ._\-])((?:23\.976|24|25|29\.97|30|50|59\.94|60|120)(?:fps|p))(?:$|[ ._\-])/i, (item) => item.toLowerCase());
+  const colorDepth = matchTechnical(value, /(?:^|[ ._\-])(8bit|10bit|12bit)(?:$|[ ._\-])/i, (item) => item.toLowerCase());
+  const source = matchTechnical(value, /(?:^|[ ._\-])(AMZN|Amazon|NF|Netflix|ATVP|AppleTV|DSNP|Disney\+|HMAX|HBO|Hulu|Bilibili|CR|TVING|Viu)(?:$|[ ._\-])/i);
+  return {
+    video_format: videoFormat,
+    resource_type: resourceType,
+    source,
+    effect: [dolbyVision, dynamicRange].filter(Boolean).join(' '),
+    audio_info: audioInfo,
+    video_codec: videoCodec,
+    audio_codec: audioCodec,
+    release_group: knownReleaseGroup(value, settings),
+    release_type: resourceType,
+    high_quality: /(?:^|[ ._\-])HQ(?:$|[ ._\-])/i.test(value) ? 'HQ' : '',
+    dolby_vision: dolbyVision,
+    dynamic_range: dynamicRange,
+    frame_rate: frameRate,
+    color_depth: colorDepth,
+  };
+}
+
 function tvNumbers(value, mediaTypeHint = '') {
   const patterns = [
     /(?:^|[^A-Za-z0-9])S(\d{1,3})[ ._\-]*E(\d{1,4})(?:[ ._\-]*(?:E|\-E?)(\d{1,4}))?(?:v\d+)?(?:$|[^A-Za-z0-9])/i,
@@ -247,11 +458,13 @@ function cleanTitle(value) {
 }
 
 export function parseMediaName(value, options = {}) {
-  const original = stemOf(value);
+  const rawOriginal = stemOf(value);
+  const auxiliary = applyAuxiliaryRecognition(rawOriginal, options);
+  const original = auxiliary.value || rawOriginal;
   const hint = cleanText(options.media_type).toLowerCase();
   const technical = stripTechnicalBrackets(original);
   const numbers = tvNumbers(technical, hint);
-  const yearMatch = /(?:^|[^0-9])(19\d{2}|20\d{2}|21\d{2})(?:$|[^0-9])/.exec(technical);
+  const yearMatch = /(?:^|[^0-9])(19\d{2}|20\d{2}|21\d{2})(?:$|[^0-9pP])/.exec(technical);
   const year = options.year == null ? (yearMatch ? Number(yearMatch[1]) : null) : Number(options.year);
   const cutIndexes = [numbers.marker_index, yearMatch?.index ?? -1].filter((index) => index >= 0);
   let titleSource = cutIndexes.length ? technical.slice(0, Math.min(...cutIndexes)) : technical;
@@ -261,10 +474,10 @@ export function parseMediaName(value, options = {}) {
   const forcedSeason = options.season === '' || options.season == null ? null : Number(options.season);
   const forcedEpisode = options.episode === '' || options.episode == null ? null : Number(options.episode);
   const forcedEpisodeEnd = options.episode_end === '' || options.episode_end == null ? null : Number(options.episode_end);
-  const season = forcedSeason ?? numbers.season;
-  const episode = forcedEpisode ?? numbers.episode;
+  const season = forcedSeason ?? auxiliary.directives.season ?? numbers.season;
+  const episode = forcedEpisode ?? auxiliary.directives.episode ?? numbers.episode;
   const episodeEnd = forcedEpisodeEnd ?? numbers.episode_end;
-  const mediaType = hint || ((episode != null || numbers.season != null) ? 'tv' : 'movie');
+  const mediaType = hint || auxiliary.directives.media_type || ((episode != null || numbers.season != null) ? 'tv' : 'movie');
   return {
     original,
     title,
@@ -273,9 +486,11 @@ export function parseMediaName(value, options = {}) {
     season: Number.isInteger(season) ? season : null,
     episode: Number.isInteger(episode) ? episode : null,
     episode_end: Number.isInteger(episodeEnd) ? episodeEnd : null,
+    tmdb_id: Number.isInteger(auxiliary.directives.tmdb_id) ? auxiliary.directives.tmdb_id : null,
     edition: releaseEdition(original),
     quality: releaseQuality(original),
     part: releasePart(original),
+    ...technicalMetadata(original, options),
   };
 }
 
@@ -395,12 +610,12 @@ function parentSeason(filePath, candidatePath) {
   return match ? Number(match[1]) : null;
 }
 
-function bestSidecarVideo(sidecar, videos) {
+function bestSidecarVideo(sidecar, videos, settings = DEFAULT_ORGANIZER_SETTINGS) {
   if (!videos.length) return null;
   const sidecarStem = normalizeSearchTitle(stemOf(sidecar).replace(/(?:chs|cht|chi|eng|jpn|kor|zh[-_.]?(?:cn|tw)|简体|繁体|繁體|字幕|forced|sdh|default)/gi, ''));
   const exact = videos.find((video) => sidecarStem === normalizeSearchTitle(stemOf(video.source)));
   if (exact) return exact;
-  const parsed = parseMediaName(sidecar, { media_type: 'tv' });
+  const parsed = parseMediaName(sidecar, { media_type: 'tv', ...auxiliaryParserOptions(settings) });
   if (parsed.episode != null) {
     const episodeMatch = videos.find((video) => video.parsed.episode === parsed.episode && (parsed.season == null || video.parsed.season === parsed.season));
     if (episodeMatch) return episodeMatch;
@@ -410,7 +625,16 @@ function bestSidecarVideo(sidecar, videos) {
   return videos.length === 1 ? videos[0] : null;
 }
 
-export async function analyzeMediaCandidate(candidatePath, overrides = {}) {
+function auxiliaryParserOptions(settings = {}) {
+  return {
+    recognition_words: settings.recognition_words || '',
+    release_groups: settings.release_groups || '',
+    render_words: settings.render_words || '',
+    capture_groups: settings.capture_groups || '',
+  };
+}
+
+export async function analyzeMediaCandidate(candidatePath, overrides = {}, settings = DEFAULT_ORGANIZER_SETTINGS) {
   const absoluteCandidate = path.resolve(candidatePath);
   const files = await walkCandidate(absoluteCandidate);
   const candidateStat = await fsp.lstat(absoluteCandidate).catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
@@ -418,9 +642,11 @@ export async function analyzeMediaCandidate(candidatePath, overrides = {}) {
   if (!files.videos.length) throw new Error('没有找到可整理的视频文件');
   const candidateName = candidateStat.isFile() ? stemOf(absoluteCandidate) : path.basename(absoluteCandidate);
   const explicitType = cleanText(overrides.media_type).toLowerCase();
-  const group = parseMediaName(candidateName, { media_type: explicitType, year: overrides.year, season: overrides.season });
+  const recognition = auxiliaryParserOptions(settings);
+  const group = parseMediaName(candidateName, { ...recognition, media_type: explicitType, year: overrides.year, season: overrides.season });
   const preliminary = files.videos.map((source) => {
     const parsed = parseMediaName(source, {
+      ...recognition,
       media_type: explicitType || group.media_type,
       fallback_title: group.title,
       year: overrides.year,
@@ -437,6 +663,7 @@ export async function analyzeMediaCandidate(candidatePath, overrides = {}) {
   const videos = preliminary.map((item) => ({
     ...item,
     parsed: parseMediaName(item.source, {
+      ...recognition,
       media_type: mediaType,
       fallback_title: title,
       year,
@@ -446,17 +673,18 @@ export async function analyzeMediaCandidate(candidatePath, overrides = {}) {
     }),
   }));
   const sidecars = [...files.subtitles.map((source) => ({ source, kind: 'subtitle' })), ...files.audio.map((source) => ({ source, kind: 'audio' }))]
-    .map((sidecar) => ({ ...sidecar, video_source: bestSidecarVideo(sidecar.source, videos)?.source || null }));
+    .map((sidecar) => ({ ...sidecar, video_source: bestSidecarVideo(sidecar.source, videos, settings)?.source || null }));
   return {
     candidate_path: absoluteCandidate,
     candidate_type: candidateStat.isFile() ? 'file' : 'dir',
     media_type: mediaType,
     title,
     year: Number.isInteger(year) ? year : null,
+    tmdb_id: group.tmdb_id || preliminary.find((item) => item.parsed.tmdb_id)?.parsed.tmdb_id || null,
     videos,
     sidecars,
     ignored_samples: files.ignored_samples,
-    query: { title, year: Number.isInteger(year) ? year : null, media_type: mediaType },
+    query: { title, year: Number.isInteger(year) ? year : null, media_type: mediaType, tmdb_id: group.tmdb_id || null },
   };
 }
 
@@ -515,7 +743,7 @@ export function cloudCandidateFingerprint(candidate, entries) {
   };
 }
 
-export function analyzeCloudMediaCandidate({ candidate, entries = [] }, overrides = {}) {
+export function analyzeCloudMediaCandidate({ candidate, entries = [] }, overrides = {}, settings = DEFAULT_ORGANIZER_SETTINGS) {
   const root = normalizeOrganizerCloudEntry(candidate, candidate?.path || candidate?.name);
   const normalized = (root.is_directory ? entries : [candidate])
     .map((entry) => normalizeOrganizerCloudEntry(entry, entry.path || entry.name))
@@ -536,10 +764,12 @@ export function analyzeCloudMediaCandidate({ candidate, entries = [] }, override
   videosRaw.sort((left, right) => left.path.localeCompare(right.path, 'zh-CN', { numeric: true }));
   const explicitType = cleanText(overrides.media_type).toLowerCase();
   const candidateName = root.is_directory ? root.name : stemOf(root.name);
-  const group = parseMediaName(candidateName, { media_type: explicitType, year: overrides.year, season: overrides.season });
+  const recognition = auxiliaryParserOptions(settings);
+  const group = parseMediaName(candidateName, { ...recognition, media_type: explicitType, year: overrides.year, season: overrides.season });
   const preliminary = videosRaw.map((entry) => ({
     entry,
     parsed: parseMediaName(entry.path, {
+      ...recognition,
       media_type: explicitType || group.media_type,
       fallback_title: group.title,
       year: overrides.year,
@@ -560,6 +790,7 @@ export function analyzeCloudMediaCandidate({ candidate, entries = [] }, override
     size: entry.size,
     modified_ms: entry.modified_ms,
     parsed: parseMediaName(entry.path, {
+      ...recognition,
       media_type: mediaType,
       fallback_title: title,
       year,
@@ -572,7 +803,7 @@ export function analyzeCloudMediaCandidate({ candidate, entries = [] }, override
   const videoByPath = new Map(videos.map((video) => [video.source, video]));
   const sidecars = [...subtitles.map((entry) => ({ entry, kind: 'subtitle' })), ...audio.map((entry) => ({ entry, kind: 'audio' }))]
     .map(({ entry, kind }) => {
-      const matched = bestSidecarVideo(entry.path, videos);
+      const matched = bestSidecarVideo(entry.path, videos, settings);
       return {
         source: entry.path,
         source_id: entry.id,
@@ -593,10 +824,11 @@ export function analyzeCloudMediaCandidate({ candidate, entries = [] }, override
     media_type: mediaType,
     title,
     year: Number.isInteger(year) ? year : null,
+    tmdb_id: group.tmdb_id || preliminary.find((item) => item.parsed.tmdb_id)?.parsed.tmdb_id || null,
     videos,
     sidecars,
     ignored_samples: ignoredSamples,
-    query: { title, year: Number.isInteger(year) ? year : null, media_type: mediaType },
+    query: { title, year: Number.isInteger(year) ? year : null, media_type: mediaType, tmdb_id: group.tmdb_id || null },
   };
 }
 
@@ -649,6 +881,10 @@ function normalizeTmdbDetails(item, mediaType, imageUrl) {
     genre_ids: (item.genres || []).map((genre) => Number(genre.id)).filter(Number.isInteger),
     studios: (item.production_companies || []).map((company) => company.name).filter(Boolean),
     countries: (item.production_countries || []).map((country) => country.iso_3166_1).filter(Boolean),
+    original_language: cleanText(item.original_language).toLowerCase(),
+    origin_countries: (item.origin_country || item.production_countries || [])
+      .map((country) => cleanText(country?.iso_3166_1 || country).toUpperCase())
+      .filter(Boolean),
     directors,
     actors: (item.credits?.cast || []).slice(0, 30).map((person) => ({ name: person.name, role: person.character || '', order: person.order ?? 0, thumb: person.profile_path ? imageUrl(person.profile_path, 'w185') : '' })),
     poster_path: cleanText(item.poster_path),
@@ -747,6 +983,29 @@ export function createTmdbClient({ apiKey, language = 'zh-CN', imageLanguage = '
   return { request, test, search, details, season, imageUrl };
 }
 
+function segmentedSearchTitles(value) {
+  const original = cleanText(value);
+  const variants = [];
+  const add = (candidate) => {
+    const normalized = cleanText(candidate).replace(/^[\s:：·\-]+|[\s:：·\-]+$/g, '');
+    if (normalized.length >= 2 && normalizeSearchTitle(normalized) !== normalizeSearchTitle(original)
+      && !variants.some((item) => normalizeSearchTitle(item) === normalizeSearchTitle(normalized))) variants.push(normalized);
+  };
+  for (const part of original.split(/[\/|｜]/)) add(part);
+  add(original.replace(/[（(【\[].*?[）)】\]]/g, ' '));
+  const cjk = original.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]{2,}/gu)?.join(' ');
+  const latin = original.match(/[A-Za-z][A-Za-z0-9'’:&+\-]*(?:\s+[A-Za-z0-9][A-Za-z0-9'’:&+\-]*)*/g)?.join(' ');
+  add(cjk);
+  add(latin);
+  return variants.slice(0, 3);
+}
+
+function isExactTmdbCandidate(candidate, query) {
+  const titles = [candidate?.title, candidate?.original_title].map(normalizeSearchTitle).filter(Boolean);
+  return titles.includes(normalizeSearchTitle(query.title))
+    && (!query.year || !candidate?.year || Number(query.year) === Number(candidate.year));
+}
+
 export async function resolveTmdbMatch({ analysis, client, settings = DEFAULT_ORGANIZER_SETTINGS, overrides = {} }) {
   const mediaType = cleanText(overrides.media_type || analysis.media_type) === 'tv' ? 'tv' : 'movie';
   const query = {
@@ -754,21 +1013,32 @@ export async function resolveTmdbMatch({ analysis, client, settings = DEFAULT_OR
     year: overrides.year == null || overrides.year === '' ? analysis.year : Number(overrides.year),
     media_type: mediaType,
   };
-  if (!query.title && overrides.tmdb_id == null) return { ready: false, error_code: 'title_required', message: '无法从文件名提取媒体名称，请输入名称或 TMDB ID', query, candidates: [] };
+  const recognizedTmdbId = analysis.tmdb_id ?? analysis.query?.tmdb_id;
+  if (!query.title && overrides.tmdb_id == null && recognizedTmdbId == null) return { ready: false, error_code: 'title_required', message: '无法从文件名提取媒体名称，请输入名称或 TMDB ID', query, candidates: [] };
   let candidates = [];
   let selected = null;
-  const forcedId = overrides.tmdb_id == null || overrides.tmdb_id === '' ? null : Number(overrides.tmdb_id);
+  const forcedId = overrides.tmdb_id == null || overrides.tmdb_id === '' ? Number(recognizedTmdbId) || null : Number(overrides.tmdb_id);
   if (forcedId) {
     const details = await client.details(mediaType, forcedId);
     selected = { tmdb_id: details.tmdb_id, media_type: mediaType, title: details.title, original_title: details.original_title, year: details.year, release_date: details.release_date, overview: details.overview, vote_average: details.vote_average, popularity: 0, poster_path: details.poster_path, poster_url: details.poster_url, score: 1, forced: true };
     candidates = [selected];
   } else {
     candidates = await client.search(query);
+    if (!candidates.length && settings.word_segment_search !== false) {
+      const extra = [];
+      for (const title of segmentedSearchTitles(query.title)) {
+        extra.push(...await client.search({ ...query, title }));
+        if (extra.length >= 20) break;
+      }
+      const unique = new Map(extra.map((candidate) => [`${candidate.media_type}:${candidate.tmdb_id}`, candidate]));
+      candidates = [...unique.values()].sort((left, right) => right.score - left.score || right.popularity - left.popularity).slice(0, 20);
+    }
     const minimumScore = Number(settings.minimum_match_score ?? DEFAULT_ORGANIZER_SETTINGS.minimum_match_score);
     const first = candidates[0];
     const second = candidates[1];
-    const exact = first && normalizeSearchTitle(first.title) === normalizeSearchTitle(query.title) && (!query.year || !first.year || Number(query.year) === Number(first.year));
-    if (first && first.score >= minimumScore && (exact || !second || first.score - second.score >= 0.06)) selected = first;
+    const exact = first && isExactTmdbCandidate(first, query);
+    if (settings.similarity_match === false) selected = candidates.find((candidate) => isExactTmdbCandidate(candidate, query)) || null;
+    else if (first && first.score >= minimumScore && (exact || !second || first.score - second.score >= 0.06)) selected = first;
     if (!selected) {
       return {
         ready: false,
@@ -806,8 +1076,9 @@ export function sanitizePathComponent(value, fallback = 'Unknown') {
 }
 
 export function renderNamingTemplate(template, context) {
+  const normalizedContext = Object.fromEntries(Object.entries(context || {}).map(([key, value]) => [key.toLocaleLowerCase(), value]));
   const rendered = cleanText(template).replace(/\{([a-z_]+)(?::(\d+))?\}/gi, (_, key, width) => {
-    const value = context[key] ?? '';
+    const value = context?.[key] ?? normalizedContext[String(key).toLocaleLowerCase()] ?? '';
     if (value === '' || value === null || value === undefined) return '';
     return width ? String(value).padStart(Number(width), '0') : String(value);
   });
@@ -872,22 +1143,88 @@ async function resolvePlannedTarget(target, source, conflictPolicy, claimed) {
 function templateContext(metadata, parsed, episodeDetails = null) {
   const season = parsed.season ?? '';
   const episode = parsed.episode ?? '';
+  const seasonTag = season === '' ? '' : `S${String(season).padStart(2, '0')}`;
+  const episodeTag = episode === '' ? '' : `E${String(episode).padStart(2, '0')}`;
+  const episodeEnd = parsed.episode_end != null && parsed.episode_end !== parsed.episode ? `-E${String(parsed.episode_end).padStart(2, '0')}` : '';
+  const countryCodes = [...new Set([...(metadata.countries || []), ...(metadata.origin_countries || [])].map((value) => cleanText(value).toUpperCase()).filter(Boolean))];
+  const countryNames = countryCodes.map((code) => COUNTRY_NAMES_ZH[code] || code);
+  const originalFilename = parsed.original || '';
+  const seasonYear = Number(String(episodeDetails?.air_date || '').slice(0, 4)) || metadata.year || '';
+  const videoCodecFrameRateHighQuality = [parsed.video_codec, parsed.frame_rate, parsed.high_quality].filter(Boolean).join(' ');
+  const sourcePlatform = [parsed.resource_type, parsed.source].filter(Boolean).join(' ');
+  const effectVersion = [parsed.effect, parsed.edition].filter(Boolean).join(' ');
+  const remux = /remux/i.test(parsed.resource_type || parsed.release_type || '') ? 'REMUX' : '';
+  const mediaInfo = composeMediaInfo(metadata.media_type, parsed);
   return {
     title: metadata.title,
     original_title: metadata.original_title,
+    en_title: metadata.original_title || metadata.title,
     year: metadata.year || '',
     tmdb_id: metadata.tmdb_id,
+    tmdbid: metadata.tmdb_id,
     season,
     episode,
-    episode_end: parsed.episode_end != null && parsed.episode_end !== parsed.episode ? `-E${String(parsed.episode_end).padStart(2, '0')}` : '',
+    episode_end: episodeEnd,
+    season_episode: `${seasonTag}${episodeTag}${episodeEnd}`,
     episode_title: episodeDetails?.name || '',
     edition: parsed.edition ? ` - ${parsed.edition}` : '',
     quality: parsed.quality ? ` - ${parsed.quality}` : '',
     part: parsed.part ? ` - ${parsed.part}` : '',
-    country: metadata.countries?.[0] || '未知地区',
-    season_tag: season === '' ? '' : `S${String(season).padStart(2, '0')}`,
-    episode_tag: episode === '' ? '' : `E${String(episode).padStart(2, '0')}`,
+    country: countryNames[0] || '未知地区',
+    country_code: countryCodes[0] || '',
+    release_country: countryNames.join('、') || '未知地区',
+    original_filename: originalFilename,
+    original_name: originalFilename,
+    segment: parsed.part || '',
+    season_year: seasonYear,
+    season_tag: seasonTag,
+    episode_tag: episodeTag,
+    video_format: parsed.video_format || '',
+    videoFormat: parsed.video_format || '',
+    resource_type: parsed.resource_type || '',
+    resourceType: parsed.resource_type || '',
+    source: parsed.source || '',
+    effect: parsed.effect || '',
+    audio_info: parsed.audio_info || '',
+    audioInfo: parsed.audio_info || '',
+    video_codec: parsed.video_codec || '',
+    videoCodec: parsed.video_codec || '',
+    audio_codec: parsed.audio_codec || '',
+    audioCodec: parsed.audio_codec || '',
+    release_group: parsed.release_group || '',
+    releaseGroup: parsed.release_group || '',
+    release_type: parsed.release_type || '',
+    high_quality: parsed.high_quality || '',
+    dolby_vision: parsed.dolby_vision || '',
+    dynamic_range: parsed.dynamic_range || '',
+    frame_rate: parsed.frame_rate || '',
+    color_depth: parsed.color_depth || '',
+    source_platform: sourcePlatform,
+    version: parsed.edition || '',
+    effect_version: effectVersion,
+    remux,
+    version_number: parsed.part || '',
+    video_codec_frame_rate_high_quality: videoCodecFrameRateHighQuality,
+    media_info: mediaInfo,
+    media_probed: parsed.media_probed === true,
   };
+}
+
+function composeMediaInfo(mediaType, parsed = {}) {
+  const values = mediaType === 'tv'
+    ? [parsed.video_format, parsed.source, parsed.release_type || parsed.resource_type, parsed.high_quality, parsed.dolby_vision, parsed.dynamic_range, parsed.frame_rate, parsed.color_depth, parsed.video_codec, parsed.audio_codec]
+    : [parsed.video_format, parsed.resource_type || parsed.release_type, parsed.effect, parsed.audio_info, parsed.video_codec, parsed.audio_codec];
+  const body = values.map(cleanText).filter(Boolean).filter((value, index, items) => index === 0 || value !== items[index - 1]).join('.');
+  const group = cleanText(parsed.release_group);
+  return `${body}${group ? `${body ? '-' : ''}${group}` : ''}`;
+}
+
+const TECHNICAL_TEMPLATE_TOKEN = /\{\{?\s*(?:media_info|video_?format|resource_?type|source|effect|audio_?info|video_?codec|audio_?codec|release_?group|release_?type|high_?quality|dolby_?vision|dynamic_?range|frame_?rate|color_?depth)\s*\}?\}/i;
+
+function appendMediaInfoSuffix(relativePath, template, context, enabled) {
+  if (!enabled || !context.media_probed || !context.media_info || TECHNICAL_TEMPLATE_TOKEN.test(template)) return relativePath;
+  const extension = path.posix.extname(relativePath);
+  return `${relativePath.slice(0, extension ? -extension.length : undefined)}.${context.media_info}${extension}`;
 }
 
 function episodeDetails(metadata, season, episode) {
@@ -912,13 +1249,19 @@ function cleanRenderedSegment(value) {
 }
 
 export function renderOrganizerPathTemplate(template, context) {
-  const aliases = cleanText(template)
+  const normalizedContext = Object.fromEntries(Object.entries(context || {}).map(([key, value]) => [key.toLocaleLowerCase(), value]));
+  const conditional = cleanText(template).replace(/\{\{@if@\}\}([\s\S]*?)\{\{@endif@\}\}/gi, (_, body) => {
+    const keys = [...body.matchAll(/\{\{\s*([a-z_][a-z0-9_]*)\s*\}\}/gi)].map((match) => match[1].toLocaleLowerCase());
+    return keys.length && keys.every((key) => normalizedContext[key] !== '' && normalizedContext[key] !== null && normalizedContext[key] !== undefined) ? body : '';
+  });
+  const aliases = conditional
+    .replace(/\{\{\s*([a-z_][a-z0-9_]*)\s*\}\}/gi, '{$1}')
     .replace(/\{catgroy\}/gi, '{category}')
     .replace(/\{tmdbid\}/gi, '{tmdb_id}')
     .replace(/\{Season\s+x\}/gi, '{season_tag}')
     .replace(/\{(?:Episode|Expose)\s+n\}/gi, '{episode_tag}');
   const rendered = aliases.replace(/\{([a-z_]+)(?::(\d+))?\}/gi, (_, key, width) => {
-    const value = context[key] ?? '';
+    const value = context?.[key] ?? normalizedContext[String(key).toLocaleLowerCase()] ?? '';
     if (value === '' || value === null || value === undefined) return '';
     return width ? String(value).padStart(Number(width), '0') : String(value);
   });
@@ -1049,8 +1392,9 @@ export async function buildCloudNativePreview({ analysis, match, mapping, settin
     }
     const details = metadata.media_type === 'tv' ? episodeDetails(metadata, video.parsed.season, video.parsed.episode) : null;
     const extension = path.posix.extname(video.source_name || video.source).replace(/^\./, '').toLowerCase();
-    const context = { ...templateContext(metadata, video.parsed, details), category, catgroy: category, ext: extension };
+    const context = { ...templateContext(metadata, video.parsed, details), category, catgroy: category, ext: extension, fileExt: extension ? `.${extension}` : '' };
     let relative = renderOrganizerPathTemplate(template, context);
+    relative = appendMediaInfoSuffix(relative, template, context, settings.include_media_info !== false);
     if (video.extra_kind) {
       const baseDirectory = path.posix.dirname(relative);
       const extraDirectory = video.extra_kind === 'trailer' ? 'trailers' : 'extras';
@@ -1128,7 +1472,8 @@ export async function buildCloudNativePreview({ analysis, match, mapping, settin
   }
   const failed = items.filter((item) => !item.success).length;
   const skipped = items.filter((item) => item.action === 'skip').length;
-  const warnings = skipped + analysis.ignored_samples.length + Object.values(metadata.seasons || {}).filter((season) => season.error).length;
+  const probeWarnings = Array.isArray(analysis.media_probe_warnings) ? analysis.media_probe_warnings : [];
+  const warnings = skipped + analysis.ignored_samples.length + probeWarnings.length + Object.values(metadata.seasons || {}).filter((season) => season.error).length;
   const message = failed ? `有 ${failed} 项无法生成目标，请人工修正` : `已生成 ${items.length} 项云端整理预览${warnings ? `，${warnings} 项提示` : ''}`;
   return {
     success: failed === 0 && mainVideos.length > 0,
@@ -1139,6 +1484,7 @@ export async function buildCloudNativePreview({ analysis, match, mapping, settin
     candidates: match.candidates,
     selected: match.selected,
     metadata,
+    media_probe_warnings: probeWarnings,
     target_root: mapping.target_path,
     target_root_id: mapping.target_dir_id,
     media_root: cloudPreviewTarget(mapping, mediaRoot),

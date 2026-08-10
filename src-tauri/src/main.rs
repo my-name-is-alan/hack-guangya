@@ -3,6 +3,7 @@
 mod native_mount;
 mod organizer;
 mod organizer_core;
+mod virtual_library;
 mod webdav;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -12,10 +13,10 @@ use md5::Md5;
 use native_mount::{NativeMountInfo, NativeMountManager, NativeMountOptions};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use organizer::{
-    add_organizer_mapping, get_organizer_state, remove_organizer_job, remove_organizer_mapping,
-    retry_organizer_job, run_organizer_job, scan_organizer_mapping, scrape_selected_files,
-    start as start_organizer, test_organizer_connection, update_organizer_mapping,
-    update_organizer_settings,
+    add_organizer_mapping, get_organizer_state, rearchive_organizer_job, remove_organizer_job,
+    remove_organizer_mapping, retry_organizer_job, run_organizer_job, scan_organizer_mapping,
+    scrape_selected_files, start as start_organizer, test_organizer_connection,
+    update_organizer_mapping, update_organizer_settings,
 };
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use reqwest::header::{
@@ -48,6 +49,9 @@ use tokio::{
     time::{sleep, Duration, Instant},
 };
 use uuid::Uuid;
+use virtual_library::{
+    VirtualLibraryInfo, VirtualLibraryManager, VirtualLibraryMapping, VirtualLibraryOptions,
+};
 
 const API_BASE: &str = "https://api.guangyapan.com";
 const ACCOUNT_BASE: &str = "https://account.guangyapan.com";
@@ -86,6 +90,7 @@ const PENDING_UPLOAD_RETRY_SECS: u64 = 15;
 const UPLOAD_STATE_OSS_COMPLETE: &str = "oss_complete";
 const UPLOAD_STATE_CLOUD_CONFIRMED: &str = "cloud_confirmed";
 const UPLOAD_CANCELLED_MESSAGE: &str = "上传已取消";
+const UPLOAD_PAUSED_MESSAGE: &str = "上传已暂停";
 const AUTO_SHARE_QUIET_SECS: i64 = 30;
 const TOKEN_REFRESH_INTERVAL_SECS: u64 = 20 * 60;
 const DEFAULT_WEBDAV_PORT: u16 = 19_090;
@@ -223,6 +228,8 @@ struct AppConfig {
     webdav_password: String,
     #[serde(default)]
     native_mount: NativeMountOptions,
+    #[serde(default)]
+    virtual_library: VirtualLibraryOptions,
 }
 impl Default for AppConfig {
     fn default() -> Self {
@@ -237,6 +244,7 @@ impl Default for AppConfig {
             webdav_username: default_webdav_username(),
             webdav_password: String::new(),
             native_mount: NativeMountOptions::default(),
+            virtual_library: VirtualLibraryOptions::default(),
         }
     }
 }
@@ -293,6 +301,8 @@ struct RuntimeState {
     inflight_items: HashMap<String, UploadItem>,
     failed_uploads: HashMap<String, UploadItem>,
     cancelled_uploads: HashMap<String, Stamp>,
+    paused_uploads: HashSet<String>,
+    queue_pause_requests: HashSet<String>,
     remote_cache: HashMap<String, String>,
     watchers: HashMap<String, RecommendedWatcher>,
     event_tx: UnboundedSender<FsEvent>,
@@ -320,6 +330,7 @@ struct RuntimeState {
     webdav_running: bool,
     webdav_error: Option<String>,
     native_mount: NativeMountManager,
+    virtual_library: VirtualLibraryManager,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1050,8 +1061,20 @@ fn upload_is_cancelled(state: &SharedState, key: &str) -> bool {
         .is_some_and(|guard| guard.cancelled_uploads.contains_key(key))
 }
 
+fn upload_pause_requested(state: &SharedState, key: &str) -> bool {
+    state.lock().ok().is_some_and(|guard| {
+        guard.paused_uploads.contains(key) || guard.queue_pause_requests.contains(key)
+    })
+}
+
 async fn wait_for_upload_cancellation(state: &SharedState, key: &str) {
     while !upload_is_cancelled(state, key) {
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_upload_pause(state: &SharedState, key: &str) {
+    while !upload_pause_requested(state, key) {
         sleep(Duration::from_millis(50)).await;
     }
 }
@@ -1063,6 +1086,21 @@ where
     tokio::select! {
         value = future => Ok(value),
         _ = wait_for_upload_cancellation(state, key) => Err(UPLOAD_CANCELLED_MESSAGE.to_string()),
+    }
+}
+
+async fn interruptible_upload_step<T, F>(
+    state: &SharedState,
+    key: &str,
+    future: F,
+) -> Result<T, String>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        value = future => Ok(value),
+        _ = wait_for_upload_cancellation(state, key) => Err(UPLOAD_CANCELLED_MESSAGE.to_string()),
+        _ = wait_for_upload_pause(state, key) => Err(UPLOAD_PAUSED_MESSAGE.to_string()),
     }
 }
 fn normalize_sync_types(values: &[String]) -> Vec<String> {
@@ -1312,7 +1350,8 @@ fn save_config(state: &RuntimeState) {
         "webdav_port": state.webdav_port,
         "webdav_username": state.webdav_username,
         "webdav_password": state.webdav_password,
-        "native_mount": state.native_mount.options()
+        "native_mount": state.native_mount.options(),
+        "virtual_library": state.virtual_library.options()
     });
     let _ = fs::write(
         &state.config_path,
@@ -5924,14 +5963,18 @@ async fn requeue_busy_upload(app: tauri::AppHandle, state: SharedState, mut item
         false
     };
     if queued {
+        let paused = state
+            .lock()
+            .ok()
+            .is_some_and(|guard| guard.paused_uploads.contains(&key));
         emit(
             &app,
             json!({
                 "type": "file",
-                "state": "waiting-file",
+                "state": if paused { "paused" } else { "waiting-file" },
                 "file_path": item.file_path.to_string_lossy(),
                 "mapping_id": item.mapping_id,
-                "stage": "另外的程序正在使用该文件，释放后将自动上传"
+                "stage": if paused { "已暂停，可从当前断点继续" } else { "另外的程序正在使用该文件，释放后将自动上传" }
             }),
         );
         emit_state(&app, &state);
@@ -6601,7 +6644,10 @@ pub(crate) async fn organizer_upload_bytes(
     };
     let state = app.state::<SharedState>();
     let result = upload_item(app, state.inner(), &item).await;
-    if result.is_ok() {
+    if let Ok(outcome) = &result {
+        // Organizer metadata bypasses the ordinary upload queue, so it must
+        // explicitly publish the terminal transfer event after cloud indexing.
+        finalize_successful_upload(app, state.inner(), &item, outcome).await;
         let _ = fs::remove_file(&file_path);
         let _ = fs::remove_dir(&temp_dir);
     }
@@ -6961,6 +7007,7 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
                     let key = item_key(&candidate.mapping_id, &candidate.file_path);
                     !guard.inflight.contains_key(&key)
                         && !guard.cancelled_uploads.contains_key(&key)
+                        && !guard.paused_uploads.contains(&key)
                         && !flash_preflight_cached(&guard, candidate)
                 });
                 position.and_then(|position| {
@@ -7003,7 +7050,7 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
             let result = match prepare_upload_item(&item).await {
                 Ok(Some(ready)) => {
                     item = ready;
-                    abortable_upload_step(
+                    interruptible_upload_step(
                         &state2,
                         &upload_key,
                         preflight_flash_upload(&app2, &state2, &item),
@@ -7017,6 +7064,10 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
             };
             let waiting_for_file = result.as_ref().ok().is_some_and(Option::is_none);
             let cancelled = upload_is_cancelled(&state2, &upload_key);
+            let pause_interrupted = result
+                .as_ref()
+                .err()
+                .is_some_and(|message| message == UPLOAD_PAUSED_MESSAGE);
             let auth_expired = result
                 .as_ref()
                 .err()
@@ -7027,6 +7078,8 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
                 .is_some_and(|guard| guard.pending_cloud.contains_key(&upload_key));
             let mut db_path = None;
             let mut requeued = false;
+            let mut paused_upload = false;
+            let mut individually_paused = false;
             if let Ok(mut guard) = state2.lock() {
                 guard.active_flash_preflights = guard.active_flash_preflights.saturating_sub(1);
                 guard.inflight.remove(&upload_key);
@@ -7040,6 +7093,13 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
                         .mappings
                         .iter()
                         .any(|mapping| mapping.id == item.mapping_id && mapping.enabled);
+                individually_paused = guard.paused_uploads.contains(&upload_key);
+                let queue_pause_requested = guard.queue_pause_requests.remove(&upload_key);
+                paused_upload = !cloud_pending
+                    && (pause_interrupted || individually_paused || queue_pause_requested);
+                if !paused_upload {
+                    guard.paused_uploads.remove(&upload_key);
+                }
                 if cancelled {
                     guard.pending_cloud.remove(&upload_key);
                     guard.flash_preflight_cache.remove(&upload_key);
@@ -7115,6 +7175,35 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
                     }),
                 );
                 emit_state(&app2, &state2);
+                drain_queue(app2, state2);
+                return;
+            }
+            if paused_upload {
+                let uploaded_bytes = db_path
+                    .as_deref()
+                    .and_then(|path| load_upload_checkpoint(path, &item).ok().flatten())
+                    .map(|checkpoint| checkpoint.uploaded_bytes)
+                    .unwrap_or(0);
+                emit(
+                    &app2,
+                    json!({
+                        "type": "file",
+                        "state": "paused",
+                        "file_path": item.file_path.to_string_lossy(),
+                        "mapping_id": item.mapping_id,
+                        "uploaded_bytes": uploaded_bytes,
+                        "total_bytes": item.size,
+                        "stage": if individually_paused { "已暂停" } else { "队列已暂停" }
+                    }),
+                );
+                emit_state(&app2, &state2);
+                if waiting_for_file {
+                    tauri::async_runtime::spawn(requeue_busy_upload(
+                        app2.clone(),
+                        state2.clone(),
+                        item.clone(),
+                    ));
+                }
                 drain_queue(app2, state2);
                 return;
             }
@@ -7302,6 +7391,7 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                     let key = item_key(&candidate.mapping_id, &candidate.file_path);
                     !guard.inflight.contains_key(&key)
                         && !guard.cancelled_uploads.contains_key(&key)
+                        && !guard.paused_uploads.contains(&key)
                 });
                 let item = position.and_then(|position| guard.queue.remove(position));
                 if let Some(item) = &item {
@@ -7337,16 +7427,24 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
             let result = match prepare_upload_item(&item).await {
                 Ok(Some(ready)) => {
                     item = ready;
-                    abortable_upload_step(&state2, &upload_key, upload_item(&app2, &state2, &item))
-                        .await
-                        .and_then(|result| result)
-                        .map(Some)
+                    interruptible_upload_step(
+                        &state2,
+                        &upload_key,
+                        upload_item(&app2, &state2, &item),
+                    )
+                    .await
+                    .and_then(|result| result)
+                    .map(Some)
                 }
                 Ok(None) => Ok(None),
                 Err(message) => Err(message),
             };
             let waiting_for_file = result.as_ref().ok().is_some_and(Option::is_none);
             let cancelled = upload_is_cancelled(&state2, &upload_key);
+            let pause_interrupted = result
+                .as_ref()
+                .err()
+                .is_some_and(|message| message == UPLOAD_PAUSED_MESSAGE);
             let auth_expired = result
                 .as_ref()
                 .err()
@@ -7355,6 +7453,8 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
             let error_message = result.as_ref().err().cloned();
             let mut db_path = None;
             let mut cloud_pending = false;
+            let mut paused_upload = false;
+            let mut individually_paused = false;
             if let Ok(mut guard) = state2.lock() {
                 guard.active_uploads = guard.active_uploads.saturating_sub(1);
                 guard.inflight.remove(&upload_key);
@@ -7364,6 +7464,29 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                     guard.token = None;
                 }
                 cloud_pending = guard.pending_cloud.contains_key(&upload_key);
+                individually_paused = guard.paused_uploads.contains(&upload_key);
+                let queue_pause_requested = guard.queue_pause_requests.remove(&upload_key);
+                paused_upload = !cloud_pending
+                    && !cancelled
+                    && (pause_interrupted
+                        || (waiting_for_file && (individually_paused || queue_pause_requested)));
+                if paused_upload {
+                    let mapping_active = item.mapping_id.starts_with("__")
+                        || guard
+                            .mappings
+                            .iter()
+                            .any(|mapping| mapping.id == item.mapping_id && mapping.enabled);
+                    if !waiting_for_file
+                        && mapping_active
+                        && !guard.queue.iter().any(|queued| {
+                            item_key(&queued.mapping_id, &queued.file_path) == upload_key
+                        })
+                    {
+                        guard.queue.push_front(item.clone());
+                    }
+                } else {
+                    guard.paused_uploads.remove(&upload_key);
+                }
                 if cancelled {
                     guard.pending_cloud.remove(&upload_key);
                     guard.flash_preflight_cache.remove(&upload_key);
@@ -7398,6 +7521,35 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
                     }),
                 );
                 emit_state(&app2, &state2);
+                drain_queue(app2, state2);
+                return;
+            }
+            if paused_upload {
+                let uploaded_bytes = db_path
+                    .as_deref()
+                    .and_then(|path| load_upload_checkpoint(path, &item).ok().flatten())
+                    .map(|checkpoint| checkpoint.uploaded_bytes)
+                    .unwrap_or(0);
+                emit(
+                    &app2,
+                    json!({
+                        "type": "file",
+                        "state": "paused",
+                        "file_path": item.file_path.to_string_lossy(),
+                        "mapping_id": item.mapping_id,
+                        "uploaded_bytes": uploaded_bytes,
+                        "total_bytes": item.size,
+                        "stage": if individually_paused { "已暂停，可从当前断点继续" } else { "队列已暂停，可从当前断点继续" }
+                    }),
+                );
+                emit_state(&app2, &state2);
+                if waiting_for_file {
+                    tauri::async_runtime::spawn(requeue_busy_upload(
+                        app2.clone(),
+                        state2.clone(),
+                        item.clone(),
+                    ));
+                }
                 drain_queue(app2, state2);
                 return;
             }
@@ -8164,6 +8316,142 @@ fn select_rclone_binary() -> Option<String> {
     dialog
         .pick_file()
         .map(|path| path.to_string_lossy().to_string())
+}
+
+fn virtual_library_info(state: &RuntimeState) -> VirtualLibraryInfo {
+    state.virtual_library.info()
+}
+
+#[tauri::command]
+fn get_virtual_library_info(
+    state: tauri::State<'_, SharedState>,
+) -> Result<VirtualLibraryInfo, String> {
+    let guard = state.lock().map_err(|error| error.to_string())?;
+    Ok(virtual_library_info(&guard))
+}
+
+#[tauri::command]
+fn update_virtual_library_settings(
+    state: tauri::State<'_, SharedState>,
+    refresh_minutes: u64,
+    emby_upstream: String,
+) -> Result<VirtualLibraryInfo, String> {
+    let mut guard = state.lock().map_err(|error| error.to_string())?;
+    guard.virtual_library.set_refresh_minutes(refresh_minutes)?;
+    guard.virtual_library.set_emby_upstream(emby_upstream)?;
+    save_config(&guard);
+    Ok(virtual_library_info(&guard))
+}
+
+#[tauri::command]
+fn upsert_virtual_library_mapping(
+    state: tauri::State<'_, SharedState>,
+    mapping: VirtualLibraryMapping,
+) -> Result<VirtualLibraryInfo, String> {
+    let mut guard = state.lock().map_err(|error| error.to_string())?;
+    guard.virtual_library.upsert_mapping(mapping)?;
+    save_config(&guard);
+    Ok(virtual_library_info(&guard))
+}
+
+#[tauri::command]
+fn remove_virtual_library_mapping(
+    state: tauri::State<'_, SharedState>,
+    id: String,
+) -> Result<VirtualLibraryInfo, String> {
+    let mut guard = state.lock().map_err(|error| error.to_string())?;
+    guard.virtual_library.remove_mapping(id.trim())?;
+    save_config(&guard);
+    Ok(virtual_library_info(&guard))
+}
+
+fn publish_virtual_library(app: &tauri::AppHandle, state: &SharedState) {
+    if let Ok(guard) = state.lock() {
+        emit(
+            app,
+            json!({
+                "type": "virtual-library",
+                "data": virtual_library_info(&guard)
+            }),
+        );
+    }
+}
+
+fn spawn_virtual_library_sync(
+    app: tauri::AppHandle,
+    state: SharedState,
+    id: String,
+) -> Result<(), String> {
+    let mapping = {
+        let mut guard = state.lock().map_err(|error| error.to_string())?;
+        let mapping = guard
+            .virtual_library
+            .mapping(&id)
+            .ok_or_else(|| "虚拟库配置不存在".to_string())?;
+        if !mapping.enabled {
+            return Err("该虚拟库已停用".to_string());
+        }
+        guard.virtual_library.begin_sync(&id)?;
+        mapping
+    };
+    publish_virtual_library(&app, &state);
+    tauri::async_runtime::spawn(async move {
+        let result = virtual_library::sync_mapping(&state, &mapping).await;
+        let outcome_message = match &result {
+            Ok(summary) => format!(
+                "虚拟库同步完成：{}（{} 个 STRM，{} 个元数据）",
+                mapping.name, summary.strm_files, summary.metadata_files
+            ),
+            Err(error) => format!("虚拟库同步失败：{}：{error}", mapping.name),
+        };
+        if let Ok(mut guard) = state.lock() {
+            guard.virtual_library.finish_sync(&id, result.clone());
+        }
+        status(
+            &app,
+            if result.is_ok() { "success" } else { "error" },
+            outcome_message,
+        );
+        publish_virtual_library(&app, &state);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn sync_virtual_library(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+    id: String,
+) -> Result<VirtualLibraryInfo, String> {
+    spawn_virtual_library_sync(app, state.inner().clone(), id)?;
+    let guard = state.lock().map_err(|error| error.to_string())?;
+    Ok(virtual_library_info(&guard))
+}
+
+#[tauri::command]
+fn select_virtual_library_target() -> Option<String> {
+    rfd::FileDialog::new()
+        .pick_folder()
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+async fn virtual_library_refresh_loop(app: tauri::AppHandle, state: SharedState) {
+    loop {
+        let refresh_minutes = state
+            .lock()
+            .ok()
+            .map(|guard| guard.virtual_library.options().refresh_minutes)
+            .unwrap_or(virtual_library::default_refresh_minutes());
+        sleep(Duration::from_secs(refresh_minutes.saturating_mul(60))).await;
+        let mappings = state
+            .lock()
+            .ok()
+            .map(|guard| guard.virtual_library.options().mappings)
+            .unwrap_or_default();
+        for mapping in mappings.into_iter().filter(|mapping| mapping.enabled) {
+            let _ = spawn_virtual_library_sync(app.clone(), state.clone(), mapping.id);
+        }
+    }
 }
 
 fn auth_context(state: &tauri::State<'_, SharedState>) -> Result<(String, String), String> {
@@ -11836,6 +12124,10 @@ fn remove_mapping(
         .recovering_pending
         .retain(|key| !key.starts_with(&prefix));
     guard.inflight.retain(|key, _| !key.starts_with(&prefix));
+    guard.paused_uploads.retain(|key| !key.starts_with(&prefix));
+    guard
+        .queue_pause_requests
+        .retain(|key| !key.starts_with(&prefix));
     save_config(&guard);
     let db_path = guard.db_path.clone();
     drop(guard);
@@ -12280,8 +12572,150 @@ async fn retry_auto_share_event(
 fn pause_queue(app: tauri::AppHandle, state: tauri::State<'_, SharedState>) {
     if let Ok(mut guard) = state.lock() {
         guard.paused = true;
+        let active_keys = guard.inflight_items.keys().cloned().collect::<Vec<_>>();
+        guard.queue_pause_requests.extend(active_keys);
     }
     emit_state(&app, state.inner());
+}
+
+#[tauri::command]
+fn pause_upload(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+    file_path: String,
+    mapping_id: Option<String>,
+) -> Result<bool, String> {
+    let target_path = file_path.trim();
+    if target_path.is_empty() {
+        return Err("缺少要暂停的上传路径".into());
+    }
+    let target_mapping = mapping_id.unwrap_or_default();
+    let (db_path, matched, inflight_keys) = {
+        let mut guard = state.lock().map_err(|error| error.to_string())?;
+        let matches = |item: &UploadItem| {
+            item.file_path.to_string_lossy() == target_path
+                && (target_mapping.is_empty() || item.mapping_id == target_mapping)
+        };
+        let mut matched = HashMap::<String, UploadItem>::new();
+        for item in guard
+            .queue
+            .iter()
+            .chain(guard.waiting_files.values())
+            .chain(guard.inflight_items.values())
+        {
+            if matches(item) {
+                matched.insert(item_key(&item.mapping_id, &item.file_path), item.clone());
+            }
+        }
+        if matched.is_empty() {
+            return Ok(false);
+        }
+        let inflight_keys = matched
+            .keys()
+            .filter(|key| guard.inflight_items.contains_key(*key))
+            .cloned()
+            .collect::<HashSet<_>>();
+        guard.paused_uploads.extend(matched.keys().cloned());
+        (guard.db_path.clone(), matched, inflight_keys)
+    };
+    for (key, item) in &matched {
+        let uploaded_bytes = load_upload_checkpoint(&db_path, item)?
+            .map(|checkpoint| checkpoint.uploaded_bytes)
+            .unwrap_or(0);
+        let inflight = inflight_keys.contains(key);
+        emit(
+            &app,
+            json!({
+                "type": "file",
+                "state": if inflight { "pausing" } else { "paused" },
+                "file_path": item.file_path.to_string_lossy(),
+                "mapping_id": item.mapping_id,
+                "uploaded_bytes": uploaded_bytes,
+                "total_bytes": item.size,
+                "stage": if inflight { "正在暂停并保存上传断点" } else { "已暂停，可从当前断点继续" }
+            }),
+        );
+    }
+    emit_state(&app, state.inner());
+    Ok(true)
+}
+
+#[tauri::command]
+fn resume_upload(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+    file_path: String,
+    mapping_id: Option<String>,
+) -> Result<bool, String> {
+    let target_path = file_path.trim();
+    if target_path.is_empty() {
+        return Err("缺少要继续的上传路径".into());
+    }
+    let target_mapping = mapping_id.unwrap_or_default();
+    let (matched, waiting_keys, waiting_for_login) = {
+        let mut guard = state.lock().map_err(|error| error.to_string())?;
+        if guard.paused {
+            return Err("上传队列已暂停，请先恢复队列".into());
+        }
+        let matches = |item: &UploadItem| {
+            item.file_path.to_string_lossy() == target_path
+                && (target_mapping.is_empty() || item.mapping_id == target_mapping)
+        };
+        let mut matched = HashMap::<String, UploadItem>::new();
+        for item in guard
+            .queue
+            .iter()
+            .chain(guard.waiting_files.values())
+            .chain(guard.inflight_items.values())
+        {
+            let key = item_key(&item.mapping_id, &item.file_path);
+            if guard.paused_uploads.contains(&key) && matches(item) {
+                matched.insert(key, item.clone());
+            }
+        }
+        if matched.is_empty() {
+            return Ok(false);
+        }
+        if matched
+            .keys()
+            .any(|key| guard.inflight_items.contains_key(key))
+        {
+            return Err("上传任务正在进入暂停状态，请稍后继续".into());
+        }
+        let waiting_keys = matched
+            .keys()
+            .filter(|key| guard.waiting_files.contains_key(*key))
+            .cloned()
+            .collect::<HashSet<_>>();
+        for key in matched.keys() {
+            guard.paused_uploads.remove(key);
+        }
+        (matched, waiting_keys, guard.token.is_none())
+    };
+    for (key, item) in &matched {
+        let (state_name, stage) = if waiting_keys.contains(key) {
+            ("waiting-file", "另外的程序正在使用该文件，释放后将自动上传")
+        } else if waiting_for_login {
+            ("waiting-login", "等待登录后继续上传")
+        } else {
+            ("queued", "已恢复，等待上传通道")
+        };
+        emit(
+            &app,
+            json!({
+                "type": "file",
+                "state": state_name,
+                "file_path": item.file_path.to_string_lossy(),
+                "mapping_id": item.mapping_id,
+                "uploaded_bytes": 0,
+                "total_bytes": item.size,
+                "stage": stage
+            }),
+        );
+    }
+    emit_state(&app, state.inner());
+    drain_queue(app, state.inner().clone());
+    Ok(true)
 }
 
 #[tauri::command]
@@ -12341,6 +12775,8 @@ fn cancel_upload(
             guard.flash_preflight_cache.remove(key);
             guard.pending_cloud.remove(key);
             guard.recovering_pending.remove(key);
+            guard.paused_uploads.remove(key);
+            guard.queue_pause_requests.remove(key);
         }
         guard
             .queue
@@ -12402,6 +12838,8 @@ fn retry_upload(
     item.modified_ms = modified_ms(&metadata);
     guard.failed_uploads.remove(&key);
     guard.cancelled_uploads.remove(&key);
+    guard.paused_uploads.remove(&key);
+    guard.queue_pause_requests.remove(&key);
     guard.waiting_files.remove(&key);
     guard.flash_preflight_cache.remove(&key);
     guard
@@ -13688,6 +14126,8 @@ fn run() {
             let webdav_username = config.webdav_username.clone();
             let webdav_password = config.webdav_password.clone();
             let native_mount_options = config.native_mount.clone();
+            let virtual_library = VirtualLibraryManager::new(config.virtual_library.clone());
+            let virtual_library_proxy_port = virtual_library.options().proxy_port;
             let upload_concurrency = normalize_transfer_concurrency(
                 config.upload_concurrency,
                 DEFAULT_UPLOAD_CONCURRENCY,
@@ -13730,6 +14170,8 @@ fn run() {
                 inflight_items: HashMap::new(),
                 failed_uploads: HashMap::new(),
                 cancelled_uploads: HashMap::new(),
+                paused_uploads: HashSet::new(),
+                queue_pause_requests: HashSet::new(),
                 remote_cache,
                 watchers: HashMap::new(),
                 event_tx,
@@ -13761,6 +14203,7 @@ fn run() {
                     native_mount_data_dir,
                     resource_dir,
                 ),
+                virtual_library,
             }));
             app.manage(DownloadRegistry::default());
             app.manage(PendingAppUpdate::default());
@@ -13780,6 +14223,11 @@ fn run() {
                     webdav_port,
                 ));
             }
+            tauri::async_runtime::spawn(virtual_library::serve_proxy(
+                app_handle.clone(),
+                state.clone(),
+                virtual_library_proxy_port,
+            ));
             if let Ok(guard) = state.lock() {
                 save_config(&guard);
             }
@@ -13842,6 +14290,10 @@ fn run() {
             ));
             tauri::async_runtime::spawn(auto_share_loop(app_handle.clone(), state.clone()));
             tauri::async_runtime::spawn(token_refresh_loop(app_handle.clone(), state.clone()));
+            tauri::async_runtime::spawn(virtual_library_refresh_loop(
+                app_handle.clone(),
+                state.clone(),
+            ));
             resume_developer_transfer_jobs(app_handle.clone(), state.clone())?;
             drain_queue(app_handle.clone(), state.clone());
             emit_state(&app_handle, &state);
@@ -13857,6 +14309,12 @@ fn run() {
             stop_native_mount,
             select_native_mount_target,
             select_rclone_binary,
+            get_virtual_library_info,
+            update_virtual_library_settings,
+            upsert_virtual_library_mapping,
+            remove_virtual_library_mapping,
+            sync_virtual_library,
+            select_virtual_library_target,
             clear_expired_session,
             refresh_session,
             start_device_login,
@@ -13880,6 +14338,8 @@ fn run() {
             select_upload_files,
             select_upload_folder,
             queue_upload_paths,
+            pause_upload,
+            resume_upload,
             cancel_upload,
             retry_upload,
             copy_files,
@@ -13955,6 +14415,7 @@ fn run() {
             scan_organizer_mapping,
             run_organizer_job,
             retry_organizer_job,
+            rearchive_organizer_job,
             scrape_selected_files,
             resume_queue,
             get_app_version,

@@ -13,7 +13,7 @@ export function nextUploadProgress(previous, payload, updatedAt = Date.now()) {
   // A delayed progress event from the backend must never turn a completed or
   // failed item back into an active upload. A new explicit file event can
   // still start another upload for the same path.
-  if (payload?.type === 'progress' && terminalStates.has(current.state)) return current;
+  if (payload?.type === 'progress' && (terminalStates.has(current.state) || ['pausing', 'paused'].includes(current.state))) return current;
 
   const nextState = payload?.type === 'progress'
     ? (['preparing', 'processing'].includes(current.state) ? current.state : 'uploading')
@@ -49,6 +49,8 @@ export function nextUploadProgress(previous, payload, updatedAt = Date.now()) {
     preparing: '正在准备',
     uploading: '正在上传',
     processing: '已上传，正在等待云端入库',
+    pausing: '正在暂停并保存上传断点',
+    paused: '已暂停',
     done: '上传完成',
     error: '上传失败',
     cancelled: '已取消',

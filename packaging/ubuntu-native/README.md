@@ -1,12 +1,12 @@
 # 光鸭文件夹同步 Ubuntu 原生服务
 
-此安装包自带 Node.js 24、rclone Linux x64 运行时和生产依赖，不需要安装 Docker、Node.js 或 pnpm。支持使用 systemd 的 Ubuntu 20.04、22.04、24.04 x86_64；安装器会在缺少时通过 apt 安装 FUSE3。
+此安装包自带 Node.js 24、rclone Linux x64 运行时和生产依赖，不需要安装 Docker、Node.js 或 pnpm。支持使用 systemd 的 Ubuntu 20.04、22.04、24.04 x86_64；安装器会在缺少时通过 apt 安装 FFprobe/FFmpeg 与 FUSE3。
 
 ## 安装
 
 ```bash
-tar -xzf guangya-sync-native-ubuntu-x64-0.1.27.tar.gz
-cd guangya-sync-native-ubuntu-x64-0.1.27
+tar -xzf guangya-sync-native-ubuntu-x64-0.1.28.tar.gz
+cd guangya-sync-native-ubuntu-x64-0.1.28
 sudo ./install.sh
 ```
 
@@ -22,6 +22,7 @@ sudo ./install.sh
 - 网页服务器文件选择器：默认仅可浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；应用自身的 `DATA_DIR` 会被隐藏，以保护 SQLite 登录会话
 - 默认监控目录：`/var/lib/guangya-sync/watch`
 - 上传后归档目录：`/var/lib/guangya-sync/archive`
+- Emby STRM 虚拟库：`/var/lib/guangya-sync/virtual-library`
 
 如果只想开放指定目录，或要修改默认监控与归档目录，请编辑 `/etc/guangya-sync.env`。多个可浏览根目录使用英文逗号分隔：
 
@@ -49,6 +50,17 @@ sudo guangya-sync restart
 
 ```bash
 GUANGYA_NATIVE_MOUNT_TARGET=/var/lib/guangya-sync/mount
+```
+
+## Emby STRM 虚拟库
+
+网页“设置 → 挂载 → Emby 虚拟库”可把云端视频和音频映射为同名 `.strm`，STRM 内容是云端纯路径，并可按每个目录决定是否下载 NFO、海报和字幕。Emby 原始地址（默认 `127.0.0.1:8096`）不受影响；客户端改连光鸭代理端口 `127.0.0.1:18096` 后，普通请求完整转发给 Emby，只有播放路径命中虚拟库清单时才返回 302 云盘直链。
+
+```bash
+GUANGYA_VIRTUAL_LIBRARY_ROOT=/var/lib/guangya-sync/virtual-library
+GUANGYA_EMBY_UPSTREAM=http://127.0.0.1:8096
+GUANGYA_EMBY_PROXY_HOST=0.0.0.0
+GUANGYA_EMBY_PROXY_ALLOW_NON_LOOPBACK=1
 ```
 
 管理账号和监听地址也保存在同一配置文件中：
