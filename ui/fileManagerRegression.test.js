@@ -239,6 +239,13 @@ test('GCID import passes the configured 32 workers through to the native runner'
   assert.match(submitSource, /concurrency:\s*Math\.min\(32,/);
 });
 
+test('GCID import tells users that restarting a completed JSON performs a full recheck', async () => {
+  const source = await cloudViewSource;
+  const importModal = sourceBetween(source, 'title="导入 GCID JSON"', 'title="选择服务器文件或文件夹"');
+
+  assert.match(importModal, /重复导入同一 JSON 会重新核对全部文件/);
+});
+
 test('CloudView applies compact breadcrumbs and the saved folder-open preference', async () => {
   const source = await cloudViewSource;
 

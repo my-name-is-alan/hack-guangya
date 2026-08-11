@@ -2017,7 +2017,7 @@ onBeforeUnmount(() => {
     >
       <div class="gcid-import-note">
         <FileAddOutlined aria-hidden="true" />
-        <span>导入到「{{ currentPath.at(-1)?.name || '全部文件' }}」下的新文件夹，启动后可关闭窗口继续处理。</span>
+        <span>导入到「{{ currentPath.at(-1)?.name || '全部文件' }}」下的新文件夹；重复导入同一 JSON 会重新核对全部文件，已存在的文件不会重复创建。</span>
       </div>
 
       <a-form layout="vertical" class="gcid-import-form">

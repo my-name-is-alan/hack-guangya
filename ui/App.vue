@@ -1996,7 +1996,7 @@ onBeforeUnmount(() => {
           type="info"
           show-icon
           message="导入光鸭 GCID 导出文件"
-          :description="`文件会导入到当前目录「${currentFolderName}」下的新文件夹；任务状态保存到本机，应用重启后仍可继续。`"
+          :description="`文件会导入到当前目录「${currentFolderName}」下的新文件夹；重复导入同一 JSON 会重新核对全部文件，已存在的文件不会重复创建。`"
           class="drawer-alert"
         />
 

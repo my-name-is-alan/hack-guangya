@@ -1819,6 +1819,12 @@ fn reset_remote_cache(remote_cache: &mut HashMap<String, String>) {
     remote_cache.insert(String::new(), String::new());
 }
 
+fn invalidate_remote_directory_cache(state: &SharedState) {
+    if let Ok(mut guard) = state.lock() {
+        reset_remote_cache(&mut guard.remote_cache);
+    }
+}
+
 fn trim_file_fingerprint_cache(database: &Path, max_entries: usize) -> Result<(), String> {
     let max_entries = i64::try_from(max_entries).map_err(|_| "缓存条目上限无效".to_string())?;
     open_database(database)?
@@ -3906,11 +3912,8 @@ fn prepare_gcid_import_database(
                destination_name = excluded.destination_name,
                total_files = excluded.total_files,
                total_size = excluded.total_size,
-               status = CASE
-                 WHEN gcid_import_jobs.status IN ('completed', 'completed_with_errors')
-                   THEN gcid_import_jobs.status
-                 ELSE 'ready'
-               END,
+               status = 'ready',
+               current_path = '',
                error = NULL,
                updated_at = excluded.updated_at",
             params![
@@ -3937,8 +3940,13 @@ fn prepare_gcid_import_database(
                    file_name = excluded.file_name,
                    file_size = excluded.file_size,
                    gcid = excluded.gcid,
-                   cid = excluded.cid
-                 WHERE gcid_import_files.status NOT IN ('imported', 'existing')",
+                   cid = excluded.cid,
+                   status = 'pending',
+                   attempts = 0,
+                   task_id = NULL,
+                   file_id = NULL,
+                   error = NULL,
+                   updated_at = excluded.updated_at",
             )
             .map_err(|error| format!("准备导入记录失败：{error}"))?;
         for file in files {
@@ -3957,14 +3965,6 @@ fn prepare_gcid_import_database(
                 .map_err(|error| format!("保存导入记录失败：{error}"))?;
         }
     }
-    transaction
-        .execute(
-            "UPDATE gcid_import_files
-             SET status = 'pending', error = '上次任务中断，已等待继续', updated_at = ?2
-             WHERE job_id = ?1 AND status = 'processing'",
-            params![job_id, now],
-        )
-        .map_err(|error| format!("恢复导入记录失败：{error}"))?;
     transaction
         .commit()
         .map_err(|error| format!("提交导入任务失败：{error}"))?;
@@ -4003,6 +4003,45 @@ fn load_gcid_import_counts(
         }
     }
     Ok(counts)
+}
+
+fn gcid_import_has_retryable_work(counts: &GcidImportCounts) -> bool {
+    counts.pending > 0
+        || counts.processing > 0
+        || counts.failed > 0
+        || counts.missed > 0
+        || counts.conflict > 0
+}
+
+fn gcid_import_is_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "completed_with_errors")
+}
+
+fn reset_all_gcid_import_files(database_path: &Path, job_id: &str) -> Result<(), String> {
+    open_database(database_path)?
+        .execute(
+            "UPDATE gcid_import_files
+             SET status = 'pending', attempts = 0, task_id = NULL, file_id = NULL,
+                 error = NULL, updated_at = ?2
+             WHERE job_id = ?1",
+            params![job_id, unix_timestamp()],
+        )
+        .map_err(|error| format!("重置导入记录失败：{error}"))?;
+    Ok(())
+}
+
+fn reset_retryable_gcid_import_files(database_path: &Path, job_id: &str) -> Result<(), String> {
+    open_database(database_path)?
+        .execute(
+            "UPDATE gcid_import_files
+             SET status = 'pending', attempts = 0, task_id = NULL, file_id = NULL,
+                 error = NULL, updated_at = ?2
+             WHERE job_id = ?1
+               AND status IN ('processing', 'failed', 'missed', 'conflict')",
+            params![job_id, unix_timestamp()],
+        )
+        .map_err(|error| format!("恢复未完成导入记录失败：{error}"))?;
+    Ok(())
 }
 
 fn load_gcid_import_status(
@@ -10265,6 +10304,9 @@ async fn prepare_gcid_import(
         &destination_parent_id,
         &destination_name,
     )?;
+    // A target can be deleted or renamed by this app, another client, or the
+    // official web UI. Re-imports must resolve fresh directory IDs.
+    invalidate_remote_directory_cache(state.inner());
     load_gcid_import_status(&database_path, Some(&job_id))?
         .ok_or_else(|| "创建导入任务后无法读取状态".to_string())
 }
@@ -10303,7 +10345,8 @@ fn start_gcid_import(
     }
     let current = load_gcid_import_status(&database_path, Some(&job_id))?
         .ok_or_else(|| "导入任务不存在，请重新选择 JSON".to_string())?;
-    if current.counts.pending == 0 && current.counts.processing == 0 && current.counts.failed == 0 {
+    let reimport_all = gcid_import_is_terminal(&current.status);
+    if !reimport_all && !gcid_import_has_retryable_work(&current.counts) {
         return Ok(current);
     }
     {
@@ -10312,18 +10355,26 @@ fn start_gcid_import(
             return Err("这个导入任务已经在运行".to_string());
         }
     }
-    let connection = open_database(&database_path)?;
-    if let Err(error) = connection.execute(
-        "UPDATE gcid_import_files
-         SET status = 'pending', attempts = 0, error = NULL, updated_at = ?2
-         WHERE job_id = ?1 AND status IN ('processing', 'failed')",
-        params![job_id, unix_timestamp()],
-    ) {
+    let reset_result = if reimport_all {
+        reset_all_gcid_import_files(&database_path, &job_id)
+    } else {
+        reset_retryable_gcid_import_files(&database_path, &job_id)
+    };
+    if let Err(error) = reset_result {
         if let Ok(mut guard) = state.lock() {
             guard.gcid_import_running.remove(&job_id);
         }
-        return Err(format!("恢复未完成导入记录失败：{error}"));
+        return Err(error);
     }
+    let connection = match open_database(&database_path) {
+        Ok(connection) => connection,
+        Err(error) => {
+            if let Ok(mut guard) = state.lock() {
+                guard.gcid_import_running.remove(&job_id);
+            }
+            return Err(error);
+        }
+    };
     if let Err(error) = connection.execute(
         "UPDATE gcid_import_jobs
          SET status = 'running', error = NULL, updated_at = ?2
@@ -12079,7 +12130,9 @@ async fn move_files(
         &[],
     )
     .await?;
-    finish_operation_response(&token, &device_id, response).await
+    let result = finish_operation_response(&token, &device_id, response).await?;
+    invalidate_remote_directory_cache(state.inner());
+    Ok(result)
 }
 
 #[tauri::command]
@@ -12097,7 +12150,9 @@ async fn delete_files(
         &[],
     )
     .await?;
-    finish_operation_response(&token, &device_id, response).await
+    let result = finish_operation_response(&token, &device_id, response).await?;
+    invalidate_remote_directory_cache(state.inner());
+    Ok(result)
 }
 
 #[tauri::command]
@@ -12115,7 +12170,9 @@ async fn restore_files(
         &[],
     )
     .await?;
-    finish_operation_response(&token, &device_id, response).await
+    let result = finish_operation_response(&token, &device_id, response).await?;
+    invalidate_remote_directory_cache(state.inner());
+    Ok(result)
 }
 
 #[tauri::command]
@@ -12133,7 +12190,9 @@ async fn permanently_delete_files(
         &[],
     )
     .await?;
-    finish_operation_response(&token, &device_id, response).await
+    let result = finish_operation_response(&token, &device_id, response).await?;
+    invalidate_remote_directory_cache(state.inner());
+    Ok(result)
 }
 
 #[tauri::command]
@@ -12216,6 +12275,7 @@ async fn batch_rename_files(
             return Err(format!("目标重命名失败（{}）：{error}", item.new_name));
         }
     }
+    invalidate_remote_directory_cache(state.inner());
     Ok(json!({ "renamed": staged.len() }))
 }
 
@@ -18974,7 +19034,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_gcid_import_is_idempotent_when_prepared_again() {
+    fn repreparing_completed_gcid_import_rechecks_every_file() {
         let root = std::env::temp_dir().join(format!("guangya-gcid-test-{}", Uuid::new_v4()));
         let database = root.join("state.sqlite3");
         let source = root.join("library.json");
@@ -18998,7 +19058,10 @@ mod tests {
         let connection = open_database(&database).expect("database should reopen");
         connection
             .execute(
-                "UPDATE gcid_import_files SET status = 'imported' WHERE job_id = ?1",
+                "UPDATE gcid_import_files
+                 SET status = 'imported', attempts = 3, task_id = 'old-task',
+                     file_id = 'old-file', error = 'old-error'
+                 WHERE job_id = ?1",
                 params![job_id],
             )
             .expect("file should become imported");
@@ -19018,9 +19081,140 @@ mod tests {
         let status = load_gcid_import_status(&database, Some(&job_id))
             .expect("status should load")
             .expect("status should exist");
-        assert_eq!(status.status, "completed");
-        assert_eq!(status.counts.imported, 1);
-        assert_eq!(status.counts.pending, 0);
+        assert_eq!(status.status, "ready");
+        assert_eq!(status.counts.imported, 0);
+        assert_eq!(status.counts.pending, 1);
+        let reset = open_database(&database)
+            .unwrap()
+            .query_row(
+                "SELECT attempts, task_id, file_id, error
+                 FROM gcid_import_files WHERE job_id = ?1",
+                params![job_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .expect("re-import state should load");
+        assert_eq!(reset, (0, None, None, None));
+        fs::remove_dir_all(root).expect("GCID fixture cleanup");
+    }
+
+    #[test]
+    fn retrying_gcid_import_requeues_missed_conflict_failed_and_processing_files() {
+        let root = std::env::temp_dir().join(format!("guangya-gcid-retry-test-{}", Uuid::new_v4()));
+        let database = root.join("state.sqlite3");
+        init_database(&database).expect("database should initialize");
+        let connection = open_database(&database).expect("database should open");
+        connection
+            .execute(
+                "INSERT INTO gcid_import_jobs
+                   (job_id, source_path, source_name, destination_parent_id,
+                    destination_name, total_files, total_size, status, created_at, updated_at)
+                 VALUES ('retry-job', 'source.json', 'source.json', '', 'Media Library',
+                         5, '5', 'completed_with_errors', 1, 1)",
+                [],
+            )
+            .expect("job should be inserted");
+        for (index, status) in ["imported", "missed", "conflict", "failed", "processing"]
+            .into_iter()
+            .enumerate()
+        {
+            connection
+                .execute(
+                    "INSERT INTO gcid_import_files
+                       (job_id, path, folder_path, file_name, file_size, gcid, cid,
+                        status, attempts, task_id, file_id, error, updated_at)
+                     VALUES ('retry-job', ?1, '', ?1, 1, ?2, ?3, ?4, 4,
+                             'old-task', 'old-file', 'old-error', 1)",
+                    params![
+                        format!("{index}.mkv"),
+                        format!("{index:040X}"),
+                        format!("{:040X}", index + 100),
+                        status
+                    ],
+                )
+                .expect("file should be inserted");
+        }
+        drop(connection);
+
+        let before = load_gcid_import_status(&database, Some("retry-job"))
+            .unwrap()
+            .unwrap();
+        assert!(gcid_import_has_retryable_work(&before.counts));
+        reset_retryable_gcid_import_files(&database, "retry-job")
+            .expect("retryable files should be reset");
+        let after = load_gcid_import_status(&database, Some("retry-job"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.counts.imported, 1);
+        assert_eq!(after.counts.pending, 4);
+        assert_eq!(
+            open_database(&database)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM gcid_import_files
+                     WHERE job_id = 'retry-job' AND status = 'pending'
+                       AND attempts = 0 AND task_id IS NULL AND file_id IS NULL AND error IS NULL",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            4
+        );
+        fs::remove_dir_all(root).expect("GCID fixture cleanup");
+    }
+
+    #[test]
+    fn restarting_terminal_gcid_import_rechecks_imported_and_existing_files() {
+        let root =
+            std::env::temp_dir().join(format!("guangya-gcid-reimport-test-{}", Uuid::new_v4()));
+        let database = root.join("state.sqlite3");
+        init_database(&database).expect("database should initialize");
+        let connection = open_database(&database).expect("database should open");
+        connection
+            .execute(
+                "INSERT INTO gcid_import_jobs
+                   (job_id, source_path, source_name, destination_parent_id,
+                    destination_name, total_files, total_size, status, created_at, updated_at)
+                 VALUES ('reimport-job', 'source.json', 'source.json', '', 'Media Library',
+                         2, '2', 'completed', 1, 1)",
+                [],
+            )
+            .expect("job should be inserted");
+        for (index, status) in ["imported", "existing"].into_iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO gcid_import_files
+                       (job_id, path, folder_path, file_name, file_size, gcid, cid,
+                        status, attempts, task_id, file_id, error, updated_at)
+                     VALUES ('reimport-job', ?1, '', ?1, 1, ?2, ?3, ?4, 4,
+                             'old-task', 'old-file', 'old-error', 1)",
+                    params![
+                        format!("{index}.mkv"),
+                        format!("{index:040X}"),
+                        format!("{:040X}", index + 100),
+                        status
+                    ],
+                )
+                .expect("file should be inserted");
+        }
+        drop(connection);
+
+        assert!(gcid_import_is_terminal("completed"));
+        assert!(gcid_import_is_terminal("completed_with_errors"));
+        reset_all_gcid_import_files(&database, "reimport-job")
+            .expect("terminal import should be reset");
+        let after = load_gcid_import_status(&database, Some("reimport-job"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.counts.pending, 2);
+        assert_eq!(after.counts.imported, 0);
+        assert_eq!(after.counts.existing, 0);
         fs::remove_dir_all(root).expect("GCID fixture cleanup");
     }
 }
