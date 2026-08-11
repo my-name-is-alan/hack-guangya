@@ -334,10 +334,11 @@ HDHive 请求矩阵：
 | 读取整理状态 | `get_organizer_state` | 同名 | `GET /api/organizer` | SQLite | Local/R；返回原生引擎版本、TMDB 公开配置、监控映射和最近 100 条任务，不返回密钥。 |
 | 保存识别设置 | `update_organizer_settings` | 同名 | `PUT /api/organizer/settings` | SQLite | Local/R；保存语言、匹配阈值、成人内容开关、电影/电视剧完整路径模板和分类值；页面提供三个模板预设；空密钥表示保留旧值，`TMDB_API_KEY` / `TMDB_READ_ACCESS_TOKEN` 等非空环境变量优先。 |
 | 测试 TMDB | `test_organizer_connection` | 同名 | `POST /api/organizer/test` | `GET /3/configuration` | 3P/R；v3 Key 使用 `api_key`，Read Access Token 使用 Bearer，不记录完整凭据。 |
-| 新增/更新监控 | `add_organizer_mapping` / `update_organizer_mapping` | 同名 | `POST/PATCH /api/organizer/mappings` | 光鸭云盘文件列表 | Local/R；来源 A 与目标 B 必须是已选择的云端目录 ID，路径仅用于展示；两者不得相同或互相包含；固定为云端轮询，识别或整理期间拒绝修改。 |
+| 新增/更新监控 | `add_organizer_mapping` / `update_organizer_mapping` | 同名 | `POST/PATCH /api/organizer/mappings` | 光鸭云盘文件列表 | Local/R；来源 A 是已选择的云端目录，目标 B 必须来自全局“刮削输出”的媒体库目标；目标路径跟随全局配置更新。两者不得相同或互相包含；固定为云端轮询，识别或整理期间拒绝修改。监控不复制规则，每次识别统一读取全局二级分类、辅助识别、搜索和命名设置。 |
 | 删除监控 | `remove_organizer_mapping` | 同名 | `DELETE /api/organizer/mappings/{id}` | SQLite/云端列表 | Local/R；识别或整理期间拒绝删除；删除监控和历史记录不删除 A/B 中任何云端文件。 |
 | 立即扫描 | `scan_organizer_mapping` | 同名 | `POST /api/organizer/mappings/{id}/scan` | 光鸭云盘文件列表 | Local/R；A 根目录一级文件夹或单个视频为候选项，候选内部递归识别视频、字幕、音轨和花絮。 |
 | 执行整理 | `run_organizer_job` | 同名 | `POST /api/organizer/jobs/{id}/run` | 光鸭云盘 copy/move/rename/upload | Local/RW；重新校验源指纹和配置签名后，只执行云盘内复制/移动、冲突策略和可选刮削；不支持硬链接/软链接或跨盘路径；移动/覆盖需确认旧分享失效风险。模板变量同时接受 `{tmdb_id}`/`{tmdbid}`、`{category}`/`{catgroy}` 和 `{Season x}`/`{Expose n}` 别名。 |
+| 分享整理结果 | `share_organizer_job` | 同名 | `POST /api/organizer/jobs/{id}/share` | `POST /userres/v1/share_file` | Local/RW；仅允许已完成任务，按预览中的 `share_relative_path` 定位已存在的最终电影/剧集目录并创建新分享，不会创建缺失目录，也不要求用户逐层进入二级分类路径。每次点击生成新链接并可继续投递 HDHive。 |
 | 重新识别 | `retry_organizer_job` | 同名 | `POST /api/organizer/jobs/{id}/retry` | TMDB search/details/season | 3P/R；可覆盖标题、年份、`tmdb_id`、媒体类型、季号、集号及结束集号。 |
 | 删除单条历史 | `remove_organizer_job` | 同名 | `DELETE /api/organizer/jobs/{id}` | SQLite | Local/RW；运行中的任务不可删除，只删除整理记录，不触碰 A/B 云端文件。 |
 

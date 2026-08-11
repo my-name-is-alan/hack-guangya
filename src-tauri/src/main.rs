@@ -15,14 +15,14 @@ use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMod
 use organizer::{
     add_organizer_mapping, get_organizer_state, rearchive_organizer_job, remove_organizer_job,
     remove_organizer_mapping, retry_organizer_job, run_organizer_job, scan_organizer_mapping,
-    scrape_selected_files, start as start_organizer, test_organizer_connection,
-    update_organizer_mapping, update_organizer_settings,
+    scrape_selected_files, share_organizer_job, start as start_organizer,
+    test_organizer_connection, update_organizer_mapping, update_organizer_settings,
 };
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use reqwest::header::{
     HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_RANGE, CONTENT_TYPE, DATE, ETAG, RANGE,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::Sha1;
@@ -95,7 +95,7 @@ const AUTO_SHARE_QUIET_SECS: i64 = 30;
 const TOKEN_REFRESH_INTERVAL_SECS: u64 = 20 * 60;
 const DEFAULT_WEBDAV_PORT: u16 = 19_090;
 const DEFAULT_WEBDAV_USERNAME: &str = "guangya";
-const MAX_GCID_IMPORT_CONCURRENCY: usize = 16;
+const MAX_GCID_IMPORT_CONCURRENCY: usize = 32;
 const MAX_GCID_IMPORT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_GCID_IMPORT_ATTEMPTS: i64 = 5;
 const GCID_EXPORT_FILE_CONCURRENCY: usize = 8;
@@ -4092,8 +4092,12 @@ fn claim_gcid_import_file(
     job_id: &str,
 ) -> Result<Option<GcidImportFile>, String> {
     let mut connection = open_database(database_path)?;
+    // A deferred transaction lets every worker read the same pending row and
+    // then makes all but one fail while upgrading to a writer. Reserving the
+    // write lock before the SELECT keeps claiming serialized while the cloud
+    // work itself still runs at the configured concurrency.
     let transaction = connection
-        .transaction()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| format!("开始领取导入记录失败：{error}"))?;
     let record = transaction
         .query_row(
@@ -16675,6 +16679,7 @@ fn run() {
             run_organizer_job,
             retry_organizer_job,
             rearchive_organizer_job,
+            share_organizer_job,
             scrape_selected_files,
             resume_queue,
             get_app_version,
@@ -18903,6 +18908,69 @@ mod tests {
         assert_eq!(first.len(), 32);
         assert!(validate_gcid_destination("Media Library").is_ok());
         assert!(validate_gcid_destination("../Media Library").is_err());
+    }
+
+    #[test]
+    fn concurrent_gcid_workers_claim_distinct_files_without_exiting_on_sqlite_lock() {
+        let root = std::env::temp_dir().join(format!("guangya-gcid-claim-test-{}", Uuid::new_v4()));
+        let database = root.join("state.sqlite3");
+        init_database(&database).expect("database should initialize");
+        let connection = open_database(&database).expect("database should open");
+        connection
+            .execute(
+                "INSERT INTO gcid_import_jobs
+                   (job_id, source_path, source_name, destination_parent_id,
+                    destination_name, total_files, total_size, status, created_at, updated_at)
+                 VALUES ('job', 'source.json', 'source.json', '', 'Media Library',
+                         ?1, '32', 'running', 1, 1)",
+                params![MAX_GCID_IMPORT_CONCURRENCY],
+            )
+            .expect("job should be inserted");
+        for index in 0..MAX_GCID_IMPORT_CONCURRENCY {
+            let path = format!("Movies/{index:02}.mkv");
+            connection
+                .execute(
+                    "INSERT INTO gcid_import_files
+                       (job_id, path, folder_path, file_name, file_size, gcid, cid, updated_at)
+                     VALUES ('job', ?1, 'Movies', ?2, 1, ?3, ?4, 1)",
+                    params![
+                        path,
+                        format!("{index:02}.mkv"),
+                        format!("{index:040X}"),
+                        format!("{:040X}", index + 100)
+                    ],
+                )
+                .expect("file should be inserted");
+        }
+        drop(connection);
+
+        let barrier = Arc::new(std::sync::Barrier::new(MAX_GCID_IMPORT_CONCURRENCY + 1));
+        let workers = (0..MAX_GCID_IMPORT_CONCURRENCY)
+            .map(|_| {
+                let database = database.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    claim_gcid_import_file(&database, "job")
+                        .expect("concurrent claim should wait for the writer")
+                        .expect("a pending file should remain")
+                        .path
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let claimed = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker should finish"))
+            .collect::<HashSet<_>>();
+        assert_eq!(claimed.len(), MAX_GCID_IMPORT_CONCURRENCY);
+        let counts = load_gcid_import_status(&database, Some("job"))
+            .expect("status should load")
+            .expect("job should exist")
+            .counts;
+        assert_eq!(counts.processing, MAX_GCID_IMPORT_CONCURRENCY as u64);
+        assert_eq!(counts.pending, 0);
+        fs::remove_dir_all(root).expect("GCID fixture cleanup");
     }
 
     #[test]

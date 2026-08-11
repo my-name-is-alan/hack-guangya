@@ -230,6 +230,15 @@ test('GCID import keeps creation compact and moves running progress into a detai
   assert.match(statusSource, /<a-drawer[^>]*title="GCID 导入详情"/);
 });
 
+test('GCID import passes the configured 32 workers through to the native runner', async () => {
+  const source = await cloudViewSource;
+  const importModal = sourceBetween(source, 'title="导入 GCID JSON"', 'title="选择服务器文件或文件夹"');
+  const submitSource = sourceBetween(source, 'async function submitGcidImport()', 'async function readDirectoryEntry');
+
+  assert.match(importModal, /v-model:value="gcidImport\.concurrency"[^>]*:max="32"/);
+  assert.match(submitSource, /concurrency:\s*Math\.min\(32,/);
+});
+
 test('CloudView applies compact breadcrumbs and the saved folder-open preference', async () => {
   const source = await cloudViewSource;
 

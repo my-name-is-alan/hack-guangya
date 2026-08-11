@@ -1465,7 +1465,7 @@ async function submitGcidImport() {
     }
     status = unwrapData(await bridge.invoke('start_gcid_import', {
       job_id: status.job_id,
-      concurrency: Math.min(16, Math.max(1, Math.round(Number(gcidImport.concurrency) || 4))),
+      concurrency: Math.min(32, Math.max(1, Math.round(Number(gcidImport.concurrency) || 4))),
     }));
     applyGcidImportStatus(status);
     startGcidImportPolling();
@@ -2039,7 +2039,7 @@ onBeforeUnmount(() => {
           </a-col>
           <a-col :span="9">
             <a-form-item label="并发数">
-              <a-input-number v-model:value="gcidImport.concurrency" :min="1" :max="16" :precision="0" :disabled="gcidImportRunning" style="width:100%" />
+              <a-input-number v-model:value="gcidImport.concurrency" :min="1" :max="32" :precision="0" :disabled="gcidImportRunning" style="width:100%" />
             </a-form-item>
           </a-col>
         </a-row>

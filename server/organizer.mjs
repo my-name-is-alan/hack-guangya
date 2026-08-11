@@ -156,6 +156,24 @@ function normalizeScrapeTargets(value) {
   });
 }
 
+function configuredOutputTarget(targets, targetDirId) {
+  const normalizedId = cleanText(targetDirId);
+  return (Array.isArray(targets) ? targets : []).find((target) => cleanText(target?.dir_id ?? target?.target_dir_id) === normalizedId) || null;
+}
+
+function bindConfiguredOutputTarget(mapping, targets, { allowLegacy = false } = {}) {
+  const target = configuredOutputTarget(targets, mapping.target_dir_id);
+  if (!target) {
+    if (allowLegacy) return mapping;
+    throw new Error('目标 B 目录必须从“刮削输出”中已配置的媒体库目标选择');
+  }
+  return {
+    ...mapping,
+    target_dir_id: cleanText(target.dir_id ?? target.target_dir_id),
+    target_path: normalizeCloudPath(target.path ?? target.target_path, '/'),
+  };
+}
+
 export function normalizeOrganizerMappingInput(input = {}, current = {}) {
   const sourceDirId = cleanText(input.source_dir_id ?? current.source_dir_id);
   const targetDirId = cleanText(input.target_dir_id ?? current.target_dir_id);
@@ -697,8 +715,13 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     const apiBase = normalizeMirrorUrl(input.tmdb_api_base ?? input.tmdb_url_base ?? input.tmdb_api_proxy, stored.tmdb_api_base || 'https://api.themoviedb.org/3', 'TMDB API 镜像');
     const imageBase = normalizeMirrorUrl(input.tmdb_image_base ?? input.tmdb_image_url ?? input.tmdb_image_proxy, stored.tmdb_image_base || 'https://image.tmdb.org/t/p', 'TMDB 图片镜像');
     const categoryRules = normalizeCategoryRules(input.category_rules ?? parseJson(stored.category_rules, DEFAULT_CATEGORY_RULES));
-    const scrapeTargets = normalizeScrapeTargets(input.scrape_targets ?? parseJson(stored.scrape_targets, []));
+    const previousScrapeTargets = normalizeScrapeTargets(parseJson(stored.scrape_targets, []));
+    const scrapeTargets = normalizeScrapeTargets(input.scrape_targets ?? previousScrapeTargets);
     const defaultScrapeTypes = normalizeScrapeTypes(input.default_scrape_types ?? parseJson(stored.default_scrape_types, DEFAULT_SCRAPE_TYPES), true);
+    const nextTargetIds = new Set(scrapeTargets.map((target) => target.dir_id));
+    const removedTargetIds = new Set(previousScrapeTargets.map((target) => target.dir_id).filter((id) => !nextTargetIds.has(id)));
+    const usedRemovedTarget = listMappings().find((mapping) => removedTargetIds.has(mapping.target_dir_id));
+    if (usedRemovedTarget) throw new Error(`刮削输出“${usedRemovedTarget.target_path}”仍被整理监控使用，请先修改对应监控的输出目标`);
     database.prepare(`INSERT INTO organizer_settings
       (id, tmdb_api_key, language, image_language, include_adult, minimum_match_score, word_segment_search, similarity_match,
        recognition_words, release_groups, render_words, capture_groups, include_media_info, movie_path_template, tv_path_template, movie_category, tv_category,
@@ -717,6 +740,8 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
       .run(apiKey, language, imageLanguage, Number(includeAdult), minimumMatchScore, Number(wordSegmentSearch), Number(similarityMatch),
         recognitionWords, releaseGroups, renderWords, captureGroups, Number(includeMediaInfo), moviePathTemplate, tvPathTemplate, movieCategory, tvCategory,
         apiBase, imageBase, JSON.stringify(categoryRules), JSON.stringify(scrapeTargets), JSON.stringify(defaultScrapeTypes), nowSeconds());
+    const updateMappingTargetPath = database.prepare('UPDATE organizer_mappings SET target_path = ?, updated_at = ? WHERE target_dir_id = ?');
+    for (const target of scrapeTargets) updateMappingTargetPath.run(target.path, nowSeconds(), target.dir_id);
     emit('settings-updated');
     return publicSettings();
   }
@@ -771,7 +796,11 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
 
   async function addMapping(input = {}) {
     if (!publicSettings().configured) throw new Error('请先配置 TMDB API Key');
-    const normalized = normalizeOrganizerMappingInput(input, { enabled: true, scan_existing: true, transfer_type: 'copy', scrape: false, scrape_types: publicSettings().default_scrape_types, sync_extras: true, conflict_policy: 'skip', auto_execute: false, share_after_organize: false, settle_seconds: 30 });
+    const settings = publicSettings();
+    const normalized = bindConfiguredOutputTarget(
+      normalizeOrganizerMappingInput(input, { enabled: true, scan_existing: true, transfer_type: 'copy', scrape: false, scrape_types: settings.default_scrape_types, sync_extras: true, conflict_policy: 'skip', auto_execute: false, share_after_organize: false, settle_seconds: 30 }),
+      settings.scrape_targets,
+    );
     await validateMapping(normalized);
     if (listMappings().some((item) => item.source_dir_id === normalized.source_dir_id)) throw new Error('该云盘 A 目录已经存在整理监控');
     const timestamp = nowSeconds();
@@ -797,8 +826,10 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     return withMappingMutation(id, async () => {
       const current = getMapping(id);
       if (!current) throw new Error('整理监控不存在');
-      const normalized = normalizeOrganizerMappingInput(input, current);
-      if (normalized.enabled && !publicSettings().configured) throw new Error('请先配置 TMDB API Key');
+      const settings = publicSettings();
+      const targetWasSubmitted = input.target_dir_id !== undefined || input.target_path !== undefined;
+      const normalized = bindConfiguredOutputTarget(normalizeOrganizerMappingInput(input, current), settings.scrape_targets, { allowLegacy: !targetWasSubmitted });
+      if (normalized.enabled && !settings.configured) throw new Error('请先配置 TMDB API Key');
       await validateMapping(normalized);
       if (listMappings().some((item) => item.id !== id && item.source_dir_id === normalized.source_dir_id)) throw new Error('该云盘 A 目录已经存在整理监控');
       saveMapping({ ...current, ...normalized, id, updated_at: nowSeconds() });
@@ -1316,6 +1347,31 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     try { return await executeJobInner(id); } finally { executingJobs.delete(id); }
   }
 
+  async function shareJob(id) {
+    if (executingJobs.has(id)) throw new Error('该任务正在整理，请等待完成');
+    const job = getJob(id);
+    if (!job) throw new Error('整理任务不存在');
+    if (!['completed', 'completed_warning'].includes(job.status)) throw new Error('只有已完成的整理任务才能创建分享');
+    const mapping = getMapping(job.mapping_id);
+    if (!mapping) throw new Error('整理监控不存在');
+    const relativePath = cleanText(job.preview?.share_relative_path);
+    if (!relativePath) throw new Error('整理预览缺少最终媒体目录，无法创建分享');
+    if (typeof cloud.shareAfterOrganize !== 'function') throw new Error('当前运行端未接入整理后分享');
+    const resolver = createTargetResolver(mapping);
+    const target = await resolver.resolve(relativePath, true);
+    if (!target?.id || !target.is_directory) throw new Error('最终媒体目录已经不存在，无法创建分享');
+    const share = await cloud.shareAfterOrganize({
+      mappingId: mapping.id,
+      remoteTargetId: target.id,
+      title: cleanText(job.preview?.share_title) || '整理后的媒体',
+      targetType: 'folder',
+    });
+    const result = { ...(job.result || {}), success: true, share };
+    updateJob(id, { result_json: JSON.stringify(result) });
+    emit('job-updated', { job_id: id, mapping_id: mapping.id, status: job.status, shared: true });
+    return share;
+  }
+
   async function runJob(id, input = {}) {
     const job = getJob(id);
     if (!job) throw new Error('整理任务不存在');
@@ -1437,7 +1493,7 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     pendingTimers.clear();
   }
 
-  return { state, updateSettings, testConnection, addMapping, updateMapping, removeMapping, removeJob, scanMapping, runJob, retryJob, rearchiveJob, notifyUpload, scrapeSelected, initialize, close };
+  return { state, updateSettings, testConnection, addMapping, updateMapping, removeMapping, removeJob, scanMapping, runJob, retryJob, rearchiveJob, shareJob, notifyUpload, scrapeSelected, initialize, close };
 }
 
 export const organizerInternals = {
@@ -1450,5 +1506,6 @@ export const organizerInternals = {
   normalizeScrapeTypes,
   normalizeSettleSeconds,
   normalizeTransferType,
+  bindConfiguredOutputTarget,
   parseFfprobeTechnicalData,
 };

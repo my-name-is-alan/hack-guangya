@@ -129,3 +129,18 @@ test('organizer default categories persist immediately and history exposes rearc
   }
   assert.match(bridgeSource, /remove_organizer_job[\s\S]*method: 'DELETE'[\s\S]*JSON\.stringify\(args\.input/);
 });
+
+test('organizer monitors use global output and rules while completed jobs share the final media folder', () => {
+  assert.match(organizerViewSource, /输出媒体库（刮削输出）[\s\S]*:options="scrapeTargetOptions"/);
+  assert.match(organizerViewSource, /统一沿用全局整理规则/);
+  assert.match(organizerViewSource, /二级分类[\s\S]*辅助识别[\s\S]*搜索策略/);
+  assert.match(organizerViewSource, /share_organizer_job/);
+  assert.match(organizerViewSource, /最终媒体目录分享/);
+  assert.match(bridgeSource, /share_organizer_job[\s\S]*\/share/);
+  assert.match(serverOrganizerSource, /bindConfiguredOutputTarget[\s\S]*刮削输出/);
+  const shareStart = serverOrganizerSource.indexOf('async function shareJob(id)');
+  const shareEnd = serverOrganizerSource.indexOf('async function runJob', shareStart);
+  assert.ok(shareStart >= 0 && shareEnd > shareStart);
+  assert.match(serverOrganizerSource.slice(shareStart, shareEnd), /resolver\.resolve\(relativePath, true\)/);
+  assert.doesNotMatch(serverOrganizerSource.slice(shareStart, shareEnd), /ensureDirectory/);
+});

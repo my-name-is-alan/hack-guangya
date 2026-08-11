@@ -5,6 +5,7 @@ import {
   ArrowLeftOutlined,
   CheckCircleOutlined,
   CloseCircleOutlined,
+  CopyOutlined,
   DeleteOutlined,
   EditOutlined,
   EyeOutlined,
@@ -14,11 +15,12 @@ import {
   PlusOutlined,
   ReloadOutlined,
   SearchOutlined,
+  ShareAltOutlined,
   SettingOutlined,
   WarningOutlined,
 } from '@antdv-next/icons';
 import { bridge } from '../bridge.js';
-import { errorText, fileId, formatSize, isFolder, unwrapData } from '../formatters.js';
+import { copyText, errorText, fileId, formatSize, isFolder, unwrapData } from '../formatters.js';
 import {
   organizerCandidates,
   organizerConflictLabel,
@@ -169,6 +171,22 @@ const previewSummary = computed(() => preview.job?.preview?.data?.summary || {})
 const reviewCandidates = computed(() => organizerCandidates(review.job));
 const mappingTitle = computed(() => mappingDrawer.editingId ? '编辑整理监控' : '新增整理监控');
 const pathPresetOptions = computed(() => (organizer.settings.path_presets || []).map((item) => ({ label: item.name, value: item.id })));
+const scrapeTargetOptions = computed(() => (organizer.settings.scrape_targets || []).map((target) => ({
+  label: `${target.name || '媒体库'} · ${target.path || '/'}`,
+  value: String(target.dir_id || target.target_dir_id || ''),
+})).filter((item) => item.value));
+const mappingTargetConfigured = computed(() => scrapeTargetOptions.value.some((item) => item.value === String(mappingForm.target_dir_id || '')));
+const globalRuleSummary = computed(() => {
+  const settings = organizer.settings || DEFAULT_SETTINGS;
+  const auxiliary = ['recognition_words', 'release_groups', 'render_words', 'capture_groups']
+    .filter((key) => String(settings[key] || '').split(/\r?\n/).some((line) => line.trim() && !line.trim().startsWith('#'))).length;
+  const categoryCount = (settings.category_rules || []).filter((rule) => rule.enabled !== false).length;
+  const search = [
+    settings.word_segment_search !== false ? '分词搜索' : '',
+    settings.similarity_match !== false ? `相似度 ≥ ${Number(settings.minimum_match_score ?? 0.72).toFixed(2)}` : '仅精确匹配',
+  ].filter(Boolean).join(' · ');
+  return { auxiliary, categoryCount, search };
+});
 const templateExamples = computed(() => organizerTemplateExamples(
   settingsForm.movie_path_template,
   settingsForm.tv_path_template,
@@ -222,7 +240,7 @@ const jobColumns = [
   { title: '识别与目标', key: 'result', width: 300 },
   { title: '状态', key: 'status', width: 108 },
   { title: '更新时间', key: 'time', width: 142 },
-  { title: '操作', key: 'actions', width: 210 },
+  { title: '操作', key: 'actions', width: 330 },
 ];
 
 const JOB_DELETE_ACTIONS = Object.freeze([
@@ -358,6 +376,7 @@ function resetMappingForm() {
 function openNewMapping() {
   mappingDrawer.editingId = '';
   resetMappingForm();
+  if (scrapeTargetOptions.value.length === 1) selectMappingOutputTarget(scrapeTargetOptions.value[0].value);
   mappingDrawer.open = true;
 }
 
@@ -383,6 +402,22 @@ function openEditMapping(mapping) {
     settle_seconds: Number(mapping.settle_seconds || 30),
   });
   mappingDrawer.open = true;
+}
+
+function selectMappingOutputTarget(value) {
+  const target = (organizer.settings.scrape_targets || []).find((item) => String(item.dir_id || item.target_dir_id || '') === String(value || ''));
+  mappingForm.target_dir_id = target ? String(target.dir_id || target.target_dir_id || '') : '';
+  mappingForm.target_path = target ? String(target.path || target.target_path || '/') : '';
+}
+
+function configureScrapeTargets() {
+  mappingDrawer.open = false;
+  settingsSection.value = 'scrape';
+}
+
+function mappingOutputName(mapping) {
+  const target = (organizer.settings.scrape_targets || []).find((item) => String(item.dir_id || item.target_dir_id || '') === String(mapping.target_dir_id || ''));
+  return target?.name || '旧版自定义目标';
 }
 
 function applyPathPreset(value) {
@@ -468,6 +503,12 @@ function openEditTarget(target) {
 }
 
 function removeTarget(target) {
+  const dirId = String(target.dir_id || target.target_dir_id || '');
+  const usedBy = organizer.mappings.find((mapping) => String(mapping.target_dir_id || '') === dirId);
+  if (usedBy) {
+    message.warning(`该输出仍被监控 ${usedBy.source_path} 使用，请先修改监控的输出媒体库`);
+    return;
+  }
   settingsForm.scrape_targets = settingsForm.scrape_targets.filter((item) => item.id !== target.id);
 }
 
@@ -562,7 +603,11 @@ async function submitMapping() {
     return;
   }
   if (!mappingForm.target_dir_id) {
-    message.warning('请选择光鸭云盘目标 B 目录');
+    message.warning('请从刮削输出中选择媒体库目标');
+    return;
+  }
+  if (!mappingTargetConfigured.value) {
+    message.warning('当前 B 目录不在“刮削输出”目标中，请重新选择');
     return;
   }
   if (!organizer.settings.configured) {
@@ -702,6 +747,45 @@ async function runJob(job) {
   } finally {
     jobBusy[job.id] = false;
   }
+}
+
+function jobShareUrl(job) {
+  const share = job?.result?.share || {};
+  return String(share.share_url || share.shareUrl || share.shareURL || share.url || '').trim();
+}
+
+async function copyJobShare(job) {
+  const url = jobShareUrl(job);
+  if (!url) {
+    message.warning('当前任务还没有分享链接');
+    return;
+  }
+  await copyText(url, message);
+}
+
+function createJobShare(job) {
+  const existing = jobShareUrl(job);
+  Modal.confirm({
+    title: existing ? '重新创建最终媒体目录分享' : '创建最终媒体目录分享',
+    content: `将直接分享“${job.preview?.share_title || fileName(job.source_path)}”整理后的最终媒体文件夹，不需要逐层进入分类目录。${existing ? '这会生成一个新链接，旧链接不会复用。' : ''}`,
+    okText: existing ? '创建新链接' : '创建分享',
+    cancelText: '取消',
+    async onOk() {
+      jobBusy[`share:${job.id}`] = true;
+      try {
+        const share = await bridge.invoke('share_organizer_job', { id: job.id });
+        await loadState({ silent: true });
+        const url = String(share?.share_url || share?.shareUrl || share?.shareURL || share?.url || '').trim();
+        if (url) await copyText(url, message);
+        else message.success('最终媒体目录分享已创建');
+      } catch (error) {
+        message.error(errorText(error));
+        throw error;
+      } finally {
+        jobBusy[`share:${job.id}`] = false;
+      }
+    },
+  });
 }
 
 function openReview(job, mode = 'review') {
@@ -994,7 +1078,7 @@ onBeforeUnmount(() => {
                   {{ mapping.watch_error ? '监控异常' : mapping.enabled ? '监控中' : '已暂停' }}
                 </a-tag>
               </div>
-              <span class="path-flow">A {{ mapping.source_path }} → B {{ mapping.target_path }}</span>
+              <span class="path-flow">A {{ mapping.source_path }} → B {{ mappingOutputName(mapping) }} · {{ mapping.target_path }}</span>
               <div class="mapping-meta">
                 <span>云端每 15 秒轮询</span>
                 <span>{{ organizerMediaLabel(mapping.media_type) }}</span>
@@ -1066,6 +1150,8 @@ onBeforeUnmount(() => {
                 <a-button v-if="record.status === 'ready'" type="primary" size="small" :loading="jobBusy[record.id]" @click="runJob(record)"><PlayCircleOutlined />执行</a-button>
                 <a-button v-else-if="record.status === 'needs_review'" type="link" size="small" :loading="jobBusy[record.id]" @click="openReview(record)"><SearchOutlined />人工确认</a-button>
                 <a-button v-if="['failed', 'completed', 'completed_warning'].includes(record.status)" type="link" size="small" :loading="jobBusy[record.id]" @click="openReorganize(record)"><ReloadOutlined />重新归档</a-button>
+                <a-button v-if="['completed', 'completed_warning'].includes(record.status) && record.preview?.share_relative_path" type="link" size="small" :loading="jobBusy[`share:${record.id}`]" @click="createJobShare(record)"><ShareAltOutlined />{{ jobShareUrl(record) ? '重新分享' : '创建分享' }}</a-button>
+                <a-button v-if="jobShareUrl(record)" type="text" size="small" aria-label="复制整理分享链接" @click="copyJobShare(record)"><CopyOutlined /></a-button>
                 <a-button v-if="!['recognizing', 'running'].includes(record.status)" type="text" danger size="small" :loading="jobBusy[record.id]" :aria-label="`删除整理记录 ${fileName(record.source_path)}`" @click="openDeleteActions(record)"><DeleteOutlined />删除</a-button>
               </a-space>
             </template>
@@ -1089,16 +1175,27 @@ onBeforeUnmount(() => {
           <a-button style="width: 92px" @click="openCloudFolderPicker('source')"><FolderOpenOutlined />选择</a-button>
         </a-input-group>
       </a-form-item>
-      <a-form-item label="目标 B 目录" required extra="路径模板生成的相对目录和文件名会写入这个云盘目录。">
-        <a-input-group compact>
-          <a-input v-model:value="mappingForm.target_path" readonly placeholder="选择网盘内媒体库根目录" style="width: calc(100% - 92px)" />
-          <a-button style="width: 92px" @click="openCloudFolderPicker('target')"><FolderOpenOutlined />选择</a-button>
-        </a-input-group>
+      <a-form-item label="输出媒体库（刮削输出）" required extra="监控只能写入“刮削输出”中统一配置的媒体库目标；路径模板会在该目录下创建分类结构。">
+        <a-select :value="mappingForm.target_dir_id || undefined" :options="scrapeTargetOptions" placeholder="选择已配置的刮削输出目标" @change="selectMappingOutputTarget" />
+        <div class="output-target-help">
+          <small>{{ mappingForm.target_path || '尚未选择输出目录' }}</small>
+          <a-button type="link" size="small" @click="configureScrapeTargets">管理刮削输出</a-button>
+        </div>
+        <a-alert v-if="mappingForm.target_dir_id && !mappingTargetConfigured" type="warning" show-icon message="这是旧版自定义 B 目录；保存前需要改为刮削输出中配置的目标。" />
       </a-form-item>
+      <div class="global-rule-source" aria-label="全局整理规则继承说明">
+        <div><strong>统一沿用全局整理规则</strong><a-tag color="blue">自动联动</a-tag></div>
+        <p>监控不再维护重复规则；每次识别都会读取最新的全局二级分类、辅助识别、搜索设置和命名模板。</p>
+        <div class="global-rule-metrics">
+          <span><small>二级分类</small><strong>{{ globalRuleSummary.categoryCount }} 条启用</strong></span>
+          <span><small>辅助识别</small><strong>{{ globalRuleSummary.auxiliary }} 组已配置</strong></span>
+          <span><small>搜索策略</small><strong>{{ globalRuleSummary.search }}</strong></span>
+        </div>
+      </div>
       <div class="mapping-template-preview" aria-label="当前命名规则预览">
         <span><strong>电影命名</strong><code>{{ templateExamples.movie.path || '尚无预览' }}</code></span>
         <span><strong>电视剧命名</strong><code>{{ templateExamples.tv.path || '尚无预览' }}</code></span>
-        <small>当前归档规则使用“通用配置”中的全局命名模板和“二级分类”中的首条命中规则。</small>
+        <small>全局规则保存后会自动作用于所有监控；已有预览会要求重新识别，避免按旧规则执行。</small>
       </div>
       <div class="form-grid">
         <a-form-item label="云端静默等待">
@@ -1124,7 +1221,7 @@ onBeforeUnmount(() => {
         </a-form-item>
         <label><span><strong>同步字幕与外置音轨</strong><small>同名或同季集的字幕、音轨会跟随主视频命名</small></span><a-switch v-model:checked="mappingForm.sync_extras" /></label>
         <label><span><strong>识别成功后自动执行</strong><small>关闭时任务停在“待执行”，确认目标路径后再整理</small></span><a-switch v-model:checked="mappingForm.auto_execute" /></label>
-        <label><span><strong>整理后重新分享并投稿 HDHive</strong><small>先完成 B 目录落库，再从 B 目录创建新分享；不会先分享 A 目录</small></span><a-switch v-model:checked="mappingForm.share_after_organize" /></label>
+        <label><span><strong>自动分享最终媒体目录并投稿 HDHive</strong><small>不分享冗长的分类根目录；每个项目完成后直接分享其最终电影/剧集文件夹。关闭后仍可在任务列表一键创建。</small></span><a-switch v-model:checked="mappingForm.share_after_organize" /></label>
         <label><span><strong>启用云盘目录监控</strong><small>关闭时仅保存配置，不轮询 A 目录</small></span><a-switch v-model:checked="mappingForm.enabled" /></label>
       </div>
     </a-form>
@@ -1289,6 +1386,15 @@ onBeforeUnmount(() => {
 .mapping-template-preview > span { display: grid; grid-template-columns: 78px minmax(0, 1fr); align-items: baseline; gap: 8px; }
 .mapping-template-preview code { overflow-wrap: anywhere; color: var(--text-2, #667085); font-size: 10px; }
 .mapping-template-preview small { color: var(--text-3, #98a2b3); font-size: 10px; }
+.output-target-help { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 30px; }
+.output-target-help small { min-width: 0; overflow: hidden; color: var(--text-3, #8b8f98); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.global-rule-source { display: grid; gap: 8px; margin: 0 0 14px; padding: 12px; border: 1px solid color-mix(in srgb, #1677ff 24%, var(--line-soft, #edf0f3)); border-radius: 9px; background: color-mix(in srgb, #1677ff 5%, var(--surface, #fff)); }
+.global-rule-source > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.global-rule-source p { margin: 0; color: var(--text-2, #667085); font-size: 11px; line-height: 1.5; }
+.global-rule-metrics { display: grid; grid-template-columns: .8fr .8fr 1.4fr; gap: 7px; }
+.global-rule-metrics span { display: grid; gap: 2px; min-width: 0; padding: 8px 9px; border: 1px solid var(--line-soft, #edf0f3); border-radius: 7px; background: var(--surface, #fff); }
+.global-rule-metrics small { color: var(--text-3, #8b8f98); font-size: 9px; }
+.global-rule-metrics strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; padding: 12px 4px 6px; }
 .eyebrow { color: var(--text-3, #8b8f98); font-size: 10px; font-weight: 700; letter-spacing: .16em; }
 .page-heading h1 { margin: 3px 0 2px; font-size: 27px; line-height: 1.2; letter-spacing: -.035em; }
@@ -1426,5 +1532,6 @@ onBeforeUnmount(() => {
   .category-rule-card header { grid-template-columns: 28px minmax(0, 1fr) auto; }
   .category-rule-card header > :deep(.ant-select) { grid-column: 2 / -1; }
   .mapping-template-preview > span { grid-template-columns: 1fr; }
+  .global-rule-metrics { grid-template-columns: 1fr; }
 }
 </style>

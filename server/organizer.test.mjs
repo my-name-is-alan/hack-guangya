@@ -392,6 +392,7 @@ test('cloud-native organizer moves A to B, scrapes selected types and creates a 
     release_groups: 'WiKi',
     render_words: String.raw`(?i)H[ .]?265 => HEVC`,
     capture_groups: String.raw`-([A-Za-z0-9@._-]+)$`,
+    scrape_targets: [{ id: 'library-b', name: '主媒体库', dir_id: 'b', path: '/B' }],
   });
   assert.equal(settings.configured, true);
   assert.equal(Object.hasOwn(settings, 'api_key'), false);
@@ -404,6 +405,7 @@ test('cloud-native organizer moves A to B, scrapes selected types and creates a 
   assert.throws(() => service.updateSettings({ recognition_words: '@?{season=1} => Series' }), /尚未支持的 @\? 条件规则/);
   assert.deepEqual(await service.testConnection(), { success: true, message: 'TMDB 连接成功' });
   await assert.rejects(service.addMapping({ source_dir_id: 'a', target_dir_id: 'a', source_path: '/A', target_path: '/A' }), /不能相同/);
+  await assert.rejects(service.addMapping({ source_dir_id: 'a', target_dir_id: 'other', source_path: '/A', target_path: '/Other' }), /刮削输出/);
   await assert.rejects(service.addMapping({ source_dir_id: 'a', target_dir_id: 'b', source_path: '/A', target_path: '/B', transfer_type: 'move' }), /分享失效风险/);
 
   const mapping = await service.addMapping({
@@ -441,6 +443,14 @@ test('cloud-native organizer moves A to B, scrapes selected types and creates a 
   assert.equal(completed.result.share.share_url, 'https://share.example/fresh-b');
   assert.equal(shares.length, 1);
   assert.equal(shares[0].remoteTargetId === 'a' || shares[0].remoteTargetId === 'movie-dir', false);
+  const recreatedShare = await service.shareJob(completed.id);
+  assert.equal(recreatedShare.share_url, 'https://share.example/fresh-b');
+  assert.equal(shares.length, 2);
+  assert.equal(shares[1].remoteTargetId, shares[0].remoteTargetId);
+  assert.equal(service.state().jobs.find((job) => job.id === completed.id).result.share.share_url, 'https://share.example/fresh-b');
+  assert.throws(() => service.updateSettings({ scrape_targets: [] }), /仍被整理监控使用/);
+  service.updateSettings({ scrape_targets: [{ id: 'library-b', name: '主媒体库', dir_id: 'b', path: '/媒体库' }] });
+  assert.equal(service.state().mappings.find((item) => item.id === mapping.id).target_path, '/媒体库');
   assert.equal(nodes.get('movie-file').parent_id === 'movie-dir', false);
   assert.equal(completed.result.warnings.some((warning) => warning.includes('已有分享失效')), true);
   await assert.rejects(service.runJob(completed.id), /已经整理完成/);

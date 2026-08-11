@@ -222,6 +222,7 @@ export const bridge = isTauri ? {
     if (command === 'run_organizer_job') return webRequest(`/api/organizer/jobs/${encodeURIComponent(args.id)}/run`, { method: 'POST', body: JSON.stringify(args.input || {}) });
     if (command === 'retry_organizer_job') return webRequest(`/api/organizer/jobs/${encodeURIComponent(args.id)}/retry`, { method: 'POST', body: JSON.stringify(args.input || {}) });
     if (command === 'rearchive_organizer_job') return webRequest(`/api/organizer/jobs/${encodeURIComponent(args.id)}/rearchive`, { method: 'POST', body: JSON.stringify(args.input || {}) });
+    if (command === 'share_organizer_job') return webRequest(`/api/organizer/jobs/${encodeURIComponent(args.id)}/share`, { method: 'POST', body: '{}' });
     if (command === 'scrape_selected_files') return webRequest('/api/organizer/scrape-selected', { method: 'POST', body: JSON.stringify(args.input || args) });
     if (command === 'get_app_version') return { version: 'Docker Web' };
     if (command === 'fetch_app_update' || command === 'install_app_update') {

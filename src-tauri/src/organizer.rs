@@ -902,6 +902,81 @@ fn normalize_scrape_targets(value: Option<Vec<Value>>) -> Result<Vec<Value>, Str
     Ok(result)
 }
 
+fn configured_output_target<'a>(targets: &'a [Value], target_dir_id: &str) -> Option<&'a Value> {
+    targets.iter().find(|target| {
+        target
+            .get("dir_id")
+            .or_else(|| target.get("target_dir_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.trim() == target_dir_id.trim())
+    })
+}
+
+fn bind_configured_output_target(
+    mut mapping: OrganizerMapping,
+    targets: &[Value],
+    allow_legacy: bool,
+) -> Result<OrganizerMapping, String> {
+    let Some(target) = configured_output_target(targets, &mapping.target_dir_id) else {
+        if allow_legacy {
+            return Ok(mapping);
+        }
+        return Err("目标 B 目录必须从“刮削输出”中已配置的媒体库目标选择".to_string());
+    };
+    mapping.target_dir_id = target
+        .get("dir_id")
+        .or_else(|| target.get("target_dir_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    mapping.target_path = normalize_cloud_path(
+        target
+            .get("path")
+            .or_else(|| target.get("target_path"))
+            .and_then(Value::as_str)
+            .unwrap_or("/"),
+    );
+    Ok(mapping)
+}
+
+#[cfg(test)]
+mod configured_output_target_tests {
+    use super::*;
+
+    #[test]
+    fn mapping_output_is_bound_to_the_global_scrape_target() {
+        let mapping = OrganizerMapping {
+            id: "mapping".to_string(),
+            source_path: "/A".to_string(),
+            target_path: "/stale".to_string(),
+            source_dir_id: "a".to_string(),
+            target_dir_id: "b".to_string(),
+            enabled: true,
+            scan_existing: true,
+            monitor_mode: "cloud_polling".to_string(),
+            transfer_type: "copy".to_string(),
+            media_type: String::new(),
+            scrape: false,
+            scrape_types: Vec::new(),
+            sync_extras: true,
+            conflict_policy: "skip".to_string(),
+            auto_execute: false,
+            share_after_organize: false,
+            share_risk_acknowledged: false,
+            settle_seconds: 30,
+            watch_error: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let targets =
+            vec![json!({ "id": "library", "name": "媒体库", "dir_id": "b", "path": "/刮削输出" })];
+        let bound = bind_configured_output_target(mapping.clone(), &targets, false).unwrap();
+        assert_eq!(bound.target_path, "/刮削输出");
+        assert!(bind_configured_output_target(mapping, &[], false).is_err());
+    }
+}
+
 fn resolve_media_category(metadata: &MediaMetadata, secrets: &OrganizerSecrets) -> String {
     let media_type = if metadata.media_type == "tv" {
         "tv"
@@ -4316,6 +4391,30 @@ fn update_settings(
             .unwrap_or(&current.default_scrape_types),
         true,
     )?;
+    let previous_target_ids = current
+        .scrape_targets
+        .iter()
+        .filter_map(|target| target.get("dir_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    let next_target_ids = scrape_targets
+        .iter()
+        .filter_map(|target| target.get("dir_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    let removed_target_ids = previous_target_ids
+        .difference(&next_target_ids)
+        .cloned()
+        .collect::<HashSet<_>>();
+    if let Some(mapping) = list_mappings(path)?
+        .into_iter()
+        .find(|mapping| removed_target_ids.contains(&mapping.target_dir_id))
+    {
+        return Err(format!(
+            "刮削输出“{}”仍被整理监控使用，请先修改对应监控的输出目标",
+            mapping.target_path
+        ));
+    }
     let connection = open_database(path)?;
     connection
         .execute(
@@ -4363,6 +4462,22 @@ fn update_settings(
             ],
         )
         .map_err(|error| format!("保存整理设置失败：{error}"))?;
+    for target in &scrape_targets {
+        let Some(dir_id) = target.get("dir_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let target_path = target
+            .get("path")
+            .and_then(Value::as_str)
+            .map(normalize_cloud_path)
+            .unwrap_or_else(|| "/".to_string());
+        connection
+            .execute(
+                "UPDATE organizer_mappings SET target_path=?1, updated_at=?2 WHERE target_dir_id=?3",
+                params![target_path, now_seconds(), dir_id],
+            )
+            .map_err(|error| format!("同步整理监控输出路径失败：{error}"))?;
+    }
     public_settings(path)
 }
 
@@ -5544,7 +5659,11 @@ pub async fn add_organizer_mapping(
         return Err("请先配置 TMDB API Key".to_string());
     }
     let secrets = load_secrets(&path)?;
-    let mut mapping = normalize_mapping_input(input, None, &secrets.default_scrape_types)?;
+    let mut mapping = bind_configured_output_target(
+        normalize_mapping_input(input, None, &secrets.default_scrape_types)?,
+        &secrets.scrape_targets,
+        false,
+    )?;
     if list_mappings(&path)?
         .iter()
         .any(|current| current.source_dir_id == mapping.source_dir_id)
@@ -5581,7 +5700,12 @@ pub async fn update_organizer_mapping(
     mapping_idle(&path, &id)?;
     let current = get_mapping(&path, &id)?.ok_or_else(|| "整理监控不存在".to_string())?;
     let secrets = load_secrets(&path)?;
-    let mapping = normalize_mapping_input(input, Some(&current), &secrets.default_scrape_types)?;
+    let target_was_submitted = input.target_dir_id.is_some() || input.target_path.is_some();
+    let mapping = bind_configured_output_target(
+        normalize_mapping_input(input, Some(&current), &secrets.default_scrape_types)?,
+        &secrets.scrape_targets,
+        !target_was_submitted,
+    )?;
     if mapping.enabled && !public_settings(&path)?.configured {
         return Err("请先配置 TMDB API Key".to_string());
     }
@@ -5705,6 +5829,60 @@ pub async fn scan_organizer_mapping(
 ) -> Result<Value, String> {
     let queued = scan_mapping_inner(&app, state.inner(), &id, true, None, None, None).await?;
     Ok(json!({ "queued": queued }))
+}
+
+#[tauri::command]
+pub async fn share_organizer_job(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, OrganizerSharedState>,
+    id: String,
+) -> Result<Value, String> {
+    let path = database_path(state.inner())?;
+    let job = get_job(&path, &id)?.ok_or_else(|| "整理任务不存在".to_string())?;
+    if !matches!(job.status.as_str(), "completed" | "completed_warning") {
+        return Err("只有已完成的整理任务才能创建分享".to_string());
+    }
+    let mapping =
+        get_mapping(&path, &job.mapping_id)?.ok_or_else(|| "整理监控不存在".to_string())?;
+    let preview = job
+        .preview
+        .clone()
+        .ok_or_else(|| "整理预览缺少最终媒体目录，无法创建分享".to_string())?;
+    if preview.share_relative_path.trim().is_empty() {
+        return Err("整理预览缺少最终媒体目录，无法创建分享".to_string());
+    }
+    let target = resolve_target(&app, &mapping, &preview.share_relative_path)
+        .await?
+        .filter(|entry| entry.is_directory)
+        .ok_or_else(|| "最终媒体目录已经不存在，无法创建分享".to_string())?;
+    let share = create_fresh_organizer_share(
+        app.clone(),
+        &mapping.id,
+        &target.id,
+        if preview.share_title.trim().is_empty() {
+            "整理后的媒体"
+        } else {
+            &preview.share_title
+        },
+    )
+    .await?;
+    let mut result = job.result.unwrap_or_default();
+    result.success = true;
+    result.share = Some(share.clone());
+    update_job_fields(
+        &path,
+        &id,
+        &[(
+            "result_json",
+            serde_json::to_value(result).map_err(|error| format!("保存整理分享失败：{error}"))?,
+        )],
+    )?;
+    emit(
+        &app,
+        "job-updated",
+        json!({ "job_id": id, "mapping_id": mapping.id, "status": job.status, "shared": true }),
+    );
+    Ok(share)
 }
 
 #[tauri::command]

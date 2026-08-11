@@ -120,6 +120,7 @@ commands.allow = [
   "run_organizer_job",
   "retry_organizer_job",
   "rearchive_organizer_job",
+  "share_organizer_job",
   "scrape_selected_files",
   "resume_queue",
   "get_app_version",

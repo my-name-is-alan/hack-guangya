@@ -4637,7 +4637,7 @@ async function routeApiV2(request, response, url) {
   if (organizerScanMatch && request.method === 'POST') {
     return json(response, 200, await organizer.scanMapping(decodeURIComponent(organizerScanMatch[1])));
   }
-  const organizerJobMatch = url.pathname.match(/^\/api\/organizer\/jobs\/([^/]+)\/(run|retry|rearchive)$/);
+  const organizerJobMatch = url.pathname.match(/^\/api\/organizer\/jobs\/([^/]+)\/(run|retry|rearchive|share)$/);
   if (organizerJobMatch && request.method === 'POST') {
     const body = await readBody(request, { maxBytes: 16 * 1024 });
     const jobId = decodeURIComponent(organizerJobMatch[1]);
@@ -4645,7 +4645,9 @@ async function routeApiV2(request, response, url) {
       ? await organizer.runJob(jobId, body)
       : organizerJobMatch[2] === 'rearchive'
         ? await organizer.rearchiveJob(jobId, body)
-        : await organizer.retryJob(jobId, body);
+        : organizerJobMatch[2] === 'share'
+          ? await organizer.shareJob(jobId)
+          : await organizer.retryJob(jobId, body);
     return json(response, 200, result);
   }
   const organizerJobDeleteMatch = url.pathname.match(/^\/api\/organizer\/jobs\/([^/]+)$/);
