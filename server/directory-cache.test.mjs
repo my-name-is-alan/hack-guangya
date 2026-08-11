@@ -35,7 +35,13 @@ test('目录缓存复用新鲜结果并将过期目录合并为一次后台刷�
 
 test('目录变更会失效子目录缓存，写操作失效可阻止旧请求回填', async () => {
   let now = 0;
-  const cache = createDirectoryCache({ freshMs: 10, staleMs: 20, now: () => now });
+  const invalidatedDirectories = [];
+  const cache = createDirectoryCache({
+    freshMs: 10,
+    staleMs: 20,
+    now: () => now,
+    onDirectoryInvalidated: (fileId) => invalidatedDirectories.push(fileId),
+  });
   await cache.get('root', async () => [{
     fileId: 'folder',
     fileName: '资料',
@@ -52,17 +58,105 @@ test('目录变更会失效子目录缓存，写操作失效可阻止旧请求�
     utime: 2,
   }], { force: true });
   assert.equal(cache.stats().entries, 1);
+  assert.deepEqual(invalidatedDirectories, ['folder']);
 
   let release;
+  let calls = 0;
   const pending = cache.get('root', async () => {
-    await new Promise((resolve) => { release = resolve; });
-    return [{ fileId: 'stale', fileName: '旧请求' }];
+    calls += 1;
+    if (calls === 1) {
+      await new Promise((resolve) => { release = resolve; });
+      return [{ fileId: 'stale', fileName: '旧请求' }];
+    }
+    return [{ fileId: 'fresh', fileName: '失效后重读' }];
   }, { force: true });
   await new Promise((resolve) => setImmediate(resolve));
   cache.invalidate('root');
   release();
-  await pending;
-  assert.equal(cache.stats().entries, 0);
+  assert.equal((await pending)[0].fileId, 'fresh');
+  assert.equal(calls, 2);
+  assert.equal(cache.stats().entries, 1);
+  assert.equal((await cache.get('root', async () => []))[0].fileId, 'fresh');
+});
+
+test('两代请求交错完成时最旧响应不能覆盖最新目录', async () => {
+  const cache = createDirectoryCache();
+  let calls = 0;
+  let releaseOld;
+  let releaseMiddle;
+  const loader = async () => {
+    calls += 1;
+    if (calls === 1) {
+      await new Promise((resolve) => { releaseOld = resolve; });
+      return [{ fileId: 'stale-old', fileName: '第一代旧结果' }];
+    }
+    if (calls === 2) {
+      await new Promise((resolve) => { releaseMiddle = resolve; });
+      return [{ fileId: 'stale-middle', fileName: '第二代旧结果' }];
+    }
+    return [{ fileId: 'fresh', fileName: '第三代最新结果' }];
+  };
+
+  const oldRead = cache.get('root', loader, { force: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  cache.invalidate('root');
+
+  const middleRead = cache.get('root', loader, { force: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  cache.invalidate('root');
+
+  releaseMiddle();
+  assert.equal((await middleRead)[0].fileId, 'fresh');
+  releaseOld();
+  assert.equal((await oldRead)[0].fileId, 'fresh');
+  assert.equal((await cache.get('root', async () => []))[0].fileId, 'fresh');
+  assert.ok(calls >= 3);
+});
+
+test('普通访问使用 SWR，强一致写路径会等待刷新结果', async () => {
+  let now = 0;
+  let calls = 0;
+  const cache = createDirectoryCache({ freshMs: 100, staleMs: 1_000, now: () => now });
+  const loader = async () => [{ fileId: `version-${++calls}` }];
+  assert.equal((await cache.get('root', loader))[0].fileId, 'version-1');
+
+  now = 101;
+  assert.equal((await cache.get('root', loader))[0].fileId, 'version-1');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal((await cache.get('root', loader))[0].fileId, 'version-2');
+
+  now = 202;
+  assert.equal(
+    (await cache.get('root', loader, { foreground: true }))[0].fileId,
+    'version-3',
+  );
+  assert.equal(calls, 3);
+
+  await assert.rejects(
+    () => cache.get('root', async () => { throw new Error('云端强读失败'); }, { force: true }),
+    /云端强读失败/,
+  );
+});
+
+test('后台刷新只更新近期访问目录且不会让冷目录永久活跃', async () => {
+  let now = 0;
+  let calls = 0;
+  const cache = createDirectoryCache({
+    freshMs: 100,
+    activeMs: 500,
+    refreshLimit: 4,
+    now: () => now,
+  });
+  const loader = async () => [{ fileId: `version-${++calls}` }];
+  await cache.get('root', loader);
+  now = 101;
+  assert.deepEqual(await cache.refreshActive(), { attempted: 1, refreshed: 1 });
+  assert.equal(calls, 2);
+
+  now = 601;
+  assert.deepEqual(await cache.refreshActive(), { attempted: 0, refreshed: 0 });
+  assert.equal(calls, 2);
+  assert.equal(cache.stats().active, 0);
 });
 
 test('登录身份变化会清空目录缓存并阻止跨账号复用', async () => {

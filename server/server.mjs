@@ -36,6 +36,10 @@ import {
   testNetworkTarget,
 } from './network-preferences.mjs';
 import { createOrganizerService } from './organizer.mjs';
+import {
+  invalidateRemoteDirectoryIds as invalidateRemoteDirectoryIdsFromCache,
+  reconcileRemoteDirectoryCache as reconcileRemoteDirectoryCacheEntries,
+} from './remote-directory-cache.mjs';
 import { uploadPartSize } from './upload-parts.mjs';
 import { createVirtualLibraryService } from './virtual-library.mjs';
 import { createWebDavHandler, normalizeWebDavEntry, WebDavError } from './webdav.mjs';
@@ -457,6 +461,38 @@ const pausedUploads = new Set();
 const queuePauseRequests = new Set();
 const activeUploadClients = new Map();
 const remoteCache = new Map([['', '']]);
+const remoteCacheValidatedAt = new Map([['', Number.POSITIVE_INFINITY]]);
+const remoteCacheGates = new Map();
+let remoteCacheGeneration = 0;
+const remoteDirectoryFreshMs = 15_000;
+function resetRemoteDirectoryCache() {
+  remoteCacheGeneration += 1;
+  remoteCache.clear();
+  remoteCache.set('', '');
+  remoteCacheValidatedAt.clear();
+  remoteCacheValidatedAt.set('', Number.POSITIVE_INFINITY);
+}
+function cleanupRemoteDirectoryCacheMetadata() {
+  for (const key of remoteCacheValidatedAt.keys()) {
+    if (!remoteCache.has(key)) remoteCacheValidatedAt.delete(key);
+  }
+}
+function invalidateRemoteDirectoryIds(fileIds) {
+  remoteCacheGeneration += 1;
+  const removed = invalidateRemoteDirectoryIdsFromCache(remoteCache, fileIds);
+  cleanupRemoteDirectoryCacheMetadata();
+  return removed;
+}
+function reconcileRemoteDirectoryCache(parentId, records, { complete = false } = {}) {
+  const checkedAt = Date.now();
+  const removed = reconcileRemoteDirectoryCacheEntries(remoteCache, parentId, records, {
+    complete,
+    onConfirmed: (key) => remoteCacheValidatedAt.set(key, checkedAt),
+  });
+  if (removed > 0) remoteCacheGeneration += 1;
+  cleanupRemoteDirectoryCacheMetadata();
+  return removed;
+}
 if (cacheEnabled) trimManagedCaches();
 else clearManagedCaches();
 const pendingAutoShares = new Map();
@@ -623,6 +659,7 @@ function trimRemoteCache() {
     if (excess <= 0) break;
     if (key === '') continue;
     remoteCache.delete(key);
+    remoteCacheValidatedAt.delete(key);
     excess -= 1;
   }
 }
@@ -665,8 +702,7 @@ function cacheState() {
 }
 function clearManagedCaches() {
   database.exec('DELETE FROM file_fingerprints');
-  remoteCache.clear();
-  remoteCache.set('', '');
+  resetRemoteDirectoryCache();
   return cacheState();
 }
 
@@ -1159,8 +1195,9 @@ async function releaseDeveloperNameObfuscation(jobId) {
       return restored;
     });
     database.prepare("DELETE FROM developer_transfer_name_restores WHERE status = 'completed' AND updated_at < ?").run(now - 30 * 86_400);
-    remoteCache.clear();
-    remoteCache.set('', '');
+    resetRemoteDirectoryCache();
+    webDavDirectoryCache.clear();
+    publishCloudDirectoryInvalidated([], { all: true, source: 'developer-name-restore' });
     updateDeveloperTransferJob(jobId, {
       phase: previous?.phase || 'completed',
       processed_count: total,
@@ -1470,6 +1507,20 @@ function state() { return { logged_in: Boolean(token), paused, pending: queue.si
 function publish(payload) { const line = `data: ${JSON.stringify(payload)}\n\n`; for (const response of clients) response.write(line); }
 function publishState() { publish({ type: 'state', state: state() }); }
 function status(level, message) { publish({ type: 'status', level, message }); }
+function publishCloudDirectoryInvalidated(parentIds = [], {
+  all = false,
+  source = 'cloud-write',
+} = {}) {
+  const normalized = [...new Set((Array.isArray(parentIds) ? parentIds : [parentIds])
+    .filter((value) => value !== undefined && value !== null)
+    .map((value) => String(value)))];
+  publish({
+    type: 'cloud-directory-invalidated',
+    parent_ids: normalized,
+    all: Boolean(all),
+    source: String(source),
+  });
+}
 function json(response, code, payload, headers = {}) { response.writeHead(code, { 'content-type': 'application/json; charset=utf-8', ...headers }); response.end(JSON.stringify(payload)); }
 function enforceLoopbackHost(request, response) {
   if (adminPassword) return true;
@@ -1523,8 +1574,8 @@ function replaceAuthSession(accessToken, nextRefreshToken = null) { database.pre
 function invalidateAuthSession() {
   token = null;
   refreshToken = null;
-  remoteCache.clear();
-  remoteCache.set('', '');
+  resetRemoteDirectoryCache();
+  synchronizeWebDavCacheScope();
   replaceAuthSession(null, null);
   publishState();
 }
@@ -1923,7 +1974,7 @@ const organizer = createOrganizerService({
     createDirectory: organizerCreateCloudDirectory,
     copyEntry: (fileId, parentId) => executeFileTask('/userres/v1/file/copy_file', { fileIds: [String(fileId)], parentId: String(parentId) }),
     moveEntry: (fileId, parentId) => executeFileTask('/userres/v1/file/move_file', { fileIds: [String(fileId)], parentId: String(parentId) }),
-    renameEntry: (fileId, name) => renameRemote(String(fileId), String(name)),
+    renameEntry: (fileId, name) => organizerRenameCloudEntry(String(fileId), String(name)),
     deleteEntry: (fileId) => executeFileTask('/userres/v1/file/delete_file', { fileIds: [String(fileId)] }),
     uploadBuffer: organizerUploadBuffer,
     getDownloadUrl: async (fileId) => (await getCloudDownload({ file_ids: [String(fileId)], packaged: false })).download_url,
@@ -2173,8 +2224,12 @@ async function openReceivedShare(value) {
 async function restoreReceivedShare(body) {
   const accessToken = String(body.access_token || '').trim();
   if (!accessToken) throw new Error('分享访问令牌为空，请重新打开分享链接');
-  const response = await apiPost('/userres/v1/restore_share', { accessToken, fileIds: validateFileIds(body.file_ids), parentId: String(body.parent_id || '') });
+  const parentId = String(body.parent_id || '');
+  const response = await apiPost('/userres/v1/restore_share', { accessToken, fileIds: validateFileIds(body.file_ids), parentId });
   await waitOperation(response.data?.taskId);
+  resetRemoteDirectoryCache();
+  webDavDirectoryCache.invalidate(parentId);
+  publishCloudDirectoryInvalidated([parentId], { source: 'received-share-restore' });
   return response.data || {};
 }
 
@@ -2943,8 +2998,8 @@ async function completeSmsLogin(body) {
   if (!accessToken) throw new Error('手机号登录没有返回 access_token');
   token = accessToken;
   refreshToken = nextRefreshToken || null;
-  remoteCache.clear();
-  remoteCache.set('', '');
+  resetRemoteDirectoryCache();
+  synchronizeWebDavCacheScope();
   replaceAuthSession(token, refreshToken);
   smsChallenges.delete(verificationId);
   status('success', '手机号登录成功，可以开始使用云盘和备份任务');
@@ -2975,8 +3030,8 @@ async function pollDeviceLogin(deviceCode) {
   if (accessToken) {
     token = String(accessToken);
     refreshToken = nextRefreshToken ? String(nextRefreshToken) : null;
-    remoteCache.clear();
-    remoteCache.set('', '');
+    resetRemoteDirectoryCache();
+    synchronizeWebDavCacheScope();
     replaceAuthSession(token, refreshToken);
     status('success', '扫码登录成功，可以开始使用云盘和备份任务');
     publishState();
@@ -3022,6 +3077,7 @@ async function refreshSavedSession() {
     if (!accessToken) throw new Error('刷新登录状态时没有返回 access_token');
     token = String(accessToken);
     if (nextRefreshToken) refreshToken = String(nextRefreshToken);
+    synchronizeWebDavCacheScope();
     saveAuthSession(token, refreshToken);
     publishState();
     pump();
@@ -3030,30 +3086,108 @@ async function refreshSavedSession() {
   })().finally(() => { refreshPromise = null; });
   return refreshPromise;
 }
-async function findFolder(parentId, name) { for (let page = 0; page < 100; page += 1) { const response = await apiPost('/userres/v1/file/get_file_list', { page, pageSize: 100, parentId, resType: 2, needSubFolderStat: true }); const list = response.data?.list || []; const found = list.find((item) => item.resType === 2 && item.fileName === name); if (found?.fileId) return String(found.fileId); if (!list.length || (page + 1) * 100 >= Number(response.data?.total || 0)) break; } return null; }
+async function findFolder(parentId, name) {
+  let seen = 0;
+  for (let page = 0; page < 100; page += 1) {
+    const response = await apiPost('/userres/v1/file/get_file_list', {
+      page,
+      pageSize: 100,
+      parentId,
+      resType: 2,
+      needSubFolderStat: true,
+    });
+    const list = Array.isArray(response.data?.list) ? response.data.list : [];
+    const found = list.find((item) => Number(item.resType) === 2 && item.fileName === name);
+    if (found?.fileId) return String(found.fileId);
+    seen += list.length;
+    const total = response.data?.total == null ? Number.NaN : Number(response.data.total);
+    if (!list.length
+      || (Number.isFinite(total) && total >= 0 && seen >= total)
+      || (!Number.isFinite(total) && list.length < 100)) break;
+  }
+  return null;
+}
+const REMOTE_CACHE_INVALIDATED = Symbol('remote-cache-invalidated');
+async function resolveRemoteDirectoryPart({ cacheKey, parentId, part, prefix, generation }) {
+  const pending = remoteCacheGates.get(cacheKey);
+  if (pending?.generation === generation) return pending.promise;
+  const task = (async () => {
+    if (generation !== remoteCacheGeneration) return REMOTE_CACHE_INVALIDATED;
+    if (cacheEnabled && remoteCache.has(cacheKey)) {
+      const cachedId = String(remoteCache.get(cacheKey));
+      const age = Date.now() - Number(remoteCacheValidatedAt.get(cacheKey) || 0);
+      if (age <= remoteDirectoryFreshMs) return cachedId;
+      const verifiedId = await findFolder(parentId, part);
+      if (generation !== remoteCacheGeneration) return REMOTE_CACHE_INVALIDATED;
+      if (verifiedId) {
+        if (verifiedId !== cachedId) {
+          invalidateRemoteDirectoryIds([cachedId]);
+          return REMOTE_CACHE_INVALIDATED;
+        }
+        remoteCacheValidatedAt.set(cacheKey, Date.now());
+        return verifiedId;
+      }
+      invalidateRemoteDirectoryIds([cachedId]);
+      return REMOTE_CACHE_INVALIDATED;
+    }
+    const response = await apiPost('/userres/v1/file/create_dir', {
+      parentId,
+      dirName: part,
+      failIfNameExist: true,
+    }, [159]);
+    const fileId = response.data?.fileId
+      || (response.code === 159 ? await findFolder(parentId, part) : null);
+    if (!fileId) throw new Error(`无法创建远程目录 ${prefix}`);
+    if (response.code !== 159) {
+      await waitOperation(response.data?.taskId);
+      webDavDirectoryCache.invalidate(parentId);
+      publishCloudDirectoryInvalidated([parentId], { source: 'upload-create-directory' });
+    }
+    if (generation !== remoteCacheGeneration) return REMOTE_CACHE_INVALIDATED;
+    const resolvedId = String(fileId);
+    if (cacheEnabled) {
+      remoteCache.delete(cacheKey);
+      remoteCache.set(cacheKey, resolvedId);
+      remoteCacheValidatedAt.set(cacheKey, Date.now());
+      trimRemoteCache();
+    }
+    return resolvedId;
+  })();
+  const record = { generation, promise: task };
+  remoteCacheGates.set(cacheKey, record);
+  try {
+    return await task;
+  } finally {
+    if (remoteCacheGates.get(cacheKey) === record) remoteCacheGates.delete(cacheKey);
+  }
+}
 async function ensureRemote(baseParentId, remotePath) {
   const normalized = normalizeRemote(remotePath);
   if (!normalized) return String(baseParentId || '');
-  let parentId = String(baseParentId || '');
-  let prefix = '';
-  for (const part of normalized.split('/')) {
-    prefix = prefix ? `${prefix}/${part}` : part;
-    const cacheKey = `${baseParentId || ''}::${prefix}`;
-    if (cacheEnabled && remoteCache.has(cacheKey)) {
-      parentId = remoteCache.get(cacheKey);
-      continue;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const generation = remoteCacheGeneration;
+    let parentId = String(baseParentId || '');
+    let prefix = '';
+    let retry = false;
+    for (const part of normalized.split('/')) {
+      prefix = prefix ? `${prefix}/${part}` : part;
+      const cacheKey = `${baseParentId || ''}::${prefix}`;
+      const resolvedId = await resolveRemoteDirectoryPart({
+        cacheKey,
+        parentId,
+        part,
+        prefix,
+        generation,
+      });
+      if (resolvedId === REMOTE_CACHE_INVALIDATED || generation !== remoteCacheGeneration) {
+        retry = true;
+        break;
+      }
+      parentId = resolvedId;
     }
-    const response = await apiPost('/userres/v1/file/create_dir', { parentId, dirName: part, failIfNameExist: true }, [159]);
-    const fileId = response.data?.fileId || (response.code === 159 ? await findFolder(parentId, part) : null);
-    if (!fileId) throw new Error(`无法创建远程目录 ${prefix}`);
-    parentId = String(fileId);
-    if (cacheEnabled) {
-      remoteCache.delete(cacheKey);
-      remoteCache.set(cacheKey, parentId);
-      trimRemoteCache();
-    }
+    if (!retry) return parentId;
   }
-  return parentId;
+  throw new Error('远程目录持续发生变化，请稍后重试');
 }
 const CLOUD_TASK_PENDING_CODES = new Set([147]);
 const CLOUD_TASK_INVALID_CODES = new Set([145, 146, 152, 155, 163]);
@@ -3208,6 +3342,7 @@ async function preflightFlashUpload(item) {
 
   publish({ type: 'progress', file_path: eventPath, percent: 0, uploaded_bytes: 0, total_bytes: stat.size, bytes_per_second: 0, stage: '正在后台校验秒传' });
   const parentId = await ensureRemote(item.remote_parent_id || '', item.remote_dir);
+  item.resolved_remote_parent_id = parentId;
   assertUploadRunnable(key);
   const res = { fileSize: stat.size };
   if (stat.size < 1024 * 1024) {
@@ -3259,6 +3394,7 @@ async function upload(item) {
   assertUploadRunnable(key);
   publish({ type: 'progress', file_path: eventPath, percent: 0, uploaded_bytes: 0, total_bytes: stat.size, stage: '正在准备云端目录' });
   const parentId = await ensureRemote(item.remote_parent_id || '', item.remote_dir);
+  item.resolved_remote_parent_id = parentId;
   assertUploadRunnable(key);
   publish({ type: 'progress', file_path: eventPath, percent: 0, uploaded_bytes: 0, total_bytes: stat.size, stage: '正在申请上传凭证' });
   let checkpoint = loadUploadCheckpoint(item);
@@ -3519,6 +3655,18 @@ async function finalizeConfirmedUpload(key, item, taskData, recovered = false) {
     return false;
   }
   if (!confirmPendingUploadRecord(key, taskData.taskId, taskData.remoteFileId)) return false;
+  const hasResolvedParent = item.resolved_remote_parent_id !== undefined
+    && item.resolved_remote_parent_id !== null;
+  if (hasResolvedParent || !item.remote_dir) {
+    const resolvedParentId = String(item.resolved_remote_parent_id ?? item.remote_parent_id ?? '');
+    webDavDirectoryCache.invalidate(resolvedParentId);
+    publishCloudDirectoryInvalidated([resolvedParentId], { source: 'upload-confirmed' });
+  } else {
+    // Older persisted upload records did not retain the resolved leaf directory.
+    // Clear safely instead of announcing an incorrect parent to mounted clients.
+    webDavDirectoryCache.clear();
+    publishCloudDirectoryInvalidated([], { all: true, source: 'upload-confirmed-legacy' });
+  }
   const mapping = mappings.find((entry) => entry.id === item.mapping_id && entry.enabled);
   if (mapping) {
     try {
@@ -4192,6 +4340,7 @@ async function reconcileOfflineNameRestores(suppliedData) {
     const complete = database.prepare("UPDATE offline_name_restores SET file_id = ?, status = 'completed', last_error = NULL, updated_at = ? WHERE task_id = ?");
     const failed = database.prepare("UPDATE offline_name_restores SET file_id = ?, attempts = attempts + 1, last_error = ?, updated_at = ? WHERE task_id = ?");
     const now = Math.floor(Date.now() / 1000);
+    let renamed = false;
     for (const restore of pending) {
       const task = tasks.get(String(restore.task_id));
       if (!task || Number(task.status ?? task.taskStatus ?? task.state) !== 2) continue;
@@ -4206,9 +4355,15 @@ async function reconcileOfflineNameRestores(suppliedData) {
         await renameRemote(fileId, restore.original_name);
         complete.run(fileId, now, restore.task_id);
         task.fileName = restore.original_name;
+        renamed = true;
       } catch (error) {
         failed.run(fileId, String(error?.message || error || '恢复原文件名失败').slice(0, 500), now, restore.task_id);
       }
+    }
+    if (renamed) {
+      resetRemoteDirectoryCache();
+      webDavDirectoryCache.clear();
+      publishCloudDirectoryInvalidated([], { all: true, source: 'offline-name-restore' });
     }
     database.prepare("DELETE FROM offline_name_restores WHERE status = 'completed' AND updated_at < ?").run(now - 30 * 86_400);
     return annotateOfflineNameRestores(data);
@@ -4219,14 +4374,15 @@ async function reconcileOfflineNameRestores(suppliedData) {
 async function executeFileTask(endpoint, payload) {
   const result = await apiPost(endpoint, payload);
   await waitOperation(result.data?.taskId);
-  remoteCache.clear();
-  remoteCache.set('', '');
+  resetRemoteDirectoryCache();
   webDavDirectoryCache.clear();
+  publishCloudDirectoryInvalidated([], { all: true, source: endpoint });
   return result.data || {};
 }
 async function organizerListCloudChildren(parentId) {
   if (!token) throw new Error('请先登录光鸭云盘');
   const records = [];
+  let complete = false;
   for (let page = 0; page < 1000; page += 1) {
     const response = await apiPost('/userres/v1/file/get_file_list', {
       page,
@@ -4238,9 +4394,15 @@ async function organizerListCloudChildren(parentId) {
     });
     const list = Array.isArray(response.data?.list) ? response.data.list : [];
     records.push(...list);
-    const total = Number(response.data?.total || records.length);
-    if (!list.length || records.length >= total) break;
+    const total = response.data?.total == null ? Number.NaN : Number(response.data.total);
+    if (!list.length
+      || (Number.isFinite(total) && total >= 0 && records.length >= total)
+      || (!Number.isFinite(total) && list.length < 100)) {
+      complete = true;
+      break;
+    }
   }
+  reconcileRemoteDirectoryCache(parentId, records, { complete });
   return records;
 }
 async function organizerCreateCloudDirectory(parentId, name) {
@@ -4250,10 +4412,16 @@ async function organizerCreateCloudDirectory(parentId, name) {
     failIfNameExist: true,
   });
   await waitOperation(response.data?.taskId);
-  remoteCache.clear();
-  remoteCache.set('', '');
+  resetRemoteDirectoryCache();
   webDavDirectoryCache.clear();
+  publishCloudDirectoryInvalidated([parentId], { source: 'organizer-create-directory' });
   return response.data || {};
+}
+async function organizerRenameCloudEntry(fileId, name) {
+  await renameRemote(fileId, name);
+  resetRemoteDirectoryCache();
+  webDavDirectoryCache.clear();
+  publishCloudDirectoryInvalidated([], { all: true, source: 'organizer-rename' });
 }
 async function organizerUploadBuffer(parentId, name, bytes) {
   const temporaryRoot = path.join(manualUploadRoot, 'organizer', crypto.randomUUID());
@@ -4283,7 +4451,6 @@ async function organizerUploadBuffer(parentId, name, bytes) {
     const key = queueKey(mappingId, temporaryFile);
     await finalizeConfirmedUpload(key, item, { taskId: outcome.taskId, remoteFileId: outcome.remoteFileId });
     completed = true;
-    webDavDirectoryCache.clear();
     return { fileId: outcome.remoteFileId, id: outcome.remoteFileId };
   } finally {
     if (completed) await fsp.rm(temporaryRoot, { recursive: true, force: true });
@@ -4299,11 +4466,29 @@ async function batchRename(renames) {
   let stagedCount = 0;
   for (const entry of staged) { try { await renameRemote(entry.item.fileId, entry.temporary); stagedCount += 1; } catch (error) { for (const rollback of staged.slice(0, stagedCount).reverse()) { try { await renameRemote(rollback.item.fileId, rollback.item.currentName); } catch {} } throw new Error(`暂存重命名失败（${entry.item.currentName}）：${error.message}`); } }
   for (let index = 0; index < staged.length; index += 1) { const entry = staged[index]; try { await renameRemote(entry.item.fileId, entry.item.newName); } catch (error) { for (const rollback of staged.slice(0, index).reverse()) { try { await renameRemote(rollback.item.fileId, rollback.item.currentName); } catch {} } for (const rollback of staged.slice(index).reverse()) { try { await renameRemote(rollback.item.fileId, rollback.item.currentName); } catch {} } throw new Error(`目标重命名失败（${entry.item.newName}）：${error.message}`); } }
+  resetRemoteDirectoryCache();
+  webDavDirectoryCache.clear();
+  publishCloudDirectoryInvalidated([], { all: true, source: 'batch-rename' });
   return { renamed: staged.length };
 }
-const webDavDirectoryCache = createDirectoryCache();
+const webDavDirectoryCache = createDirectoryCache({
+  onDirectoryInvalidated: (fileId) => invalidateRemoteDirectoryIds([fileId]),
+});
+const webDavDirectoryRefreshTimer = setInterval(() => {
+  if (!token) return;
+  void webDavDirectoryCache.refreshActive().catch(() => {});
+}, 5_000);
+webDavDirectoryRefreshTimer.unref?.();
+
+function synchronizeWebDavCacheScope() {
+  webDavDirectoryCache.setScope(token
+    ? crypto.createHash('sha256').update(String(token)).digest('base64url')
+    : 'logged-out');
+}
+synchronizeWebDavCacheScope();
 async function fetchWebDavChildren(parentId) {
   const records = [];
+  let complete = false;
   for (let page = 0; page < 1000; page += 1) {
     const result = await apiPost('/userres/v1/file/get_file_list', {
       page,
@@ -4315,16 +4500,20 @@ async function fetchWebDavChildren(parentId) {
     });
     const list = Array.isArray(result.data?.list) ? result.data.list : [];
     records.push(...list);
-    const total = Number(result.data?.total || records.length);
-    if (!list.length || records.length >= total) break;
+    const total = result.data?.total == null ? Number.NaN : Number(result.data.total);
+    if (!list.length
+      || (Number.isFinite(total) && total >= 0 && records.length >= total)
+      || (!Number.isFinite(total) && list.length < 100)) {
+      complete = true;
+      break;
+    }
   }
+  reconcileRemoteDirectoryCache(parentId, records, { complete });
   return records;
 }
 async function listWebDavChildren(parentId, options) {
   if (!token) throw new WebDavError(503, '请先登录光鸭云盘');
-  webDavDirectoryCache.setScope(
-    crypto.createHash('sha256').update(String(token)).digest('base64url'),
-  );
+  synchronizeWebDavCacheScope();
   const normalizedParentId = String(parentId || '');
   return webDavDirectoryCache.get(
     normalizedParentId,
@@ -4333,24 +4522,33 @@ async function listWebDavChildren(parentId, options) {
   );
 }
 async function createWebDavDirectory({ parentId, name }) {
+  const normalizedParentId = String(parentId || '');
   const result = await apiPost('/userres/v1/file/create_dir', {
-    parentId: String(parentId || ''),
+    parentId: normalizedParentId,
     dirName: name,
     failIfNameExist: true,
   });
-  webDavDirectoryCache.invalidate(parentId);
+  await waitOperation(result.data?.taskId);
+  webDavDirectoryCache.invalidate(normalizedParentId);
+  publishCloudDirectoryInvalidated([normalizedParentId], { source: 'webdav-mkcol' });
   return result.data || {};
 }
 async function deleteWebDavEntry({ entry }) {
   const result = await apiPost('/userres/v1/file/delete_file', { fileIds: [entry.id] });
   await waitOperation(result.data?.taskId);
-  webDavDirectoryCache.invalidate(entry.parentId);
-  if (entry.isDirectory) webDavDirectoryCache.invalidateSubtree(entry.id);
+  const normalizedParentId = String(entry.parentId || '');
+  webDavDirectoryCache.invalidate(normalizedParentId);
+  if (entry.isDirectory) {
+    webDavDirectoryCache.invalidateSubtree(entry.id);
+    invalidateRemoteDirectoryIds([entry.id]);
+  }
+  publishCloudDirectoryInvalidated([normalizedParentId], { source: 'webdav-delete' });
 }
 async function moveWebDavEntry({ entry, parentId, name }) {
   const sourceParentId = String(entry.parentId || '');
   const destinationParentId = String(parentId || '');
   const moved = sourceParentId !== destinationParentId;
+  if (entry.isDirectory) invalidateRemoteDirectoryIds([entry.id]);
   if (moved) {
     const result = await apiPost('/userres/v1/file/move_file', {
       fileIds: [entry.id],
@@ -4381,21 +4579,33 @@ async function moveWebDavEntry({ entry, parentId, name }) {
       throw error;
     }
   }
+  webDavDirectoryCache.invalidate(sourceParentId);
+  webDavDirectoryCache.invalidate(destinationParentId);
+  publishCloudDirectoryInvalidated(
+    [sourceParentId, destinationParentId],
+    { source: 'webdav-move' },
+  );
 }
 async function copyWebDavEntry({ entry, parentId, name }) {
-  const before = (await listWebDavChildren(parentId)).map(normalizeWebDavEntry);
+  const normalizedParentId = String(parentId || '');
+  const before = (await listWebDavChildren(normalizedParentId, { force: true, foreground: true }))
+    .map(normalizeWebDavEntry);
   if (entry.name !== name && before.some((item) => item.name === entry.name)) {
     throw new WebDavError(409, `目标目录中已有 ${entry.name}，无法安全完成改名复制`);
   }
   const beforeIds = new Set(before.map((item) => item.id));
   const result = await apiPost('/userres/v1/file/copy_file', {
     fileIds: [entry.id],
-    parentId: String(parentId || ''),
+    parentId: normalizedParentId,
   });
   await waitOperation(result.data?.taskId);
-  webDavDirectoryCache.invalidate(parentId);
-  if (entry.name === name) return;
-  const after = (await listWebDavChildren(parentId)).map(normalizeWebDavEntry);
+  webDavDirectoryCache.invalidate(normalizedParentId);
+  if (entry.name === name) {
+    publishCloudDirectoryInvalidated([normalizedParentId], { source: 'webdav-copy' });
+    return;
+  }
+  const after = (await listWebDavChildren(normalizedParentId, { force: true, foreground: true }))
+    .map(normalizeWebDavEntry);
   const copied = after.find((item) => item.name === entry.name && !beforeIds.has(item.id));
   if (!copied?.id) throw new WebDavError(409, '云端复制已完成，但无法定位副本进行重命名');
   try {
@@ -4404,7 +4614,8 @@ async function copyWebDavEntry({ entry, parentId, name }) {
     try { await deleteWebDavEntry({ entry: copied }); } catch {}
     throw error;
   }
-  webDavDirectoryCache.invalidate(parentId);
+  webDavDirectoryCache.invalidate(normalizedParentId);
+  publishCloudDirectoryInvalidated([normalizedParentId], { source: 'webdav-copy' });
 }
 async function putWebDavFile({ request, parentId, name, existing }) {
   const temporaryRoot = path.join(manualUploadRoot, 'webdav', crypto.randomUUID());
@@ -4462,7 +4673,9 @@ async function putWebDavFile({ request, parentId, name, existing }) {
       throw error;
     }
     if (backup) await deleteWebDavEntry({ entry: backup });
-    webDavDirectoryCache.invalidate(parentId);
+    const normalizedParentId = String(parentId || '');
+    webDavDirectoryCache.invalidate(normalizedParentId);
+    publishCloudDirectoryInvalidated([normalizedParentId], { source: 'webdav-put' });
     return { id: String(uploaded.remoteFileId) };
   } finally {
     await fsp.rm(temporaryRoot, { recursive: true, force: true });
@@ -4786,7 +4999,18 @@ async function routeApiV2(request, response, url) {
   if (request.method === 'POST' && url.pathname === '/api/auth/device/poll') { const body = await readBody(request); return json(response, 200, await pollDeviceLogin(body.device_code)); }
   if (request.method === 'POST' && url.pathname === '/api/auth/sms/send') { const body = await readBody(request); return json(response, 200, await sendSmsLogin(body)); }
   if (request.method === 'POST' && url.pathname === '/api/auth/sms/login') { const body = await readBody(request); return json(response, 200, await completeSmsLogin(body)); }
-  if (request.method === 'POST' && url.pathname === '/api/auth') { const body = await readBody(request); token = String(body.token || '').trim().replace(/^Bearer\s+/i, '') || null; refreshToken = null; remoteCache.clear(); remoteCache.set('', ''); replaceAuthSession(token, null); publishState(); pump(); schedulePendingUploadRecovery(0); return json(response, 200, state()); }
+  if (request.method === 'POST' && url.pathname === '/api/auth') {
+    const body = await readBody(request);
+    token = String(body.token || '').trim().replace(/^Bearer\s+/i, '') || null;
+    refreshToken = null;
+    resetRemoteDirectoryCache();
+    synchronizeWebDavCacheScope();
+    replaceAuthSession(token, null);
+    publishState();
+    pump();
+    schedulePendingUploadRecovery(0);
+    return json(response, 200, state());
+  }
   if (request.method === 'GET' && url.pathname === '/api/assets') return json(response, 200, await apiPost('/assets/v1/get_assets', {}));
   if (request.method === 'GET' && url.pathname === '/api/global-config') return json(response, 200, await apiPost('/misc/v1/get_global_config', {}));
   if (request.method === 'GET' && url.pathname === '/api/overview') return json(response, 200, await apiOverview());
@@ -4799,7 +5023,23 @@ async function routeApiV2(request, response, url) {
       sortType: 0,
     };
     if (url.searchParams.get('resType') === '2') body.resType = 2;
-    return json(response, 200, await apiFileReadWithDeveloperFallback('/userres/v1/file/get_file_list', body, fileListRequestTimeoutMs));
+    if (url.searchParams.get('refresh') === '1') {
+      webDavDirectoryCache.invalidate(body.parentId);
+      resetRemoteDirectoryCache();
+    }
+    const result = await apiFileReadWithDeveloperFallback('/userres/v1/file/get_file_list', body, fileListRequestTimeoutMs);
+    const records = Array.isArray(result.data?.list) ? result.data.list : [];
+    const total = result.data?.total == null ? Number.NaN : Number(result.data.total);
+    reconcileRemoteDirectoryCache(body.parentId, records, {
+      complete: body.page === 0 && (
+        (Number.isFinite(total) && total >= 0 && records.length >= total)
+        || (!Number.isFinite(total) && records.length < body.pageSize)
+      ),
+    });
+    // A UI visit is itself a successful upstream revalidation. Drop the
+    // mount-facing snapshot so the next PROPFIND observes the same directory.
+    webDavDirectoryCache.invalidate(body.parentId);
+    return json(response, 200, result, { 'cache-control': 'no-store' });
   }
   if (request.method === 'GET' && url.pathname === '/api/files/detail') {
     const fileId = validateIdentifier(url.searchParams.get('fileId'), '文件 ID');
@@ -5259,6 +5499,8 @@ server.listen(port, listenHost, async () => {
 });
 
 process.once('exit', () => {
+  clearInterval(webDavDirectoryRefreshTimer);
+  webDavDirectoryCache.dispose();
   nativeMountManager.shutdown();
   virtualLibrary.close();
 });

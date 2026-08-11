@@ -6,8 +6,8 @@ use crate::organizer_core::{
 };
 use crate::{
     api_post, finish_operation_response, hdhive_request, load_global_network_proxy,
-    organizer_upload_bytes, poll_hdhive_receipt, save_auto_share_event, share_file_payload,
-    share_id_for_hdhive, PendingAutoShare, SharedState,
+    organizer_upload_bytes, poll_hdhive_receipt, publish_cloud_mutation, save_auto_share_event,
+    share_file_payload, share_id_for_hdhive, PendingAutoShare, SharedState,
 };
 use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -2096,11 +2096,8 @@ async fn create_cloud_directory(
         &[],
     )
     .await?;
-    let mut created = response
-        .data
-        .as_ref()
-        .map(|value| normalize_cloud_entry(value, None))
-        .unwrap_or_default();
+    let data = finish_operation_response(&token, &device_id, response).await?;
+    let mut created = normalize_cloud_entry(&data, None);
     if created.id.is_empty() {
         created = list_cloud_children(app, parent_id)
             .await?
@@ -2108,6 +2105,14 @@ async fn create_cloud_directory(
             .find(|entry| entry.is_directory && entry.name.eq_ignore_ascii_case(name))
             .ok_or_else(|| format!("创建云端目录后无法定位：{name}"))?;
     }
+    publish_cloud_mutation(
+        app,
+        app.state::<SharedState>().inner(),
+        [parent_id.to_string()],
+        &[],
+        false,
+        "organizer-create-folder",
+    );
     Ok(created)
 }
 
@@ -2121,9 +2126,16 @@ async fn cloud_copy(app: &tauri::AppHandle, id: &str, parent_id: &str) -> Result
         &[],
     )
     .await?;
-    finish_operation_response(&token, &device_id, response)
-        .await
-        .map(|_| ())
+    finish_operation_response(&token, &device_id, response).await?;
+    publish_cloud_mutation(
+        app,
+        app.state::<SharedState>().inner(),
+        [parent_id.to_string()],
+        &[],
+        false,
+        "organizer-copy",
+    );
+    Ok(())
 }
 
 async fn cloud_move(app: &tauri::AppHandle, id: &str, parent_id: &str) -> Result<(), String> {
@@ -2136,9 +2148,16 @@ async fn cloud_move(app: &tauri::AppHandle, id: &str, parent_id: &str) -> Result
         &[],
     )
     .await?;
-    finish_operation_response(&token, &device_id, response)
-        .await
-        .map(|_| ())
+    finish_operation_response(&token, &device_id, response).await?;
+    publish_cloud_mutation(
+        app,
+        app.state::<SharedState>().inner(),
+        [parent_id.to_string()],
+        &[id.to_string()],
+        true,
+        "organizer-move",
+    );
+    Ok(())
 }
 
 async fn cloud_delete(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
@@ -2151,9 +2170,16 @@ async fn cloud_delete(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
         &[],
     )
     .await?;
-    finish_operation_response(&token, &device_id, response)
-        .await
-        .map(|_| ())
+    finish_operation_response(&token, &device_id, response).await?;
+    publish_cloud_mutation(
+        app,
+        app.state::<SharedState>().inner(),
+        Vec::new(),
+        &[id.to_string()],
+        true,
+        "organizer-delete",
+    );
+    Ok(())
 }
 
 async fn cloud_rename(app: &tauri::AppHandle, id: &str, name: &str) -> Result<(), String> {
@@ -2166,9 +2192,16 @@ async fn cloud_rename(app: &tauri::AppHandle, id: &str, name: &str) -> Result<()
         &[],
     )
     .await?;
-    finish_operation_response(&token, &device_id, response)
-        .await
-        .map(|_| ())
+    finish_operation_response(&token, &device_id, response).await?;
+    publish_cloud_mutation(
+        app,
+        app.state::<SharedState>().inner(),
+        Vec::new(),
+        &[id.to_string()],
+        true,
+        "organizer-rename",
+    );
+    Ok(())
 }
 
 fn video_extension(value: &str) -> bool {

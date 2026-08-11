@@ -96,6 +96,8 @@ const detailsOpen = ref(false);
 const detailsRecord = ref(null);
 let selectionAnchorId = '';
 let gcidImportPollTimer = null;
+let directoryAutoRefreshTimer = null;
+const DIRECTORY_AUTO_REFRESH_MS = 15_000;
 const uploadMenuItems = computed(() => [
   { key: 'files', label: '选择文件' },
   { key: 'folder', label: '选择文件夹' },
@@ -228,6 +230,7 @@ const renameRuleValuePlaceholders = {
   suffix: '输入要添加的后缀',
 };
 const folderPicker = reactive({ open: false, loading: false, title: '', action: 'copy', sourceIds: [], targetId: '', path: [{ id: '', name: '全部文件' }], options: [], page: 0, total: 0 });
+let latestFolderPickerRequest = 0;
 
 const fileColumns = [
   { title: '名称', key: 'name', ellipsis: true },
@@ -778,7 +781,7 @@ async function handleFileContextMenuClick({ key }) {
   closeFileContextMenu(false);
   if (key === 'newFolder') return openNewFolderModal();
   if (key === 'paste') return pasteFileClipboard();
-  if (key === 'refresh') return loadCloudFiles();
+  if (key === 'refresh') return loadCloudFiles(filesPage.value, { force: true, preserveCurrent: true });
   if (!record) return;
   if (key === 'open') return enterFolder(record);
   if (key === 'copy') return setFileClipboard('copy', targets);
@@ -848,13 +851,26 @@ function reconcileVisibleFileState() {
   if (selectionAnchorId && !visibleIds.has(String(selectionAnchorId))) selectionAnchorId = String(selectedKeys.value.at(-1) || '');
 }
 
-async function loadCloudFiles(page = filesPage.value) {
+async function loadCloudFiles(page = filesPage.value, options = {}) {
   try {
-    await loadFiles(page);
+    await loadFiles(page, options);
     reconcileVisibleFileState();
   } catch (error) {
-    message.error(errorText(error));
+    if (!options.quiet) message.error(errorText(error));
   }
+}
+
+function revalidateVisibleDirectory() {
+  if (!appState.logged_in || document.visibilityState !== 'visible') return;
+  void loadCloudFiles(filesPage.value, {
+    background: true,
+    preserveCurrent: true,
+    quiet: true,
+  });
+}
+
+function handleDirectoryVisibilityChange() {
+  if (document.visibilityState === 'visible') revalidateVisibleDirectory();
 }
 
 watch(() => route.query.focus, async (focusValue) => {
@@ -1282,17 +1298,19 @@ async function openFolderPicker(action, records) {
   await loadFolderPickerOptions('', 0);
 }
 async function loadFolderPickerOptions(parentId, page = 0) {
+  const requestId = ++latestFolderPickerRequest;
   folderPicker.loading = true;
   try {
     const normalizedPage = Math.max(0, Math.floor(Number(page) || 0));
     const data = unwrapData(await bridge.invoke('list_files', { page: normalizedPage, parent_id: parentId }));
+    if (requestId !== latestFolderPickerRequest || String(parentId || '') !== String(folderPicker.path.at(-1)?.id || '')) return;
     folderPicker.options = (data.list || []).filter((item) => isFolder(item) && !folderPicker.sourceIds.includes(fileId(item)));
     folderPicker.page = normalizedPage;
     folderPicker.total = Math.max(folderPicker.options.length, Number(data.total ?? folderPicker.options.length) || 0);
   } catch (error) {
     message.error(errorText(error));
   } finally {
-    folderPicker.loading = false;
+    if (requestId === latestFolderPickerRequest) folderPicker.loading = false;
   }
 }
 function folderPickerRowProps(record) {
@@ -1653,7 +1671,7 @@ useFileKeyboardShortcuts({
     rename: () => openRenameModal(selectedRecords()),
     delete: () => deleteCloudFiles(selectedRecords()),
     goBack,
-    refresh: () => loadCloudFiles(),
+    refresh: () => loadCloudFiles(filesPage.value, { force: true, preserveCurrent: true }),
     clearSelection,
   },
 });
@@ -1667,6 +1685,12 @@ onMounted(async () => {
   window.addEventListener('dragend', handleWindowDragEnd);
   window.addEventListener('drop', handleWindowDrop);
   window.addEventListener('click', handleWindowClick);
+  window.addEventListener('focus', revalidateVisibleDirectory);
+  document.addEventListener('visibilitychange', handleDirectoryVisibilityChange);
+  directoryAutoRefreshTimer = window.setInterval(
+    revalidateVisibleDirectory,
+    DIRECTORY_AUTO_REFRESH_MS,
+  );
   await loadDeveloperTransferJobs();
   unlistenDeveloperTransfer = await bridge.subscribe((payload) => {
     if (payload?.type === 'gcid-export-progress') {
@@ -1713,6 +1737,10 @@ onBeforeUnmount(() => {
   window.removeEventListener('dragend', handleWindowDragEnd);
   window.removeEventListener('drop', handleWindowDrop);
   window.removeEventListener('click', handleWindowClick);
+  window.removeEventListener('focus', revalidateVisibleDirectory);
+  document.removeEventListener('visibilitychange', handleDirectoryVisibilityChange);
+  if (directoryAutoRefreshTimer) window.clearInterval(directoryAutoRefreshTimer);
+  directoryAutoRefreshTimer = null;
   unlistenDrag?.();
   unlistenDeveloperTransfer?.();
 });
@@ -1765,7 +1793,7 @@ onBeforeUnmount(() => {
             <a-dropdown :menu="{ items: uploadMenuItems, onClick: handleUploadMenuClick }" :trigger="['click']">
               <a-button type="primary" :loading="uploading" :disabled="!appState.logged_in"><template #icon><UploadOutlined /></template>上传</a-button>
             </a-dropdown>
-            <a-button :loading="filesLoading" :disabled="!appState.logged_in" @click="loadCloudFiles()"><template #icon><ReloadOutlined /></template>刷新</a-button>
+            <a-button :loading="filesLoading" :disabled="!appState.logged_in" @click="loadCloudFiles(filesPage, { force: true, preserveCurrent: true })"><template #icon><ReloadOutlined /></template>刷新</a-button>
           </a-flex>
         </template>
       </div>

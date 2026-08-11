@@ -5,6 +5,7 @@ ENV PNPM_CONFIG_MINIMUM_RELEASE_AGE=0
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile --config.minimumReleaseAge=0
 COPY vite.config.mjs ./
+COPY scripts/vite-vendor-chunks.mjs ./scripts/vite-vendor-chunks.mjs
 COPY src-tauri/icons/128x128.png ./src-tauri/icons/128x128.png
 COPY ui ./ui
 COPY shared ./shared

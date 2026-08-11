@@ -3,7 +3,9 @@ import { defineStore } from 'pinia'
 import { bridge } from '../bridge.js'
 import {
   fileListCacheKey,
+  normalizeDirectoryInvalidation,
   shouldApplyFileListResponse,
+  shouldInvalidateFileListCache,
   withFileListTimeout,
 } from '../fileListRequest.js'
 import { unwrapData } from '../formatters.js'
@@ -11,6 +13,12 @@ import { unwrapData } from '../formatters.js'
 export interface CloudPathItem {
   id: string
   name: string
+}
+
+interface FileLoadOptions {
+  background?: boolean
+  force?: boolean
+  preserveCurrent?: boolean
 }
 
 export const useFilesStore = defineStore('files', () => {
@@ -22,6 +30,8 @@ export const useFilesStore = defineStore('files', () => {
   const pageSize = 100
   const cache = new Map<string, { files: any[], total: number }>()
   let latestRequestId = 0
+  let foregroundRequests = 0
+  let invalidationRefreshTimer: ReturnType<typeof setTimeout> | null = null
 
   function remember(key: string, value: { files: any[], total: number }) {
     cache.delete(key)
@@ -32,19 +42,22 @@ export const useFilesStore = defineStore('files', () => {
   const currentFolderId = computed(() => currentPath.value.at(-1)?.id || '')
   const currentFolderName = computed(() => currentPath.value.at(-1)?.name || '全部文件')
 
-  async function loadFiles(nextPage = 0) {
+  async function loadFiles(nextPage = 0, options: FileLoadOptions = {}) {
     const normalizedPage = Math.max(0, Math.floor(Number(nextPage) || 0))
     const requestedFolderId = currentFolderId.value
     const cacheKey = fileListCacheKey(requestedFolderId, normalizedPage)
     const cached = cache.get(cacheKey)
     const requestId = ++latestRequestId
-    loading.value = true
+    if (!options.background) {
+      foregroundRequests += 1
+      loading.value = true
+    }
     if (cached) {
       files.value = cached.files
       page.value = normalizedPage
       total.value = cached.total
     }
-    else {
+    else if (!options.preserveCurrent) {
       files.value = []
       page.value = normalizedPage
       total.value = 0
@@ -53,6 +66,7 @@ export const useFilesStore = defineStore('files', () => {
       const data = unwrapData(await withFileListTimeout(bridge.invoke('list_files', {
         page: normalizedPage,
         parent_id: requestedFolderId,
+        force_refresh: options.force === true,
       })))
       if (!shouldApplyFileListResponse(requestId, latestRequestId, requestedFolderId, currentFolderId.value)) {
         return files.value
@@ -76,8 +90,24 @@ export const useFilesStore = defineStore('files', () => {
       throw error
     }
     finally {
-      if (requestId === latestRequestId) loading.value = false
+      if (!options.background) {
+        foregroundRequests = Math.max(0, foregroundRequests - 1)
+        loading.value = foregroundRequests > 0
+      }
     }
+  }
+
+  function handleDirectoryInvalidation(payload: any = {}) {
+    const invalidation = normalizeDirectoryInvalidation(payload)
+    for (const key of [...cache.keys()]) {
+      if (shouldInvalidateFileListCache(key, invalidation)) cache.delete(key)
+    }
+    if (!invalidation.all && !invalidation.parentIds.includes(currentFolderId.value)) return
+    if (invalidationRefreshTimer) clearTimeout(invalidationRefreshTimer)
+    invalidationRefreshTimer = setTimeout(() => {
+      invalidationRefreshTimer = null
+      void loadFiles(page.value, { background: true, preserveCurrent: true }).catch(() => {})
+    }, 150)
   }
 
   async function enterFolder(record: any) {
@@ -103,6 +133,9 @@ export const useFilesStore = defineStore('files', () => {
   function reset() {
     latestRequestId += 1
     cache.clear()
+    if (invalidationRefreshTimer) clearTimeout(invalidationRefreshTimer)
+    invalidationRefreshTimer = null
+    foregroundRequests = 0
     loading.value = false
     files.value = []
     currentPath.value = [{ id: '', name: '全部文件' }]
@@ -120,6 +153,7 @@ export const useFilesStore = defineStore('files', () => {
     currentFolderId,
     currentFolderName,
     loadFiles,
+    handleDirectoryInvalidation,
     enterFolder,
     goBack,
     jumpTo,

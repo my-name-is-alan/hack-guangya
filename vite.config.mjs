@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite';
 import path from 'node:path';
 import vue from '@vitejs/plugin-vue';
+import { vendorChunkName } from './scripts/vite-vendor-chunks.mjs';
 
 export default defineConfig({
   root: path.resolve('ui'),
@@ -13,5 +14,10 @@ export default defineConfig({
   build: {
     outDir: path.resolve('dist'),
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks: vendorChunkName,
+      },
+    },
   },
 });

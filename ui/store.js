@@ -61,8 +61,8 @@ export async function loadOverview() {
   return sessionStore.loadOverview();
 }
 
-export async function loadFiles(page = 0) {
-  return filesStore.loadFiles(page);
+export async function loadFiles(page = 0, options = {}) {
+  return filesStore.loadFiles(page, options);
 }
 
 export async function refreshState() {

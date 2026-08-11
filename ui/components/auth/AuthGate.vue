@@ -152,6 +152,7 @@ async function handleCaptchaLoad() {
 
 async function finishLogin() {
   clearQrTimers()
+  session.resetAccountScope()
   await session.connect()
   if (session.state.logged_in) message.success('登录成功')
 }

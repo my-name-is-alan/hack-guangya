@@ -104,6 +104,7 @@ export const bridge = isTauri ? {
         parentId: String(args.parent_id || ''),
       });
       if (args.folders_only === true) params.set('resType', '2');
+      if (args.force_refresh === true) params.set('refresh', '1');
       return webRequest(`/api/files?${params}`);
     }
     if (command === 'search_files') {

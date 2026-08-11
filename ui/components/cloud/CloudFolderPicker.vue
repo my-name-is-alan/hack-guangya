@@ -24,6 +24,7 @@ const picker = reactive({
   page: 0,
   total: 0,
 })
+let latestFoldersRequest = 0
 
 const columns = [
   { title: '文件夹', key: 'name', ellipsis: true },
@@ -31,14 +32,16 @@ const columns = [
 ]
 
 async function loadFolders(page = 0) {
+  const requestId = ++latestFoldersRequest
+  const parentId = picker.path.at(-1)?.id || ''
   picker.loading = true
   try {
-    const parentId = picker.path.at(-1)?.id || ''
     const data = unwrapData(await bridge.invoke('list_files', {
       parent_id: parentId,
       page,
       folders_only: true,
     }))
+    if (requestId !== latestFoldersRequest || parentId !== (picker.path.at(-1)?.id || '')) return
     picker.items = (Array.isArray(data.list) ? data.list : []).filter(isFolder)
     picker.page = page
     picker.total = Math.max(Number(data.total || 0), picker.items.length)
@@ -47,7 +50,7 @@ async function loadFolders(page = 0) {
     message.error(errorText(reason))
   }
   finally {
-    picker.loading = false
+    if (requestId === latestFoldersRequest) picker.loading = false
   }
 }
 
@@ -88,7 +91,11 @@ function handleTableChange(pagination: any) {
 }
 
 watch(() => props.open, (open) => {
-  if (!open) return
+  if (!open) {
+    latestFoldersRequest += 1
+    picker.loading = false
+    return
+  }
   picker.path = [{ id: '', name: '全部文件' }]
   void loadFolders(0)
 })

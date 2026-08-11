@@ -150,15 +150,15 @@ function send(response, statusCode, body = '', headers = {}) {
   response.end(body);
 }
 
-async function findChild(listChildren, parentId, name) {
-  const children = (await listChildren(parentId)).map(normalizeWebDavEntry);
+async function findChild(listChildren, parentId, name, options) {
+  const children = (await listChildren(parentId, options)).map(normalizeWebDavEntry);
   const exact = children.find((entry) => entry.name === name);
   if (exact) return exact;
   const folded = children.filter((entry) => entry.name.toLocaleLowerCase() === name.toLocaleLowerCase());
   return folded.length === 1 ? folded[0] : null;
 }
 
-async function resolveEntry(listChildren, segments) {
+async function resolveEntry(listChildren, segments, options) {
   if (!segments.length) {
     return {
       entry: {
@@ -176,7 +176,7 @@ async function resolveEntry(listChildren, segments) {
   let parentId = '';
   let entry = null;
   for (const segment of segments) {
-    entry = await findChild(listChildren, parentId, segment);
+    entry = await findChild(listChildren, parentId, segment, options);
     if (!entry) throw new WebDavError(404, `云端项目不存在：${segment}`);
     if (segment !== segments.at(-1) && !entry.isDirectory) {
       throw new WebDavError(409, `路径中包含文件：${segment}`);
@@ -188,14 +188,35 @@ async function resolveEntry(listChildren, segments) {
   return { entry, parentId: entry.parentId };
 }
 
-async function resolveParent(listChildren, segments) {
+async function resolveParent(listChildren, segments, options) {
   if (!segments.length) throw new WebDavError(403, '不能修改 WebDAV 根目录');
   const name = segments.at(-1);
-  if (segments.length === 1) return { parentId: '', name, existing: await findChild(listChildren, '', name) };
-  const { entry } = await resolveEntry(listChildren, segments.slice(0, -1));
+  if (segments.length === 1) return {
+    parentId: '',
+    name,
+    existing: await findChild(listChildren, '', name, options),
+  };
+  const { entry } = await resolveEntry(listChildren, segments.slice(0, -1), options);
   if (!entry.isDirectory) throw new WebDavError(409, '目标父路径不是目录');
-  return { parentId: entry.id, name, existing: await findChild(listChildren, entry.id, name) };
+  return {
+    parentId: entry.id,
+    name,
+    existing: await findChild(listChildren, entry.id, name, options),
+  };
 }
+
+function readCacheOptions(request) {
+  const cacheControl = String(request.headers['cache-control'] || '');
+  const pragma = String(request.headers.pragma || '');
+  if (/\b(?:no-cache|no-store|max-age\s*=\s*0)\b/i.test(cacheControl) || /\bno-cache\b/i.test(pragma)) {
+    return { force: true, foreground: true };
+  }
+  // Normal reads use the backend's short fresh window and stale-while-revalidate
+  // policy. Merely visiting a directory after that window triggers a refresh.
+  return undefined;
+}
+
+const WRITE_CACHE_OPTIONS = Object.freeze({ force: true, foreground: true });
 
 function destinationSegments(request, prefix) {
   const value = String(request.headers.destination || '');
@@ -240,10 +261,11 @@ export function createWebDavHandler({
       if (!['0', '1'].includes(depth)) {
         throw new WebDavError(403, '仅支持 Depth: 0 或 1');
       }
-      const { entry } = await resolveEntry(listChildren, segments);
+      const cacheOptions = readCacheOptions(request);
+      const { entry } = await resolveEntry(listChildren, segments, cacheOptions);
       const responses = [propertyResponse(prefix, segments, entry)];
       if (depth === '1' && entry.isDirectory) {
-        const children = (await listChildren(entry.id)).map(normalizeWebDavEntry);
+        const children = (await listChildren(entry.id, cacheOptions)).map(normalizeWebDavEntry);
         for (const child of children) responses.push(propertyResponse(prefix, [...segments, child.name], child));
       }
       const body = `<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">${responses.join('')}</D:multistatus>`;
@@ -251,15 +273,16 @@ export function createWebDavHandler({
     }
 
     if (method === 'PROPPATCH') {
-      const { entry } = await resolveEntry(listChildren, segments);
+      const { entry } = await resolveEntry(listChildren, segments, readCacheOptions(request));
       const body = `<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">${propertyResponse(prefix, segments, entry)}</D:multistatus>`;
       return send(response, 207, body, { 'content-type': 'application/xml; charset=utf-8', dav: '1' });
     }
 
     if (method === 'GET' || method === 'HEAD') {
-      const { entry } = await resolveEntry(listChildren, segments);
+      const cacheOptions = readCacheOptions(request);
+      const { entry } = await resolveEntry(listChildren, segments, cacheOptions);
       if (entry.isDirectory) {
-        const children = (await listChildren(entry.id)).map(normalizeWebDavEntry);
+        const children = (await listChildren(entry.id, cacheOptions)).map(normalizeWebDavEntry);
         const body = directoryIndex(prefix, segments, entry, children);
         return send(response, 200, method === 'HEAD' ? '' : body, {
           'content-type': 'text/html; charset=utf-8',
@@ -270,7 +293,7 @@ export function createWebDavHandler({
     }
 
     if (method === 'PUT') {
-      const target = await resolveParent(listChildren, segments);
+      const target = await resolveParent(listChildren, segments, WRITE_CACHE_OPTIONS);
       if (target.existing?.isDirectory) throw new WebDavError(405, '不能用文件覆盖目录');
       const result = await putFile({ request, ...target });
       return send(response, target.existing ? 204 : 201, '', {
@@ -279,23 +302,27 @@ export function createWebDavHandler({
     }
 
     if (method === 'MKCOL') {
-      const target = await resolveParent(listChildren, segments);
+      const target = await resolveParent(listChildren, segments, WRITE_CACHE_OPTIONS);
       if (target.existing) throw new WebDavError(405, '目标已经存在');
       await createDirectory({ parentId: target.parentId, name: target.name });
       return send(response, 201);
     }
 
     if (method === 'DELETE') {
-      const { entry } = await resolveEntry(listChildren, segments);
+      const { entry } = await resolveEntry(listChildren, segments, WRITE_CACHE_OPTIONS);
       if (!entry.id) throw new WebDavError(403, '不能删除 WebDAV 根目录');
       await deleteEntry({ entry });
       return send(response, 204);
     }
 
     if (method === 'MOVE' || method === 'COPY') {
-      const { entry } = await resolveEntry(listChildren, segments);
+      const { entry } = await resolveEntry(listChildren, segments, WRITE_CACHE_OPTIONS);
       if (!entry.id) throw new WebDavError(403, '不能移动或复制 WebDAV 根目录');
-      const destination = await resolveParent(listChildren, destinationSegments(request, prefix));
+      const destination = await resolveParent(
+        listChildren,
+        destinationSegments(request, prefix),
+        WRITE_CACHE_OPTIONS,
+      );
       const overwrite = String(request.headers.overwrite || 'T').toUpperCase() !== 'F';
       if (destination.existing?.id === entry.id) {
         if (method === 'MOVE') return send(response, 204);

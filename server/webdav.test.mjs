@@ -181,6 +181,31 @@ test('WebDAV 协议层支持目录与文件完整 CRUD', async (t) => {
   assert.equal((await fetch(`${base}/dav/moved.txt`)).status, 404);
 });
 
+test('WebDAV 读取保留短缓存策略，显式刷新和写路径使用强读', async (t) => {
+  const backend = inMemoryBackend();
+  const observed = [];
+  const handler = createWebDavHandler({
+    prefix: '/dav',
+    ...backend,
+    async listChildren(parentId, options) {
+      observed.push({ parentId, options });
+      return backend.listChildren(parentId);
+    },
+  });
+  const base = await startProtocolServer(handler, t);
+
+  assert.equal((await fetch(`${base}/dav/`)).status, 200);
+  assert.equal(observed.at(-1).options, undefined);
+
+  assert.equal((await fetch(`${base}/dav/`, {
+    headers: { 'cache-control': 'no-cache' },
+  })).status, 200);
+  assert.deepEqual(observed.at(-1).options, { force: true, foreground: true });
+
+  assert.equal((await fetch(`${base}/dav/强一致目录`, { method: 'MKCOL' })).status, 201);
+  assert.deepEqual(observed.at(-1).options, { force: true, foreground: true });
+});
+
 test('WebDAV MOVE 遵守 Overwrite: F', async (t) => {
   const backend = inMemoryBackend();
   backend.entries.set('1', { id: '1', parentId: '', name: 'a.txt', isDirectory: false, content: Buffer.from('a'), modifiedAt: Date.now() });

@@ -74,6 +74,7 @@ const MULTIPART_PART_SIZE_OPTIONS: &[&str] = &["auto", "4m", "8m", "16m"];
 const DEFAULT_CACHE_MAX_ENTRIES: usize = 10_000;
 const MIN_CACHE_MAX_ENTRIES: usize = 100;
 const MAX_CACHE_MAX_ENTRIES: usize = 100_000;
+const REMOTE_DIRECTORY_CACHE_KEY_SEPARATOR: char = '\0';
 const OSS_WRITE_RETRY_TIMES: usize = 5;
 const FILE_STABILITY_WAIT_MS: u64 = 1_200;
 const FILE_BUSY_RETRY_SECS: u64 = 3;
@@ -287,6 +288,26 @@ struct FsEvent {
     mapping_id: String,
     path: PathBuf,
 }
+
+#[derive(Default)]
+struct RemoteCacheGates {
+    gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl RemoteCacheGates {
+    fn gate(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let Ok(mut gates) = self.gates.lock() else {
+            return Arc::new(tokio::sync::Mutex::new(()));
+        };
+        if gates.len() > MAX_CACHE_MAX_ENTRIES.saturating_mul(2) {
+            gates.retain(|_, gate| Arc::strong_count(gate) > 1);
+        }
+        gates
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Stamp {
     size: u64,
@@ -313,6 +334,8 @@ struct RuntimeState {
     paused_uploads: HashSet<String>,
     queue_pause_requests: HashSet<String>,
     remote_cache: HashMap<String, String>,
+    remote_cache_generation: u64,
+    remote_cache_gates: Arc<RemoteCacheGates>,
     watchers: HashMap<String, RecommendedWatcher>,
     event_tx: UnboundedSender<FsEvent>,
     paused: bool,
@@ -1814,15 +1837,158 @@ fn save_cached_file_hashes(
     Ok(())
 }
 
-fn reset_remote_cache(remote_cache: &mut HashMap<String, String>) {
+fn reset_remote_cache(remote_cache: &mut HashMap<String, String>, generation: &mut u64) {
     remote_cache.clear();
     remote_cache.insert(String::new(), String::new());
+    *generation = generation.wrapping_add(1);
+}
+
+fn reset_runtime_remote_cache(state: &mut RuntimeState) {
+    reset_remote_cache(&mut state.remote_cache, &mut state.remote_cache_generation);
 }
 
 fn invalidate_remote_directory_cache(state: &SharedState) {
     if let Ok(mut guard) = state.lock() {
-        reset_remote_cache(&mut guard.remote_cache);
+        reset_runtime_remote_cache(&mut guard);
     }
+}
+
+fn publish_cloud_mutation(
+    app: &tauri::AppHandle,
+    state: &SharedState,
+    parent_ids: impl IntoIterator<Item = String>,
+    entry_ids: &[String],
+    unknown_parent_requires_full_refresh: bool,
+    source: &str,
+) {
+    invalidate_remote_directory_cache(state);
+    let mut parent_ids = parent_ids.into_iter().collect::<HashSet<_>>();
+    let all_entries_located = if entry_ids.is_empty() {
+        true
+    } else {
+        let (located_parents, all_entries_located) =
+            webdav::invalidate_directory_cache_entries(entry_ids);
+        parent_ids.extend(located_parents);
+        all_entries_located
+    };
+    let all = unknown_parent_requires_full_refresh && !all_entries_located;
+    if all {
+        webdav::invalidate_all_directory_cache();
+    } else {
+        for parent_id in &parent_ids {
+            webdav::invalidate_directory_cache(parent_id);
+        }
+    }
+    webdav::publish_directory_invalidation(app, parent_ids, all, source);
+}
+
+fn publish_all_cloud_directories_changed(
+    app: &tauri::AppHandle,
+    state: &SharedState,
+    source: &str,
+) {
+    invalidate_remote_directory_cache(state);
+    webdav::invalidate_all_directory_cache();
+    webdav::publish_directory_invalidation(app, Vec::new(), true, source);
+}
+
+fn publish_directory_contents_changed(
+    app: &tauri::AppHandle,
+    parent_ids: impl IntoIterator<Item = String>,
+    source: &str,
+) {
+    let parent_ids = parent_ids.into_iter().collect::<HashSet<_>>();
+    for parent_id in &parent_ids {
+        webdav::invalidate_directory_cache(parent_id);
+    }
+    webdav::publish_directory_invalidation(app, parent_ids, false, source);
+}
+
+fn cached_remote_path_id(
+    state: &SharedState,
+    base_parent_id: &str,
+    remote_path: &str,
+) -> Option<String> {
+    let normalized = normalize_remote_path(remote_path);
+    if normalized.is_empty() {
+        return Some(base_parent_id.to_string());
+    }
+    let guard = state.lock().ok()?;
+    let mut parent_id = base_parent_id.to_string();
+    for part in normalized.split('/') {
+        parent_id = guard
+            .remote_cache
+            .get(&remote_directory_cache_key(&parent_id, part))?
+            .clone();
+    }
+    Some(parent_id)
+}
+
+fn remote_directory_cache_key(parent_id: &str, name: &str) -> String {
+    format!("{parent_id}{REMOTE_DIRECTORY_CACHE_KEY_SEPARATOR}{name}")
+}
+
+fn reconcile_remote_directory_cache_entries(
+    remote_cache: &mut HashMap<String, String>,
+    parent_id: &str,
+    page: u64,
+    data: &Value,
+) -> bool {
+    let list = data
+        .get("list")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let directories = list
+        .iter()
+        .filter(|item| value_as_u64(item.get("resType")) == Some(2))
+        .filter_map(|item| {
+            let name = item.get("fileName").and_then(Value::as_str)?;
+            let file_id = item.get("fileId").and_then(Value::as_str)?;
+            Some((name.to_string(), file_id.to_string()))
+        })
+        .collect::<HashMap<_, _>>();
+    let total = value_as_u64(data.get("total")).unwrap_or(list.len() as u64);
+    let complete_snapshot = page == 0 && total <= list.len() as u64;
+    let prefix = format!("{parent_id}{REMOTE_DIRECTORY_CACHE_KEY_SEPARATOR}");
+    let mut invalidated = false;
+    if complete_snapshot {
+        remote_cache.retain(|key, _| {
+            if !key.starts_with(&prefix) {
+                return true;
+            }
+            let retained = directories.contains_key(&key[prefix.len()..]);
+            invalidated |= !retained;
+            retained
+        });
+    }
+    for (name, file_id) in directories {
+        let key = remote_directory_cache_key(parent_id, &name);
+        invalidated |= remote_cache
+            .get(&key)
+            .is_some_and(|cached_id| cached_id != &file_id);
+        remote_cache.insert(key, file_id);
+    }
+    invalidated
+}
+
+fn reconcile_remote_directory_cache_page(
+    state: &SharedState,
+    parent_id: &str,
+    page: u64,
+    data: &Value,
+) {
+    let Ok(mut guard) = state.lock() else {
+        return;
+    };
+    if !guard.cache_enabled {
+        return;
+    }
+    if reconcile_remote_directory_cache_entries(&mut guard.remote_cache, parent_id, page, data) {
+        guard.remote_cache_generation = guard.remote_cache_generation.wrapping_add(1);
+    }
+    let max_entries = guard.cache_max_entries;
+    trim_remote_cache(&mut guard.remote_cache, max_entries);
 }
 
 fn trim_file_fingerprint_cache(database: &Path, max_entries: usize) -> Result<(), String> {
@@ -1921,22 +2087,29 @@ fn metadata_cache_stats(
 fn clear_metadata_cache_storage(
     database: &Path,
     remote_cache: &mut HashMap<String, String>,
+    remote_cache_generation: &mut u64,
     policy: CacheSettings,
 ) -> Result<MetadataCacheStats, String> {
     open_database(database)?
         .execute("DELETE FROM file_fingerprints", [])
         .map_err(|error| format!("清理秒传指纹缓存失败：{error}"))?;
-    reset_remote_cache(remote_cache);
+    reset_remote_cache(remote_cache, remote_cache_generation);
     metadata_cache_stats(database, remote_cache, policy)
 }
 
 fn apply_cache_policy(
     database: &Path,
     remote_cache: &mut HashMap<String, String>,
+    remote_cache_generation: &mut u64,
     policy: CacheSettings,
 ) -> Result<MetadataCacheStats, String> {
     if !policy.enabled {
-        return clear_metadata_cache_storage(database, remote_cache, policy);
+        return clear_metadata_cache_storage(
+            database,
+            remote_cache,
+            remote_cache_generation,
+            policy,
+        );
     }
     trim_file_fingerprint_cache(database, policy.max_entries)?;
     trim_remote_cache(remote_cache, policy.max_entries);
@@ -2035,7 +2208,7 @@ fn invalidate_auth_session(app: &tauri::AppHandle, state: &SharedState) -> Resul
         let mut guard = state.lock().map_err(|e| e.to_string())?;
         guard.token = None;
         guard.refresh_token = None;
-        reset_remote_cache(&mut guard.remote_cache);
+        reset_runtime_remote_cache(&mut guard);
         guard.db_path.clone()
     };
     let result = clear_persisted_auth_session(&db_path);
@@ -3653,6 +3826,7 @@ async fn find_remote_folder(
     parent_id: &str,
     name: &str,
 ) -> Result<Option<String>, String> {
+    let mut seen = 0_u64;
     for page in 0..100 {
         let result = api_post(token, device_id, "/userres/v1/file/get_file_list", json!({ "page": page, "pageSize": 100, "parentId": parent_id, "resType": 2, "needSubFolderStat": true }), &[]).await?;
         let data = result.data.unwrap_or_default();
@@ -3670,15 +3844,21 @@ async fn find_remote_folder(
                 .and_then(Value::as_str)
                 .map(str::to_owned));
         }
-        let total = data.get("total").and_then(Value::as_u64).unwrap_or(0);
-        if list.is_empty() || ((page + 1) * 100) as u64 >= total {
+        seen = seen.saturating_add(list.len() as u64);
+        let total = data.get("total").and_then(Value::as_u64);
+        if remote_folder_page_complete(seen, list.len(), total) {
             break;
         }
     }
     Ok(None)
 }
 
+fn remote_folder_page_complete(seen: u64, page_len: usize, total: Option<u64>) -> bool {
+    page_len == 0 || total.is_some_and(|total| seen >= total) || (total.is_none() && page_len < 100)
+}
+
 async fn ensure_remote_path(
+    app: &tauri::AppHandle,
     state: &SharedState,
     token: &str,
     device_id: &str,
@@ -3689,55 +3869,89 @@ async fn ensure_remote_path(
     if normalized.is_empty() {
         return Ok(base_parent_id.to_string());
     }
-    let mut parent = base_parent_id.to_string();
-    let mut prefix = String::new();
-    for part in normalized.split('/') {
-        prefix = if prefix.is_empty() {
-            part.to_owned()
-        } else {
-            format!("{prefix}/{part}")
-        };
-        let cache_key = format!("{}::{prefix}", base_parent_id);
-        let cached = {
-            let guard = state.lock().map_err(|e| e.to_string())?;
-            guard
-                .cache_enabled
-                .then(|| guard.remote_cache.get(&cache_key).cloned())
-                .flatten()
-        };
-        if let Some(cached) = cached {
-            parent = cached;
-            continue;
-        }
-        let result = api_post(
-            token,
-            device_id,
-            "/userres/v1/file/create_dir",
-            json!({ "parentId": parent, "dirName": part, "failIfNameExist": true }),
-            &[159],
-        )
-        .await?;
-        let mut file_id = result
-            .data
-            .as_ref()
-            .and_then(|data| data.get("fileId"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if file_id.is_none() && result.code == 159 {
-            file_id = find_remote_folder(token, device_id, &parent, part).await?;
-        }
-        let file_id = file_id.ok_or_else(|| format!("无法创建或定位远程目录：{prefix}"))?;
-        {
-            let mut guard = state.lock().map_err(|e| e.to_string())?;
-            if guard.cache_enabled {
-                guard.remote_cache.insert(cache_key, file_id.clone());
-                let max_entries = guard.cache_max_entries;
-                trim_remote_cache(&mut guard.remote_cache, max_entries);
+    'resolve: for _ in 0..8 {
+        let mut parent = base_parent_id.to_string();
+        let mut prefix = String::new();
+        for part in normalized.split('/') {
+            prefix = if prefix.is_empty() {
+                part.to_owned()
+            } else {
+                format!("{prefix}/{part}")
+            };
+            let cache_key = remote_directory_cache_key(&parent, part);
+            let (captured_generation, gate_pool) = {
+                let guard = state.lock().map_err(|error| error.to_string())?;
+                (
+                    guard.remote_cache_generation,
+                    Arc::clone(&guard.remote_cache_gates),
+                )
+            };
+            let gate = gate_pool.gate(&format!("{captured_generation}\0{cache_key}"));
+            let _gate = gate.lock().await;
+            let (generation, cached) = {
+                let guard = state.lock().map_err(|error| error.to_string())?;
+                (
+                    guard.remote_cache_generation,
+                    guard
+                        .cache_enabled
+                        .then(|| guard.remote_cache.get(&cache_key).cloned())
+                        .flatten(),
+                )
+            };
+            if generation != captured_generation {
+                continue 'resolve;
             }
+            if let Some(cached) = cached {
+                parent = cached;
+                continue;
+            }
+            let result = api_post(
+                token,
+                device_id,
+                "/userres/v1/file/create_dir",
+                json!({ "parentId": parent, "dirName": part, "failIfNameExist": true }),
+                &[159],
+            )
+            .await?;
+            let created = result.code != 159;
+            let mut file_id = result
+                .data
+                .as_ref()
+                .and_then(|data| data.get("fileId"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if file_id.is_none() && result.code == 159 {
+                file_id = find_remote_folder(token, device_id, &parent, part).await?;
+            }
+            let file_id = file_id.ok_or_else(|| format!("无法创建或定位远程目录：{prefix}"))?;
+            if created {
+                if let Some(task_id) = result.data.as_ref().and_then(operation_task_id) {
+                    wait_operation_task(token, device_id, &task_id).await?;
+                }
+                webdav::invalidate_directory_cache(&parent);
+                webdav::publish_directory_invalidation(
+                    app,
+                    [parent.clone()],
+                    false,
+                    "upload-create-directory",
+                );
+            }
+            {
+                let mut guard = state.lock().map_err(|error| error.to_string())?;
+                if guard.remote_cache_generation != generation {
+                    continue 'resolve;
+                }
+                if guard.cache_enabled {
+                    guard.remote_cache.insert(cache_key, file_id.clone());
+                    let max_entries = guard.cache_max_entries;
+                    trim_remote_cache(&mut guard.remote_cache, max_entries);
+                }
+            }
+            parent = file_id;
         }
-        parent = file_id;
+        return Ok(parent);
     }
-    Ok(parent)
+    Err("远程目录持续发生变化，请稍后重试".into())
 }
 
 fn parse_gcid_file_size(value: &Value) -> Result<u64, String> {
@@ -4333,6 +4547,7 @@ async fn wait_gcid_import_task(
 }
 
 async fn process_gcid_import_file(
+    app: &tauri::AppHandle,
     state: &SharedState,
     destination_parent_id: &str,
     destination_name: &str,
@@ -4354,6 +4569,7 @@ async fn process_gcid_import_file(
         format!("{destination_name}/{}", record.folder_path)
     };
     let parent_id = ensure_remote_path(
+        app,
         state,
         &token,
         &device_id,
@@ -4452,6 +4668,7 @@ async fn gcid_import_worker(
             let _ =
                 update_gcid_import_attempt(&database_path, &job_id, &record.path, attempt, None);
             match process_gcid_import_file(
+                &app,
                 &state,
                 &destination_parent_id,
                 &destination_name,
@@ -4616,6 +4833,7 @@ async fn run_gcid_import(
     if let Ok(mut guard) = state.lock() {
         guard.gcid_import_running.remove(&job_id);
     }
+    publish_all_cloud_directories_changed(&app, &state, "gcid-import");
     emit_gcid_import_status(&app, &database_path, &job_id);
     if status_value == "completed" {
         status(&app, "success", "GCID JSON 秒传导入完成");
@@ -4917,6 +5135,7 @@ async fn hdhive_request(
 }
 
 async fn schedule_auto_share(
+    app: &tauri::AppHandle,
     state: &SharedState,
     item: &UploadItem,
     outcome: &UploadOutcome,
@@ -4969,6 +5188,7 @@ async fn schedule_auto_share(
         .collect::<Vec<_>>()
         .join("/");
         ensure_remote_path(
+            app,
             state,
             &token,
             &device_id,
@@ -6469,6 +6689,7 @@ async fn preflight_flash_upload(
         }),
     );
     let parent_id = ensure_remote_path(
+        app,
         state,
         &token,
         &device_id,
@@ -6672,6 +6893,7 @@ async fn upload_item(
         json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 0, "uploaded_bytes": 0, "total_bytes": item.size, "stage": "正在准备云端目录" }),
     );
     let parent_id = ensure_remote_path(
+        app,
         state,
         &token,
         &device_id,
@@ -7307,6 +7529,12 @@ async fn finalize_successful_upload(
     item: &UploadItem,
     outcome: &UploadOutcome,
 ) {
+    if let Some(parent_id) = cached_remote_path_id(state, &item.remote_parent_id, &item.remote_dir)
+    {
+        publish_directory_contents_changed(app, [parent_id], "upload-confirmed");
+    } else {
+        publish_all_cloud_directories_changed(app, state, "upload-confirmed");
+    }
     let key = item_key(&item.mapping_id, &item.file_path);
     if upload_is_cancelled(state, &key) {
         if let Ok(guard) = state.lock() {
@@ -7362,7 +7590,7 @@ async fn finalize_successful_upload(
                 format!("文件已上传，但上传后整理排队失败；为避免分享 A 目录，未执行原自动分享：{message}"),
             );
         }
-    } else if let Err(message) = schedule_auto_share(state, item, outcome).await {
+    } else if let Err(message) = schedule_auto_share(app, state, item, outcome).await {
         status(
             app,
             "error",
@@ -8197,7 +8425,7 @@ async fn enqueue_path(app: &tauri::AppHandle, state: &SharedState, event: FsEven
             match binding_reused {
                 Ok(true) => {}
                 Ok(false) => {
-                    if let Err(error) = schedule_auto_share(state, &item, &outcome).await {
+                    if let Err(error) = schedule_auto_share(app, state, &item, &outcome).await {
                         status(
                             app,
                             "error",
@@ -9174,6 +9402,7 @@ async fn list_recycle_files(
 
 #[tauri::command]
 async fn create_folder(
+    app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
     parent_id: String,
     dir_name: String,
@@ -9189,7 +9418,16 @@ async fn create_folder(
         &[],
     )
     .await?;
-    Ok(response.data.unwrap_or_else(|| json!({})))
+    let data = finish_operation_response(&token, &device_id, response).await?;
+    publish_cloud_mutation(
+        &app,
+        state.inner(),
+        [parent_id],
+        &[],
+        false,
+        "desktop-create-folder",
+    );
+    Ok(data)
 }
 
 #[tauri::command]
@@ -9255,7 +9493,12 @@ async fn list_files(
     parent_id: String,
     page: u64,
     folders_only: Option<bool>,
+    force_refresh: Option<bool>,
 ) -> Result<Value, String> {
+    if force_refresh.unwrap_or(false) {
+        invalidate_remote_directory_cache(state.inner());
+        webdav::invalidate_directory_cache(&parent_id);
+    }
     let (token, device_id) = auth_context(&state)?;
     let request = file_list_request(&parent_id, page, folders_only.unwrap_or(false));
     let primary = tokio::time::timeout(
@@ -9269,10 +9512,10 @@ async fn list_files(
         ),
     )
     .await;
-    match primary {
-        Ok(Ok(response)) => Ok(response
+    let data = match primary {
+        Ok(Ok(response)) => response
             .data
-            .unwrap_or_else(|| json!({ "list": [], "total": 0 }))),
+            .unwrap_or_else(|| json!({ "list": [], "total": 0 })),
         Ok(Err(primary_error)) => {
             developer_file_read_fallback(
                 &state,
@@ -9280,7 +9523,7 @@ async fn list_files(
                 request,
                 primary_error,
             )
-            .await
+            .await?
         }
         Err(_) => {
             developer_file_read_fallback(
@@ -9289,9 +9532,14 @@ async fn list_files(
                 request,
                 "文件目录加载超过 12 秒，请重试".to_string(),
             )
-            .await
+            .await?
         }
-    }
+    };
+    reconcile_remote_directory_cache_page(state.inner(), &parent_id, page, &data);
+    // The desktop UI just read this directory from upstream. Ensure a mounted
+    // WebDAV client cannot keep serving the older process-shared snapshot.
+    webdav::invalidate_directory_cache(&parent_id);
+    Ok(data)
 }
 
 fn file_list_request(parent_id: &str, page: u64, folders_only: bool) -> Value {
@@ -11027,6 +11275,7 @@ async fn list_received_share_files(
 
 #[tauri::command]
 async fn restore_received_share(
+    app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
     access_token: String,
     file_ids: Vec<String>,
@@ -11050,6 +11299,14 @@ async fn restore_received_share(
     if let Some(task_id) = data.get("taskId").and_then(Value::as_str) {
         wait_operation_task(&token, &device_id, task_id).await?;
     }
+    publish_cloud_mutation(
+        &app,
+        state.inner(),
+        [parent_id],
+        &[],
+        false,
+        "desktop-restore-share",
+    );
     Ok(data)
 }
 
@@ -12095,6 +12352,7 @@ async fn download_to_local(
 
 #[tauri::command]
 async fn copy_files(
+    app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
     file_ids: Vec<String>,
     parent_id: String,
@@ -12110,17 +12368,21 @@ async fn copy_files(
         &[],
     )
     .await?;
-    finish_operation_response(&token, &device_id, response).await
+    let result = finish_operation_response(&token, &device_id, response).await?;
+    publish_cloud_mutation(&app, state.inner(), [parent_id], &[], false, "desktop-copy");
+    Ok(result)
 }
 
 #[tauri::command]
 async fn move_files(
+    app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
     file_ids: Vec<String>,
     parent_id: String,
 ) -> Result<Value, String> {
     let file_ids = normalize_id_list(&file_ids, "文件或文件夹")?;
     let parent_id = normalize_parent_id(&parent_id)?;
+    let affected_ids = file_ids.clone();
     let (token, device_id) = auth_context(&state)?;
     let response = api_post(
         &token,
@@ -12131,16 +12393,25 @@ async fn move_files(
     )
     .await?;
     let result = finish_operation_response(&token, &device_id, response).await?;
-    invalidate_remote_directory_cache(state.inner());
+    publish_cloud_mutation(
+        &app,
+        state.inner(),
+        [parent_id],
+        &affected_ids,
+        true,
+        "desktop-move",
+    );
     Ok(result)
 }
 
 #[tauri::command]
 async fn delete_files(
+    app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
     file_ids: Vec<String>,
 ) -> Result<Value, String> {
     let file_ids = normalize_id_list(&file_ids, "文件或文件夹")?;
+    let affected_ids = file_ids.clone();
     let (token, device_id) = auth_context(&state)?;
     let response = api_post(
         &token,
@@ -12151,12 +12422,20 @@ async fn delete_files(
     )
     .await?;
     let result = finish_operation_response(&token, &device_id, response).await?;
-    invalidate_remote_directory_cache(state.inner());
+    publish_cloud_mutation(
+        &app,
+        state.inner(),
+        Vec::new(),
+        &affected_ids,
+        true,
+        "desktop-delete",
+    );
     Ok(result)
 }
 
 #[tauri::command]
 async fn restore_files(
+    app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
     file_ids: Vec<String>,
 ) -> Result<Value, String> {
@@ -12171,16 +12450,18 @@ async fn restore_files(
     )
     .await?;
     let result = finish_operation_response(&token, &device_id, response).await?;
-    invalidate_remote_directory_cache(state.inner());
+    publish_all_cloud_directories_changed(&app, state.inner(), "desktop-restore");
     Ok(result)
 }
 
 #[tauri::command]
 async fn permanently_delete_files(
+    app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
     file_ids: Vec<String>,
 ) -> Result<Value, String> {
     let file_ids = normalize_id_list(&file_ids, "文件或文件夹")?;
+    let affected_ids = file_ids.clone();
     let (token, device_id) = auth_context(&state)?;
     let response = api_post(
         &token,
@@ -12191,7 +12472,14 @@ async fn permanently_delete_files(
     )
     .await?;
     let result = finish_operation_response(&token, &device_id, response).await?;
-    invalidate_remote_directory_cache(state.inner());
+    publish_cloud_mutation(
+        &app,
+        state.inner(),
+        Vec::new(),
+        &affected_ids,
+        true,
+        "desktop-permanent-delete",
+    );
     Ok(result)
 }
 
@@ -12205,6 +12493,7 @@ async fn clear_recycle_bin(state: tauri::State<'_, SharedState>) -> Result<Value
 
 #[tauri::command]
 async fn batch_rename_files(
+    app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
     renames: Vec<RenameRequest>,
 ) -> Result<Value, String> {
@@ -12216,6 +12505,10 @@ async fn batch_rename_files(
     if renames.is_empty() {
         return Err("没有需要重命名的项目".into());
     }
+    let affected_ids = renames
+        .iter()
+        .map(|item| item.file_id.clone())
+        .collect::<Vec<_>>();
     for item in &renames {
         let name = item.new_name.trim();
         if name.is_empty() || name.chars().any(|value| "\\/:*?\"<>|".contains(value)) {
@@ -12275,7 +12568,14 @@ async fn batch_rename_files(
             return Err(format!("目标重命名失败（{}）：{error}", item.new_name));
         }
     }
-    invalidate_remote_directory_cache(state.inner());
+    publish_cloud_mutation(
+        &app,
+        state.inner(),
+        Vec::new(),
+        &affected_ids,
+        true,
+        "desktop-rename",
+    );
     Ok(json!({ "renamed": staged.len() }))
 }
 
@@ -13320,7 +13620,7 @@ async fn refresh_saved_session(app: tauri::AppHandle, state: SharedState) -> Res
         if next_refresh.is_some() {
             guard.refresh_token = next_refresh.clone();
         }
-        reset_remote_cache(&mut guard.remote_cache);
+        reset_runtime_remote_cache(&mut guard);
         guard.db_path.clone()
     };
     save_auth_session(&db_path, Some(&access_token), next_refresh.as_deref())?;
@@ -13573,7 +13873,7 @@ async fn login_with_sms(
         guard.token = Some(access_token);
         guard.refresh_token = refresh_token;
         guard.sms_verifications.remove(verification_id);
-        reset_remote_cache(&mut guard.remote_cache);
+        reset_runtime_remote_cache(&mut guard);
     }
     status(
         &app,
@@ -13696,7 +13996,7 @@ async fn poll_device_login(
             let mut guard = state.lock().map_err(|e| e.to_string())?;
             guard.token = Some(token.clone());
             guard.refresh_token = refresh_token.clone();
-            reset_remote_cache(&mut guard.remote_cache);
+            reset_runtime_remote_cache(&mut guard);
             guard.db_path.clone()
         };
         if let Err(message) = replace_auth_session(&db_path, Some(&token), refresh_token.as_deref())
@@ -13753,7 +14053,7 @@ async fn capture_token(
         }
         guard.token = Some(token.clone());
         guard.refresh_token = None;
-        reset_remote_cache(&mut guard.remote_cache);
+        reset_runtime_remote_cache(&mut guard);
         guard.db_path.clone()
     };
     if let Err(message) = replace_auth_session(&db_path, Some(&token), None) {
@@ -14165,7 +14465,7 @@ async fn backfill_auto_shares(
             task_id: String::new(),
             remote_file_id: Some(remote_file_id),
         };
-        schedule_auto_share(state.inner(), &item, &outcome).await?;
+        schedule_auto_share(&app, state.inner(), &item, &outcome).await?;
         scheduled += 1;
     }
     status(
@@ -16214,7 +16514,12 @@ fn update_cache_settings(
             .unwrap_or(guard.cache_max_entries),
     };
     let db_path = guard.db_path.clone();
-    apply_cache_policy(&db_path, &mut guard.remote_cache, next)?;
+    let RuntimeState {
+        remote_cache,
+        remote_cache_generation,
+        ..
+    } = &mut *guard;
+    apply_cache_policy(&db_path, remote_cache, remote_cache_generation, next)?;
     save_app_state(&db_path, "cache_enabled", &next.enabled.to_string())?;
     save_app_state(&db_path, "cache_max_entries", &next.max_entries.to_string())?;
     guard.cache_enabled = next.enabled;
@@ -16235,7 +16540,12 @@ fn clear_metadata_cache(
     let mut guard = state.lock().map_err(|error| error.to_string())?;
     let db_path = guard.db_path.clone();
     let policy = cache_settings(&guard);
-    clear_metadata_cache_storage(&db_path, &mut guard.remote_cache, policy)
+    let RuntimeState {
+        remote_cache,
+        remote_cache_generation,
+        ..
+    } = &mut *guard;
+    clear_metadata_cache_storage(&db_path, remote_cache, remote_cache_generation, policy)
 }
 #[tauri::command]
 async fn resume_queue(
@@ -16402,7 +16712,13 @@ fn run() {
                 &cache_policy.max_entries.to_string(),
             )?;
             let mut remote_cache = HashMap::from([(String::new(), String::new())]);
-            apply_cache_policy(&db_path, &mut remote_cache, cache_policy)?;
+            let mut remote_cache_generation = 0;
+            apply_cache_policy(
+                &db_path,
+                &mut remote_cache,
+                &mut remote_cache_generation,
+                cache_policy,
+            )?;
             let hdhive_enabled =
                 parse_hdhive_enabled(load_app_state(&db_path, "hdhive_enabled")?.as_deref());
             let raw_hdhive_base_url = std::env::var("HDHIVE_BASE_URL")
@@ -16492,6 +16808,8 @@ fn run() {
                 paused_uploads: HashSet::new(),
                 queue_pause_requests: HashSet::new(),
                 remote_cache,
+                remote_cache_generation,
+                remote_cache_gates: Arc::new(RemoteCacheGates::default()),
                 watchers: HashMap::new(),
                 event_tx,
                 paused: false,
@@ -17847,11 +18165,17 @@ mod tests {
         );
 
         let mut remote_cache = HashMap::from([(String::new(), String::new())]);
+        let mut remote_cache_generation = 0;
         for index in 0..105 {
             remote_cache.insert(format!("root::{index}"), format!("folder-{index}"));
         }
-        let bounded = apply_cache_policy(&database, &mut remote_cache, enabled)
-            .expect("apply enabled cache policy");
+        let bounded = apply_cache_policy(
+            &database,
+            &mut remote_cache,
+            &mut remote_cache_generation,
+            enabled,
+        )
+        .expect("apply enabled cache policy");
         assert_eq!(bounded.file_fingerprints_entries, 100);
         assert_eq!(bounded.remote_cache_entries, 100);
         assert_eq!(bounded.policy, enabled);
@@ -17869,8 +18193,13 @@ mod tests {
                 .expect("disabled cache read is a no-op")
                 .is_none()
         );
-        let cleared = apply_cache_policy(&database, &mut remote_cache, disabled)
-            .expect("disable and clear cache");
+        let cleared = apply_cache_policy(
+            &database,
+            &mut remote_cache,
+            &mut remote_cache_generation,
+            disabled,
+        )
+        .expect("disable and clear cache");
         assert_eq!(cleared.entries, 0);
         assert_eq!(cleared.policy, disabled);
         assert_eq!(
@@ -17903,6 +18232,78 @@ mod tests {
         assert!(validate_cache_max_entries(MAX_CACHE_MAX_ENTRIES + 1).is_err());
 
         fs::remove_dir_all(root).expect("remove cache policy test root");
+    }
+
+    #[test]
+    fn remote_directory_edge_cache_reconciles_only_complete_parent_snapshots() {
+        let parent = "parent-a";
+        let current_key = remote_directory_cache_key(parent, "当前目录");
+        let stale_key = remote_directory_cache_key(parent, "已删除目录");
+        let unrelated_key = remote_directory_cache_key("parent-b", "其它目录");
+        let mut cache = HashMap::from([
+            (String::new(), String::new()),
+            (stale_key.clone(), "stale-id".to_string()),
+            (unrelated_key.clone(), "other-id".to_string()),
+        ]);
+
+        assert!(reconcile_remote_directory_cache_entries(
+            &mut cache,
+            parent,
+            0,
+            &json!({
+                "list": [{ "fileId": "current-id", "fileName": "当前目录", "resType": 2 }],
+                "total": 1,
+            }),
+        ));
+        assert_eq!(
+            cache.get(&current_key).map(String::as_str),
+            Some("current-id")
+        );
+        assert!(!cache.contains_key(&stale_key));
+        assert!(cache.contains_key(&unrelated_key));
+
+        cache.insert(stale_key.clone(), "new-stale-id".to_string());
+        assert!(reconcile_remote_directory_cache_entries(
+            &mut cache,
+            parent,
+            0,
+            &json!({
+                "list": [{ "fileId": "current-id-2", "fileName": "当前目录", "resType": 2 }],
+                "total": 200,
+            }),
+        ));
+        assert_eq!(
+            cache.get(&current_key).map(String::as_str),
+            Some("current-id-2")
+        );
+        assert!(cache.contains_key(&stale_key));
+
+        let mut generation = 7;
+        reset_remote_cache(&mut cache, &mut generation);
+        assert_eq!(generation, 8);
+        assert_eq!(cache, HashMap::from([(String::new(), String::new())]));
+    }
+
+    #[test]
+    fn remote_directory_gates_coalesce_same_edge_without_blocking_other_edges() {
+        let gates = RemoteCacheGates::default();
+        let first = gates.gate("7\0parent\0folder");
+        let same = gates.gate("7\0parent\0folder");
+        let other = gates.gate("7\0parent\0other");
+        let next_generation = gates.gate("8\0parent\0folder");
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert!(!Arc::ptr_eq(&first, &next_generation));
+    }
+
+    #[test]
+    fn remote_folder_pagination_uses_seen_count_and_handles_missing_total() {
+        assert!(!remote_folder_page_complete(50, 50, Some(150)));
+        assert!(!remote_folder_page_complete(100, 50, Some(150)));
+        assert!(remote_folder_page_complete(150, 50, Some(150)));
+        assert!(!remote_folder_page_complete(100, 100, None));
+        assert!(remote_folder_page_complete(150, 50, None));
+        assert!(remote_folder_page_complete(100, 0, Some(200)));
     }
 
     #[test]
@@ -17948,6 +18349,7 @@ mod tests {
             (String::new(), String::new()),
             ("root::Movies".to_string(), "folder-1".to_string()),
         ]);
+        let mut remote_cache_generation = 0;
         let before =
             metadata_cache_stats(&database, &remote_cache, policy).expect("read cache stats");
         assert_eq!(before.file_fingerprints_entries, 1);
@@ -17955,8 +18357,13 @@ mod tests {
         assert_eq!(before.entries, 2);
         assert!(before.bytes > 0);
 
-        let after = clear_metadata_cache_storage(&database, &mut remote_cache, policy)
-            .expect("clear metadata cache");
+        let after = clear_metadata_cache_storage(
+            &database,
+            &mut remote_cache,
+            &mut remote_cache_generation,
+            policy,
+        )
+        .expect("clear metadata cache");
         assert_eq!(after.entries, 0);
         assert_eq!(after.bytes, 0);
         assert_eq!(

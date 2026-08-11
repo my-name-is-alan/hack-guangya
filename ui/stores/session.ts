@@ -102,6 +102,11 @@ export const useSessionStore = defineStore('session', () => {
     }
   }
 
+  function resetAccountScope() {
+    Object.assign(overview, { profile: {}, assets: {} })
+    useFilesStore().reset()
+  }
+
   async function loadOverview() {
     if (!state.logged_in) return
     const data = unwrapData(await bridge.invoke('get_overview'))
@@ -157,6 +162,9 @@ export const useSessionStore = defineStore('session', () => {
           const text = String(payload.message || '')
           appendLog(payload.level || 'info', text)
           if (text.includes('登录态已失效')) handleAuthExpired(text)
+        }
+        if (payload?.type === 'cloud-directory-invalidated') {
+          useFilesStore().handleDirectoryInvalidation(payload)
         }
         transfers.handleSyncEvent(payload)
       })
@@ -219,6 +227,7 @@ export const useSessionStore = defineStore('session', () => {
     unlockAccess,
     connect,
     requestRelogin,
+    resetAccountScope,
     initialize,
     dispose,
   }

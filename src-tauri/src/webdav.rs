@@ -4,9 +4,9 @@ use axum::{
     extract::State,
     http::{
         header::{
-            ACCEPT_RANGES, ALLOW, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH,
-            CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH,
-            IF_UNMODIFIED_SINCE, LAST_MODIFIED, RANGE, WWW_AUTHENTICATE,
+            ACCEPT_RANGES, ALLOW, AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION,
+            CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_MATCH, IF_MODIFIED_SINCE,
+            IF_NONE_MATCH, IF_UNMODIFIED_SINCE, LAST_MODIFIED, PRAGMA, RANGE, WWW_AUTHENTICATE,
         },
         HeaderMap, Method, Request, Response, StatusCode,
     },
@@ -209,6 +209,57 @@ impl DirectoryCache {
         }
     }
 
+    fn invalidate_entries(&self, entry_ids: &[String]) -> (Vec<String>, bool) {
+        let entry_ids = entry_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+        let (parents, matched) = self
+            .state
+            .lock()
+            .ok()
+            .map(|state| {
+                let mut parents = HashSet::new();
+                let mut matched = HashSet::new();
+                for (parent_id, cached) in &state.entries {
+                    for entry in &cached.entries {
+                        if entry_ids.contains(entry.id.as_str()) {
+                            parents.insert(parent_id.clone());
+                            matched.insert(entry.id.as_str());
+                        }
+                    }
+                }
+                (parents, matched.len())
+            })
+            .unwrap_or_default();
+        for parent_id in &parents {
+            self.invalidate(parent_id);
+        }
+        for entry_id in &entry_ids {
+            self.invalidate_subtree(entry_id);
+        }
+        (parents.into_iter().collect(), matched == entry_ids.len())
+    }
+
+    fn clear(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let keys = state
+            .entries
+            .keys()
+            .chain(state.generations.keys())
+            .cloned()
+            .collect::<HashSet<_>>();
+        state.entries.clear();
+        for key in keys {
+            let next = state
+                .generations
+                .get(&key)
+                .copied()
+                .unwrap_or(0)
+                .wrapping_add(1);
+            state.generations.insert(key, next);
+        }
+    }
+
     fn gate(&self, parent_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let Ok(mut gates) = self.gates.lock() else {
             return Arc::new(tokio::sync::Mutex::new(()));
@@ -221,6 +272,48 @@ impl DirectoryCache {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
+}
+
+fn shared_directory_cache() -> Arc<DirectoryCache> {
+    static CACHE: OnceLock<Arc<DirectoryCache>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| Arc::new(DirectoryCache::default()))
+        .clone()
+}
+
+pub(crate) fn invalidate_directory_cache(parent_id: &str) {
+    shared_directory_cache().invalidate(parent_id);
+}
+
+pub(crate) fn invalidate_directory_cache_entries(entry_ids: &[String]) -> (Vec<String>, bool) {
+    shared_directory_cache().invalidate_entries(entry_ids)
+}
+
+pub(crate) fn invalidate_all_directory_cache() {
+    shared_directory_cache().clear();
+}
+
+pub(crate) fn publish_directory_invalidation(
+    app: &tauri::AppHandle,
+    parent_ids: impl IntoIterator<Item = String>,
+    all: bool,
+    source: &str,
+) {
+    let mut parent_ids = parent_ids
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    parent_ids.sort();
+    emit(
+        app,
+        json!({
+            "type": "cloud-directory-invalidated",
+            "parent_ids": parent_ids,
+            "all": all,
+            "source": source,
+        }),
+    );
 }
 
 fn changed_directory_ids(before: &[RemoteEntry], after: &[RemoteEntry]) -> Vec<String> {
@@ -403,66 +496,89 @@ async fn fetch_children(context: &WebDavContext, parent_id: &str) -> DavResult<V
     Ok(records)
 }
 
-async fn list_children(context: &WebDavContext, parent_id: &str) -> DavResult<Vec<RemoteEntry>> {
+async fn list_children(
+    context: &WebDavContext,
+    parent_id: &str,
+    force_refresh: bool,
+) -> DavResult<Vec<RemoteEntry>> {
     let (token, _) = auth_context(&context.state)?;
     context
         .directory_cache
         .ensure_scope(Sha256::digest(token.as_bytes()).as_slice());
     let cached = context.directory_cache.snapshot(parent_id);
-    if let Some((entries, age)) = &cached {
-        if *age <= Duration::from_secs(DIRECTORY_CACHE_FRESH_SECS) {
-            return Ok(entries.clone());
+    if !force_refresh {
+        if let Some((entries, age)) = &cached {
+            if *age <= Duration::from_secs(DIRECTORY_CACHE_FRESH_SECS) {
+                return Ok(entries.clone());
+            }
+        }
+
+        let gate = context.directory_cache.gate(parent_id);
+        if let Some((entries, age)) = cached {
+            if age <= Duration::from_secs(DIRECTORY_CACHE_STALE_SECS) {
+                if let Ok(guard) = gate.clone().try_lock_owned() {
+                    let context = context.clone();
+                    let parent_id = parent_id.to_string();
+                    tokio::spawn(async move {
+                        let _guard = guard;
+                        let generation = context.directory_cache.generation(&parent_id);
+                        if let Ok(entries) = fetch_children(&context, &parent_id).await {
+                            context
+                                .directory_cache
+                                .put_if_current(&parent_id, generation, entries);
+                        }
+                    });
+                }
+                return Ok(entries);
+            }
         }
     }
 
     let gate = context.directory_cache.gate(parent_id);
-    if let Some((entries, age)) = cached {
-        if age <= Duration::from_secs(DIRECTORY_CACHE_STALE_SECS) {
-            if let Ok(guard) = gate.clone().try_lock_owned() {
-                let context = context.clone();
-                let parent_id = parent_id.to_string();
-                tokio::spawn(async move {
-                    let _guard = guard;
-                    let generation = context.directory_cache.generation(&parent_id);
-                    if let Ok(entries) = fetch_children(&context, &parent_id).await {
-                        context
-                            .directory_cache
-                            .put_if_current(&parent_id, generation, entries);
-                    }
-                });
-            }
-            return Ok(entries);
-        }
-    }
-
     let _guard = gate.lock().await;
-    if let Some((entries, age)) = context.directory_cache.snapshot(parent_id) {
-        if age <= Duration::from_secs(DIRECTORY_CACHE_FRESH_SECS) {
-            return Ok(entries);
+    if !force_refresh {
+        if let Some((entries, age)) = context.directory_cache.snapshot(parent_id) {
+            if age <= Duration::from_secs(DIRECTORY_CACHE_FRESH_SECS) {
+                return Ok(entries);
+            }
         }
     }
-    let generation = context.directory_cache.generation(parent_id);
-    match fetch_children(context, parent_id).await {
-        Ok(entries) => {
-            context
-                .directory_cache
-                .put_if_current(parent_id, generation, entries.clone());
+    for _ in 0..3 {
+        let generation = context.directory_cache.generation(parent_id);
+        match fetch_children(context, parent_id).await {
             Ok(entries)
+                if context.directory_cache.put_if_current(
+                    parent_id,
+                    generation,
+                    entries.clone(),
+                ) =>
+            {
+                return Ok(entries);
+            }
+            Ok(_) => continue,
+            Err(error) if force_refresh => return Err(error),
+            Err(error) => {
+                return context
+                    .directory_cache
+                    .snapshot(parent_id)
+                    .map(|(entries, _)| entries)
+                    .ok_or(error);
+            }
         }
-        Err(error) => context
-            .directory_cache
-            .snapshot(parent_id)
-            .map(|(entries, _)| entries)
-            .ok_or(error),
     }
+    Err(DavError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "云端目录正在变化，请重试当前操作",
+    ))
 }
 
 async fn find_child(
     context: &WebDavContext,
     parent_id: &str,
     name: &str,
+    force_refresh: bool,
 ) -> DavResult<Option<RemoteEntry>> {
-    let children = list_children(context, parent_id).await?;
+    let children = list_children(context, parent_id, force_refresh).await?;
     if let Some(exact) = children.iter().find(|entry| entry.name == name) {
         return Ok(Some(exact.clone()));
     }
@@ -477,14 +593,18 @@ async fn find_child(
     })
 }
 
-async fn resolve_entry(context: &WebDavContext, segments: &[String]) -> DavResult<RemoteEntry> {
+async fn resolve_entry(
+    context: &WebDavContext,
+    segments: &[String],
+    force_refresh: bool,
+) -> DavResult<RemoteEntry> {
     if segments.is_empty() {
         return Ok(RemoteEntry::root());
     }
     let mut parent_id = String::new();
     let mut entry = None;
     for (index, segment) in segments.iter().enumerate() {
-        let current = find_child(context, &parent_id, segment)
+        let current = find_child(context, &parent_id, segment, force_refresh)
             .await?
             .ok_or_else(|| {
                 DavError::new(StatusCode::NOT_FOUND, format!("云端项目不存在：{segment}"))
@@ -504,6 +624,7 @@ async fn resolve_entry(context: &WebDavContext, segments: &[String]) -> DavResul
 async fn resolve_parent(
     context: &WebDavContext,
     segments: &[String],
+    force_refresh: bool,
 ) -> DavResult<(String, String, Option<RemoteEntry>)> {
     if segments.is_empty() {
         return Err(DavError::new(
@@ -515,13 +636,13 @@ async fn resolve_parent(
     let parent_id = if segments.len() == 1 {
         String::new()
     } else {
-        let parent = resolve_entry(context, &segments[..segments.len() - 1]).await?;
+        let parent = resolve_entry(context, &segments[..segments.len() - 1], force_refresh).await?;
         if !parent.is_directory {
             return Err(DavError::new(StatusCode::CONFLICT, "目标父路径不是目录"));
         }
         parent.id
     };
-    let existing = find_child(context, &parent_id, &name).await?;
+    let existing = find_child(context, &parent_id, &name, force_refresh).await?;
     Ok((parent_id, name, existing))
 }
 
@@ -565,6 +686,19 @@ fn destination_path(headers: &HeaderMap) -> DavResult<Vec<String>> {
             .to_string()
     };
     decode_path(&path)
+}
+
+fn request_forces_directory_refresh(headers: &HeaderMap) -> bool {
+    [CACHE_CONTROL, PRAGMA].iter().any(|name| {
+        headers.get_all(name).iter().any(|value| {
+            value.to_str().ok().is_some_and(|value| {
+                let normalized = value.to_ascii_lowercase().replace([' ', '\t'], "");
+                normalized
+                    .split(',')
+                    .any(|directive| matches!(directive, "no-cache" | "no-store" | "max-age=0"))
+            })
+        })
+    })
 }
 
 fn authenticated(headers: &HeaderMap, state: &SharedState) -> bool {
@@ -751,7 +885,7 @@ fn directory_index(segments: &[String], entry: &RemoteEntry, children: &[RemoteE
 
 async fn create_directory(context: &WebDavContext, parent_id: &str, name: &str) -> DavResult<()> {
     let (token, device_id) = auth_context(&context.state)?;
-    api_post(
+    let response = api_post(
         &token,
         &device_id,
         "/userres/v1/file/create_dir",
@@ -760,6 +894,9 @@ async fn create_directory(context: &WebDavContext, parent_id: &str, name: &str) 
     )
     .await
     .map_err(DavError::from)?;
+    finish_operation_response(&token, &device_id, response)
+        .await
+        .map_err(DavError::from)?;
     context.directory_cache.invalidate(parent_id);
     Ok(())
 }
@@ -794,7 +931,7 @@ async fn delete_entry(context: &WebDavContext, entry: &RemoteEntry) -> DavResult
 
 async fn rename_entry(context: &WebDavContext, entry_id: &str, new_name: &str) -> DavResult<()> {
     let (token, device_id) = auth_context(&context.state)?;
-    api_post(
+    let response = api_post(
         &token,
         &device_id,
         "/userres/v1/file/rename",
@@ -803,6 +940,9 @@ async fn rename_entry(context: &WebDavContext, entry_id: &str, new_name: &str) -
     )
     .await
     .map_err(DavError::from)?;
+    finish_operation_response(&token, &device_id, response)
+        .await
+        .map_err(DavError::from)?;
     Ok(())
 }
 
@@ -876,7 +1016,7 @@ async fn copy_entry(
     parent_id: &str,
     name: &str,
 ) -> DavResult<()> {
-    let before = list_children(context, parent_id).await?;
+    let before = list_children(context, parent_id, true).await?;
     if entry.name != name && before.iter().any(|item| item.name == entry.name) {
         return Err(DavError::new(
             StatusCode::CONFLICT,
@@ -911,7 +1051,7 @@ async fn copy_entry(
     if entry.name == name {
         return Ok(());
     }
-    let copied = list_children(context, parent_id)
+    let copied = list_children(context, parent_id, true)
         .await?
         .into_iter()
         .find(|item| item.name == entry.name && !before_ids.contains(&item.id))
@@ -1254,6 +1394,7 @@ async fn handle_authenticated(
             .unwrap_or_else(|_| Response::new(Body::empty())));
     }
     if method.as_str() == "PROPFIND" {
+        let force_refresh = request_forces_directory_refresh(request.headers());
         let depth = request
             .headers()
             .get("depth")
@@ -1262,10 +1403,10 @@ async fn handle_authenticated(
         if !matches!(depth, "0" | "1") {
             return Err(DavError::new(StatusCode::FORBIDDEN, "仅支持 Depth: 0 或 1"));
         }
-        let entry = resolve_entry(context, &segments).await?;
+        let entry = resolve_entry(context, &segments, force_refresh).await?;
         let mut responses = vec![property_response(&segments, &entry)];
         if depth == "1" && entry.is_directory {
-            for child in list_children(context, &entry.id).await? {
+            for child in list_children(context, &entry.id, force_refresh).await? {
                 let mut child_segments = segments.clone();
                 child_segments.push(child.name.clone());
                 responses.push(property_response(&child_segments, &child));
@@ -1283,7 +1424,12 @@ async fn handle_authenticated(
             .map_err(|error| DavError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
     }
     if method.as_str() == "PROPPATCH" {
-        let entry = resolve_entry(context, &segments).await?;
+        let entry = resolve_entry(
+            context,
+            &segments,
+            request_forces_directory_refresh(request.headers()),
+        )
+        .await?;
         let body = format!(
             r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">{}</D:multistatus>"#,
             property_response(&segments, &entry)
@@ -1296,9 +1442,10 @@ async fn handle_authenticated(
             .map_err(|error| DavError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
     }
     if method == Method::GET || method == Method::HEAD {
-        let entry = resolve_entry(context, &segments).await?;
+        let force_refresh = request_forces_directory_refresh(request.headers());
+        let entry = resolve_entry(context, &segments, force_refresh).await?;
         if entry.is_directory {
-            let children = list_children(context, &entry.id).await?;
+            let children = list_children(context, &entry.id, force_refresh).await?;
             let body = directory_index(&segments, &entry, &children);
             return Response::builder()
                 .status(StatusCode::OK)
@@ -1318,7 +1465,7 @@ async fn handle_authenticated(
         return read_file(context, &headers, &entry, method == Method::HEAD).await;
     }
     if method == Method::PUT {
-        let (parent_id, name, existing) = resolve_parent(context, &segments).await?;
+        let (parent_id, name, existing) = resolve_parent(context, &segments, true).await?;
         if existing.as_ref().is_some_and(|entry| entry.is_directory) {
             return Err(DavError::new(
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -1327,6 +1474,7 @@ async fn handle_authenticated(
         }
         let created = existing.is_none();
         let uploaded = put_file(context, request, &parent_id, &name, existing.as_ref()).await?;
+        publish_directory_invalidation(&context.app, [parent_id], false, "webdav-put");
         return Ok(Response::builder()
             .status(if created {
                 StatusCode::CREATED
@@ -1338,7 +1486,7 @@ async fn handle_authenticated(
             .unwrap_or_else(|_| Response::new(Body::empty())));
     }
     if method.as_str() == "MKCOL" {
-        let (parent_id, name, existing) = resolve_parent(context, &segments).await?;
+        let (parent_id, name, existing) = resolve_parent(context, &segments, true).await?;
         if existing.is_some() {
             return Err(DavError::new(
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -1346,21 +1494,26 @@ async fn handle_authenticated(
             ));
         }
         create_directory(context, &parent_id, &name).await?;
+        invalidate_remote_directory_cache(&context.state);
+        publish_directory_invalidation(&context.app, [parent_id], false, "webdav-mkcol");
         return Ok(empty_response(StatusCode::CREATED));
     }
     if method == Method::DELETE {
-        let entry = resolve_entry(context, &segments).await?;
+        let entry = resolve_entry(context, &segments, true).await?;
         if entry.id.is_empty() {
             return Err(DavError::new(
                 StatusCode::FORBIDDEN,
                 "不能删除 WebDAV 根目录",
             ));
         }
+        let parent_id = entry.parent_id.clone();
         delete_entry(context, &entry).await?;
+        invalidate_remote_directory_cache(&context.state);
+        publish_directory_invalidation(&context.app, [parent_id], false, "webdav-delete");
         return Ok(empty_response(StatusCode::NO_CONTENT));
     }
     if matches!(method.as_str(), "MOVE" | "COPY") {
-        let entry = resolve_entry(context, &segments).await?;
+        let entry = resolve_entry(context, &segments, true).await?;
         if entry.id.is_empty() {
             return Err(DavError::new(
                 StatusCode::FORBIDDEN,
@@ -1368,7 +1521,8 @@ async fn handle_authenticated(
             ));
         }
         let destination = destination_path(request.headers())?;
-        let (parent_id, name, existing) = resolve_parent(context, &destination).await?;
+        let source_parent_id = entry.parent_id.clone();
+        let (parent_id, name, existing) = resolve_parent(context, &destination, true).await?;
         let overwrite = request
             .headers()
             .get("overwrite")
@@ -1422,6 +1576,17 @@ async fn handle_authenticated(
         if let Some(backup) = backup {
             delete_entry(context, &backup).await?;
         }
+        invalidate_remote_directory_cache(&context.state);
+        publish_directory_invalidation(
+            &context.app,
+            [source_parent_id, parent_id],
+            false,
+            if method.as_str() == "MOVE" {
+                "webdav-move"
+            } else {
+                "webdav-copy"
+            },
+        );
         return Ok(empty_response(if replaced {
             StatusCode::NO_CONTENT
         } else {
@@ -1435,6 +1600,7 @@ async fn handle_authenticated(
 }
 
 pub async fn serve(app: tauri::AppHandle, state: SharedState, port: u16) {
+    invalidate_all_directory_cache();
     let address = format!("127.0.0.1:{port}");
     let listener = match tokio::net::TcpListener::bind(&address).await {
         Ok(listener) => listener,
@@ -1465,7 +1631,7 @@ pub async fn serve(app: tauri::AppHandle, state: SharedState, port: u16) {
         .with_state(WebDavContext {
             app: app.clone(),
             state: state.clone(),
-            directory_cache: Arc::new(DirectoryCache::default()),
+            directory_cache: shared_directory_cache(),
         });
     if let Err(error) = axum::serve(listener, router).await {
         if let Ok(mut guard) = state.lock() {
@@ -1578,5 +1744,50 @@ mod tests {
         assert!(cache.put_if_current("", cache.generation(""), Vec::new()));
         cache.ensure_scope(b"account-b");
         assert!(cache.snapshot("").is_none());
+    }
+
+    #[test]
+    fn manual_refresh_headers_force_directory_revalidation() {
+        let mut headers = HeaderMap::new();
+        assert!(!request_forces_directory_refresh(&headers));
+
+        headers.insert(CACHE_CONTROL, "public, max-age = 0".parse().unwrap());
+        assert!(request_forces_directory_refresh(&headers));
+
+        headers.clear();
+        headers.insert(PRAGMA, "no-cache".parse().unwrap());
+        assert!(request_forces_directory_refresh(&headers));
+
+        headers.clear();
+        headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
+        assert!(!request_forces_directory_refresh(&headers));
+    }
+
+    #[test]
+    fn shared_directory_cache_invalidates_cached_entry_parents_and_unknowns_safely() {
+        let first = shared_directory_cache();
+        let second = shared_directory_cache();
+        assert!(Arc::ptr_eq(&first, &second));
+        first.clear();
+        first.ensure_scope(b"shared-account");
+        let child = RemoteEntry {
+            id: "folder".to_string(),
+            parent_id: String::new(),
+            name: "资料".to_string(),
+            is_directory: true,
+            size: 0,
+            modified_ms: 100,
+        };
+        assert!(first.put_if_current("", first.generation(""), vec![child]));
+        assert!(first.put_if_current("folder", first.generation("folder"), Vec::new()));
+
+        let (parents, all_found) = invalidate_directory_cache_entries(&["folder".to_string()]);
+        assert!(all_found);
+        assert_eq!(parents, vec![String::new()]);
+        assert!(first.snapshot("").is_none());
+        assert!(first.snapshot("folder").is_none());
+
+        let (_, all_found) = invalidate_directory_cache_entries(&["missing".to_string()]);
+        assert!(!all_found);
     }
 }

@@ -722,6 +722,7 @@ test('Web 普通删除与 WebDAV DELETE 都使用官方永久删除接口', asyn
 
   const upstreamRequests = [];
   let rejectFirstList = true;
+  let davFileName = 'dav.txt';
   const apiServer = http.createServer(async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
@@ -736,7 +737,7 @@ test('Web 普通删除与 WebDAV DELETE 都使用官方永久删除接口', asyn
         response.end(JSON.stringify({
           code: 0,
           data: {
-            list: [{ fileId: 'dav-file', fileName: 'dav.txt', resType: 1, fileSize: 3, utime: 1_722_500_000 }],
+            list: [{ fileId: 'dav-file', fileName: davFileName, resType: 1, fileSize: 3, utime: 1_722_500_000 }],
             total: 1,
           },
         }));
@@ -785,13 +786,65 @@ test('Web 普通删除与 WebDAV DELETE 都使用官方永久删除接口', asyn
   let output = '';
   child.stdout.on('data', (chunk) => { output += chunk; });
   child.stderr.on('data', (chunk) => { output += chunk; });
+  const eventAbort = new AbortController();
+  const cloudInvalidations = [];
 
   try {
     await waitUntil(() => output.includes('Guangya Web listening'));
 
+    const eventResponse = await fetch(`http://127.0.0.1:${port}/api/events`, {
+      signal: eventAbort.signal,
+    });
+    assert.equal(eventResponse.status, 200);
+    void (async () => {
+      const decoder = new TextDecoder();
+      let buffered = '';
+      try {
+        for await (const chunk of eventResponse.body) {
+          buffered += decoder.decode(chunk, { stream: true });
+          const frames = buffered.split('\n\n');
+          buffered = frames.pop() || '';
+          for (const frame of frames) {
+            const data = frame.split('\n').find((line) => line.startsWith('data: '))?.slice(6);
+            if (!data) continue;
+            const payload = JSON.parse(data);
+            if (payload.type === 'cloud-directory-invalidated') cloudInvalidations.push(payload);
+          }
+        }
+      } catch (error) {
+        if (error.name !== 'AbortError') throw error;
+      }
+    })();
+
     const failedList = await fetch(`http://127.0.0.1:${port}/api/files`);
     assert.equal(failedList.status, 400);
     assert.deepEqual(await failedList.json(), { error: '参数错误' });
+
+    const authorization = `Basic ${Buffer.from(`storage-user:${webdavPassword}`).toString('base64')}`;
+    const cachedWebDavList = await fetch(`http://127.0.0.1:${webdavPort}/dav/`, {
+      method: 'PROPFIND',
+      headers: { authorization, depth: '1' },
+    });
+    assert.match(await cachedWebDavList.text(), /dav\.txt/);
+
+    davFileName = 'visited.txt';
+    const visitedDirectory = await fetch(`http://127.0.0.1:${port}/api/files`);
+    assert.equal((await visitedDirectory.json()).data.list[0].fileName, 'visited.txt');
+    const mountAfterVisit = await fetch(`http://127.0.0.1:${webdavPort}/dav/`, {
+      method: 'PROPFIND',
+      headers: { authorization, depth: '1' },
+    });
+    assert.match(await mountAfterVisit.text(), /visited\.txt/);
+
+    davFileName = 'fresh.txt';
+    const explicitRefresh = await fetch(`http://127.0.0.1:${port}/api/files?refresh=1`);
+    assert.equal(explicitRefresh.headers.get('cache-control'), 'no-store');
+    assert.equal((await explicitRefresh.json()).data.list[0].fileName, 'fresh.txt');
+    const refreshedWebDavList = await fetch(`http://127.0.0.1:${webdavPort}/dav/`, {
+      method: 'PROPFIND',
+      headers: { authorization, depth: '1' },
+    });
+    assert.match(await refreshedWebDavList.text(), /fresh\.txt/);
 
     const deleteResponse = await fetch(`http://127.0.0.1:${port}/api/files/delete`, {
       method: 'POST',
@@ -800,8 +853,7 @@ test('Web 普通删除与 WebDAV DELETE 都使用官方永久删除接口', asyn
     });
     assert.equal(deleteResponse.status, 200, await deleteResponse.clone().text());
 
-    const authorization = `Basic ${Buffer.from(`storage-user:${webdavPassword}`).toString('base64')}`;
-    const webdavDelete = await fetch(`http://127.0.0.1:${webdavPort}/dav/dav.txt`, {
+    const webdavDelete = await fetch(`http://127.0.0.1:${webdavPort}/dav/fresh.txt`, {
       method: 'DELETE',
       headers: { authorization },
     });
@@ -811,7 +863,17 @@ test('Web 普通删除与 WebDAV DELETE 都使用官方永久删除接口', asyn
     const deleteCalls = upstreamRequests.filter((entry) => entry.url === '/userres/v1/file/delete_file');
     assert.deepEqual(recycleCalls.map((entry) => entry.body), []);
     assert.deepEqual(deleteCalls.map((entry) => entry.body), [{ fileIds: ['web-file'] }, { fileIds: ['dav-file'] }]);
+    await waitUntil(() => cloudInvalidations.length >= 2);
+    assert.deepEqual(cloudInvalidations.map((event) => ({
+      all: event.all,
+      parent_ids: event.parent_ids,
+      source: event.source,
+    })), [
+      { all: true, parent_ids: [], source: '/userres/v1/file/delete_file' },
+      { all: false, parent_ids: [''], source: 'webdav-delete' },
+    ]);
   } finally {
+    eventAbort.abort();
     child.kill();
     await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 2_000))]);
     await new Promise((resolve) => apiServer.close(resolve));
@@ -1197,8 +1259,33 @@ test('Web 接收分享可读取目录并转存到指定云盘目录', async () =
   let output = '';
   child.stdout.on('data', (chunk) => { output += chunk; });
   child.stderr.on('data', (chunk) => { output += chunk; });
+  const eventAbort = new AbortController();
+  const cloudInvalidations = [];
   try {
     await waitUntil(() => output.includes('Guangya Web listening'));
+    const eventResponse = await fetch(`http://127.0.0.1:${port}/api/events`, {
+      signal: eventAbort.signal,
+    });
+    assert.equal(eventResponse.status, 200);
+    void (async () => {
+      const decoder = new TextDecoder();
+      let buffered = '';
+      try {
+        for await (const chunk of eventResponse.body) {
+          buffered += decoder.decode(chunk, { stream: true });
+          const frames = buffered.split('\n\n');
+          buffered = frames.pop() || '';
+          for (const frame of frames) {
+            const data = frame.split('\n').find((line) => line.startsWith('data: '))?.slice(6);
+            if (!data) continue;
+            const payload = JSON.parse(data);
+            if (payload.type === 'cloud-directory-invalidated') cloudInvalidations.push(payload);
+          }
+        }
+      } catch (error) {
+        if (error.name !== 'AbortError') throw error;
+      }
+    })();
     const openedResponse = await fetch(`http://127.0.0.1:${port}/api/received-share/open`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: 'https://www.guangyapan.com/s/1926585463106830337_al8cmYXLP9l33ld2?code=iv5k#/share' }),
     });
@@ -1210,6 +1297,13 @@ test('Web 接收分享可读取目录并转存到指定云盘目录', async () =
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ access_token: opened.access_token, file_ids: ['folder-1'], parent_id: 'destination-1' }),
     });
     assert.equal(restoredResponse.status, 200, await restoredResponse.text());
+    await waitUntil(() => cloudInvalidations.length >= 1);
+    assert.deepEqual(cloudInvalidations[0], {
+      type: 'cloud-directory-invalidated',
+      parent_ids: ['destination-1'],
+      all: false,
+      source: 'received-share-restore',
+    });
     const singleDownloadResponse = await fetch(`http://127.0.0.1:${port}/api/received-share/download`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ access_token: opened.access_token, file_ids: ['file-1'], packaged: false }),
     });
@@ -1231,6 +1325,7 @@ test('Web 接收分享可读取目录并转存到指定云盘目录', async () =
     assert.equal(cloudFolderDownloadResponse.status, 200, await cloudFolderDownloadResponse.clone().text());
     assert.equal((await cloudFolderDownloadResponse.json()).download_url, 'https://download.example.test/cloud-folder-1.zip');
   } finally {
+    eventAbort.abort();
     child.kill();
     await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 2_000))]);
     await new Promise((resolve) => apiServer.close(resolve));
