@@ -98,6 +98,12 @@ const DEFAULT_WEBDAV_USERNAME: &str = "guangya";
 const MAX_GCID_IMPORT_CONCURRENCY: usize = 16;
 const MAX_GCID_IMPORT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_GCID_IMPORT_ATTEMPTS: i64 = 5;
+const GCID_EXPORT_FILE_CONCURRENCY: usize = 8;
+const GCID_EXPORT_RANGE_CONCURRENCY: usize = 3;
+const GCID_EXPORT_SAMPLE_ATTEMPTS: usize = 3;
+const DEVELOPER_NAME_RENAME_CONCURRENCY: usize = 2;
+const DEVELOPER_NAME_RENAME_ATTEMPTS: usize = 5;
+const DEVELOPER_PRE_AUDIT_BATCH_SIZE: usize = 20;
 const DOWNLOAD_PARALLEL_MIN_BYTES: u64 = 16 * 1024 * 1024;
 const DOWNLOAD_RANGE_MIN_BYTES: u64 = 8 * 1024 * 1024;
 const DOWNLOAD_RANGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -388,6 +394,9 @@ struct DeveloperTransferJob {
     pending_count: i64,
     success_count: i64,
     skipped_count: i64,
+    work_total_count: i64,
+    processed_count: i64,
+    current_path: String,
     error_code: Option<i64>,
     message: Option<String>,
     created_at: i64,
@@ -399,6 +408,36 @@ struct DeveloperApiError {
     message: String,
     code: Option<i64>,
     retryable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeveloperPreAuditBatch {
+    task_id: String,
+    file_count: i64,
+    #[serde(default)]
+    passed_count: i64,
+    #[serde(default)]
+    rejected_count: i64,
+    #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    failed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeveloperPreAuditPlan {
+    version: u8,
+    batches: Vec<DeveloperPreAuditBatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeveloperPreAuditSummary {
+    total_count: i64,
+    passed_count: i64,
+    rejected_count: i64,
+    pending_count: i64,
+    failed_batches: usize,
+    done: bool,
 }
 
 impl std::fmt::Display for DeveloperApiError {
@@ -658,6 +697,7 @@ struct CloudSelectionEntry {
     name: String,
     folder: bool,
     size: u64,
+    gcid: String,
     path: String,
 }
 
@@ -704,6 +744,7 @@ struct GeneratedGcidExportResult {
     saved_path: Option<String>,
     file_name: String,
     total_files: usize,
+    skipped_files_count: usize,
     total_size: String,
 }
 
@@ -1603,6 +1644,9 @@ fn init_database(path: &Path) -> Result<(), String> {
                pending_count INTEGER NOT NULL DEFAULT 0,
                success_count INTEGER NOT NULL DEFAULT 0,
                skipped_count INTEGER NOT NULL DEFAULT 0,
+               work_total_count INTEGER NOT NULL DEFAULT 0,
+               processed_count INTEGER NOT NULL DEFAULT 0,
+               current_path TEXT NOT NULL DEFAULT '',
                error_code INTEGER,
                message TEXT,
                created_at INTEGER NOT NULL,
@@ -1666,6 +1710,9 @@ fn init_database(path: &Path) -> Result<(), String> {
         "ALTER TABLE uploaded_files ADD COLUMN change_kind TEXT NOT NULL DEFAULT 'added'",
         "ALTER TABLE file_fingerprints ADD COLUMN cid TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE gcid_import_files ADD COLUMN cid TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE developer_transfer_jobs ADD COLUMN work_total_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE developer_transfer_jobs ADD COLUMN processed_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE developer_transfer_jobs ADD COLUMN current_path TEXT NOT NULL DEFAULT ''",
     ] {
         let _ = connection.execute(migration, []);
     }
@@ -2607,17 +2654,21 @@ fn developer_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Developer
         pending_count: row.get(12)?,
         success_count: row.get(13)?,
         skipped_count: row.get(14)?,
-        error_code: row.get(15)?,
-        message: row.get(16)?,
-        created_at: row.get(17)?,
-        updated_at: row.get(18)?,
+        work_total_count: row.get(15)?,
+        processed_count: row.get(16)?,
+        current_path: row.get(17)?,
+        error_code: row.get(18)?,
+        message: row.get(19)?,
+        created_at: row.get(20)?,
+        updated_at: row.get(21)?,
     })
 }
 
 const DEVELOPER_JOB_COLUMNS: &str =
     "id, target_id, target_name, file_ids_json, file_names_json, status, phase,
      pre_task_id, upload_task_id, total_count, passed_count, rejected_count,
-     pending_count, success_count, skipped_count, error_code, message, created_at, updated_at";
+     pending_count, success_count, skipped_count, work_total_count, processed_count,
+     current_path, error_code, message, created_at, updated_at";
 
 fn load_developer_transfer_job(
     path: &Path,
@@ -2660,7 +2711,8 @@ fn save_developer_transfer_job(path: &Path, job: &DeveloperTransferJob) -> Resul
                status = ?2, phase = ?3, pre_task_id = ?4, upload_task_id = ?5,
                total_count = ?6, passed_count = ?7, rejected_count = ?8,
                pending_count = ?9, success_count = ?10, skipped_count = ?11,
-               error_code = ?12, message = ?13, updated_at = ?14
+               work_total_count = ?12, processed_count = ?13, current_path = ?14,
+               error_code = ?15, message = ?16, updated_at = ?17
              WHERE id = ?1",
             params![
                 job.id,
@@ -2674,6 +2726,9 @@ fn save_developer_transfer_job(path: &Path, job: &DeveloperTransferJob) -> Resul
                 job.pending_count,
                 job.success_count,
                 job.skipped_count,
+                job.work_total_count,
+                job.processed_count,
+                job.current_path,
                 job.error_code,
                 job.message,
                 job.updated_at,
@@ -2907,6 +2962,57 @@ fn apply_developer_counts(job: &mut DeveloperTransferJob, data: &Value) {
     if let Some(value) = developer_count(data, "skipped_count", "skippedCount") {
         job.skipped_count = value;
     }
+}
+
+fn developer_pre_audit_plan(task_state: &str, fallback_file_count: i64) -> DeveloperPreAuditPlan {
+    let raw = task_state.trim();
+    if let Ok(plan) = serde_json::from_str::<DeveloperPreAuditPlan>(raw) {
+        if plan.version == 2 {
+            return plan;
+        }
+    }
+    DeveloperPreAuditPlan {
+        version: 1,
+        batches: vec![DeveloperPreAuditBatch {
+            task_id: raw.to_string(),
+            file_count: fallback_file_count.max(0),
+            passed_count: 0,
+            rejected_count: 0,
+            done: false,
+            failed: false,
+        }],
+    }
+}
+
+fn encode_developer_pre_audit_plan(plan: &DeveloperPreAuditPlan) -> Result<String, String> {
+    serde_json::to_string(&DeveloperPreAuditPlan {
+        version: 2,
+        batches: plan.batches.clone(),
+    })
+    .map_err(|error| format!("保存分批预审状态失败：{error}"))
+}
+
+fn summarize_developer_pre_audit_plan(plan: &DeveloperPreAuditPlan) -> DeveloperPreAuditSummary {
+    let mut summary = DeveloperPreAuditSummary {
+        total_count: 0,
+        passed_count: 0,
+        rejected_count: 0,
+        pending_count: 0,
+        failed_batches: 0,
+        done: !plan.batches.is_empty(),
+    };
+    for batch in &plan.batches {
+        let passed = batch.passed_count.max(0);
+        let rejected = batch.rejected_count.max(0);
+        summary.total_count += batch.file_count.max(passed + rejected).max(0);
+        summary.passed_count += passed;
+        summary.rejected_count += rejected;
+        summary.failed_batches += usize::from(batch.failed);
+        summary.done &= batch.done;
+    }
+    summary.pending_count =
+        (summary.total_count - summary.passed_count - summary.rejected_count).max(0);
+    summary
 }
 
 fn load_auto_share_receipts(path: &Path) -> Result<Vec<AutoShareReceipt>, String> {
@@ -9236,11 +9342,13 @@ fn cloud_selection_entry_from_value(
         )
         .ok_or_else(|| format!("文件大小无效：{name}"))?
     };
+    let gcid = cloud_record_text(value, &["gcid", "GCID", "gCid"]);
     Ok(CloudSelectionEntry {
         file_id,
         name,
         folder,
         size,
+        gcid,
         path: String::new(),
     })
 }
@@ -9588,7 +9696,133 @@ async fn cloud_download_url(token: &str, device_id: &str, file_id: &str) -> Resu
     .ok_or_else(|| "光鸭没有返回文件下载地址".to_string())
 }
 
-async fn hash_cloud_selection_entry(
+fn emit_gcid_export_progress(
+    app: &tauri::AppHandle,
+    stage: &str,
+    current_path: &str,
+    completed_files: usize,
+    total_files: usize,
+    read_bytes: u64,
+    planned_sample_bytes: u64,
+    source_total_bytes: u128,
+) {
+    emit(
+        app,
+        json!({
+            "type": "gcid-export-progress",
+            "stage": stage,
+            "current_path": current_path,
+            "completed_files": completed_files,
+            "total_files": total_files,
+            "sampled_bytes": read_bytes.to_string(),
+            "planned_sample_bytes": planned_sample_bytes.to_string(),
+            "source_total_bytes": source_total_bytes.to_string(),
+            "downloaded_bytes": read_bytes.to_string(),
+            "total_bytes": planned_sample_bytes.to_string(),
+            "percent": (completed_files as u64).saturating_mul(100) / total_files.max(1) as u64
+        }),
+    );
+}
+
+async fn read_cloud_cid_range(
+    client: &reqwest::Client,
+    download_url: &str,
+    path: &str,
+    file_size: u64,
+    index: usize,
+    range: (u64, u64),
+) -> Result<(usize, Vec<u8>), String> {
+    let (start, end) = range;
+    if start == end {
+        return Ok((index, Vec::new()));
+    }
+    let expected = end.saturating_sub(start);
+    let response = client
+        .get(download_url)
+        .header("accept-encoding", "identity")
+        .header(RANGE, format!("bytes={start}-{}", end - 1))
+        .send()
+        .await
+        .map_err(|error| format!("分段读取 {path} 失败：{error}"))?;
+    let status = response.status();
+    let partial = status == reqwest::StatusCode::PARTIAL_CONTENT;
+    let whole_file = start == 0 && end == file_size && status.is_success();
+    if !partial && !whole_file {
+        return Err(format!("云端未接受分段读取（HTTP {status}）"));
+    }
+    if partial {
+        let expected_content_range = format!("bytes {start}-{}/{file_size}", end - 1);
+        let content_range = response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !content_range.eq_ignore_ascii_case(&expected_content_range) {
+            return Err("云端返回的分段范围与请求不一致".to_string());
+        }
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("分段读取 {path} 失败：{error}"))?;
+    if bytes.len() as u64 != expected {
+        return Err(format!("分段读取 {path} 的字节数不完整"));
+    }
+    Ok((index, bytes.to_vec()))
+}
+
+async fn sample_cloud_selection_cid(
+    client: &reqwest::Client,
+    download_url: &str,
+    entry: &CloudSelectionEntry,
+) -> Result<(String, u64), String> {
+    let ranges = cid_byte_ranges(entry.size);
+    let mut parts = stream::iter(ranges.into_iter().enumerate())
+        .map(|(index, range)| {
+            read_cloud_cid_range(client, download_url, &entry.path, entry.size, index, range)
+        })
+        .buffer_unordered(GCID_EXPORT_RANGE_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+    parts.sort_by_key(|(index, _)| *index);
+    let sampled_bytes = parts
+        .iter()
+        .map(|(_, bytes)| bytes.len() as u64)
+        .sum::<u64>();
+    let mut hasher = Sha1::new();
+    for (_, bytes) in parts {
+        hasher.update(bytes);
+    }
+    Ok((hex::encode_upper(hasher.finalize()), sampled_bytes))
+}
+
+async fn sample_cloud_selection_cid_with_retry(
+    client: &reqwest::Client,
+    token: &str,
+    device_id: &str,
+    entry: &CloudSelectionEntry,
+) -> Result<(String, u64), String> {
+    let mut last_error = "云端分段读取失败".to_string();
+    for attempt in 0..GCID_EXPORT_SAMPLE_ATTEMPTS {
+        let result = match cloud_download_url(token, device_id, &entry.file_id).await {
+            Ok(download_url) => sample_cloud_selection_cid(client, &download_url, entry).await,
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error) => last_error = error,
+        }
+        if attempt + 1 < GCID_EXPORT_SAMPLE_ATTEMPTS {
+            sleep(Duration::from_millis(
+                250_u64.saturating_mul(1_u64 << attempt),
+            ))
+            .await;
+        }
+    }
+    Err(last_error)
+}
+
+async fn hash_cloud_selection_entry_full(
     app: &tauri::AppHandle,
     client: &reqwest::Client,
     token: &str,
@@ -9596,7 +9830,8 @@ async fn hash_cloud_selection_entry(
     entry: CloudSelectionEntry,
     downloaded_bytes: Arc<AtomicU64>,
     completed_files: Arc<AtomicUsize>,
-    total_bytes: u64,
+    planned_sample_bytes: u64,
+    source_total_bytes: u128,
     total_files: usize,
 ) -> Result<GeneratedGcidExportFile, String> {
     let download_url = cloud_download_url(token, device_id, &entry.file_id).await?;
@@ -9631,24 +9866,15 @@ async fn hash_cloud_selection_entry(
         downloaded_bytes.fetch_add(processed.saturating_sub(previous), Ordering::Relaxed);
         previous = processed;
         if last_emit.elapsed() >= Duration::from_millis(250) {
-            let downloaded = downloaded_bytes.load(Ordering::Relaxed);
-            let percent = if total_bytes > 0 {
-                downloaded.saturating_mul(100) / total_bytes
-            } else {
-                0
-            };
-            emit(
+            emit_gcid_export_progress(
                 app,
-                json!({
-                    "type": "gcid-export-progress",
-                    "stage": "正在读取云端文件并计算 GCID / CID",
-                    "current_path": entry.path,
-                    "completed_files": completed_files.load(Ordering::Relaxed),
-                    "total_files": total_files,
-                    "downloaded_bytes": downloaded.to_string(),
-                    "total_bytes": total_bytes.to_string(),
-                    "percent": percent.min(100)
-                }),
+                "分段读取不可用，正在完整校验",
+                &entry.path,
+                completed_files.load(Ordering::Relaxed),
+                total_files,
+                downloaded_bytes.load(Ordering::Relaxed),
+                planned_sample_bytes,
+                source_total_bytes,
             );
             last_emit = Instant::now();
         }
@@ -9656,18 +9882,15 @@ async fn hash_cloud_selection_entry(
     let hashes = accumulator.finish()?;
     let completed = completed_files.fetch_add(1, Ordering::Relaxed) + 1;
     let downloaded = downloaded_bytes.load(Ordering::Relaxed);
-    emit(
+    emit_gcid_export_progress(
         app,
-        json!({
-            "type": "gcid-export-progress",
-            "stage": "正在读取云端文件并计算 GCID / CID",
-            "current_path": entry.path,
-            "completed_files": completed,
-            "total_files": total_files,
-            "downloaded_bytes": downloaded.to_string(),
-            "total_bytes": total_bytes.to_string(),
-            "percent": if total_bytes > 0 { downloaded.saturating_mul(100) / total_bytes } else { (completed as u64).saturating_mul(100) / total_files.max(1) as u64 }
-        }),
+        "分段读取不可用，正在完整校验",
+        &entry.path,
+        completed,
+        total_files,
+        downloaded,
+        planned_sample_bytes,
+        source_total_bytes,
     );
     Ok(GeneratedGcidExportFile {
         path: entry.path,
@@ -9675,6 +9898,74 @@ async fn hash_cloud_selection_entry(
         gcid: hashes.gcid.to_ascii_lowercase(),
         cid: hashes.cid,
     })
+}
+
+async fn hash_cloud_selection_entry(
+    app: &tauri::AppHandle,
+    client: &reqwest::Client,
+    token: &str,
+    device_id: &str,
+    mut entry: CloudSelectionEntry,
+    read_bytes: Arc<AtomicU64>,
+    completed_files: Arc<AtomicUsize>,
+    planned_sample_bytes: u64,
+    source_total_bytes: u128,
+    total_files: usize,
+) -> Result<GeneratedGcidExportFile, String> {
+    emit_gcid_export_progress(
+        app,
+        "正在读取云端 GCID 并采样 CID",
+        &entry.path,
+        completed_files.load(Ordering::Relaxed),
+        total_files,
+        read_bytes.load(Ordering::Relaxed),
+        planned_sample_bytes,
+        source_total_bytes,
+    );
+    if !valid_sha1_hex(&entry.gcid) {
+        if let Ok(detail) =
+            cloud_selection_entry_detail(token, device_id, &entry.file_id, &entry.name).await
+        {
+            entry.gcid = detail.gcid;
+        }
+    }
+    if valid_sha1_hex(&entry.gcid) {
+        if let Ok((cid, sampled)) =
+            sample_cloud_selection_cid_with_retry(client, token, device_id, &entry).await
+        {
+            let read = read_bytes.fetch_add(sampled, Ordering::Relaxed) + sampled;
+            let completed = completed_files.fetch_add(1, Ordering::Relaxed) + 1;
+            emit_gcid_export_progress(
+                app,
+                "正在读取云端 GCID 并采样 CID",
+                &entry.path,
+                completed,
+                total_files,
+                read,
+                planned_sample_bytes,
+                source_total_bytes,
+            );
+            return Ok(GeneratedGcidExportFile {
+                path: entry.path,
+                size: entry.size.to_string(),
+                gcid: entry.gcid.to_ascii_lowercase(),
+                cid,
+            });
+        }
+    }
+    hash_cloud_selection_entry_full(
+        app,
+        client,
+        token,
+        device_id,
+        entry,
+        read_bytes,
+        completed_files,
+        planned_sample_bytes,
+        source_total_bytes,
+        total_files,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -9702,6 +9993,7 @@ async fn export_gcid_json(
             saved_path: None,
             file_name: suggested_name,
             total_files: 0,
+            skipped_files_count: 0,
             total_size: "0".to_string(),
         });
     };
@@ -9730,21 +10022,25 @@ async fn export_gcid_json(
         .iter()
         .try_fold(0_u128, |total, entry| total.checked_add(entry.size as u128))
         .ok_or_else(|| "所选文件总大小溢出".to_string())?;
-    let progress_total = u64::try_from(total_size).unwrap_or(u64::MAX);
-    let downloaded_bytes = Arc::new(AtomicU64::new(0));
+    let planned_sample_bytes = files.iter().fold(0_u64, |total, entry| {
+        total.saturating_add(
+            cid_byte_ranges(entry.size)
+                .into_iter()
+                .map(|(start, end)| end.saturating_sub(start))
+                .sum::<u64>(),
+        )
+    });
+    let read_bytes = Arc::new(AtomicU64::new(0));
     let completed_files = Arc::new(AtomicUsize::new(0));
-    emit(
+    emit_gcid_export_progress(
         &app,
-        json!({
-            "type": "gcid-export-progress",
-            "stage": "正在读取云端文件并计算 GCID / CID",
-            "current_path": files[0].path,
-            "completed_files": 0,
-            "total_files": files.len(),
-            "downloaded_bytes": "0",
-            "total_bytes": total_size.to_string(),
-            "percent": 0
-        }),
+        "正在扫描所选文件",
+        &files[0].path,
+        0,
+        files.len(),
+        0,
+        planned_sample_bytes,
+        total_size,
     );
     let database_path = state
         .lock()
@@ -9770,32 +10066,58 @@ async fn export_gcid_json(
             let client = client.clone();
             let token = token.clone();
             let device_id = device_id.clone();
-            let downloaded_bytes = downloaded_bytes.clone();
+            let read_bytes = read_bytes.clone();
             let completed_files = completed_files.clone();
             async move {
-                hash_cloud_selection_entry(
+                let path = entry.path.clone();
+                let result = hash_cloud_selection_entry(
                     &app,
                     &client,
                     &token,
                     &device_id,
                     entry,
-                    downloaded_bytes,
-                    completed_files,
-                    progress_total,
+                    read_bytes.clone(),
+                    completed_files.clone(),
+                    planned_sample_bytes,
+                    total_size,
                     total_files,
                 )
-                .await
-                .map(|file| (index, file))
+                .await;
+                if result.is_err() {
+                    let completed = completed_files.fetch_add(1, Ordering::Relaxed) + 1;
+                    emit_gcid_export_progress(
+                        &app,
+                        "已跳过无法读取的文件",
+                        &path,
+                        completed,
+                        total_files,
+                        read_bytes.load(Ordering::Relaxed),
+                        planned_sample_bytes,
+                        total_size,
+                    );
+                }
+                (index, path, result)
             }
         })
-        .buffer_unordered(3)
-        .try_collect::<Vec<_>>()
-        .await?;
-    outcomes.sort_by_key(|(index, _)| *index);
-    let hashed_files = outcomes
-        .into_iter()
-        .map(|(_, file)| file)
-        .collect::<Vec<_>>();
+        .buffer_unordered(GCID_EXPORT_FILE_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    outcomes.sort_by_key(|(index, _, _)| *index);
+    let mut hashed_files = Vec::new();
+    let mut skipped_files = Vec::new();
+    for (_, path, outcome) in outcomes {
+        match outcome {
+            Ok(file) => hashed_files.push(file),
+            Err(error) => skipped_files.push(format!("{path}：{error}")),
+        }
+    }
+    if hashed_files.is_empty() {
+        let reason = skipped_files
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "没有文件可导出".to_string());
+        return Err(format!("秒传 JSON 生成失败：{reason}"));
+    }
     let export = GeneratedGcidExport {
         script_version: "guangya-gcid-export-2.0".to_string(),
         export_version: "2.0".to_string(),
@@ -9823,8 +10145,8 @@ async fn export_gcid_json(
         formatted_total_size: format_export_bytes(total_size),
         generated_at: unix_timestamp(),
         scanned_folders_count: scanned_folders,
-        skipped_files_count: 0,
-        skipped_files: Vec::new(),
+        skipped_files_count: skipped_files.len(),
+        skipped_files,
         files: hashed_files,
     };
     let bytes = serde_json::to_vec_pretty(&export)
@@ -9832,24 +10154,26 @@ async fn export_gcid_json(
     tokio::fs::write(&save_path, bytes)
         .await
         .map_err(|error| format!("保存秒传 JSON 失败：{error}"))?;
-    emit(
+    emit_gcid_export_progress(
         &app,
-        json!({
-            "type": "gcid-export-progress",
-            "stage": "秒传 JSON 已生成",
-            "current_path": "",
-            "completed_files": export.total_files_count,
-            "total_files": export.total_files_count,
-            "downloaded_bytes": total_size.to_string(),
-            "total_bytes": total_size.to_string(),
-            "percent": 100
-        }),
+        if export.skipped_files_count > 0 {
+            "秒传 JSON 已生成，部分文件已跳过"
+        } else {
+            "秒传 JSON 已生成"
+        },
+        "",
+        export.total_files_count + export.skipped_files_count,
+        export.total_files_count + export.skipped_files_count,
+        read_bytes.load(Ordering::Relaxed),
+        planned_sample_bytes,
+        total_size,
     );
     Ok(GeneratedGcidExportResult {
         cancelled: false,
         saved_path: Some(save_path.to_string_lossy().to_string()),
         file_name: suggested_name,
         total_files: export.total_files_count,
+        skipped_files_count: export.skipped_files_count,
         total_size: total_size.to_string(),
     })
 }
@@ -10126,6 +10450,41 @@ async fn rename_remote(
     )
     .await?;
     Ok(())
+}
+
+async fn rename_developer_name_with_retry(
+    token: &str,
+    device_id: &str,
+    file_id: &str,
+    new_name: &str,
+) -> Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 0..DEVELOPER_NAME_RENAME_ATTEMPTS {
+        match rename_remote(token, device_id, file_id, new_name).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = error;
+                if cloud_selection_entry_detail(token, device_id, file_id, new_name)
+                    .await
+                    .is_ok_and(|entry| entry.name == new_name)
+                {
+                    return Ok(());
+                }
+            }
+        }
+        if attempt + 1 < DEVELOPER_NAME_RENAME_ATTEMPTS {
+            let delay = match attempt {
+                0 => 400,
+                1 => 800,
+                2 => 1_600,
+                _ => 3_000,
+            };
+            sleep(Duration::from_millis(delay)).await;
+        }
+    }
+    Err(format!(
+        "{last_error}（文件名改写已重试 {DEVELOPER_NAME_RENAME_ATTEMPTS} 次）"
+    ))
 }
 
 fn normalize_api_id(value: &str, label: &str) -> Result<String, String> {
@@ -14381,128 +14740,8 @@ fn developer_name_mutation_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-fn developer_temporary_name(original_name: &str, folder: bool) -> String {
-    let extension = if folder {
-        String::new()
-    } else {
-        Path::new(original_name)
-            .extension()
-            .and_then(|value| value.to_str())
-            .filter(|value| {
-                !value.is_empty()
-                    && value.len() <= 16
-                    && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
-            })
-            .map(|value| format!(".{value}"))
-            .unwrap_or_default()
-    };
-    format!(
-        "gy_{}{}",
-        &Uuid::new_v4().simple().to_string()[..20],
-        extension
-    )
-}
-
-async fn acquire_developer_name_obfuscation(
-    app: &tauri::AppHandle,
-    database_path: &Path,
-    token: &str,
-    device_id: &str,
-    job: &DeveloperTransferJob,
-) -> Result<usize, String> {
-    let _mutation_guard = developer_name_mutation_lock().lock().await;
-    let (entries, _, _) =
-        collect_cloud_selection_entries(token, device_id, &job.file_ids, &job.file_names, true)
-            .await?;
-    if entries.is_empty() {
-        return Ok(0);
-    }
-    let now = unix_timestamp();
-    let pending = {
-        let mut connection = open_database(database_path)?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| format!("开始保存预审文件名失败：{error}"))?;
-        let mut pending = Vec::new();
-        for entry in &entries {
-            let own = transaction
-                .query_row(
-                    "SELECT original_name, temporary_name
-                     FROM developer_transfer_name_restores
-                     WHERE job_id = ?1 AND file_id = ?2",
-                    params![job.id, entry.file_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()
-                .map_err(|error| format!("读取预审文件名记录失败：{error}"))?;
-            let shared = if own.is_some() {
-                None
-            } else {
-                transaction
-                    .query_row(
-                        "SELECT original_name, temporary_name
-                         FROM developer_transfer_name_restores
-                         WHERE file_id = ?1 AND status = 'active'
-                         ORDER BY created_at LIMIT 1",
-                        params![entry.file_id],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                    )
-                    .optional()
-                    .map_err(|error| format!("读取并发预审文件名记录失败：{error}"))?
-            };
-            let existing = own.or(shared);
-            let original_name = existing
-                .as_ref()
-                .map(|value| value.0.clone())
-                .unwrap_or_else(|| entry.name.clone());
-            let temporary_name = existing
-                .as_ref()
-                .map(|value| value.1.clone())
-                .unwrap_or_else(|| developer_temporary_name(&original_name, entry.folder));
-            transaction
-                .execute(
-                    "INSERT INTO developer_transfer_name_restores
-                       (job_id, file_id, original_name, temporary_name, status,
-                        last_error, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, 'active', NULL, ?5, ?5)
-                     ON CONFLICT(job_id, file_id) DO UPDATE SET
-                       status = 'active', last_error = NULL, updated_at = excluded.updated_at",
-                    params![job.id, entry.file_id, original_name, temporary_name, now],
-                )
-                .map_err(|error| format!("保存预审文件名记录失败：{error}"))?;
-            if existing.is_none() {
-                pending.push((entry.file_id.clone(), temporary_name));
-            }
-        }
-        transaction
-            .commit()
-            .map_err(|error| format!("提交预审文件名记录失败：{error}"))?;
-        pending
-    };
-    update_and_emit_developer_job(app, database_path, &job.id, |current| {
-        current.status = "auditing".to_string();
-        current.phase = "obfuscating".to_string();
-        current.message = Some(format!(
-            "正在并发混淆 {} 个源文件名，随后开始预审",
-            entries.len()
-        ));
-    })?;
-    let outcomes = stream::iter(pending.into_iter())
-        .map(|(file_id, temporary_name)| {
-            let token = token.to_string();
-            let device_id = device_id.to_string();
-            async move { rename_remote(&token, &device_id, &file_id, &temporary_name).await }
-        })
-        .buffer_unordered(8)
-        .collect::<Vec<_>>()
-        .await;
-    if let Some(error) = outcomes.into_iter().find_map(Result::err) {
-        return Err(format!("预审前混淆源文件名失败：{error}"));
-    }
-    Ok(entries.len())
-}
-
 async fn release_developer_name_obfuscation(
+    app: &tauri::AppHandle,
     database_path: &Path,
     token: &str,
     device_id: &str,
@@ -14562,7 +14801,25 @@ async fn release_developer_name_obfuscation(
         }
         (restorable, deferred)
     };
-    let outcomes = stream::iter(restorable.into_iter())
+    let previous_job = load_developer_transfer_job(database_path, job_id)?;
+    let previous_phase = previous_job
+        .as_ref()
+        .map(|job| job.phase.clone())
+        .unwrap_or_else(|| "completed".to_string());
+    let previous_message = previous_job.and_then(|job| job.message);
+    let total = restorable.len().saturating_add(deferred);
+    let first_path = restorable
+        .first()
+        .map(|row| row.original_name.clone())
+        .unwrap_or_default();
+    update_and_emit_developer_job(app, database_path, job_id, |job| {
+        job.phase = "restoring".to_string();
+        job.work_total_count = total as i64;
+        job.processed_count = deferred as i64;
+        job.current_path = first_path.clone();
+        job.message = Some(format!("正在恢复源文件名 {deferred}/{total}"));
+    })?;
+    let mut restores = stream::iter(restorable.into_iter())
         .map(|row| {
             let token = token.to_string();
             let device_id = device_id.to_string();
@@ -14580,14 +14837,30 @@ async fn release_developer_name_obfuscation(
                 let result = if current_name == row.original_name {
                     Ok(())
                 } else {
-                    rename_remote(&token, &device_id, &row.file_id, &row.original_name).await
+                    rename_developer_name_with_retry(
+                        &token,
+                        &device_id,
+                        &row.file_id,
+                        &row.original_name,
+                    )
+                    .await
                 };
                 (row, result)
             }
         })
-        .buffer_unordered(8)
-        .collect::<Vec<_>>()
-        .await;
+        .buffer_unordered(DEVELOPER_NAME_RENAME_CONCURRENCY);
+    let mut completed = deferred;
+    let mut outcomes = Vec::new();
+    while let Some((row, outcome)) = restores.next().await {
+        completed += 1;
+        let path = row.original_name.clone();
+        update_and_emit_developer_job(app, database_path, job_id, |job| {
+            job.processed_count = completed as i64;
+            job.current_path = path.clone();
+            job.message = Some(format!("正在恢复源文件名 {completed}/{total}"));
+        })?;
+        outcomes.push((row, outcome));
+    }
     let connection = open_database(database_path)?;
     let mut restored = 0_usize;
     let mut failed = 0_usize;
@@ -14630,6 +14903,12 @@ async fn release_developer_name_obfuscation(
             params![unix_timestamp() - 30 * 86_400],
         )
         .map_err(|error| format!("清理预审文件名记录失败：{error}"))?;
+    update_and_emit_developer_job(app, database_path, job_id, |job| {
+        job.phase = previous_phase.clone();
+        job.processed_count = total as i64;
+        job.current_path.clear();
+        job.message = previous_message.clone();
+    })?;
     Ok((restored, deferred, failed))
 }
 
@@ -14712,6 +14991,9 @@ async fn finish_developer_upload(
         job.status = "running".to_string();
         job.phase = "upload".to_string();
         job.upload_task_id = Some(task_id.to_string());
+        job.work_total_count = job.total_count;
+        job.processed_count = (job.success_count + job.skipped_count).min(job.total_count);
+        job.current_path.clear();
         job.message = Some("小号正在接收文件".to_string());
     })
     .map_err(|message| DeveloperApiError {
@@ -14735,6 +15017,43 @@ async fn finish_developer_upload(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_ascii_lowercase();
+        let reported_success = developer_count(&data, "success_count", "successCount")
+            .or_else(|| developer_count(&data, "use_count", "useCount"))
+            .unwrap_or(0);
+        let completed =
+            status_value == "success" || (status_value == "failed" && reported_success > 0);
+        let job = update_and_emit_developer_job(app, database_path, job_id, |job| {
+            apply_developer_counts(job, &data);
+            job.status = if completed { "success" } else { "running" }.to_string();
+            job.phase = if completed { "completed" } else { "upload" }.to_string();
+            job.work_total_count = job.total_count;
+            job.processed_count = if completed {
+                job.total_count
+            } else {
+                (job.success_count + job.skipped_count).min(job.total_count)
+            };
+            job.current_path.clear();
+            job.error_code = None;
+            job.message = Some(if completed && job.rejected_count > 0 {
+                format!(
+                    "已秒传 {} 个，{} 个未通过预审",
+                    job.success_count.max(job.passed_count),
+                    job.rejected_count
+                )
+            } else if completed {
+                "文件已秒传到小号授权目录".to_string()
+            } else {
+                "小号正在接收文件".to_string()
+            });
+        })
+        .map_err(|message| DeveloperApiError {
+            message,
+            code: None,
+            retryable: false,
+        })?;
+        if completed {
+            return Ok(job);
+        }
         if status_value == "failed" {
             let message = data
                 .get("message")
@@ -14747,29 +15066,6 @@ async fn finish_developer_upload(
                 code: None,
                 retryable: false,
             });
-        }
-        let completed = status_value == "success";
-        let job = update_and_emit_developer_job(app, database_path, job_id, |job| {
-            apply_developer_counts(job, &data);
-            job.status = if completed { "success" } else { "running" }.to_string();
-            job.phase = if completed { "completed" } else { "upload" }.to_string();
-            job.error_code = None;
-            job.message = Some(
-                if completed {
-                    "文件已秒传到小号授权目录"
-                } else {
-                    "小号正在接收文件"
-                }
-                .to_string(),
-            );
-        })
-        .map_err(|message| DeveloperApiError {
-            message,
-            code: None,
-            retryable: false,
-        })?;
-        if completed {
-            return Ok(job);
         }
         sleep(Duration::from_millis(1_500)).await;
     }
@@ -14791,6 +15087,9 @@ async fn submit_developer_upload(
     update_and_emit_developer_job(app, database_path, &job.id, |job| {
         job.status = "copying".to_string();
         job.phase = "upload".to_string();
+        job.work_total_count = job.total_count;
+        job.processed_count = 0;
+        job.current_path.clear();
         job.message = Some("正在提交小号秒传".to_string());
     })
     .map_err(|message| DeveloperApiError {
@@ -14829,12 +15128,21 @@ async fn finish_developer_pre_audit(
     client_secret: &str,
     job: &DeveloperTransferJob,
     target_token: &str,
-    task_id: &str,
+    task_state: &str,
 ) -> Result<DeveloperTransferJob, DeveloperApiError> {
+    let mut plan = developer_pre_audit_plan(task_state, job.total_count);
+    let encoded = encode_developer_pre_audit_plan(&plan).map_err(|message| DeveloperApiError {
+        message,
+        code: None,
+        retryable: false,
+    })?;
     update_and_emit_developer_job(app, database_path, &job.id, |job| {
         job.status = "auditing".to_string();
         job.phase = "pre_upload".to_string();
-        job.pre_task_id = Some(task_id.to_string());
+        job.pre_task_id = Some(encoded.clone());
+        job.work_total_count = job.total_count;
+        job.processed_count = (job.passed_count + job.rejected_count).min(job.total_count);
+        job.current_path.clear();
         job.message = Some("文件正在预审，通过后会自动秒传".to_string());
     })
     .map_err(|message| DeveloperApiError {
@@ -14843,46 +15151,105 @@ async fn finish_developer_pre_audit(
         retryable: false,
     })?;
     for _ in 0..7_200 {
-        let payload = developer_post_with_retry(
-            client_id,
-            client_secret,
-            "/developer/v1/pre_upload_status",
-            json!({ "task_id": task_id }),
-            2,
-        )
-        .await?;
-        let data = payload.get("data").cloned().unwrap_or_else(|| json!({}));
-        let audit_status = data
-            .get("status")
-            .or_else(|| payload.get("status"))
-            .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
-            .unwrap_or(0);
-        let current = update_and_emit_developer_job(app, database_path, &job.id, |job| {
-            apply_developer_counts(job, &data);
+        for index in 0..plan.batches.len() {
+            if plan.batches[index].done {
+                continue;
+            }
+            let task_id = plan.batches[index].task_id.clone();
+            match developer_post_with_retry(
+                client_id,
+                client_secret,
+                "/developer/v1/pre_upload_status",
+                json!({ "task_id": task_id }),
+                2,
+            )
+            .await
+            {
+                Ok(payload) => {
+                    let data = payload.get("data").cloned().unwrap_or_else(|| json!({}));
+                    let audit_status = data
+                        .get("status")
+                        .or_else(|| payload.get("status"))
+                        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+                        .unwrap_or(0);
+                    let batch = &mut plan.batches[index];
+                    let passed = developer_count(&data, "passed_count", "passedCount")
+                        .unwrap_or(batch.passed_count)
+                        .max(0);
+                    let rejected = developer_count(&data, "rejected_count", "rejectedCount")
+                        .unwrap_or(batch.rejected_count)
+                        .max(0);
+                    let total = developer_count(&data, "total_count", "totalCount")
+                        .unwrap_or(batch.file_count)
+                        .max(passed + rejected)
+                        .max(0);
+                    batch.file_count = total;
+                    batch.passed_count = passed;
+                    batch.rejected_count = rejected;
+                    if audit_status == 4 {
+                        batch.rejected_count = batch
+                            .rejected_count
+                            .max(batch.file_count - batch.passed_count);
+                        batch.done = true;
+                        batch.failed = true;
+                    } else if audit_status == 3 {
+                        batch.done = true;
+                    }
+                }
+                Err(_) => {
+                    let batch = &mut plan.batches[index];
+                    batch.rejected_count = batch
+                        .rejected_count
+                        .max(batch.file_count - batch.passed_count);
+                    batch.done = true;
+                    batch.failed = true;
+                }
+            }
+        }
+        let summary = summarize_developer_pre_audit_plan(&plan);
+        let encoded =
+            encode_developer_pre_audit_plan(&plan).map_err(|message| DeveloperApiError {
+                message,
+                code: None,
+                retryable: false,
+            })?;
+        let suffix = if summary.failed_batches > 0 {
+            format!("；{} 个预审批次失败，已跳过", summary.failed_batches)
+        } else {
+            String::new()
+        };
+        update_and_emit_developer_job(app, database_path, &job.id, |job| {
             job.status = "auditing".to_string();
             job.phase = "pre_upload".to_string();
-            job.message = Some("文件正在预审，通过后会自动秒传".to_string());
+            job.pre_task_id = Some(encoded.clone());
+            job.total_count = summary.total_count;
+            job.passed_count = summary.passed_count;
+            job.rejected_count = summary.rejected_count;
+            job.pending_count = summary.pending_count;
+            job.work_total_count = summary.total_count;
+            job.processed_count =
+                (summary.passed_count + summary.rejected_count).min(summary.total_count);
+            job.current_path.clear();
+            job.message = Some(format!("文件正在预审，通过后会自动秒传{suffix}"));
         })
         .map_err(|message| DeveloperApiError {
             message,
             code: None,
             retryable: false,
         })?;
-        if audit_status == 4 {
-            let message = data
-                .get("message")
-                .or_else(|| data.get("msg"))
-                .and_then(Value::as_str)
-                .unwrap_or("文件预审失败")
-                .to_string();
-            return Err(DeveloperApiError {
-                message,
-                code: None,
-                retryable: false,
-            });
-        }
-        if audit_status == 3 {
-            return submit_developer_upload(
+        if summary.done {
+            let current = load_developer_transfer_job(database_path, &job.id)
+                .map_err(|message| DeveloperApiError {
+                    message,
+                    code: None,
+                    retryable: false,
+                })?
+                .ok_or_else(|| DeveloperApiError {
+                    message: "预审完成后无法读取小号互传任务".to_string(),
+                    code: None,
+                    retryable: false,
+                })?;
+            return match submit_developer_upload(
                 app,
                 database_path,
                 client_id,
@@ -14890,7 +15257,45 @@ async fn finish_developer_pre_audit(
                 &current,
                 target_token,
             )
-            .await;
+            .await
+            {
+                Err(error) if error.code == Some(18014) => {
+                    update_and_emit_developer_job(app, database_path, &job.id, |job| {
+                        job.status = "success".to_string();
+                        job.phase = "completed".to_string();
+                        job.skipped_count = job.skipped_count.max(job.passed_count);
+                        job.work_total_count = job.total_count;
+                        job.processed_count = job.total_count;
+                        job.current_path.clear();
+                        job.error_code = None;
+                        job.message = Some(format!(
+                            "通过的 {} 个文件此前已传给该小号；{} 个未通过预审",
+                            job.passed_count, job.rejected_count
+                        ));
+                    })
+                    .map_err(|message| DeveloperApiError {
+                        message,
+                        code: None,
+                        retryable: false,
+                    })
+                }
+                Err(error) if error.code == Some(18011) => Err(DeveloperApiError {
+                    message: if current.passed_count > 0 {
+                        format!(
+                            "预审显示通过 {} 个，但平台正式秒传时未返回可上传文件",
+                            current.passed_count
+                        )
+                    } else {
+                        format!(
+                            "预审完成：{} 个文件均未通过，未开始秒传",
+                            current.rejected_count
+                        )
+                    },
+                    code: Some(18011),
+                    retryable: false,
+                }),
+                result => result,
+            };
         }
         sleep(Duration::from_secs(3)).await;
     }
@@ -14899,6 +15304,156 @@ async fn finish_developer_pre_audit(
         code: None,
         retryable: false,
     })
+}
+
+async fn start_developer_pre_audit(
+    app: &tauri::AppHandle,
+    database_path: &Path,
+    client_id: &str,
+    client_secret: &str,
+    job: &DeveloperTransferJob,
+    target_token: &str,
+    cloud_token: &str,
+    device_id: &str,
+) -> Result<DeveloperTransferJob, DeveloperApiError> {
+    let (files, _, _) = collect_cloud_selection_entries(
+        cloud_token,
+        device_id,
+        &job.file_ids,
+        &job.file_names,
+        false,
+    )
+    .await
+    .map_err(|message| DeveloperApiError {
+        message,
+        code: None,
+        retryable: false,
+    })?;
+    if files.is_empty() {
+        return Err(DeveloperApiError {
+            message: "所选内容中没有可预审的文件".to_string(),
+            code: None,
+            retryable: false,
+        });
+    }
+    let total = files.len();
+    let first_path = files
+        .first()
+        .map(|entry| entry.path.clone())
+        .unwrap_or_default();
+    update_and_emit_developer_job(app, database_path, &job.id, |job| {
+        job.status = "auditing".to_string();
+        job.phase = "pre_upload".to_string();
+        job.total_count = total as i64;
+        job.passed_count = 0;
+        job.rejected_count = 0;
+        job.pending_count = total as i64;
+        job.work_total_count = total as i64;
+        job.processed_count = 0;
+        job.current_path = first_path.clone();
+        job.message = Some("正在按原文件分批提交预审".to_string());
+    })
+    .map_err(|message| DeveloperApiError {
+        message,
+        code: None,
+        retryable: false,
+    })?;
+
+    let mut plan = DeveloperPreAuditPlan {
+        version: 2,
+        batches: Vec::new(),
+    };
+    let mut submitted = 0_usize;
+    for entries in files.chunks(DEVELOPER_PRE_AUDIT_BATCH_SIZE) {
+        let file_ids = entries
+            .iter()
+            .map(|entry| entry.file_id.clone())
+            .collect::<Vec<_>>();
+        let batch = match developer_post_with_retry(
+            client_id,
+            client_secret,
+            "/developer/v1/pre_upload",
+            json!({ "token_id": target_token, "file_ids": file_ids }),
+            2,
+        )
+        .await
+        {
+            Ok(payload) => match developer_task_id(&payload) {
+                Some(task_id) => DeveloperPreAuditBatch {
+                    task_id,
+                    file_count: entries.len() as i64,
+                    passed_count: 0,
+                    rejected_count: 0,
+                    done: false,
+                    failed: false,
+                },
+                None => DeveloperPreAuditBatch {
+                    task_id: String::new(),
+                    file_count: entries.len() as i64,
+                    passed_count: 0,
+                    rejected_count: entries.len() as i64,
+                    done: true,
+                    failed: true,
+                },
+            },
+            Err(_) => DeveloperPreAuditBatch {
+                task_id: String::new(),
+                file_count: entries.len() as i64,
+                passed_count: 0,
+                rejected_count: entries.len() as i64,
+                done: true,
+                failed: true,
+            },
+        };
+        plan.batches.push(batch);
+        submitted += entries.len();
+        let current_path = files
+            .get(submitted.min(total.saturating_sub(1)))
+            .map(|entry| entry.path.clone())
+            .unwrap_or_default();
+        let encoded =
+            encode_developer_pre_audit_plan(&plan).map_err(|message| DeveloperApiError {
+                message,
+                code: None,
+                retryable: false,
+            })?;
+        update_and_emit_developer_job(app, database_path, &job.id, |job| {
+            job.pre_task_id = Some(encoded.clone());
+            job.current_path = current_path.clone();
+            job.message = Some(format!("正在按原文件分批提交预审 {submitted}/{total}"));
+        })
+        .map_err(|message| DeveloperApiError {
+            message,
+            code: None,
+            retryable: false,
+        })?;
+    }
+    let prepared = load_developer_transfer_job(database_path, &job.id)
+        .map_err(|message| DeveloperApiError {
+            message,
+            code: None,
+            retryable: false,
+        })?
+        .ok_or_else(|| DeveloperApiError {
+            message: "分批预审提交后无法读取小号互传任务".to_string(),
+            code: None,
+            retryable: false,
+        })?;
+    let encoded = encode_developer_pre_audit_plan(&plan).map_err(|message| DeveloperApiError {
+        message,
+        code: None,
+        retryable: false,
+    })?;
+    finish_developer_pre_audit(
+        app,
+        database_path,
+        client_id,
+        client_secret,
+        &prepared,
+        target_token,
+        &encoded,
+    )
+    .await
 }
 
 async fn run_developer_transfer_job(app: tauri::AppHandle, state: SharedState, job_id: String) {
@@ -14984,6 +15539,9 @@ async fn run_developer_transfer_job(app: tauri::AppHandle, state: SharedState, j
         job = update_and_emit_developer_job(&app, &database_path, &job.id, |job| {
             job.status = "direct".to_string();
             job.phase = "direct".to_string();
+            job.work_total_count = job.total_count;
+            job.processed_count = 0;
+            job.current_path.clear();
             job.message = Some("正在尝试直接秒传".to_string());
         })
         .map_err(|message| DeveloperApiError {
@@ -15007,6 +15565,9 @@ async fn run_developer_transfer_job(app: tauri::AppHandle, state: SharedState, j
                     current.status = "success".to_string();
                     current.phase = "completed".to_string();
                     current.skipped_count = current.total_count;
+                    current.work_total_count = current.total_count;
+                    current.processed_count = current.total_count;
+                    current.current_path.clear();
                     current.error_code = None;
                     current.message = Some("这些文件此前已传给该小号，无需重复传输".to_string());
                 })
@@ -15017,69 +15578,28 @@ async fn run_developer_transfer_job(app: tauri::AppHandle, state: SharedState, j
                 })
             }
             Err(error) if error.code == Some(18011) => {
-                let (business_token, device_id) = state
-                    .lock()
-                    .map_err(|lock_error| DeveloperApiError {
+                let (cloud_token, device_id) = {
+                    let guard = state.lock().map_err(|lock_error| DeveloperApiError {
                         message: format!("读取登录态失败：{lock_error}"),
                         code: None,
                         retryable: false,
-                    })
-                    .and_then(|guard| {
-                        guard
-                            .token
-                            .clone()
-                            .map(|token| (token, guard.device_id.clone()))
-                            .ok_or_else(|| DeveloperApiError {
-                                message: "预审混淆文件名需要先登录光鸭云盘".to_string(),
-                                code: None,
-                                retryable: false,
-                            })
                     })?;
-                acquire_developer_name_obfuscation(
-                    &app,
-                    &database_path,
-                    &business_token,
-                    &device_id,
-                    &job,
-                )
-                .await
-                .map_err(|message| DeveloperApiError {
-                    message,
-                    code: None,
-                    retryable: false,
-                })?;
-                let payload = developer_post_with_retry(
-                    &client_id,
-                    &client_secret,
-                    "/developer/v1/pre_upload",
-                    json!({ "token_id": target_token, "file_ids": job.file_ids }),
-                    2,
-                )
-                .await?;
-                let task_id = developer_task_id(&payload).ok_or_else(|| DeveloperApiError {
-                    message: "开发者接口没有返回预审任务 ID".to_string(),
-                    code: None,
-                    retryable: false,
-                })?;
-                job = update_and_emit_developer_job(&app, &database_path, &job.id, |current| {
-                    current.status = "auditing".to_string();
-                    current.phase = "pre_upload".to_string();
-                    current.pre_task_id = Some(task_id.clone());
-                    current.message = Some("直传条件不足，已自动转入预审".to_string());
-                })
-                .map_err(|message| DeveloperApiError {
-                    message,
-                    code: None,
-                    retryable: false,
-                })?;
-                finish_developer_pre_audit(
+                    let token = guard.token.clone().ok_or_else(|| DeveloperApiError {
+                        message: "登录态不可用，无法展开原文件进行预审".to_string(),
+                        code: None,
+                        retryable: false,
+                    })?;
+                    (token, guard.device_id.clone())
+                };
+                start_developer_pre_audit(
                     &app,
                     &database_path,
                     &client_id,
                     &client_secret,
                     &job,
                     &target_token,
-                    &task_id,
+                    &cloud_token,
+                    &device_id,
                 )
                 .await
             }
@@ -15091,6 +15611,7 @@ async fn run_developer_transfer_job(app: tauri::AppHandle, state: SharedState, j
         let _ = update_and_emit_developer_job(&app, &database_path, &job_id, |job| {
             job.status = "failed".to_string();
             job.phase = "failed".to_string();
+            job.current_path.clear();
             job.error_code = error.code;
             job.message = Some(error.message.clone());
         });
@@ -15119,8 +15640,14 @@ async fn run_developer_transfer_job(app: tauri::AppHandle, state: SharedState, j
         });
         let restore_result = match auth {
             Some((token, device_id)) => {
-                release_developer_name_obfuscation(&database_path, &token, &device_id, &job_id)
-                    .await
+                release_developer_name_obfuscation(
+                    &app,
+                    &database_path,
+                    &token,
+                    &device_id,
+                    &job_id,
+                )
+                .await
             }
             None => Err("登录态不可用，源文件名将在下次登录后继续恢复".to_string()),
         };
@@ -15231,11 +15758,13 @@ fn resume_developer_transfer_jobs(app: tauri::AppHandle, state: SharedState) -> 
     });
     if let Some((token, device_id)) = auth {
         for restore_id in restore_ids {
+            let app = app.clone();
             let database_path = database_path.clone();
             let token = token.clone();
             let device_id = device_id.clone();
             tauri::async_runtime::spawn(async move {
                 let _ = release_developer_name_obfuscation(
+                    &app,
                     &database_path,
                     &token,
                     &device_id,
@@ -15332,8 +15861,8 @@ async fn start_developer_transfer(
         .execute(
             "INSERT INTO developer_transfer_jobs
                (id, target_id, target_name, file_ids_json, file_names_json,
-                status, phase, total_count, message, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'direct', 'direct', ?6, ?7, ?8, ?8)",
+                status, phase, total_count, work_total_count, message, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'direct', 'direct', ?6, ?6, ?7, ?8, ?8)",
             params![
                 id,
                 target_id,
@@ -17680,6 +18209,51 @@ mod tests {
     }
 
     #[test]
+    fn developer_pre_audit_plan_keeps_partial_success_and_legacy_resume() {
+        let plan = DeveloperPreAuditPlan {
+            version: 2,
+            batches: vec![
+                DeveloperPreAuditBatch {
+                    task_id: "task-a".to_string(),
+                    file_count: 20,
+                    passed_count: 17,
+                    rejected_count: 3,
+                    done: true,
+                    failed: false,
+                },
+                DeveloperPreAuditBatch {
+                    task_id: String::new(),
+                    file_count: 5,
+                    passed_count: 0,
+                    rejected_count: 5,
+                    done: true,
+                    failed: true,
+                },
+            ],
+        };
+        let encoded = encode_developer_pre_audit_plan(&plan).unwrap();
+        let decoded = developer_pre_audit_plan(&encoded, 0);
+        assert_eq!(
+            summarize_developer_pre_audit_plan(&decoded),
+            DeveloperPreAuditSummary {
+                total_count: 25,
+                passed_count: 17,
+                rejected_count: 8,
+                pending_count: 0,
+                failed_batches: 1,
+                done: true,
+            }
+        );
+
+        let legacy = developer_pre_audit_plan("legacy-task", 7);
+        assert_eq!(legacy.version, 1);
+        assert_eq!(legacy.batches.len(), 1);
+        assert_eq!(legacy.batches[0].task_id, "legacy-task");
+        assert_eq!(legacy.batches[0].file_count, 7);
+        assert!(!legacy.batches[0].done);
+    }
+
+    #[test]
     fn offline_name_obfuscation_preserves_extension_and_persists_restore_state() {
         assert_eq!(
             ed2k_file_name("ed2k://|file|Original%20Movie.mkv|1|ABC|/"),
@@ -18232,16 +18806,6 @@ mod tests {
         }
         assert_eq!(streamed.gcid, hex::encode_upper(gcid.finalize()));
         assert_eq!(streamed.cid, hex::encode_upper(cid.finalize()));
-    }
-
-    #[test]
-    fn developer_pre_audit_names_are_random_and_keep_safe_file_extensions() {
-        let first = developer_temporary_name("电影.2026.mkv", false);
-        let second = developer_temporary_name("电影.2026.mkv", false);
-        assert!(first.starts_with("gy_"));
-        assert!(first.ends_with(".mkv"));
-        assert_ne!(first, second);
-        assert!(!developer_temporary_name("资料.目录", true).ends_with(".目录"));
     }
 
     #[test]

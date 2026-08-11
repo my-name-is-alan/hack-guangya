@@ -37,14 +37,17 @@ import {
   VideoCameraOutlined,
 } from '@antdv-next/icons';
 import CompactFileBreadcrumb from '../components/files/CompactFileBreadcrumb.vue';
+import DeveloperTransferStatus from '../components/files/DeveloperTransferStatus.vue';
 import FileDetailsDrawer from '../components/files/FileDetailsDrawer.vue';
 import FileSelectionBar from '../components/files/FileSelectionBar.vue';
+import GcidExportStatus from '../components/files/GcidExportStatus.vue';
 import GcidImportStatus from '../components/files/GcidImportStatus.vue';
 import ShareResultDialog from '../components/shares/ShareResultDialog.vue';
 import { bridge, isTauri } from '../bridge.js';
 import { useFileKeyboardShortcuts } from '../composables/useFileKeyboardShortcuts.js';
 import { FOLDER_OPEN_MODE, useFolderOpenPreference } from '../composables/useFolderOpenPreference.js';
 import { gcidImportPercent, shouldConvertPasteToFile } from '../gcidImport.js';
+import { normalizeDeveloperTransferJob } from '../developerTransfer.js';
 import { buildRenamePreview } from '../renameRules.js';
 import { parseGuangyaShareLink } from '../shareLink.js';
 import { readJsonResponse } from '../httpResponse.js';
@@ -149,13 +152,15 @@ const gcidImport = reactive({
 });
 const developerTransfer = reactive({
   open: false,
+  detailsOpen: false,
   loading: false,
   submitting: false,
   records: [],
   targets: [],
   targetId: '',
+  jobs: [],
 });
-const gcidExport = reactive({ running: false, progress: null });
+const gcidExport = reactive({ running: false, detailsOpen: false, progress: null });
 const scrapeDialog = reactive({ open: false, loading: false, saving: false, targets: [], targetId: '', records: [] });
 const developerTerminalNotified = new Set();
 const gcidImportRunning = computed(() => ['preparing', 'running'].includes(gcidImport.status?.status));
@@ -537,6 +542,29 @@ function normalizeDeveloperSettings(payload) {
   };
 }
 
+function upsertDeveloperTransferJob(value) {
+  const job = normalizeDeveloperTransferJob(value);
+  if (!job) return null;
+  const index = developerTransfer.jobs.findIndex((item) => item.id === job.id);
+  if (index >= 0) developerTransfer.jobs.splice(index, 1, job);
+  else developerTransfer.jobs.unshift(job);
+  developerTransfer.jobs.sort((left, right) => right.updated_at - left.updated_at || right.created_at - left.created_at);
+  developerTransfer.jobs = developerTransfer.jobs.slice(0, 50);
+  return job;
+}
+
+async function loadDeveloperTransferJobs() {
+  try {
+    const payload = unwrapData(await bridge.invoke('list_developer_transfers', { limit: 50 }));
+    const source = Array.isArray(payload)
+      ? payload
+      : [payload?.list, payload?.items, payload?.tasks, payload?.data?.list].find(Array.isArray) || [];
+    developerTransfer.jobs = source.map(normalizeDeveloperTransferJob).filter(Boolean);
+  } catch {
+    // 开发者模式未配置时不打扰文件列表；提交互传时仍会显示明确错误。
+  }
+}
+
 async function openDeveloperTransfer(records = selectedRecords()) {
   const targets = (Array.isArray(records) ? records : []).filter((item) => fileId(item));
   if (!targets.length) {
@@ -587,9 +615,11 @@ async function submitDeveloperTransfer() {
       file_ids: developerTransfer.records.map(fileId),
       file_names: developerTransfer.records.map((item) => String(item.fileName || '未命名文件')),
     }));
+    upsertDeveloperTransferJob(job);
+    developerTransfer.detailsOpen = true;
     developerTransfer.open = false;
     clearSelection();
-    message.success(job.reused ? '相同的互传任务已在处理中' : '已开始小号秒传；需要预审时会自动续传');
+    message.success(job.reused ? '相同的互传任务已在处理中' : '已开始小号秒传；直传条件不足时会自动提交原文件预审');
   } catch (error) {
     message.error(errorText(error));
   } finally {
@@ -610,6 +640,46 @@ function saveGeneratedJsonInBrowser(fileName, payload) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
 }
 
+async function runGcidExport(targets) {
+  gcidExport.running = true;
+  gcidExport.progress = { status: 'running', stage: '正在扫描所选文件…', percent: 0 };
+  gcidExport.detailsOpen = true;
+  operationBusy.value = true;
+  let keepFailureVisible = false;
+  try {
+    const result = unwrapData(await bridge.invoke('export_gcid_json', {
+      file_ids: targets.map(fileId),
+      file_names: targets.map((item) => String(item.fileName || item.name || '未命名文件')),
+    }));
+    if (result?.cancelled) return;
+    if (result?.export) saveGeneratedJsonInBrowser(result.file_name, result.export);
+    clearSelection();
+    const total = Number(result?.total_files || 0);
+    const skipped = Number(result?.skipped_files_count ?? result?.export?.skippedFilesCount ?? 0);
+    const location = result?.saved_path ? `，已保存到 ${result.saved_path}` : '，浏览器已开始保存';
+    if (skipped > 0) message.warning(`秒传 JSON 已生成：${total} 个文件，另有 ${skipped} 个读取失败并已写入跳过清单${location}`);
+    else message.success(`秒传 JSON 已生成：${total} 个文件${location}`);
+  } catch (error) {
+    const reason = errorText(error);
+    keepFailureVisible = true;
+    gcidExport.progress = {
+      ...(gcidExport.progress || {}),
+      status: 'failed',
+      stage: '秒传 JSON 生成失败',
+      error: reason,
+    };
+    gcidExport.detailsOpen = true;
+    message.error(reason);
+  } finally {
+    gcidExport.running = false;
+    operationBusy.value = false;
+    if (!keepFailureVisible) {
+      gcidExport.detailsOpen = false;
+      gcidExport.progress = null;
+    }
+  }
+}
+
 function exportSelectedGcidJson(records = selectedRecords()) {
   const targets = (Array.isArray(records) ? records : []).filter((item) => fileId(item));
   if (!targets.length) {
@@ -621,31 +691,12 @@ function exportSelectedGcidJson(records = selectedRecords()) {
     return;
   }
   Modal.confirm({
-    title: '生成秒传 JSON 会读取全部文件内容',
-    content: '为了计算 GCID 和 CID，程序会递归读取所选文件及文件夹内的全部文件，可能产生接近文件总大小的大量下行流量。确认继续吗？',
-    okText: '继续读取并生成',
+    title: '并发生成秒传 JSON',
+    content: '程序会复用云端已有 GCID，并并发读取每个大文件的头、中、尾各 20 KB 来计算 CID（通常约 60 KB/文件）。仅在云端缺少 GCID 或不支持分段读取时，才回退完整校验。',
+    okText: '开始生成',
     cancelText: '取消',
-    async onOk() {
-      gcidExport.running = true;
-      gcidExport.progress = { stage: '正在扫描所选文件…', percent: 0 };
-      operationBusy.value = true;
-      try {
-        const result = unwrapData(await bridge.invoke('export_gcid_json', {
-          file_ids: targets.map(fileId),
-          file_names: targets.map((item) => String(item.fileName || item.name || '未命名文件')),
-        }));
-        if (result?.cancelled) return;
-        if (result?.export) saveGeneratedJsonInBrowser(result.file_name, result.export);
-        clearSelection();
-        const location = result?.saved_path ? `，已保存到 ${result.saved_path}` : '，浏览器已开始保存';
-        message.success(`秒传 JSON 已生成：${Number(result?.total_files || 0)} 个文件${location}`);
-      } catch (error) {
-        message.error(errorText(error));
-      } finally {
-        gcidExport.running = false;
-        gcidExport.progress = null;
-        operationBusy.value = false;
-      }
+    onOk() {
+      void runGcidExport(targets);
     },
   });
 }
@@ -1616,12 +1667,13 @@ onMounted(async () => {
   window.addEventListener('dragend', handleWindowDragEnd);
   window.addEventListener('drop', handleWindowDrop);
   window.addEventListener('click', handleWindowClick);
+  await loadDeveloperTransferJobs();
   unlistenDeveloperTransfer = await bridge.subscribe((payload) => {
     if (payload?.type === 'gcid-export-progress') {
       gcidExport.progress = payload;
       return;
     }
-    const job = payload?.type === 'developer-transfer' ? payload.job : null;
+    const job = payload?.type === 'developer-transfer' ? upsertDeveloperTransferJob(payload.job) : null;
     if (!job?.id || !['success', 'failed'].includes(job.status) || developerTerminalNotified.has(job.id)) return;
     developerTerminalNotified.add(job.id);
     if (job.status === 'success') message.success(job.message || `已完成到 ${job.target_name} 的小号秒传`);
@@ -1693,7 +1745,8 @@ onBeforeUnmount(() => {
           @clear-clipboard="clearFileClipboard"
         >
           <template #status>
-            <a-tag v-if="gcidExport.running" color="processing">{{ gcidExport.progress?.stage || '正在生成秒传 JSON' }} {{ Number(gcidExport.progress?.percent || 0) }}%</a-tag>
+            <GcidExportStatus v-if="gcidExport.progress" v-model:open="gcidExport.detailsOpen" :progress="gcidExport.progress" :running="gcidExport.running" />
+            <DeveloperTransferStatus v-model:open="developerTransfer.detailsOpen" :jobs="developerTransfer.jobs" />
             <GcidImportStatus v-if="gcidImportRunning" v-model:open="gcidImport.detailsOpen" :status="gcidImport.status" :percent="gcidImportProgress" />
           </template>
         </FileSelectionBar>
@@ -1704,7 +1757,8 @@ onBeforeUnmount(() => {
             <CompactFileBreadcrumb :segments="currentPath" @navigate="jumpToPath($event.index)" />
           </a-flex>
           <a-flex align="center" gap="small" class="file-primary-actions">
-            <a-tag v-if="gcidExport.running" color="processing">{{ gcidExport.progress?.stage || '正在生成秒传 JSON' }} {{ Number(gcidExport.progress?.percent || 0) }}%</a-tag>
+            <GcidExportStatus v-if="gcidExport.progress" v-model:open="gcidExport.detailsOpen" :progress="gcidExport.progress" :running="gcidExport.running" />
+            <DeveloperTransferStatus v-model:open="developerTransfer.detailsOpen" :jobs="developerTransfer.jobs" />
             <GcidImportStatus v-if="gcidImportRunning" v-model:open="gcidImport.detailsOpen" :status="gcidImport.status" :percent="gcidImportProgress" />
             <a-button v-if="isTauri && !gcidImportRunning" :disabled="!appState.logged_in" @click="openGcidImport"><template #icon><FileAddOutlined /></template>JSON 秒传</a-button>
             <a-button :disabled="!appState.logged_in" @click="openNewFolderModal"><template #icon><FolderAddOutlined /></template>新建文件夹</a-button>
@@ -1926,7 +1980,7 @@ onBeforeUnmount(() => {
     >
       <a-alert type="info" show-icon class="developer-transfer-note">
         <template #message>服务端直接复制，不下载文件</template>
-        <template #description>若文件尚未通过预审，应用会先并发临时混淆所选内容的文件名，预审和秒传完成后自动恢复；多个互传任务可同时执行。</template>
+        <template #description>应用会先尝试直接秒传；仅在业务码 18011 时提交原文件预审，通过后自动继续秒传。小号流程不会修改源文件名；开始后可在文件页查看当前阶段和数量进度。</template>
       </a-alert>
       <a-form layout="vertical">
         <a-form-item label="接收小号" required>

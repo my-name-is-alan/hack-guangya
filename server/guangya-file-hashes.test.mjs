@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
+  calculateGuangyaCidSamples,
   calculateGuangyaFileHashes,
   calculateGuangyaStreamHashes,
   cidByteRanges,
@@ -50,6 +51,16 @@ test('streamed Guangya hashes are independent of download chunk boundaries', asy
   } finally {
     await fsp.rm(root, { recursive: true, force: true });
   }
+});
+
+test('CID can be rebuilt from only the three advertised byte ranges', async () => {
+  const content = Buffer.alloc(900_123);
+  for (let index = 0; index < content.length; index += 1) content[index] = (index * 29) % 251;
+  const full = await calculateGuangyaStreamHashes([content], content.length);
+  const samples = cidByteRanges(content.length)
+    .map(({ start, end }) => content.subarray(start, end));
+  assert.equal(calculateGuangyaCidSamples(samples, content.length), full.cid);
+  assert.equal(samples.reduce((total, bytes) => total + bytes.length, 0), 60 * 1024);
 });
 
 test('Guangya hash boundaries follow the released browser worker', () => {

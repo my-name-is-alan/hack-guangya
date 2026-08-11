@@ -12,7 +12,12 @@ import { fetch as undiciFetch } from 'undici';
 import { autoShareTargetFor, shareFilePayload, signHdhiveRequest } from './auto-share.mjs';
 import { createAccessControl } from './access-control.mjs';
 import { createDirectoryCache } from './directory-cache.mjs';
-import { calculateGuangyaFileHashes, calculateGuangyaStreamHashes } from './guangya-file-hashes.mjs';
+import {
+  calculateGuangyaCidSamples,
+  calculateGuangyaFileHashes,
+  calculateGuangyaStreamHashes,
+  cidByteRanges,
+} from './guangya-file-hashes.mjs';
 import {
   buildAccountHeaders,
   buildBusinessHeaders,
@@ -35,6 +40,13 @@ import { uploadPartSize } from './upload-parts.mjs';
 import { createVirtualLibraryService } from './virtual-library.mjs';
 import { createWebDavHandler, normalizeWebDavEntry, WebDavError } from './webdav.mjs';
 import { parseGuangyaShareLink } from '../ui/shareLink.js';
+import {
+  chunkDeveloperPreAuditFileIds,
+  createDeveloperPreAuditBatch,
+  decodeDeveloperPreAuditPlan,
+  encodeDeveloperPreAuditPlan,
+  finalizeDeveloperPreAuditSummary,
+} from '../shared/developer-pre-audit.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const uiRoot = path.resolve(here, '..', 'dist');
@@ -265,6 +277,9 @@ database.exec(`
     pending_count INTEGER NOT NULL DEFAULT 0,
     success_count INTEGER NOT NULL DEFAULT 0,
     skipped_count INTEGER NOT NULL DEFAULT 0,
+    work_total_count INTEGER NOT NULL DEFAULT 0,
+    processed_count INTEGER NOT NULL DEFAULT 0,
+    current_path TEXT NOT NULL DEFAULT '',
     error_code INTEGER,
     message TEXT,
     created_at INTEGER NOT NULL,
@@ -328,6 +343,15 @@ function appStateValue(key) {
 function saveAppStateValue(key, value) {
   database.prepare('INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
     .run(key, String(value), Math.floor(Date.now() / 1000));
+}
+for (const [column, definition] of [
+  ['work_total_count', 'INTEGER NOT NULL DEFAULT 0'],
+  ['processed_count', 'INTEGER NOT NULL DEFAULT 0'],
+  ['current_path', "TEXT NOT NULL DEFAULT ''"],
+]) {
+  if (!database.prepare("PRAGMA table_info(developer_transfer_jobs)").all().some((entry) => entry.name === column)) {
+    database.exec(`ALTER TABLE developer_transfer_jobs ADD COLUMN ${column} ${definition}`);
+  }
 }
 let networkPreferences = normalizeNetworkPreferences({
   proxy_url: appStateValue('network_proxy'),
@@ -825,6 +849,9 @@ function developerTransferJob(row) {
     pending_count: Number(row.pending_count || 0),
     success_count: Number(row.success_count || 0),
     skipped_count: Number(row.skipped_count || 0),
+    work_total_count: Number(row.work_total_count || 0),
+    processed_count: Number(row.processed_count || 0),
+    current_path: String(row.current_path || ''),
     error_code: row.error_code == null ? null : Number(row.error_code),
     message: row.message == null ? null : String(row.message),
     created_at: Number(row.created_at),
@@ -844,7 +871,8 @@ function listDeveloperTransfers(limit = 50) {
 function updateDeveloperTransferJob(id, patch) {
   const allowed = new Set([
     'status', 'phase', 'pre_task_id', 'upload_task_id', 'total_count', 'passed_count',
-    'rejected_count', 'pending_count', 'success_count', 'skipped_count', 'error_code', 'message',
+    'rejected_count', 'pending_count', 'success_count', 'skipped_count', 'work_total_count',
+    'processed_count', 'current_path', 'error_code', 'message',
   ]);
   const entries = Object.entries(patch).filter(([key, value]) => allowed.has(key) && value !== undefined);
   if (entries.length) {
@@ -1017,9 +1045,10 @@ function cloudEntryFromRecord(record, fallbackId = '', fallbackName = '') {
   const folder = resType === 2 || value.isFolder === true || value.is_folder === true || value.isDir === true;
   const rawSize = value.fileSize ?? value.file_size ?? value.totalSize ?? value.total_size ?? value.size ?? 0;
   const size = Number(rawSize || 0);
+  const gcid = String(value.gcid ?? value.GCID ?? value.gCid ?? '').trim();
   if (!fileId || !name) throw new Error('光鸭返回的文件详情缺少文件 ID 或名称');
   if (!folder && (!Number.isSafeInteger(size) || size < 0)) throw new Error(`文件大小无效：${name}`);
-  return { fileId, name, folder, size: folder ? 0 : size };
+  return { fileId, name, folder, size: folder ? 0 : size, gcid };
 }
 
 function safeCloudPathSegment(value) {
@@ -1063,54 +1092,25 @@ async function collectCloudSelectionEntries(fileIds, fallbackNames = [], include
   return { entries, roots, scannedFolders };
 }
 
-function developerTemporaryName(originalName, folder) {
-  const extension = folder ? '' : path.extname(originalName);
-  const safeExtension = /^\.[A-Za-z0-9]{1,16}$/.test(extension) ? extension : '';
-  return `gy_${crypto.randomUUID().replaceAll('-', '').slice(0, 20)}${safeExtension}`;
-}
-
-async function acquireDeveloperNameObfuscation(job) {
-  return withDeveloperNameMutationLock(async () => {
-    const { entries } = await collectCloudSelectionEntries(job.file_ids, job.file_names, true);
-    if (!entries.length) return 0;
-    const now = Math.floor(Date.now() / 1000);
-    const findShared = database.prepare(
-      "SELECT original_name, temporary_name FROM developer_transfer_name_restores WHERE file_id = ? AND status = 'active' ORDER BY created_at LIMIT 1",
-    );
-    const save = database.prepare(`INSERT INTO developer_transfer_name_restores
-      (job_id, file_id, original_name, temporary_name, status, last_error, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'active', NULL, ?, ?)
-      ON CONFLICT(job_id, file_id) DO UPDATE SET status = 'active', last_error = NULL, updated_at = excluded.updated_at`);
-    const pendingRenames = [];
-    database.exec('BEGIN IMMEDIATE');
+async function renameDeveloperNameWithRetry(fileId, newName) {
+  const attempts = 5;
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
-      for (const entry of entries) {
-        const own = database.prepare('SELECT original_name, temporary_name FROM developer_transfer_name_restores WHERE job_id = ? AND file_id = ?').get(job.id, entry.fileId);
-        const shared = own || findShared.get(entry.fileId);
-        const originalName = String(shared?.original_name || entry.name);
-        const temporaryName = String(shared?.temporary_name || developerTemporaryName(originalName, entry.folder));
-        save.run(job.id, entry.fileId, originalName, temporaryName, now, now);
-        if (!shared) pendingRenames.push({ ...entry, originalName, temporaryName });
-      }
-      database.exec('COMMIT');
+      await renameRemote(fileId, newName);
+      return;
     } catch (error) {
-      database.exec('ROLLBACK');
-      throw error;
+      lastError = error;
+      try {
+        if ((await cloudEntryDetail(fileId, newName)).name === newName) return;
+      } catch {}
     }
-    updateDeveloperTransferJob(job.id, {
-      status: 'auditing',
-      phase: 'obfuscating',
-      message: `正在并发混淆 ${entries.length} 个源文件名，随后开始预审`,
-    });
-    try {
-      await mapConcurrent(pendingRenames, 8, (entry) => renameRemote(entry.fileId, entry.temporaryName));
-    } catch (error) {
-      throw new Error(`预审前混淆源文件名失败：${error?.message || error}`);
+    if (attempt + 1 < attempts) {
+      const delay = [400, 800, 1_600, 3_000][Math.min(attempt, 3)];
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
-    remoteCache.clear();
-    remoteCache.set('', '');
-    return entries.length;
-  });
+  }
+  throw new Error(`${lastError?.message || lastError || '文件名改写失败'}（文件名改写已重试 ${attempts} 次）`);
 }
 
 async function releaseDeveloperNameObfuscation(jobId) {
@@ -1126,24 +1126,47 @@ async function releaseDeveloperNameObfuscation(jobId) {
       if (active) deferred += 1;
       else restorable.push(row);
     }
-    const outcomes = await mapConcurrent(restorable, 8, async (row) => {
+    const previous = loadDeveloperTransferJob(jobId);
+    const total = restorable.length + deferred;
+    let processed = deferred;
+    updateDeveloperTransferJob(jobId, {
+      phase: 'restoring',
+      work_total_count: total,
+      processed_count: processed,
+      current_path: String(restorable[0]?.original_name || ''),
+      message: `正在恢复源文件名 ${processed}/${total}`,
+    });
+    const outcomes = await mapConcurrent(restorable, 2, async (row) => {
+      let restored = false;
       try {
         let currentName = '';
         try { currentName = (await cloudEntryDetail(String(row.file_id))).name; } catch {}
         if (currentName !== String(row.original_name)) {
-          await renameRemote(String(row.file_id), String(row.original_name));
+          await renameDeveloperNameWithRetry(String(row.file_id), String(row.original_name));
         }
         database.prepare("UPDATE developer_transfer_name_restores SET status = 'completed', last_error = NULL, updated_at = ? WHERE file_id = ? AND status <> 'active'").run(Math.floor(Date.now() / 1000), row.file_id);
-        return true;
+        restored = true;
       } catch (error) {
         database.prepare("UPDATE developer_transfer_name_restores SET status = 'restore_failed', last_error = ?, updated_at = ? WHERE file_id = ? AND status <> 'active'")
           .run(String(error?.message || error || '恢复原文件名失败').slice(0, 500), Math.floor(Date.now() / 1000), row.file_id);
-        return false;
       }
+      processed += 1;
+      updateDeveloperTransferJob(jobId, {
+        processed_count: processed,
+        current_path: String(row.original_name || ''),
+        message: `正在恢复源文件名 ${processed}/${total}`,
+      });
+      return restored;
     });
     database.prepare("DELETE FROM developer_transfer_name_restores WHERE status = 'completed' AND updated_at < ?").run(now - 30 * 86_400);
     remoteCache.clear();
     remoteCache.set('', '');
+    updateDeveloperTransferJob(jobId, {
+      phase: previous?.phase || 'completed',
+      processed_count: total,
+      current_path: '',
+      message: previous?.message ?? null,
+    });
     return {
       restored: outcomes.filter(Boolean).length,
       deferred,
@@ -1153,24 +1176,55 @@ async function releaseDeveloperNameObfuscation(jobId) {
 }
 
 async function finishDeveloperUpload(client, jobId, taskId) {
-  updateDeveloperTransferJob(jobId, { status: 'running', phase: 'upload', upload_task_id: taskId, message: '小号正在接收文件' });
+  const initial = loadDeveloperTransferJob(jobId);
+  updateDeveloperTransferJob(jobId, {
+    status: 'running', phase: 'upload', upload_task_id: taskId,
+    work_total_count: initial?.total_count || 0,
+    processed_count: Math.min(initial?.total_count || 0, (initial?.success_count || 0) + (initial?.skipped_count || 0)),
+    current_path: '', message: '小号正在接收文件',
+  });
   for (let index = 0; index < 400; index += 1) {
     const payload = await developerPostWithRetry(client, '/developer/v1/upload_status', { task_id: taskId });
     const data = payload?.data || {};
     const stateValue = String(data.status || payload.status || '').toLowerCase();
     const counts = developerCounts(data);
-    if (stateValue === 'success') {
-      return updateDeveloperTransferJob(jobId, { ...counts, status: 'success', phase: 'completed', error_code: null, message: '文件已秒传到小号授权目录' });
+    const current = loadDeveloperTransferJob(jobId);
+    const total = counts.total_count ?? current?.total_count ?? 0;
+    const successCount = counts.success_count ?? current?.success_count ?? 0;
+    const skippedCount = counts.skipped_count ?? current?.skipped_count ?? 0;
+    if (stateValue === 'success' || (stateValue === 'failed' && successCount > 0)) {
+      const rejectedCount = current?.rejected_count || 0;
+      const message = rejectedCount > 0
+        ? `已秒传 ${successCount || current?.passed_count || 0} 个，${rejectedCount} 个未通过预审`
+        : '文件已秒传到小号授权目录';
+      return updateDeveloperTransferJob(jobId, {
+        ...counts, status: 'success', phase: 'completed',
+        work_total_count: total, processed_count: total,
+        current_path: '', error_code: null, message,
+      });
     }
-    if (stateValue === 'failed') throw new Error(String(data.message || data.msg || '小号秒传任务失败'));
-    updateDeveloperTransferJob(jobId, { ...counts, status: 'running', phase: 'upload', message: '小号正在接收文件' });
+    if (stateValue === 'failed') {
+      updateDeveloperTransferJob(jobId, {
+        ...counts, status: 'running', phase: 'upload', work_total_count: total,
+        processed_count: Math.min(total, successCount + skippedCount), current_path: '',
+      });
+      throw new Error(String(data.message || data.msg || '小号秒传任务失败'));
+    }
+    updateDeveloperTransferJob(jobId, {
+      ...counts, status: 'running', phase: 'upload', work_total_count: total,
+      processed_count: Math.min(total, successCount + skippedCount),
+      current_path: '', message: '小号正在接收文件',
+    });
     await new Promise((resolve) => setTimeout(resolve, 1_500));
   }
   throw new Error('小号秒传任务长时间未完成，请稍后在任务记录中重试');
 }
 
 async function submitDeveloperUpload(client, job, targetToken) {
-  updateDeveloperTransferJob(job.id, { status: 'copying', phase: 'upload', message: '正在提交小号秒传' });
+  updateDeveloperTransferJob(job.id, {
+    status: 'copying', phase: 'upload', work_total_count: job.total_count,
+    processed_count: 0, current_path: '', message: '正在提交小号秒传',
+  });
   const payload = await developerPostWithRetry(client, '/developer/v1/upload_by_fileid', {
     token_id: targetToken,
     file_ids: job.file_ids,
@@ -1180,19 +1234,111 @@ async function submitDeveloperUpload(client, job, targetToken) {
   return finishDeveloperUpload(client, job.id, taskId);
 }
 
-async function finishDeveloperPreAudit(client, job, targetToken, taskId) {
-  updateDeveloperTransferJob(job.id, { status: 'auditing', phase: 'pre_upload', pre_task_id: taskId, message: '文件正在预审，通过后会自动秒传' });
-  for (let index = 0; index < 7_200; index += 1) {
-    const payload = await developerPostWithRetry(client, '/developer/v1/pre_upload_status', { task_id: taskId });
-    const data = payload?.data || {};
-    const auditStatus = Number(data.status ?? payload.status ?? 0);
-    const counts = developerCounts(data);
-    updateDeveloperTransferJob(job.id, { ...counts, status: 'auditing', phase: 'pre_upload', message: '文件正在预审，通过后会自动秒传' });
-    if (auditStatus === 4) throw new Error(String(data.message || data.msg || '文件预审失败'));
-    if (auditStatus === 3) return submitDeveloperUpload(client, loadDeveloperTransferJob(job.id), targetToken);
+async function finishDeveloperPreAudit(client, job, targetToken, taskState) {
+  const plan = decodeDeveloperPreAuditPlan(taskState, job.total_count);
+  updateDeveloperTransferJob(job.id, {
+    status: 'auditing', phase: 'pre_upload', pre_task_id: encodeDeveloperPreAuditPlan(plan.batches),
+    work_total_count: job.total_count,
+    processed_count: Math.min(job.total_count, job.passed_count + job.rejected_count),
+    current_path: '', message: '文件正在预审，通过后会自动秒传',
+  });
+  for (let pollIndex = 0; pollIndex < 7_200; pollIndex += 1) {
+    for (const batch of plan.batches) {
+      if (batch.done) continue;
+      try {
+        const payload = await developerPostWithRetry(client, '/developer/v1/pre_upload_status', { task_id: batch.task_id });
+        const data = payload?.data || {};
+        const auditStatus = Number(data.status ?? payload.status ?? 0);
+        const counts = developerCounts(data);
+        batch.file_count = Math.max(batch.file_count, counts.total_count || 0, (counts.passed_count || 0) + (counts.rejected_count || 0));
+        batch.passed_count = counts.passed_count ?? batch.passed_count;
+        batch.rejected_count = counts.rejected_count ?? batch.rejected_count;
+        if (auditStatus === 4) {
+          batch.rejected_count = Math.max(batch.rejected_count, batch.file_count - batch.passed_count);
+          batch.done = true;
+          batch.failed = true;
+        } else if (auditStatus === 3) {
+          batch.done = true;
+        }
+      } catch {
+        batch.rejected_count = Math.max(batch.rejected_count, batch.file_count - batch.passed_count);
+        batch.done = true;
+        batch.failed = true;
+      }
+    }
+    const summary = finalizeDeveloperPreAuditSummary(plan);
+    const suffix = summary.failed_batches ? `；${summary.failed_batches} 个预审批次失败，已跳过` : '';
+    updateDeveloperTransferJob(job.id, {
+      status: 'auditing', phase: 'pre_upload', pre_task_id: encodeDeveloperPreAuditPlan(plan.batches),
+      total_count: summary.total_count, passed_count: summary.passed_count,
+      rejected_count: summary.rejected_count, pending_count: summary.pending_count,
+      work_total_count: summary.total_count,
+      processed_count: Math.min(summary.total_count, summary.passed_count + summary.rejected_count),
+      current_path: '', message: `文件正在预审，通过后会自动秒传${suffix}`,
+    });
+    if (summary.done) {
+      const completed = loadDeveloperTransferJob(job.id);
+      try {
+        return await submitDeveloperUpload(client, completed, targetToken);
+      } catch (error) {
+        if (error instanceof DeveloperApiError && error.apiCode === 18014) {
+          return updateDeveloperTransferJob(job.id, {
+            status: 'success', phase: 'completed',
+            skipped_count: Math.max(completed.skipped_count, completed.passed_count),
+            work_total_count: completed.total_count, processed_count: completed.total_count,
+            current_path: '', error_code: null,
+            message: `通过的 ${completed.passed_count} 个文件此前已传给该小号；${completed.rejected_count} 个未通过预审`,
+          });
+        }
+        if (!(error instanceof DeveloperApiError) || error.apiCode !== 18011) throw error;
+        const detail = completed.passed_count > 0
+          ? `预审显示通过 ${completed.passed_count} 个，但平台正式秒传时未返回可上传文件`
+          : `预审完成：${completed.rejected_count} 个文件均未通过，未开始秒传`;
+        throw new DeveloperApiError(detail, { code: 18011 });
+      }
+    }
     await new Promise((resolve) => setTimeout(resolve, 3_000));
   }
   throw new Error('文件预审超过 6 小时仍未完成');
+}
+
+async function startDeveloperPreAudit(client, job, targetToken) {
+  const collected = await collectCloudSelectionEntries(job.file_ids, job.file_names, false);
+  const files = collected.entries.filter((entry) => !entry.folder);
+  if (!files.length) throw new Error('所选内容中没有可预审的文件');
+  const chunks = chunkDeveloperPreAuditFileIds(files.map((entry) => entry.fileId));
+  const batches = [];
+  let submitted = 0;
+  updateDeveloperTransferJob(job.id, {
+    status: 'auditing', phase: 'pre_upload', total_count: files.length,
+    passed_count: 0, rejected_count: 0, pending_count: files.length,
+    work_total_count: files.length, processed_count: 0,
+    current_path: files[0]?.path || '', message: '正在按原文件分批提交预审',
+  });
+  for (const chunk of chunks) {
+    try {
+      const payload = await developerPostWithRetry(client, '/developer/v1/pre_upload', {
+        token_id: targetToken,
+        file_ids: chunk,
+      });
+      const taskId = developerTaskId(payload);
+      if (!taskId) throw new Error('开发者接口没有返回预审任务 ID');
+      batches.push(createDeveloperPreAuditBatch(taskId, chunk.length));
+    } catch {
+      batches.push(createDeveloperPreAuditBatch('', chunk.length, {
+        rejected_count: chunk.length, done: true, failed: true,
+      }));
+    }
+    submitted += chunk.length;
+    const currentPath = files[Math.min(submitted, files.length - 1)]?.path || '';
+    updateDeveloperTransferJob(job.id, {
+      status: 'auditing', phase: 'pre_upload', pre_task_id: encodeDeveloperPreAuditPlan(batches),
+      work_total_count: files.length, processed_count: 0, current_path: currentPath,
+      message: `正在按原文件分批提交预审 ${submitted}/${files.length}`,
+    });
+  }
+  const prepared = loadDeveloperTransferJob(job.id);
+  return finishDeveloperPreAudit(client, prepared, targetToken, encodeDeveloperPreAuditPlan(batches));
 }
 
 async function runDeveloperTransferJob(jobId) {
@@ -1212,30 +1358,30 @@ async function runDeveloperTransferJob(jobId) {
       await finishDeveloperPreAudit(client, job, target.token_id, job.pre_task_id);
       return;
     }
-    updateDeveloperTransferJob(job.id, { status: 'direct', phase: 'direct', message: '正在尝试直接秒传' });
+    updateDeveloperTransferJob(job.id, {
+      status: 'direct', phase: 'direct', work_total_count: job.total_count,
+      processed_count: 0, current_path: '', message: '正在尝试直接秒传',
+    });
     try {
       await submitDeveloperUpload(client, job, target.token_id);
     } catch (error) {
       if (error instanceof DeveloperApiError && error.apiCode === 18014) {
-        updateDeveloperTransferJob(job.id, { status: 'success', phase: 'completed', skipped_count: job.total_count, error_code: null, message: '这些文件此前已传给该小号，无需重复传输' });
+        updateDeveloperTransferJob(job.id, {
+          status: 'success', phase: 'completed', skipped_count: job.total_count,
+          work_total_count: job.total_count, processed_count: job.total_count,
+          current_path: '', error_code: null, message: '这些文件此前已传给该小号，无需重复传输',
+        });
         return;
       }
       if (!(error instanceof DeveloperApiError) || error.apiCode !== 18011) throw error;
-      await acquireDeveloperNameObfuscation(job);
-      const payload = await developerPostWithRetry(client, '/developer/v1/pre_upload', {
-        token_id: target.token_id,
-        file_ids: job.file_ids,
-      });
-      const taskId = developerTaskId(payload);
-      if (!taskId) throw new Error('开发者接口没有返回预审任务 ID');
-      job = updateDeveloperTransferJob(job.id, { status: 'auditing', phase: 'pre_upload', pre_task_id: taskId, message: '直传条件不足，已自动转入预审' });
-      await finishDeveloperPreAudit(client, job, target.token_id, taskId);
+      await startDeveloperPreAudit(client, job, target.token_id);
     }
   } catch (error) {
     const code = error instanceof DeveloperApiError ? error.apiCode : null;
     updateDeveloperTransferJob(jobId, {
       status: 'failed',
       phase: 'failed',
+      current_path: '',
       error_code: code,
       message: String(error?.message || error || '小号互传失败'),
     });
@@ -1299,9 +1445,9 @@ async function startDeveloperTransfer(body) {
   const id = crypto.randomUUID();
   const now = Math.floor(Date.now() / 1000);
   database.prepare(`INSERT INTO developer_transfer_jobs
-    (id, target_id, target_name, file_ids_json, file_names_json, status, phase, total_count, message, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, 'direct', 'direct', ?, ?, ?, ?)`)
-    .run(id, targetId, target.name, identity, JSON.stringify(sortedFileNames), sortedFileIds.length, '正在并发启动小号秒传', now, now);
+    (id, target_id, target_name, file_ids_json, file_names_json, status, phase, total_count, work_total_count, message, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'direct', 'direct', ?, ?, ?, ?, ?)`)
+    .run(id, targetId, target.name, identity, JSON.stringify(sortedFileNames), sortedFileIds.length, sortedFileIds.length, '正在并发启动小号秒传', now, now);
   const job = loadDeveloperTransferJob(id);
   setImmediate(() => void runDeveloperTransferJob(id));
   return job;
@@ -2130,29 +2276,34 @@ async function exportGcidJson(body) {
     }));
   if (!files.length) throw new Error('所选内容中没有可生成秒传 JSON 的文件');
   const totalSize = files.reduce((total, entry) => total + BigInt(entry.size), 0n);
-  let downloadedBytes = 0n;
+  const plannedSampleBytes = files.reduce((total, entry) => total + cidByteRanges(entry.size)
+    .reduce((rangeTotal, range) => rangeTotal + BigInt(range.end - range.start), 0n), 0n);
+  let readBytes = 0n;
   let completedFiles = 0;
   let lastPublishAt = 0;
   const publishProgress = (stage, currentPath, force = false) => {
     const now = Date.now();
     if (!force && now - lastPublishAt < 250) return;
     lastPublishAt = now;
-    const percent = totalSize > 0n ? Number(downloadedBytes * 100n / totalSize) : Math.floor(completedFiles * 100 / files.length);
+    const percent = Math.floor(completedFiles * 100 / files.length);
     publish({
       type: 'gcid-export-progress',
       stage,
       current_path: currentPath,
       completed_files: completedFiles,
       total_files: files.length,
-      downloaded_bytes: downloadedBytes.toString(),
-      total_bytes: totalSize.toString(),
+      sampled_bytes: readBytes.toString(),
+      planned_sample_bytes: plannedSampleBytes.toString(),
+      source_total_bytes: totalSize.toString(),
+      downloaded_bytes: readBytes.toString(),
+      total_bytes: plannedSampleBytes.toString(),
       percent: Math.max(0, Math.min(100, percent)),
     });
   };
-  publishProgress('正在读取云端文件并计算 GCID / CID', files[0].path, true);
-  const hashed = await mapConcurrent(files, 3, async (entry) => {
+  const fetchCloud = createProxiedFetch(networkPreferences.proxy_url, undiciFetch);
+  const fullHash = async (entry) => {
     const download = await getCloudDownload({ file_ids: [entry.fileId], packaged: false });
-    const response = await createProxiedFetch(networkPreferences.proxy_url, undiciFetch)(download.download_url, {
+    const response = await fetchCloud(download.download_url, {
       method: 'GET',
       headers: { 'accept-encoding': 'identity' },
     });
@@ -2163,19 +2314,89 @@ async function exportGcidJson(body) {
     }
     let previous = 0;
     const hashes = await calculateGuangyaStreamHashes(response.body, entry.size, (processed) => {
-      downloadedBytes += BigInt(processed - previous);
+      readBytes += BigInt(processed - previous);
       previous = processed;
-      publishProgress('正在读取云端文件并计算 GCID / CID', entry.path);
+      publishProgress('分段读取不可用，正在完整校验', entry.path);
     });
-    completedFiles += 1;
-    publishProgress('正在读取云端文件并计算 GCID / CID', entry.path, true);
+    return hashes;
+  };
+  const rangeHash = async (entry) => {
+    const download = await getCloudDownload({ file_ids: [entry.fileId], packaged: false });
+    const ranges = cidByteRanges(entry.size);
+    const parts = await mapConcurrent(ranges, 3, async (range) => {
+      if (range.start === range.end) return Buffer.alloc(0);
+      const response = await fetchCloud(download.download_url, {
+        method: 'GET',
+        headers: {
+          'accept-encoding': 'identity',
+          range: `bytes=${range.start}-${range.end - 1}`,
+        },
+      });
+      const partial = response.status === 206;
+      const wholeFile = range.start === 0 && range.end === entry.size && response.ok;
+      if (!partial && !wholeFile) throw new Error(`云端未接受分段读取（HTTP ${response.status}）`);
+      if (partial && String(response.headers.get('content-range') || '').toLowerCase() !== `bytes ${range.start}-${range.end - 1}/${entry.size}`) {
+        throw new Error('云端返回的分段范围与请求不一致');
+      }
+      const bytes = Buffer.from(await response.arrayBuffer());
+      if (bytes.length !== range.end - range.start) throw new Error(`分段读取 ${entry.path} 的字节数不完整`);
+      return bytes;
+    });
     return {
-      path: entry.path,
-      size: String(entry.size),
-      gcid: hashes.gcid.toLowerCase(),
-      cid: hashes.cid,
+      cid: calculateGuangyaCidSamples(parts, entry.size),
+      sampled: parts.reduce((total, bytes) => total + BigInt(bytes.length), 0n),
     };
+  };
+  const rangeHashWithRetry = async (entry) => {
+    let lastError = new Error('云端分段读取失败');
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return await rangeHash(entry);
+      } catch (error) {
+        lastError = error;
+        if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250 * (2 ** attempt)));
+      }
+    }
+    throw lastError;
+  };
+  publishProgress('正在扫描所选文件', files[0].path, true);
+  const outcomes = await mapConcurrent(files, 8, async (entry) => {
+    try {
+      publishProgress('正在读取云端 GCID 并采样 CID', entry.path, true);
+      let gcid = String(entry.gcid || '').trim();
+      if (!/^[0-9a-f]{40}$/i.test(gcid)) {
+        try { gcid = String((await cloudEntryDetail(entry.fileId, entry.name)).gcid || '').trim(); } catch {}
+      }
+      let hashes;
+      let sampledMode = false;
+      if (/^[0-9a-f]{40}$/i.test(gcid)) {
+        try {
+          const sampled = await rangeHashWithRetry(entry);
+          readBytes += sampled.sampled;
+          hashes = { gcid, cid: sampled.cid };
+          sampledMode = true;
+        } catch {}
+      }
+      if (!hashes) hashes = await fullHash(entry);
+      completedFiles += 1;
+      publishProgress(sampledMode ? '正在读取云端 GCID 并采样 CID' : '分段读取不可用，正在完整校验', entry.path, true);
+      return {
+        file: {
+          path: entry.path,
+          size: String(entry.size),
+          gcid: hashes.gcid.toLowerCase(),
+          cid: hashes.cid,
+        },
+      };
+    } catch (error) {
+      completedFiles += 1;
+      publishProgress('已跳过无法读取的文件', entry.path, true);
+      return { skipped: `${entry.path}：${String(error?.message || error || '读取失败').slice(0, 500)}` };
+    }
   });
+  const hashed = outcomes.flatMap((outcome) => outcome.file ? [outcome.file] : []);
+  const skippedFiles = outcomes.flatMap((outcome) => outcome.skipped ? [outcome.skipped] : []);
+  if (!hashed.length) throw new Error(`秒传 JSON 生成失败：${skippedFiles[0] || '没有文件可导出'}`);
   const rootNames = collected.roots.map((entry) => entry.name);
   const exportData = {
     scriptVersion: 'guangya-gcid-export-2.0',
@@ -2193,15 +2414,16 @@ async function exportGcidJson(body) {
     formattedTotalSize: formatExportBytes(totalSize),
     generatedAt: Math.floor(Date.now() / 1000),
     scannedFoldersCount: collected.scannedFolders,
-    skippedFilesCount: 0,
-    skippedFiles: [],
+    skippedFilesCount: skippedFiles.length,
+    skippedFiles,
     files: hashed,
   };
-  publishProgress('秒传 JSON 已生成', '', true);
+  publishProgress(skippedFiles.length ? '秒传 JSON 已生成，部分文件已跳过' : '秒传 JSON 已生成', '', true);
   return {
     cancelled: false,
     file_name: exportJsonFileName(rootNames),
     total_files: hashed.length,
+    skipped_files_count: skippedFiles.length,
     total_size: totalSize.toString(),
     export: exportData,
   };

@@ -245,7 +245,7 @@ sign = lower_hex(SHA512(MD5_binary(src)))
 | 解析 GCID 导入 | `prepare_gcid_import` | `prepare_gcid_import` | — | 本地 SQLite 导入任务 | Local/R。 |
 | 查询/启动 GCID 导入 | `get_gcid_import_status` / `start_gcid_import` | 同名 handler | — | 建目录 → token → flash → 上传任务确认 | L/R；导出文件必须同时声明并提供 GCID/CID，两者统一为大写十六进制；只导入可秒传项目，未命中或 flash 返回 112 时记录为 missed，不上传本地字节。 |
 | 独立 GCID 批量导入 CLI | `node scripts/import-guangya-gcid.mjs` | — | — | 读取桌面状态库 → 建目录 → token → flash → 上传任务确认 | L/R；与主 App 共用 Windows 协议模块、30 秒 API 超时和 110/117/118 刷新规则；GCID/CID 统一为大写十六进制，只有 147 继续轮询。 |
-| 选中云端内容生成秒传 JSON | `export_gcid_json` | `export_gcid_json` | `POST /api/files/export-gcid` | 递归列目录 → 逐文件签名下载 → 流式计算 GCID/CID | R；桌面与 Web 均最多并发读取 3 个文件，不进入上传/下载队列。开始前必须提示会完整读取所选内容并可能产生接近文件总大小的下行流量；单文件夹导出时 `commonPath` 为文件夹名，`files[].path` 相对该文件夹。 |
+| 选中云端内容生成秒传 JSON | `export_gcid_json` | `export_gcid_json` | `POST /api/files/export-gcid` | 递归列目录 → 复用详情中的 GCID → Range 采样计算 CID | R；桌面与 Web 均最多并发处理 8 个文件，每个文件内部最多并发读取 3 个范围。大于等于 60 KiB 的文件通常只读取头、中、尾各 20 KiB；分段读取有 3 次有界退避重试，详情缺少有效 GCID 或重试后 CDN 仍不接受 Range/范围不一致时才回退完整流式计算。单个文件最终失败只写入 `skippedFiles`，不再使整批结果作废；全部失败时才终止。生成过程发送当前路径、文件计数、采样字节与文件总大小进度；单文件夹导出时 `commonPath` 为文件夹名，`files[].path` 相对该文件夹。 |
 
 统一普通上传链：
 
@@ -367,7 +367,7 @@ HDHive 请求矩阵：
 | 开关开发者模式 | `update_developer_mode` | 同名 | `POST /api/developer/mode` | SQLite `app_state` + 当前 `/v1/user/me` | Local/R；只有已验证账号与当前登录账号相同且验证时的 `client_id` 未变化才能开启。 |
 | 新增/更新小号 TOKEN | `upsert_developer_target` | 同名 | `POST /api/developer/targets` | SQLite `developer_targets` | Local/R；编辑时空 TOKEN 表示保留旧值。 |
 | 删除小号 TOKEN | `delete_developer_target` | 同名 | `DELETE /api/developer/targets/{id}` | SQLite | Local/R；该目标有进行中任务时拒绝删除。 |
-| 开始小号秒传 | `start_developer_transfer` | 同名 | `POST /api/developer/transfers` | 所有权复核 → 直传 → 文件名混淆 → 预审兜底 → 直传 → 恢复原名 | D/R；仅开发者模式开启时可用；提交前用开发者 `get_file_detail` 复核首个源文件，`file_ids` 去重且最多 20。新任务立即并发运行，不进入传输队列；只有 18011 分支递归混淆源名称，秒传成功或失败后均恢复，并持久化待恢复记录用于重启续作。 |
+| 开始小号秒传 | `start_developer_transfer` | 同名 | `POST /api/developer/transfers` | 所有权复核 → 直传 → 递归展开原文件并分批预审 → 用原始选择正式秒传 | D/R；仅开发者模式开启时可用；提交前用开发者 `get_file_detail` 复核首个源文件，顶层 `file_ids` 去重且最多 20。18011 分支不改名，递归展开叶子文件后每 20 个一批提交预审并持久化批次任务；单文件或单批失败只累计为未通过，其它批次继续。全部批次结束后仍以原始顶层选择调用正式上传，由平台只复制 pass 项并保留原文件夹结构；最终没有可上传文件时才失败。旧版遗留的名称恢复记录继续兼容恢复。 |
 | 查看互传任务 | `list_developer_transfers` | 同名 | `GET /api/developer/transfers` | SQLite + SSE/Tauri event | Local/R；进行中任务随应用启动恢复。 |
 
 上游状态机：

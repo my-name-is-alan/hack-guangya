@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import {
+  developerTransferIsActive,
+  developerTransferPercent,
+  developerTransferStageLabel,
+  normalizeDeveloperTransferJob,
+} from './developerTransfer.js';
 
 const read = (relative) => readFile(new URL(relative, import.meta.url), 'utf8');
 
@@ -85,7 +91,7 @@ test('direct upload falls back to pre-audit only for business code 18011', async
   assert.match(rust, /"\/developer\/v1\/upload_status"/);
 });
 
-test('pre-audit obfuscates names concurrently and restores them after transfer', async () => {
+test('pre-audit submits original file ids without changing source names', async () => {
   const [server, rust, cloud, selectionBar] = await Promise.all([
     read('../server/server.mjs'),
     read('../src-tauri/src/main.rs'),
@@ -93,19 +99,31 @@ test('pre-audit obfuscates names concurrently and restores them after transfer',
     read('./components/files/FileSelectionBar.vue'),
   ]);
 
-  for (const source of [server, rust]) {
-    assert.match(source, /developer_transfer_name_restores/);
-    assert.match(source, /obfuscat/i);
-    assert.match(source, /restore_failed/);
-    assert.match(source, /buffer_unordered\(8\)|mapConcurrent\(pendingRenames, 8/);
-  }
-  assert.ok(server.indexOf('acquireDeveloperNameObfuscation(job)') < server.indexOf("'/developer/v1/pre_upload'", server.indexOf('acquireDeveloperNameObfuscation(job)')));
-  assert.ok(rust.indexOf('acquire_developer_name_obfuscation(') < rust.indexOf('"/developer/v1/pre_upload"', rust.indexOf('Err(error) if error.code == Some(18011)')));
-  assert.match(cloud, /临时混淆所选内容的文件名/);
+  const serverBranchStart = server.indexOf('if (!(error instanceof DeveloperApiError) || error.apiCode !== 18011)');
+  const rustBranchStart = rust.indexOf('Err(error) if error.code == Some(18011)');
+  const serverBranch = server.slice(serverBranchStart, server.indexOf('await finishDeveloperPreAudit', serverBranchStart));
+  const rustBranch = rust.slice(rustBranchStart, rust.indexOf('finish_developer_pre_audit(', rustBranchStart));
+  assert.ok(serverBranchStart >= 0);
+  assert.ok(rustBranchStart >= 0);
+  assert.match(serverBranch, /startDeveloperPreAudit/);
+  assert.match(rustBranch, /start_developer_pre_audit/);
+  assert.doesNotMatch(serverBranch, /acquireDeveloperNameObfuscation|renameDeveloperNameWithRetry/);
+  assert.doesNotMatch(rustBranch, /acquire_developer_name_obfuscation|rename_developer_name_with_retry/);
+  assert.match(server, /chunkDeveloperPreAuditFileIds/);
+  assert.match(server, /collectCloudSelectionEntries\(job\.file_ids, job\.file_names, false\)/);
+  assert.match(rust, /collect_cloud_selection_entries\(/);
+  assert.match(rust, /DEVELOPER_PRE_AUDIT_BATCH_SIZE/);
+  assert.match(server, /return await submitDeveloperUpload\(client, completed, targetToken\)/);
+  assert.match(rust, /return match submit_developer_upload\(/);
+  assert.match(server, /error\.apiCode === 18014/);
+  assert.match(rust, /error\.code == Some\(18014\)/);
+  assert.match(server, /预审完成：\$\{completed\.rejected_count\} 个文件均未通过，未开始秒传/);
+  assert.match(rust, /预审完成：\{\} 个文件均未通过，未开始秒传/);
+  assert.match(cloud, /小号流程不会修改源文件名/);
   assert.match(selectionBar, /exportGcid/);
 });
 
-test('selected cloud files and folders can export a GCID plus CID JSON with a traffic warning', async () => {
+test('selected cloud files and folders export GCID plus sampled CID with visible progress', async () => {
   const [server, rust, cloud, bridge] = await Promise.all([
     read('../server/server.mjs'),
     read('../src-tauri/src/main.rs'),
@@ -113,15 +131,42 @@ test('selected cloud files and folders can export a GCID plus CID JSON with a tr
     read('./bridge.js'),
   ]);
 
-  assert.match(cloud, /会递归读取所选文件及文件夹内的全部文件/);
-  assert.match(cloud, /大量下行流量/);
+  assert.match(cloud, /头、中、尾各 20 KB/);
+  assert.match(cloud, /GcidExportStatus/);
+  assert.match(cloud, /DeveloperTransferStatus/);
   assert.match(cloud, /export_gcid_json/);
-  assert.match(server, /calculateGuangyaStreamHashes/);
-  assert.match(server, /buffer_unordered|mapConcurrent\(files, 3/);
+  assert.match(cloud, /onOk\(\)\s*\{\s*void runGcidExport\(targets\)/);
+  assert.match(cloud, /keepFailureVisible/);
+  assert.match(server, /calculateGuangyaCidSamples/);
+  assert.match(server, /mapConcurrent\(files, 8/);
+  assert.match(server, /rangeHashWithRetry/);
+  assert.match(server, /skippedFiles/);
+  assert.match(server, /content-range/);
   assert.match(server, /guangya-gcid-export-2\.0/);
   assert.match(server, /entry\.path\.slice\(rootPrefix\.length\)/);
   assert.match(rust, /FlashHashAccumulator/);
-  assert.match(rust, /buffer_unordered\(3\)/);
+  assert.match(rust, /GCID_EXPORT_FILE_CONCURRENCY/);
+  assert.match(rust, /sample_cloud_selection_cid_with_retry/);
+  assert.match(rust, /skipped_files/);
+  assert.match(rust, /read_cloud_cid_range/);
   assert.match(rust, /guangya-gcid-export-2\.0/);
   assert.match(bridge, /command === 'export_gcid_json'/);
+});
+
+test('developer transfer progress normalizes persisted and live job payloads', () => {
+  const job = normalizeDeveloperTransferJob({
+    id: 'job-1',
+    targetName: '小号 A',
+    status: 'auditing',
+    phase: 'obfuscating',
+    totalCount: 3,
+    workTotalCount: 88,
+    processedCount: 81,
+    currentPath: '目录/当前文件.mkv',
+  });
+  assert.equal(developerTransferIsActive(job), true);
+  assert.equal(developerTransferPercent(job), 92);
+  assert.equal(developerTransferStageLabel(job), '处理源文件名');
+  assert.equal(job.current_path, '目录/当前文件.mkv');
+  assert.equal(developerTransferIsActive({ ...job, status: 'failed', phase: 'restoring' }), true);
 });

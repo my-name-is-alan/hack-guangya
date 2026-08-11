@@ -10,6 +10,12 @@ import {
   ReloadOutlined,
 } from '@antdv-next/icons'
 import { bridge } from '../../bridge.js'
+import {
+  developerTransferIsActive,
+  developerTransferPercent,
+  developerTransferProgressLabel,
+  developerTransferStageLabel,
+} from '../../developerTransfer.js'
 import { errorText, formatTime, unwrapData } from '../../formatters.js'
 import { useFilesStore } from '../../stores/files'
 
@@ -33,6 +39,9 @@ type TransferJob = {
   pending_count: number
   success_count: number
   skipped_count: number
+  work_total_count: number
+  processed_count: number
+  current_path: string
   status: string
   phase: string
   message?: string | null
@@ -151,6 +160,9 @@ function normalizeJob(value: any): TransferJob | null {
     pending_count: Number(value?.pending_count ?? value?.pendingCount ?? 0) || 0,
     success_count: Number(value?.success_count ?? value?.successCount ?? 0) || 0,
     skipped_count: Number(value?.skipped_count ?? value?.skippedCount ?? 0) || 0,
+    work_total_count: Number(value?.work_total_count ?? value?.workTotalCount ?? 0) || 0,
+    processed_count: Number(value?.processed_count ?? value?.processedCount ?? 0) || 0,
+    current_path: String(value?.current_path ?? value?.currentPath ?? ''),
     status: String(value?.status ?? 'queued').toLowerCase(),
     phase: String(value?.phase ?? '').toLowerCase(),
     message: value?.message == null ? null : String(value.message),
@@ -489,6 +501,11 @@ onBeforeUnmount(() => unsubscribe?.())
                 <span>发送到 {{ item.target_name }}</span>
                 <span>{{ jobCountLabel(item) }}</span>
               </div>
+              <div v-if="developerTransferIsActive(item)" class="job-progress">
+                <div><span>{{ developerTransferStageLabel(item) }}</span><strong>{{ developerTransferProgressLabel(item) }}</strong></div>
+                <a-progress :percent="developerTransferPercent(item)" :show-info="false" status="active" :stroke-width="5" />
+                <small v-if="item.current_path" :title="item.current_path">当前：{{ item.current_path }}</small>
+              </div>
               <div v-if="item.message" class="job-message" :class="{ error: item.status === 'failed' }">{{ item.message }}</div>
             </article>
           </div>
@@ -561,6 +578,10 @@ onBeforeUnmount(() => unsubscribe?.())
 .job-meta { display: flex; flex-wrap: wrap; gap: 5px 18px; margin-top: 9px; color: var(--text-2, #475467); font-size: 12px; }
 .job-message { margin-top: 7px; color: var(--text-3, #98a2b3); font-size: 12px; line-height: 1.5; }
 .job-message.error { color: var(--danger, #ff4d4f); }
+.job-progress { display: grid; gap: 5px; margin-top: 10px; }
+.job-progress > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--text-2, #475467); font-size: 12px; }
+.job-progress strong { font-variant-numeric: tabular-nums; }
+.job-progress small { overflow: hidden; color: var(--text-3, #98a2b3); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 code { color: var(--text-2, #475467); font-size: 12px; }
 @media (max-width: 760px) {
   .developer-panel { padding-inline: 14px; }

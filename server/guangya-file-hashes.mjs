@@ -18,6 +18,22 @@ export function cidByteRanges(fileSize) {
   ];
 }
 
+export function calculateGuangyaCidSamples(samples, fileSize) {
+  if (!Number.isSafeInteger(fileSize) || fileSize < 0) throw new Error('秒传文件大小无效');
+  const ranges = cidByteRanges(fileSize);
+  if (!Array.isArray(samples) || samples.length !== ranges.length) {
+    throw new Error('CID 分段数量与文件大小不匹配');
+  }
+  const hasher = crypto.createHash('sha1');
+  for (let index = 0; index < ranges.length; index += 1) {
+    const bytes = Buffer.isBuffer(samples[index]) ? samples[index] : Buffer.from(samples[index] || []);
+    const expected = ranges[index].end - ranges[index].start;
+    if (bytes.length !== expected) throw new Error('CID 分段字节数不完整');
+    hasher.update(bytes);
+  }
+  return hasher.digest('hex').toUpperCase();
+}
+
 export function createGuangyaHashAccumulator(fileSize) {
   if (!Number.isSafeInteger(fileSize) || fileSize < 0) throw new Error('秒传文件大小无效');
   const chunkSize = gcidChunkSize(fileSize);

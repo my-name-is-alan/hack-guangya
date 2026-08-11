@@ -52,7 +52,7 @@ pnpm tauri dev
 pnpm tauri build
 ```
 
-安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.29_x64-setup.exe`
+安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.30_x64-setup.exe`
 
 正式更新包必须使用长期保存的同一把 Tauri 私钥签名。构建机设置 `TAURI_SIGNING_PRIVATE_KEY`（可填私钥内容或私钥文件路径）和可选的 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 后执行构建，再生成 GitHub Release 所需文件：
 
@@ -71,7 +71,7 @@ pnpm package:updater
 
 模式开启后，普通 PC 接口仍是文件列表与详情的主路径；只有主接口读取失败，才使用 `https://dapi.guangyapan.com` 的同名只读接口兜底。新建、移动、重命名、删除等未出现在开发者文档中的操作仍使用当前 PC 登录会话。Docker Web 也可以通过 `GUANGYA_DEVELOPER_CLIENT_ID`、`GUANGYA_DEVELOPER_CLIENT_SECRET` 注入凭据，但仍必须在“多号秒传 → Token 配置”完成当前账号验证和模式启用。
 
-小号在光鸭中创建接收 TOKEN，并给 TOKEN 授权一个目标目录；在“多号秒传 → Token 配置”添加该 TOKEN。之后在“文件”中选中最多 20 个文件或文件夹，点击“小号秒传”并选择接收小号；任务状态可在“多号秒传 → 任务记录”查看。提交前应用会再次用开发者凭据确认所选文件属于已绑定账号，然后调用 `upload_by_fileid`；若文件尚未通过审核（业务码 `18011`），自动调用 `pre_upload`，后台轮询预审完成后继续秒传。任务及脱敏统计保存在本机 SQLite，应用重启后会恢复未完成任务；完整 `client_secret` 和接收 TOKEN 不通过状态接口回显。
+小号在光鸭中创建接收 TOKEN，并给 TOKEN 授权一个目标目录；在“多号秒传 → Token 配置”添加该 TOKEN。之后在“文件”中选中最多 20 个文件或文件夹，点击“小号秒传”并选择接收小号；文件页会持续显示直传、预审和秒传的数量进度，详细记录也可在“多号秒传 → 任务记录”查看。提交前应用会再次用开发者凭据确认所选文件属于已绑定账号，然后调用 `upload_by_fileid`；若文件尚未通过审核（业务码 `18011`），应用递归展开原始叶子文件并按 20 个一批调用 `pre_upload`，后台汇总各批预审结果后仍用原始选择继续秒传，不再修改源文件名。单个文件或单个预审批次失败只计入未通过，不会中止其它文件；正式上传由平台只复制通过项，因此文件夹结构仍按原始选择保留。若最终确实没有任何可上传文件，会明确显示未通过数量。任务及脱敏统计保存在本机 SQLite，应用重启后会恢复未完成任务；完整 `client_secret` 和接收 TOKEN 不通过状态接口回显。旧版本遗留的名称恢复记录仍会在启动后继续恢复。
 
 > [!NOTE]
 > 官方 TOKEN 模型是单向绑定：一个接收 TOKEN 只支持“当前开发者账号 → TOKEN 所属小号”。同一个 TOKEN 不能反向传回；真正双向互传需要另一方向也具备开发者凭据和接收 TOKEN。接口规则以[官方 TOKEN 上传文档](https://wcn6ijfe07e0.feishu.cn/wiki/R6Z2weFwKiwnuBktcoacoDAHnZg)为准。
@@ -123,7 +123,7 @@ WebDAV 是在线文件系统，不是离线镜像。打开大文件时由系统 
 Docker Hub 镜像：[`94xhzy/guangya-sync`](https://hub.docker.com/r/94xhzy/guangya-sync)，推荐固定使用版本标签：
 
 ```bash
-docker pull 94xhzy/guangya-sync:0.1.29
+docker pull 94xhzy/guangya-sync:0.1.30
 ```
 
 先准备管理账号。用户名默认是 `admin`；请生成独立的强随机密码，复制 `.env.example` 为 `.env` 并填入 `GUANGYA_ADMIN_PASSWORD`：
@@ -207,7 +207,7 @@ pnpm web
 pnpm package:ubuntu
 ```
 
-输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.29.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
+输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.30.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
 
 ## 接口边界
 
