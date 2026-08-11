@@ -243,20 +243,21 @@ sign = lower_hex(SHA512(MD5_binary(src)))
 | 选择 GCID JSON | `select_gcid_import_file` | `select_gcid_import_file` | — | 本地文件选择器 | Local/R；桌面专属。 |
 | 粘贴 JSON 暂存 | `stage_gcid_import_text` | `stage_gcid_import_text` | — | 受限大小的本地暂存文件 | Local/R。 |
 | 解析 GCID 导入 | `prepare_gcid_import` | `prepare_gcid_import` | — | 本地 SQLite 导入任务 | Local/R。 |
-| 查询/启动 GCID 导入 | `get_gcid_import_status` / `start_gcid_import` | 同名 handler | — | 建目录 → token → flash → 上传任务确认 | S/R；GCID 统一为大写十六进制；只导入可秒传项目，未命中或 flash 返回 112 时记录为 missed，不上传本地字节。 |
-| 独立 GCID 批量导入 CLI | `node scripts/import-guangya-gcid.mjs` | — | — | 读取桌面状态库 → 建目录 → token → flash → 上传任务确认 | S/R；与主 App 共用 Windows 协议模块、30 秒 API 超时和 110/117/118 刷新规则；GCID 统一为大写十六进制，只有 147 继续轮询。 |
+| 查询/启动 GCID 导入 | `get_gcid_import_status` / `start_gcid_import` | 同名 handler | — | 建目录 → token → flash → 上传任务确认 | L/R；导出文件必须同时声明并提供 GCID/CID，两者统一为大写十六进制；只导入可秒传项目，未命中或 flash 返回 112 时记录为 missed，不上传本地字节。 |
+| 独立 GCID 批量导入 CLI | `node scripts/import-guangya-gcid.mjs` | — | — | 读取桌面状态库 → 建目录 → token → flash → 上传任务确认 | L/R；与主 App 共用 Windows 协议模块、30 秒 API 超时和 110/117/118 刷新规则；GCID/CID 统一为大写十六进制，只有 147 继续轮询。 |
+| 选中云端内容生成秒传 JSON | `export_gcid_json` | `export_gcid_json` | `POST /api/files/export-gcid` | 递归列目录 → 逐文件签名下载 → 流式计算 GCID/CID | R；桌面与 Web 均最多并发读取 3 个文件，不进入上传/下载队列。开始前必须提示会完整读取所选内容并可能产生接近文件总大小的下行流量；单文件夹导出时 `commonPath` 为文件夹名，`files[].path` 相对该文件夹。 |
 
 统一普通上传链：
 
 1. 用 `get_file_list` 定位已有远程目录；缺少层级时调用 `POST /userres/v1/file/create_dir`。159 表示并发下目录已存在，应重新查询，不能直接失败；
 2. `POST /userres/v1/get_res_center_token`，body 至少含 `capacity:2`、`name`、`parentId`、`res.fileSize`；小于 1 MiB 的当前实现还带整文件 MD5；
-3. token 直接返回 code 156 时视为秒传候选；大文件可计算大写 GCID 后调用 `POST /userres/v1/check_can_flash_upload`。api_map 的小文件样本在该接口返回过 112，因此普通 OSS 回退必须可用；
+3. token 直接返回 code 156 时视为秒传候选；大文件按当前网页算法计算大写 GCID 与 CID，再以 `{taskId,gcid,cid}` 调用 `POST /userres/v1/check_can_flash_upload`。CID 取文件头部、中间三分之一处、尾部各 20 KiB（文件小于 60 KiB 时取全文）的拼接 SHA-1；api_map 的小文件样本在该接口返回过 112，因此普通 OSS 回退必须可用；
 4. 未秒传时将字节上传到返回的 `fullEndPoint/objectPath`。大文件使用 multipart；STS/断点失效时通过 `POST /userres/v1/get_res_center_resume_token` 刷新；
 5. OSS 完成或秒传命中后，轮询 `POST /userres/v1/file/get_info_by_task_id`。147 只表示仍在入库；成功且拿到最终 `fileId` 才能标记 `cloud_confirmed`；
 6. 145/146/152/155/163 不是 pending，应清理旧 checkpoint 并重建上传任务；网络类错误做有界退避；
 7. 云端确认前再次校验本地源文件的大小、mtime 和身份。复制中的文件继续增长时不得标记完成、自动分享或执行归档/删除，而是等待稳定后的新版本重新入队。
 
-上游证据：`get_res_center_token`、OSS PUT、`get_info_by_task_id` 的 147→成功均为 L；resume token 和成功秒传为 S/R；`check_can_flash_upload` 的小文件 112 分支有 L 样本。
+上游证据：`get_res_center_token`、OSS PUT、`get_info_by_task_id` 的 147→成功均为 L；2026-08-11 当前网页上传器的 `check_can_flash_upload` 请求体与 GCID/CID worker 算法为 L；resume token 和成功秒传为 S/R；该接口的小文件 112 分支有 L 样本。
 
 ### 4.4 下载
 
@@ -292,8 +293,9 @@ sign = lower_hex(SHA512(MD5_binary(src)))
 | UI 能力 | bridge | Tauri handler | Web route | 光鸭上游 | 状态/备注 |
 |---|---|---|---|---|---|
 | 解析云添加资源 | `resolve_offline_resource` | `resolve_offline_resource` | `POST /api/offline/resolve` | `POST /cloudcollection/v1/resolve_res` | L/R；body 为 `{url}`；返回标准化 URL、`resType`，以及链接/磁力/电驴资源摘要，创建前先展示解析结果；普通 HTTPS 资源已用本轮自有临时文件实测。 |
-| 创建离线任务 | `create_offline_task` | `create_offline_task` | `POST /api/offline` | `POST /cloudcollection/v1/create_task` | L/R（普通 HTTPS）；解析成功后传标准化 `url/parentId`，可选 `fileIndexes/newName`，不把解析响应的 `resType` 伪造成创建参数；Magnet 子文件索引只使用解析结果中未被排除的有效索引。 |
-| 查看任务 | `list_offline_tasks` | `list_offline_tasks` | `GET /api/offline` | `POST /cloudcollection/v1/list_task` | L/R；严格使用官方不透明 `cursor`、`pageSize` 与 `status[]`；UI 消费 `cursor/hasMore` 翻页，`page>0` 会在本地拒绝，不能把数字页码伪装成上游能力。 |
+| 创建离线任务 | `create_offline_task` | `create_offline_task` | `POST /api/offline` | `POST /cloudcollection/v1/create_task` | L/R（普通 HTTPS）；解析成功后传标准化 `url/parentId`，可选 `fileIndexes/newName`，不把解析响应的 `resType` 伪造成创建参数；Magnet 子文件索引只使用解析结果中未被排除的有效索引。开启“文件名混淆”后，Magnet/ED2K 跳过云端预解析并默认保存全部文件；原名称从 Magnet `dn` 或 ED2K 链接本地读取，提交前移除 `dn` 或替换 ED2K 内嵌名称，同时把 `newName` 替换为随机安全名称。原名称与 `taskId` 只持久化在本机，任务成功取得 `fileId` 后调用重命名接口恢复。 |
+| 查看任务 | `list_offline_tasks` | `list_offline_tasks` | `GET /api/offline` | `POST /cloudcollection/v1/list_task` | L/R；严格使用官方不透明 `cursor`、`pageSize` 与 `status[]`；UI 消费 `cursor/hasMore` 翻页，`page>0` 会在本地拒绝，不能把数字页码伪装成上游能力。上游可能在 `status=2` 后仍返回未收口的 `progress`，因此 UI 以成功状态为准显示 100%。 |
+| 离线保护设置 | `get_offline_settings` / `update_offline_settings` | `get_offline_settings` / `update_offline_settings` | `GET/POST /api/settings/offline` | 本地设置 | L/R；持久化 Magnet/ED2K 文件名混淆开关，并返回等待恢复名称的任务数；关闭开关不会丢弃此前已排队的恢复任务。 |
 | 取消运行中任务 | `cancel_offline_tasks` | `cancel_offline_tasks` | `POST /api/offline/cancel` | `POST /cloudcollection/v2/delete_task` | L/R；官方 PC 对运行中任务也使用 `{taskIds}` 的 v2 delete，UI 文案明确为“取消任务”；本轮只取消并清理了新建的临时任务。 |
 | 清理任务记录 | `delete_offline_tasks` | `delete_offline_tasks` | `POST /api/offline/delete` | `POST /cloudcollection/v2/delete_task` | P/R；与取消同 endpoint，但 UI 只在终态显示“删除记录”。 |
 | 重试任务 | `retry_offline_tasks` | `retry_offline_tasks` | `POST /api/offline/retry` | `POST /cloudcollection/v2/retry_task` | P/R；body 为去重后的 `taskIds`；失败、取消或部分完成可重试。 |
@@ -365,7 +367,7 @@ HDHive 请求矩阵：
 | 开关开发者模式 | `update_developer_mode` | 同名 | `POST /api/developer/mode` | SQLite `app_state` + 当前 `/v1/user/me` | Local/R；只有已验证账号与当前登录账号相同且验证时的 `client_id` 未变化才能开启。 |
 | 新增/更新小号 TOKEN | `upsert_developer_target` | 同名 | `POST /api/developer/targets` | SQLite `developer_targets` | Local/R；编辑时空 TOKEN 表示保留旧值。 |
 | 删除小号 TOKEN | `delete_developer_target` | 同名 | `DELETE /api/developer/targets/{id}` | SQLite | Local/R；该目标有进行中任务时拒绝删除。 |
-| 开始小号秒传 | `start_developer_transfer` | 同名 | `POST /api/developer/transfers` | 所有权复核 → 直传 → 预审兜底 → 直传 | D/R；仅开发者模式开启时可用；提交前用开发者 `get_file_detail` 复核首个源文件，`file_ids` 去重且最多 20。 |
+| 开始小号秒传 | `start_developer_transfer` | 同名 | `POST /api/developer/transfers` | 所有权复核 → 直传 → 文件名混淆 → 预审兜底 → 直传 → 恢复原名 | D/R；仅开发者模式开启时可用；提交前用开发者 `get_file_detail` 复核首个源文件，`file_ids` 去重且最多 20。新任务立即并发运行，不进入传输队列；只有 18011 分支递归混淆源名称，秒传成功或失败后均恢复，并持久化待恢复记录用于重启续作。 |
 | 查看互传任务 | `list_developer_transfers` | 同名 | `GET /api/developer/transfers` | SQLite + SSE/Tauri event | Local/R；进行中任务随应用启动恢复。 |
 
 上游状态机：

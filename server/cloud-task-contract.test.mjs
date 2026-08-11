@@ -13,3 +13,13 @@ test('Web cloud confirmation uses structured codes instead of localized message 
   assert.match(source, /云端入库成功响应缺少有效的 fileId，已停止轮询/);
   assert.doesNotMatch(source, /isCloudIndexPendingMessage/);
 });
+
+test('every Web flash-upload check carries both Guangya hashes', () => {
+  const calls = [...source.matchAll(/apiPost\('\/userres\/v1\/check_can_flash_upload',\s*\{([^}]+)\}/g)];
+  assert.equal(calls.length, 2);
+  for (const [, body] of calls) {
+    assert.match(body, /\btaskId\b/);
+    assert.match(body, /\bgcid\b/);
+    assert.match(body, /\bcid\b/);
+  }
+});

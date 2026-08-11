@@ -51,8 +51,11 @@ export function validateExport(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new Error('导入文件顶层必须是 JSON 对象');
   }
-  if (payload.source !== 'guangya' || payload.hashType !== 'gcid' || payload.usesGcidInExport !== true) {
-    throw new Error('只支持光鸭 GCID 导出格式');
+  if (payload.source !== 'guangya'
+    || payload.hashType !== 'gcid'
+    || payload.usesGcidInExport !== true
+    || payload.usesCidInExport !== true) {
+    throw new Error('只支持同时包含 GCID 与 CID 的光鸭导出格式');
   }
   if (!Array.isArray(payload.files) || payload.files.length === 0) {
     throw new Error('导入文件不包含 files 记录');
@@ -76,6 +79,10 @@ export function validateExport(payload) {
     if (!/^[0-9A-F]{40}$/.test(gcid)) {
       throw new Error(`第 ${index + 1} 条记录的 GCID 无效`);
     }
+    const cid = String(item?.cid || '').toUpperCase();
+    if (!/^[0-9A-F]{40}$/.test(cid)) {
+      throw new Error(`第 ${index + 1} 条记录的 CID 无效`);
+    }
     const parts = relativePath.split('/');
     const name = parts.pop();
     return {
@@ -84,6 +91,7 @@ export function validateExport(payload) {
       name,
       size,
       gcid,
+      cid,
     };
   });
   if (payload.totalFilesCount != null && Number(payload.totalFilesCount) !== files.length) {
@@ -189,6 +197,7 @@ function initializeStateDatabase(statePath, files, metadata) {
       name TEXT NOT NULL,
       size INTEGER NOT NULL,
       gcid TEXT NOT NULL,
+      cid TEXT NOT NULL DEFAULT '',
       status TEXT NOT NULL DEFAULT 'pending',
       attempts INTEGER NOT NULL DEFAULT 0,
       task_id TEXT,
@@ -199,6 +208,9 @@ function initializeStateDatabase(statePath, files, metadata) {
     CREATE INDEX IF NOT EXISTS import_files_status_attempts
       ON import_files(status, attempts, path);
   `);
+  if (!database.prepare("PRAGMA table_info(import_files)").all().some((column) => column.name === 'cid')) {
+    database.exec("ALTER TABLE import_files ADD COLUMN cid TEXT NOT NULL DEFAULT ''");
+  }
   const upsertMetadata = database.prepare(`
     INSERT INTO metadata (key, value) VALUES (?, ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value
@@ -211,17 +223,18 @@ function initializeStateDatabase(statePath, files, metadata) {
     }
     const insertFile = database.prepare(`
       INSERT INTO import_files
-        (path, folder_path, name, size, gcid, status, attempts, updated_at)
-      VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)
+        (path, folder_path, name, size, gcid, cid, status, attempts, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?)
       ON CONFLICT(path) DO UPDATE SET
         folder_path = excluded.folder_path,
         name = excluded.name,
         size = excluded.size,
-        gcid = excluded.gcid
+        gcid = excluded.gcid,
+        cid = excluded.cid
       WHERE import_files.status NOT IN ('imported', 'existing')
     `);
     for (const file of files) {
-      insertFile.run(file.path, file.folderPath, file.name, file.size, file.gcid, now);
+      insertFile.run(file.path, file.folderPath, file.name, file.size, file.gcid, file.cid, now);
     }
     database.exec(`
       UPDATE import_files
@@ -442,7 +455,7 @@ class ImportRunner {
       failed: 0,
     };
     this.selectNext = database.prepare(`
-      SELECT path, folder_path, name, size, gcid, attempts
+      SELECT path, folder_path, name, size, gcid, cid, attempts
       FROM import_files
       WHERE
         status = 'pending'
@@ -652,6 +665,7 @@ class ImportRunner {
         flash = await this.api.post('/userres/v1/check_can_flash_upload', {
           taskId,
           gcid: row.gcid,
+          cid: row.cid,
         });
       } catch (error) {
         if (error.apiCode === 112) {

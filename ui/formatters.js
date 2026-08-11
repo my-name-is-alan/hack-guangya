@@ -61,6 +61,17 @@ export function offlineStatus(record) {
   return ['下载中', 'processing'];
 }
 
+export function offlineProgress(record) {
+  const status = String(pick(record, ['status', 'taskStatus', 'state'], '')).trim().toLowerCase();
+  if (status === '2' || ['success', 'done', 'complete', 'completed', 'finish', 'finished'].includes(status)) return 100;
+  const raw = Number(pick(record, ['progress', 'percent', 'progressPercent', 'downloadProgress'], Number.NaN));
+  if (Number.isFinite(raw)) return Math.max(0, Math.min(100, raw <= 1 && raw > 0 ? raw * 100 : raw));
+  const done = Number(pick(record, ['downloadedSize', 'downloadSize', 'completedSize', 'currentSize'], 0));
+  const total = Number(pick(record, ['totalSize', 'fileSize', 'size'], 0));
+  if (done > 0 && total > 0) return Math.max(0, Math.min(100, (done / total) * 100));
+  return null;
+}
+
 export function cloudShareStatus(record) {
   return ({ 1: ['分享中', 'success'], 2: ['已过期', 'warning'], 3: ['已取消', 'default'], 4: ['已封禁', 'error'] })[Number(record.shareStatus)] || ['未知', 'default'];
 }

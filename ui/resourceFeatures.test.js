@@ -33,6 +33,8 @@ test('文件工作区接入新建、详情、最近记录和回收站闭环', ()
 test('云添加使用官方 cursor、资源预解析、子文件序号和任务生命周期命令', () => {
   const offline = read('views', 'OfflineView.vue');
   const bridge = read('bridge.js');
+  const settings = read('views', 'SystemSettingsView.vue');
+  const offlineSettings = read('components', 'settings', 'OfflineSettingsPanel.vue');
 
   assert.match(offline, /'resolve_offline_resource'/);
   assert.match(offline, /resolvedUrl/);
@@ -43,6 +45,14 @@ test('云添加使用官方 cursor、资源预解析、子文件序号和任务�
   assert.match(offline, /'retry_offline_tasks'/);
   assert.match(offline, /hasMore/);
   assert.match(offline, /nextCursor/);
+  assert.match(offline, /restore_name:\s*restoreName/);
+  assert.match(offline, /protectedSubmission \? \{\} : unwrapData\(await resolveOfflineResource/);
+  assert.match(offline, /保护模式跳过云端预解析，默认保存全部文件/);
+  assert.match(offline, /nameRestoreStatus/);
+  assert.match(settings, /OfflineSettingsPanel/);
+  assert.match(offlineSettings, /filename_obfuscation_enabled/);
+  assert.match(bridge, /command === 'get_offline_settings'/);
+  assert.match(bridge, /command === 'update_offline_settings'/);
   assert.doesNotMatch(offline, /list_offline_tasks',\s*\{\s*page:/);
   assert.match(bridge, /command === 'list_offline_tasks'[\s\S]*?cursor:/);
   assert.doesNotMatch(bridge.match(/command === 'list_offline_tasks'[\s\S]*?return webRequest\(`\/api\/offline\?\$\{params\}`\);/)?.[0] || '', /page:/);

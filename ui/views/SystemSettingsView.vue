@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router'
 import {
   CloudServerOutlined,
   DatabaseOutlined,
+  DownloadOutlined,
   FolderOpenOutlined,
   GlobalOutlined,
   KeyOutlined,
@@ -21,6 +22,7 @@ const CacheSettingsPanel = defineAsyncComponent(() => import('../components/sett
 const DeveloperSettingsPanel = defineAsyncComponent(() => import('../components/settings/DeveloperSettingsPanel.vue'))
 const HdhiveSettingsPanel = defineAsyncComponent(() => import('../components/settings/HdhiveSettingsPanel.vue'))
 const MountSettingsPanel = defineAsyncComponent(() => import('../components/settings/MountSettingsPanel.vue'))
+const OfflineSettingsPanel = defineAsyncComponent(() => import('../components/settings/OfflineSettingsPanel.vue'))
 const PreferenceSettingsPanel = defineAsyncComponent(() => import('../components/settings/PreferenceSettingsPanel.vue'))
 const TransferSettingsPanel = defineAsyncComponent(() => import('../components/settings/TransferSettingsPanel.vue'))
 const UpdateSettingsPanel = defineAsyncComponent(() => import('../components/settings/UpdateSettingsPanel.vue'))
@@ -58,6 +60,11 @@ watch(() => route.query.tab, (value) => { if (typeof value === 'string' && value
       <a-tab-pane key="transfer">
         <template #tab><span class="setting-tab"><SwapOutlined />传输</span></template>
         <TransferSettingsPanel />
+      </a-tab-pane>
+
+      <a-tab-pane key="offline">
+        <template #tab><span class="setting-tab"><DownloadOutlined />离线下载</span></template>
+        <OfflineSettingsPanel />
       </a-tab-pane>
 
       <a-tab-pane key="network">

@@ -18,7 +18,7 @@ use organizer::{
     scrape_selected_files, start as start_organizer, test_organizer_connection,
     update_organizer_mapping, update_organizer_settings,
 };
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use reqwest::header::{
     HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_RANGE, CONTENT_TYPE, DATE, ETAG, RANGE,
 };
@@ -115,6 +115,9 @@ const MAX_API_CURSOR_LENGTH: usize = 256;
 const MAX_REMOTE_NAME_LENGTH: usize = 255;
 const MAX_OFFLINE_URL_LENGTH: usize = 8_192;
 const MAX_OFFLINE_FILE_INDEXES: usize = 1_000;
+const OFFLINE_RESTORE_POLL_SECS: u64 = 5;
+const OFFLINE_RESTORE_RETRY_SECS: i64 = 15;
+static OFFLINE_RESTORE_RECONCILING: AtomicUsize = AtomicUsize::new(0);
 const MAX_SHARE_TRAFFIC_BYTES: u64 = 1_125_899_906_842_624;
 const DEFAULT_MEDIA_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "heic", "heif", "avif", "tif", "tiff",
@@ -426,6 +429,12 @@ struct TransferSettings {
     multipart_part_size: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct OfflineSettings {
+    filename_obfuscation_enabled: bool,
+    pending_restores: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct NetworkPreferences {
     proxy_url: String,
@@ -448,6 +457,12 @@ struct NetworkPreferencesInput {
 struct CacheSettings {
     enabled: bool,
     max_entries: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileHashes {
+    gcid: String,
+    cid: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -619,6 +634,8 @@ struct GcidExport {
     #[serde(default)]
     uses_gcid_in_export: bool,
     #[serde(default)]
+    uses_cid_in_export: bool,
+    #[serde(default)]
     common_path: String,
     #[serde(default)]
     total_files_count: Option<u64>,
@@ -632,6 +649,62 @@ struct GcidExportFile {
     path: String,
     size: Value,
     gcid: String,
+    cid: String,
+}
+
+#[derive(Debug, Clone)]
+struct CloudSelectionEntry {
+    file_id: String,
+    name: String,
+    folder: bool,
+    size: u64,
+    path: String,
+}
+
+#[derive(Debug, Clone)]
+struct DeveloperNameRestore {
+    file_id: String,
+    original_name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeneratedGcidExport {
+    script_version: String,
+    export_version: String,
+    source: String,
+    hash_type: String,
+    uses_gcid_in_export: bool,
+    uses_cid_in_export: bool,
+    uses_base62_etags_in_export: bool,
+    common_path: String,
+    source_folder_id: String,
+    source_folder_name: String,
+    total_files_count: usize,
+    total_size: Value,
+    formatted_total_size: String,
+    generated_at: i64,
+    scanned_folders_count: usize,
+    skipped_files_count: usize,
+    skipped_files: Vec<String>,
+    files: Vec<GeneratedGcidExportFile>,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneratedGcidExportFile {
+    path: String,
+    size: String,
+    gcid: String,
+    cid: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneratedGcidExportResult {
+    cancelled: bool,
+    saved_path: Option<String>,
+    file_name: String,
+    total_files: usize,
+    total_size: String,
 }
 
 #[derive(Debug, Clone)]
@@ -641,6 +714,7 @@ struct GcidImportFile {
     name: String,
     size: u64,
     gcid: String,
+    cid: String,
     attempts: i64,
 }
 
@@ -1425,6 +1499,7 @@ fn init_database(path: &Path) -> Result<(), String> {
                size INTEGER NOT NULL,
                modified_ms TEXT NOT NULL,
                gcid TEXT NOT NULL,
+               cid TEXT NOT NULL DEFAULT '',
                computed_at INTEGER NOT NULL,
                PRIMARY KEY (file_path, size, modified_ms)
              );
@@ -1496,6 +1571,7 @@ fn init_database(path: &Path) -> Result<(), String> {
                file_name TEXT NOT NULL,
                file_size INTEGER NOT NULL,
                gcid TEXT NOT NULL,
+               cid TEXT NOT NULL DEFAULT '',
                status TEXT NOT NULL DEFAULT 'pending',
                attempts INTEGER NOT NULL DEFAULT 0,
                task_id TEXT,
@@ -1531,6 +1607,28 @@ fn init_database(path: &Path) -> Result<(), String> {
                message TEXT,
                created_at INTEGER NOT NULL,
                updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS developer_transfer_name_restores (
+               job_id TEXT NOT NULL,
+               file_id TEXT NOT NULL,
+               original_name TEXT NOT NULL,
+               temporary_name TEXT NOT NULL,
+               status TEXT NOT NULL DEFAULT 'active',
+               last_error TEXT,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               PRIMARY KEY (job_id, file_id)
+             );
+             CREATE TABLE IF NOT EXISTS offline_name_restores (
+               task_id TEXT PRIMARY KEY,
+               original_name TEXT NOT NULL,
+               temporary_name TEXT NOT NULL,
+               file_id TEXT,
+               status TEXT NOT NULL DEFAULT 'pending',
+               attempts INTEGER NOT NULL DEFAULT 0,
+               last_error TEXT,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL
              );",
         )
         .map_err(|e| format!("初始化 SQLite 失败：{e}"))?;
@@ -1540,6 +1638,10 @@ fn init_database(path: &Path) -> Result<(), String> {
                ON gcid_import_files(job_id, status, path);
              CREATE INDEX IF NOT EXISTS developer_transfer_jobs_status
                ON developer_transfer_jobs(status, updated_at);
+             CREATE INDEX IF NOT EXISTS developer_transfer_name_restores_status
+               ON developer_transfer_name_restores(status, file_id, updated_at);
+             CREATE INDEX IF NOT EXISTS offline_name_restores_status
+               ON offline_name_restores(status, updated_at);
              UPDATE gcid_import_files
                SET status = 'pending', error = '应用上次退出，已等待继续'
                WHERE status = 'processing';
@@ -1562,6 +1664,8 @@ fn init_database(path: &Path) -> Result<(), String> {
         "ALTER TABLE uploaded_files ADD COLUMN remote_dir TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE uploaded_files ADD COLUMN relative_path TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE uploaded_files ADD COLUMN change_kind TEXT NOT NULL DEFAULT 'added'",
+        "ALTER TABLE file_fingerprints ADD COLUMN cid TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE gcid_import_files ADD COLUMN cid TEXT NOT NULL DEFAULT ''",
     ] {
         let _ = connection.execute(migration, []);
     }
@@ -1582,44 +1686,49 @@ fn init_database(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn load_cached_file_gcid(
+fn valid_sha1_hex(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn load_cached_file_hashes(
     database: &Path,
     file_path: &Path,
     size: u64,
     modified_ms: u128,
     settings: CacheSettings,
-) -> Result<Option<String>, String> {
+) -> Result<Option<FileHashes>, String> {
     if !settings.enabled {
         return Ok(None);
     }
     let size = i64::try_from(size).map_err(|_| "文件过大，无法缓存秒传指纹".to_string())?;
     let connection = open_database(database)?;
-    let gcid = connection
+    let hashes = connection
         .query_row(
-            "SELECT gcid FROM file_fingerprints
+            "SELECT gcid, cid FROM file_fingerprints
              WHERE file_path = ?1 AND size = ?2 AND modified_ms = ?3",
             params![
                 file_path.to_string_lossy().as_ref(),
                 size,
                 modified_ms.to_string()
             ],
-            |row| row.get::<_, String>(0),
+            |row| {
+                Ok(FileHashes {
+                    gcid: row.get(0)?,
+                    cid: row.get(1)?,
+                })
+            },
         )
         .optional()
         .map_err(|error| format!("读取秒传指纹缓存失败：{error}"))?;
-    Ok(
-        gcid.filter(|value| {
-            value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }),
-    )
+    Ok(hashes.filter(|value| valid_sha1_hex(&value.gcid) && valid_sha1_hex(&value.cid)))
 }
 
-fn save_cached_file_gcid(
+fn save_cached_file_hashes(
     database: &Path,
     file_path: &Path,
     size: u64,
     modified_ms: u128,
-    gcid: &str,
+    hashes: &FileHashes,
     settings: CacheSettings,
 ) -> Result<(), String> {
     if !settings.enabled {
@@ -1639,15 +1748,17 @@ fn save_cached_file_gcid(
     connection
         .execute(
             "INSERT INTO file_fingerprints
-               (file_path, size, modified_ms, gcid, computed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+               (file_path, size, modified_ms, gcid, cid, computed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(file_path, size, modified_ms)
-             DO UPDATE SET gcid = excluded.gcid, computed_at = excluded.computed_at",
+             DO UPDATE SET gcid = excluded.gcid, cid = excluded.cid,
+                           computed_at = excluded.computed_at",
             params![
                 file_path.as_ref(),
                 size,
                 modified_ms,
-                gcid,
+                hashes.gcid,
+                hashes.cid,
                 unix_timestamp()
             ],
         )
@@ -1696,7 +1807,7 @@ fn trim_remote_cache(remote_cache: &mut HashMap<String, String>, max_entries: us
 fn file_fingerprint_cache_usage(database: &Path) -> Result<(u64, u64), String> {
     let connection = open_database(database)?;
     let mut statement = connection
-        .prepare("SELECT file_path, modified_ms, gcid FROM file_fingerprints")
+        .prepare("SELECT file_path, modified_ms, gcid, cid FROM file_fingerprints")
         .map_err(|error| format!("读取秒传指纹缓存统计失败：{error}"))?;
     let rows = statement
         .query_map([], |row| {
@@ -1704,17 +1815,18 @@ fn file_fingerprint_cache_usage(database: &Path) -> Result<(u64, u64), String> {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })
         .map_err(|error| format!("读取秒传指纹缓存统计失败：{error}"))?;
     let mut entries = 0_u64;
     let mut bytes = 0_u64;
     for row in rows {
-        let (file_path, modified_ms, gcid) =
+        let (file_path, modified_ms, gcid, cid) =
             row.map_err(|error| format!("解析秒传指纹缓存统计失败：{error}"))?;
         entries = entries.saturating_add(1);
         bytes = bytes.saturating_add(
-            u64::try_from(file_path.len() + modified_ms.len() + gcid.len())
+            u64::try_from(file_path.len() + modified_ms.len() + gcid.len() + cid.len())
                 .unwrap_or(u64::MAX)
                 .saturating_add(16),
         );
@@ -3558,8 +3670,12 @@ fn normalize_gcid_relative_path(value: &str) -> Result<String, String> {
 fn parse_gcid_export(raw: &[u8]) -> Result<(Vec<GcidImportFile>, u128, String), String> {
     let export: GcidExport =
         serde_json::from_slice(raw).map_err(|error| format!("JSON 格式无效：{error}"))?;
-    if export.source != "guangya" || export.hash_type != "gcid" || !export.uses_gcid_in_export {
-        return Err("只支持光鸭 GCID 导出格式".to_string());
+    if export.source != "guangya"
+        || export.hash_type != "gcid"
+        || !export.uses_gcid_in_export
+        || !export.uses_cid_in_export
+    {
+        return Err("只支持同时包含 GCID 与 CID 的光鸭导出格式".to_string());
     }
     if export.files.is_empty() {
         return Err("导入文件不包含 files 记录".to_string());
@@ -3589,6 +3705,10 @@ fn parse_gcid_export(raw: &[u8]) -> Result<(Vec<GcidImportFile>, u128, String), 
         if gcid.len() != 40 || !gcid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(format!("第 {} 条记录的 GCID 无效", index + 1));
         }
+        let cid = item.cid.to_ascii_uppercase();
+        if !valid_sha1_hex(&cid) {
+            return Err(format!("第 {} 条记录的 CID 无效", index + 1));
+        }
         let (folder_path, name) = relative_path
             .rsplit_once('/')
             .map(|(folder, name)| (folder.to_string(), name.to_string()))
@@ -3602,6 +3722,7 @@ fn parse_gcid_export(raw: &[u8]) -> Result<(Vec<GcidImportFile>, u128, String), 
             name,
             size,
             gcid,
+            cid,
             attempts: 0,
         });
     }
@@ -3702,14 +3823,15 @@ fn prepare_gcid_import_database(
         let mut insert = transaction
             .prepare(
                 "INSERT INTO gcid_import_files
-                   (job_id, path, folder_path, file_name, file_size, gcid,
+                   (job_id, path, folder_path, file_name, file_size, gcid, cid,
                     status, attempts, task_id, file_id, error, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, NULL, NULL, NULL, ?7)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0, NULL, NULL, NULL, ?8)
                  ON CONFLICT(job_id, path) DO UPDATE SET
                    folder_path = excluded.folder_path,
                    file_name = excluded.file_name,
                    file_size = excluded.file_size,
-                   gcid = excluded.gcid
+                   gcid = excluded.gcid,
+                   cid = excluded.cid
                  WHERE gcid_import_files.status NOT IN ('imported', 'existing')",
             )
             .map_err(|error| format!("准备导入记录失败：{error}"))?;
@@ -3723,6 +3845,7 @@ fn prepare_gcid_import_database(
                     file.name,
                     size,
                     file.gcid,
+                    file.cid,
                     now
                 ])
                 .map_err(|error| format!("保存导入记录失败：{error}"))?;
@@ -3868,7 +3991,7 @@ fn claim_gcid_import_file(
         .map_err(|error| format!("开始领取导入记录失败：{error}"))?;
     let record = transaction
         .query_row(
-            "SELECT path, folder_path, file_name, file_size, gcid, attempts
+            "SELECT path, folder_path, file_name, file_size, gcid, cid, attempts
              FROM gcid_import_files
              WHERE job_id = ?1 AND status = 'pending'
              ORDER BY path
@@ -3881,7 +4004,8 @@ fn claim_gcid_import_file(
                     name: row.get(2)?,
                     size: row.get(3)?,
                     gcid: row.get(4)?,
-                    attempts: row.get(5)?,
+                    cid: row.get(5)?,
+                    attempts: row.get(6)?,
                 })
             },
         )
@@ -4128,7 +4252,7 @@ async fn process_gcid_import_file(
             &token,
             &device_id,
             "/userres/v1/check_can_flash_upload",
-            json!({ "taskId": task_id, "gcid": record.gcid }),
+            json!({ "taskId": task_id, "gcid": record.gcid, "cid": record.cid }),
             &[112],
         )
         .await?;
@@ -5814,6 +5938,127 @@ fn gcid_chunk_size(file_size: u64) -> usize {
     }
 }
 
+fn cid_byte_ranges(file_size: u64) -> Vec<(u64, u64)> {
+    if file_size < 60 * 1024 {
+        return vec![(0, file_size)];
+    }
+    let middle = file_size / 3;
+    vec![
+        (0, 20 * 1024),
+        (middle, middle + 20 * 1024),
+        (file_size - 20 * 1024, file_size),
+    ]
+}
+
+fn update_cid_hasher(
+    hasher: &mut Sha1,
+    ranges: &[(u64, u64)],
+    chunk_start: u64,
+    chunk: &[u8],
+) -> Result<u64, String> {
+    let chunk_end = chunk_start.saturating_add(chunk.len() as u64);
+    let mut sampled = 0_u64;
+    for (start, end) in ranges {
+        let overlap_start = chunk_start.max(*start);
+        let overlap_end = chunk_end.min(*end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        let local_start = usize::try_from(overlap_start - chunk_start)
+            .map_err(|_| "CID 采样位置超出范围".to_string())?;
+        let local_end = usize::try_from(overlap_end - chunk_start)
+            .map_err(|_| "CID 采样位置超出范围".to_string())?;
+        hasher.update(&chunk[local_start..local_end]);
+        sampled = sampled.saturating_add(overlap_end - overlap_start);
+    }
+    Ok(sampled)
+}
+
+struct FlashHashAccumulator {
+    file_size: u64,
+    chunk_size: usize,
+    gcid_chunk: Vec<u8>,
+    gcid_chunk_bytes: usize,
+    gcid_hasher: Sha1,
+    cid_hasher: Sha1,
+    cid_ranges: Vec<(u64, u64)>,
+    expected_cid_bytes: u64,
+    cid_bytes: u64,
+    position: u64,
+}
+
+impl FlashHashAccumulator {
+    fn new(file_size: u64) -> Self {
+        let chunk_size = gcid_chunk_size(file_size);
+        let cid_ranges = cid_byte_ranges(file_size);
+        let expected_cid_bytes = cid_ranges
+            .iter()
+            .map(|(start, end)| end - start)
+            .sum::<u64>();
+        Self {
+            file_size,
+            chunk_size,
+            gcid_chunk: vec![0_u8; chunk_size],
+            gcid_chunk_bytes: 0,
+            gcid_hasher: Sha1::new(),
+            cid_hasher: Sha1::new(),
+            cid_ranges,
+            expected_cid_bytes,
+            cid_bytes: 0,
+            position: 0,
+        }
+    }
+
+    fn flush_gcid_chunk(&mut self) {
+        if self.gcid_chunk_bytes == 0 {
+            return;
+        }
+        self.gcid_hasher
+            .update(Sha1::digest(&self.gcid_chunk[..self.gcid_chunk_bytes]));
+        self.gcid_chunk_bytes = 0;
+    }
+
+    fn update(&mut self, bytes: &[u8]) -> Result<u64, String> {
+        let chunk_start = self.position;
+        let chunk_end = chunk_start
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| "秒传指纹读取位置溢出".to_string())?;
+        if chunk_end > self.file_size {
+            return Err("下载内容超过云端文件声明大小".to_string());
+        }
+        self.cid_bytes = self.cid_bytes.saturating_add(update_cid_hasher(
+            &mut self.cid_hasher,
+            &self.cid_ranges,
+            chunk_start,
+            bytes,
+        )?);
+        let mut offset = 0_usize;
+        while offset < bytes.len() {
+            let copied = (self.chunk_size - self.gcid_chunk_bytes).min(bytes.len() - offset);
+            self.gcid_chunk[self.gcid_chunk_bytes..self.gcid_chunk_bytes + copied]
+                .copy_from_slice(&bytes[offset..offset + copied]);
+            self.gcid_chunk_bytes += copied;
+            offset += copied;
+            if self.gcid_chunk_bytes == self.chunk_size {
+                self.flush_gcid_chunk();
+            }
+        }
+        self.position = chunk_end;
+        Ok(self.position)
+    }
+
+    fn finish(mut self) -> Result<FileHashes, String> {
+        if self.position != self.file_size || self.cid_bytes != self.expected_cid_bytes {
+            return Err("下载内容与云端文件声明大小不一致".to_string());
+        }
+        self.flush_gcid_chunk();
+        Ok(FileHashes {
+            gcid: hex::encode_upper(self.gcid_hasher.finalize()),
+            cid: hex::encode_upper(self.cid_hasher.finalize()),
+        })
+    }
+}
+
 async fn calculate_file_md5(path: &Path) -> Result<String, String> {
     let mut file = tokio::fs::File::open(path)
         .await
@@ -5833,28 +6078,25 @@ async fn calculate_file_md5(path: &Path) -> Result<String, String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-async fn calculate_file_gcid(
+async fn calculate_file_flash_hashes(
     app: &tauri::AppHandle,
     path: &Path,
     file_size: u64,
-) -> Result<String, String> {
+) -> Result<FileHashes, String> {
     let mut file = tokio::fs::File::open(path)
         .await
         .map_err(|error| format!("读取秒传文件失败：{error}"))?;
     let chunk_size = gcid_chunk_size(file_size);
     let mut buffer = vec![0_u8; chunk_size];
-    let mut outer = Sha1::new();
+    let mut accumulator = FlashHashAccumulator::new(file_size);
     let mut hashed = 0_u64;
-    loop {
-        let read = file
-            .read(&mut buffer)
+    while hashed < file_size {
+        let read = usize::try_from((file_size - hashed).min(chunk_size as u64))
+            .map_err(|_| "秒传指纹分块大小超出范围".to_string())?;
+        file.read_exact(&mut buffer[..read])
             .await
             .map_err(|error| format!("计算文件 GCID 失败：{error}"))?;
-        if read == 0 {
-            break;
-        }
-        outer.update(Sha1::digest(&buffer[..read]));
-        hashed += read as u64;
+        hashed = accumulator.update(&buffer[..read])?;
         let percent = if file_size == 0 {
             100
         } else {
@@ -5871,7 +6113,9 @@ async fn calculate_file_gcid(
             }),
         );
     }
-    Ok(hex::encode_upper(outer.finalize()))
+    accumulator
+        .finish()
+        .map_err(|_| "计算秒传指纹时文件大小发生变化".to_string())
 }
 
 #[cfg(windows)]
@@ -6121,9 +6365,9 @@ async fn preflight_flash_upload(
     .map_err(|error| format!("上传凭证格式异常：{error}"))?;
 
     if !instant_upload && item.size >= OSS_MIB {
-        let cached_gcid = match {
+        let cached_hashes = match {
             let guard = state.lock().map_err(|error| error.to_string())?;
-            load_cached_file_gcid(
+            load_cached_file_hashes(
                 &guard.db_path,
                 &item.file_path,
                 item.size,
@@ -6137,7 +6381,7 @@ async fn preflight_flash_upload(
                 None
             }
         };
-        let gcid_result = if let Some(gcid) = cached_gcid {
+        let hashes_result = if let Some(hashes) = cached_hashes {
             emit(
                 app,
                 json!({
@@ -6150,18 +6394,18 @@ async fn preflight_flash_upload(
                     "stage": "后台已复用本地秒传指纹"
                 }),
             );
-            Ok(gcid)
+            Ok(hashes)
         } else {
-            let result = calculate_file_gcid(app, &item.file_path, item.size).await;
-            if let Ok(gcid) = &result {
+            let result = calculate_file_flash_hashes(app, &item.file_path, item.size).await;
+            if let Ok(hashes) = &result {
                 let saved = {
                     let guard = state.lock().map_err(|error| error.to_string())?;
-                    save_cached_file_gcid(
+                    save_cached_file_hashes(
                         &guard.db_path,
                         &item.file_path,
                         item.size,
                         item.modified_ms,
-                        gcid,
+                        hashes,
                         cache_settings(&guard),
                     )
                 };
@@ -6171,12 +6415,16 @@ async fn preflight_flash_upload(
             }
             result
         };
-        match gcid_result {
-            Ok(gcid) => match api_post(
+        match hashes_result {
+            Ok(hashes) => match api_post(
                 &token,
                 &device_id,
                 "/userres/v1/check_can_flash_upload",
-                json!({ "taskId": data.task_id, "gcid": gcid }),
+                json!({
+                    "taskId": data.task_id,
+                    "gcid": hashes.gcid,
+                    "cid": hashes.cid
+                }),
                 &[],
             )
             .await
@@ -6424,9 +6672,9 @@ async fn upload_item(
             app,
             json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 0, "uploaded_bytes": 0, "total_bytes": item.size, "stage": "正在校验秒传" }),
         );
-        let cached_gcid = match {
+        let cached_hashes = match {
             let guard = state.lock().map_err(|error| error.to_string())?;
-            load_cached_file_gcid(
+            load_cached_file_hashes(
                 &guard.db_path,
                 &item.file_path,
                 item.size,
@@ -6440,7 +6688,7 @@ async fn upload_item(
                 None
             }
         };
-        let gcid_result = if let Some(gcid) = cached_gcid {
+        let hashes_result = if let Some(hashes) = cached_hashes {
             emit(
                 app,
                 json!({
@@ -6453,18 +6701,18 @@ async fn upload_item(
                     "stage": "已复用本地秒传指纹"
                 }),
             );
-            Ok(gcid)
+            Ok(hashes)
         } else {
-            let result = calculate_file_gcid(app, &item.file_path, item.size).await;
-            if let Ok(gcid) = &result {
+            let result = calculate_file_flash_hashes(app, &item.file_path, item.size).await;
+            if let Ok(hashes) = &result {
                 let saved = {
                     let guard = state.lock().map_err(|error| error.to_string())?;
-                    save_cached_file_gcid(
+                    save_cached_file_hashes(
                         &guard.db_path,
                         &item.file_path,
                         item.size,
                         item.modified_ms,
-                        gcid,
+                        hashes,
                         cache_settings(&guard),
                     )
                 };
@@ -6474,12 +6722,16 @@ async fn upload_item(
             }
             result
         };
-        match gcid_result {
-            Ok(gcid) => match api_post(
+        match hashes_result {
+            Ok(hashes) => match api_post(
                 &token,
                 &device_id,
                 "/userres/v1/check_can_flash_upload",
-                json!({ "taskId": data.task_id, "gcid": gcid }),
+                json!({
+                    "taskId": data.task_id,
+                    "gcid": hashes.gcid,
+                    "cid": hashes.cid
+                }),
                 &[],
             )
             .await
@@ -8910,6 +9162,233 @@ fn file_list_request(parent_id: &str, page: u64, folders_only: bool) -> Value {
     request
 }
 
+fn cloud_record_value(value: &Value) -> &Value {
+    [
+        "fileInfo",
+        "file_info",
+        "resourceInfo",
+        "resource_info",
+        "file",
+    ]
+    .into_iter()
+    .find_map(|key| value.get(key).filter(|entry| entry.is_object()))
+    .unwrap_or(value)
+}
+
+fn cloud_record_text(value: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|key| {
+            value.get(*key).and_then(|entry| match entry {
+                Value::String(text) => Some(text.trim().to_string()),
+                Value::Number(number) => Some(number.to_string()),
+                _ => None,
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn cloud_selection_entry_from_value(
+    value: &Value,
+    fallback_id: &str,
+    fallback_name: &str,
+) -> Result<CloudSelectionEntry, String> {
+    let value = cloud_record_value(value);
+    let file_id = {
+        let value = cloud_record_text(value, &["fileId", "file_id", "id"]);
+        if value.is_empty() {
+            fallback_id.to_string()
+        } else {
+            value
+        }
+    };
+    let name = {
+        let value = cloud_record_text(value, &["fileName", "file_name", "name"]);
+        if value.is_empty() {
+            fallback_name.to_string()
+        } else {
+            value
+        }
+    };
+    if file_id.trim().is_empty() || name.trim().is_empty() {
+        return Err("光鸭返回的文件详情缺少文件 ID 或名称".to_string());
+    }
+    let resource_type = value_as_u64(
+        value
+            .get("resType")
+            .or_else(|| value.get("res_type"))
+            .or_else(|| value.get("type")),
+    )
+    .unwrap_or(0);
+    let folder = resource_type == 2
+        || value.get("isFolder").and_then(Value::as_bool) == Some(true)
+        || value.get("is_folder").and_then(Value::as_bool) == Some(true)
+        || value.get("isDir").and_then(Value::as_bool) == Some(true);
+    let size = if folder {
+        0
+    } else {
+        value_as_u64(
+            value
+                .get("fileSize")
+                .or_else(|| value.get("file_size"))
+                .or_else(|| value.get("totalSize"))
+                .or_else(|| value.get("total_size"))
+                .or_else(|| value.get("size")),
+        )
+        .ok_or_else(|| format!("文件大小无效：{name}"))?
+    };
+    Ok(CloudSelectionEntry {
+        file_id,
+        name,
+        folder,
+        size,
+        path: String::new(),
+    })
+}
+
+fn safe_cloud_path_segment(value: &str) -> String {
+    let segment = value
+        .chars()
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if matches!(character, '/' | '\\') {
+                Some('_')
+            } else {
+                Some(character)
+            }
+        })
+        .collect::<String>();
+    let segment = segment.trim();
+    if segment.is_empty() {
+        "未命名文件".to_string()
+    } else {
+        segment.to_string()
+    }
+}
+
+async fn cloud_selection_entry_detail(
+    token: &str,
+    device_id: &str,
+    file_id: &str,
+    fallback_name: &str,
+) -> Result<CloudSelectionEntry, String> {
+    let response = api_post(
+        token,
+        device_id,
+        "/userres/v1/file/get_file_detail",
+        json!({ "fileId": file_id }),
+        &[],
+    )
+    .await?;
+    cloud_selection_entry_from_value(
+        response.data.as_ref().unwrap_or(&Value::Null),
+        file_id,
+        fallback_name,
+    )
+}
+
+async fn cloud_selection_children(
+    token: &str,
+    device_id: &str,
+    parent_id: &str,
+) -> Result<Vec<CloudSelectionEntry>, String> {
+    let mut entries = Vec::new();
+    for page in 0..1000_u64 {
+        let response = api_post(
+            token,
+            device_id,
+            "/userres/v1/file/get_file_list",
+            json!({
+                "page": page,
+                "pageSize": 100,
+                "parentId": parent_id,
+                "orderBy": 0,
+                "sortType": 0,
+                "needSubFolderStat": true
+            }),
+            &[],
+        )
+        .await?;
+        let data = response.data.unwrap_or_else(|| json!({}));
+        let list = data
+            .get("list")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let count = list.len();
+        for item in list {
+            entries.push(cloud_selection_entry_from_value(&item, "", "")?);
+        }
+        let total = value_as_u64(data.get("total")).unwrap_or(entries.len() as u64);
+        if count == 0 || entries.len() as u64 >= total {
+            break;
+        }
+    }
+    Ok(entries)
+}
+
+async fn collect_cloud_selection_entries(
+    token: &str,
+    device_id: &str,
+    file_ids: &[String],
+    fallback_names: &[String],
+    include_folders: bool,
+) -> Result<(Vec<CloudSelectionEntry>, Vec<CloudSelectionEntry>, usize), String> {
+    let mut detailed = stream::iter(file_ids.iter().cloned().enumerate())
+        .map(|(index, file_id)| {
+            let token = token.to_string();
+            let device_id = device_id.to_string();
+            let fallback_name = fallback_names.get(index).cloned().unwrap_or_default();
+            async move {
+                cloud_selection_entry_detail(&token, &device_id, &file_id, &fallback_name)
+                    .await
+                    .map(|entry| (index, entry))
+            }
+        })
+        .buffer_unordered(8)
+        .try_collect::<Vec<_>>()
+        .await?;
+    detailed.sort_by_key(|(index, _)| *index);
+    let roots = detailed
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .collect::<Vec<_>>();
+    let mut queue = roots
+        .iter()
+        .cloned()
+        .map(|entry| {
+            let path = safe_cloud_path_segment(&entry.name);
+            (entry, path)
+        })
+        .collect::<VecDeque<_>>();
+    let mut visited = HashSet::new();
+    let mut entries = Vec::new();
+    let mut scanned_folders = 0_usize;
+    while let Some((mut entry, relative_path)) = queue.pop_front() {
+        if !visited.insert(entry.file_id.clone()) {
+            continue;
+        }
+        entry.path = relative_path.clone();
+        if entry.folder {
+            scanned_folders += 1;
+            if include_folders {
+                entries.push(entry.clone());
+            }
+            for child in cloud_selection_children(token, device_id, &entry.file_id).await? {
+                let child_path =
+                    format!("{relative_path}/{}", safe_cloud_path_segment(&child.name));
+                queue.push_back((child, child_path));
+            }
+        } else {
+            entries.push(entry);
+        }
+        if visited.len().saturating_add(queue.len()) > 100_000 {
+            return Err("一次最多处理 100000 个云端文件或文件夹".to_string());
+        }
+    }
+    Ok((entries, roots, scanned_folders))
+}
+
 #[tauri::command]
 async fn search_files(
     state: tauri::State<'_, SharedState>,
@@ -9025,6 +9504,354 @@ fn collect_manual_uploads(path: &Path, remote_prefix: &str, files: &mut Vec<(Pat
     for entry in entries.flatten() {
         collect_manual_uploads(&entry.path(), &folder_prefix, files);
     }
+}
+
+fn format_export_bytes(bytes: u128) -> String {
+    let units = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut unit = 0_usize;
+    let mut divisor = 1_u128;
+    while unit < units.len() - 1 && bytes >= divisor.saturating_mul(1024) {
+        divisor = divisor.saturating_mul(1024);
+        unit += 1;
+    }
+    if unit == 0 {
+        return format!("{bytes} B");
+    }
+    let hundredths = bytes.saturating_mul(100).saturating_add(divisor / 2) / divisor;
+    format!(
+        "{}.{:02} {}",
+        hundredths / 100,
+        hundredths % 100,
+        units[unit]
+    )
+}
+
+fn export_json_file_name(names: &[String]) -> String {
+    let source = if names.is_empty() {
+        "光鸭秒传".to_string()
+    } else if names.len() == 1 {
+        safe_cloud_path_segment(&names[0])
+    } else {
+        format!("光鸭秒传_{}项", names.len())
+    };
+    let stem = Path::new(&source)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("光鸭秒传")
+        .chars()
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if "\\/:*?\"<>|".contains(character) {
+                Some('_')
+            } else {
+                Some(character)
+            }
+        })
+        .take(120)
+        .collect::<String>();
+    format!(
+        "{}_秒传.json",
+        if stem.is_empty() {
+            "光鸭秒传"
+        } else {
+            &stem
+        }
+    )
+}
+
+async fn cloud_download_url(token: &str, device_id: &str, file_id: &str) -> Result<String, String> {
+    let response = api_post(
+        token,
+        device_id,
+        "/userres/v1/get_res_download_url",
+        json!({ "fileId": file_id }),
+        &[],
+    )
+    .await?;
+    let data = response.data.unwrap_or_else(|| json!({}));
+    [
+        "signedURL",
+        "signedUrl",
+        "downloadUrl",
+        "downloadURL",
+        "url",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        data.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+    .ok_or_else(|| "光鸭没有返回文件下载地址".to_string())
+}
+
+async fn hash_cloud_selection_entry(
+    app: &tauri::AppHandle,
+    client: &reqwest::Client,
+    token: &str,
+    device_id: &str,
+    entry: CloudSelectionEntry,
+    downloaded_bytes: Arc<AtomicU64>,
+    completed_files: Arc<AtomicUsize>,
+    total_bytes: u64,
+    total_files: usize,
+) -> Result<GeneratedGcidExportFile, String> {
+    let download_url = cloud_download_url(token, device_id, &entry.file_id).await?;
+    let mut response = client
+        .get(&download_url)
+        .header("accept-encoding", "identity")
+        .send()
+        .await
+        .map_err(|error| format!("读取 {} 失败：{error}", entry.path))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "读取 {} 失败（HTTP {}）",
+            entry.path,
+            response.status()
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length != entry.size)
+    {
+        return Err(format!("文件大小发生变化：{}", entry.path));
+    }
+    let mut accumulator = FlashHashAccumulator::new(entry.size);
+    let mut previous = 0_u64;
+    let mut last_emit = Instant::now();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("读取 {} 失败：{error}", entry.path))?
+    {
+        let processed = accumulator.update(&chunk)?;
+        downloaded_bytes.fetch_add(processed.saturating_sub(previous), Ordering::Relaxed);
+        previous = processed;
+        if last_emit.elapsed() >= Duration::from_millis(250) {
+            let downloaded = downloaded_bytes.load(Ordering::Relaxed);
+            let percent = if total_bytes > 0 {
+                downloaded.saturating_mul(100) / total_bytes
+            } else {
+                0
+            };
+            emit(
+                app,
+                json!({
+                    "type": "gcid-export-progress",
+                    "stage": "正在读取云端文件并计算 GCID / CID",
+                    "current_path": entry.path,
+                    "completed_files": completed_files.load(Ordering::Relaxed),
+                    "total_files": total_files,
+                    "downloaded_bytes": downloaded.to_string(),
+                    "total_bytes": total_bytes.to_string(),
+                    "percent": percent.min(100)
+                }),
+            );
+            last_emit = Instant::now();
+        }
+    }
+    let hashes = accumulator.finish()?;
+    let completed = completed_files.fetch_add(1, Ordering::Relaxed) + 1;
+    let downloaded = downloaded_bytes.load(Ordering::Relaxed);
+    emit(
+        app,
+        json!({
+            "type": "gcid-export-progress",
+            "stage": "正在读取云端文件并计算 GCID / CID",
+            "current_path": entry.path,
+            "completed_files": completed,
+            "total_files": total_files,
+            "downloaded_bytes": downloaded.to_string(),
+            "total_bytes": total_bytes.to_string(),
+            "percent": if total_bytes > 0 { downloaded.saturating_mul(100) / total_bytes } else { (completed as u64).saturating_mul(100) / total_files.max(1) as u64 }
+        }),
+    );
+    Ok(GeneratedGcidExportFile {
+        path: entry.path,
+        size: entry.size.to_string(),
+        gcid: hashes.gcid.to_ascii_lowercase(),
+        cid: hashes.cid,
+    })
+}
+
+#[tauri::command]
+async fn export_gcid_json(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+    file_ids: Vec<String>,
+    file_names: Option<Vec<String>>,
+) -> Result<GeneratedGcidExportResult, String> {
+    let file_ids = normalize_id_list(&file_ids, "文件或文件夹")?;
+    let file_names = file_names
+        .unwrap_or_default()
+        .into_iter()
+        .take(file_ids.len())
+        .map(|value| value.chars().take(255).collect::<String>())
+        .collect::<Vec<_>>();
+    let suggested_name = export_json_file_name(&file_names);
+    let Some(save_path) = rfd::FileDialog::new()
+        .add_filter("光鸭 GCID JSON", &["json"])
+        .set_file_name(&suggested_name)
+        .save_file()
+    else {
+        return Ok(GeneratedGcidExportResult {
+            cancelled: true,
+            saved_path: None,
+            file_name: suggested_name,
+            total_files: 0,
+            total_size: "0".to_string(),
+        });
+    };
+    let (token, device_id) = auth_context(&state)?;
+    let (entries, roots, scanned_folders) =
+        collect_cloud_selection_entries(&token, &device_id, &file_ids, &file_names, false).await?;
+    let single_folder = (roots.len() == 1 && roots[0].folder).then(|| roots[0].clone());
+    let root_prefix = single_folder
+        .as_ref()
+        .map(|entry| format!("{}/", safe_cloud_path_segment(&entry.name)))
+        .unwrap_or_default();
+    let files = entries
+        .into_iter()
+        .filter(|entry| !entry.folder)
+        .map(|mut entry| {
+            if !root_prefix.is_empty() && entry.path.starts_with(&root_prefix) {
+                entry.path = entry.path[root_prefix.len()..].to_string();
+            }
+            entry
+        })
+        .collect::<Vec<_>>();
+    if files.is_empty() {
+        return Err("所选内容中没有可生成秒传 JSON 的文件".to_string());
+    }
+    let total_size = files
+        .iter()
+        .try_fold(0_u128, |total, entry| total.checked_add(entry.size as u128))
+        .ok_or_else(|| "所选文件总大小溢出".to_string())?;
+    let progress_total = u64::try_from(total_size).unwrap_or(u64::MAX);
+    let downloaded_bytes = Arc::new(AtomicU64::new(0));
+    let completed_files = Arc::new(AtomicUsize::new(0));
+    emit(
+        &app,
+        json!({
+            "type": "gcid-export-progress",
+            "stage": "正在读取云端文件并计算 GCID / CID",
+            "current_path": files[0].path,
+            "completed_files": 0,
+            "total_files": files.len(),
+            "downloaded_bytes": "0",
+            "total_bytes": total_size.to_string(),
+            "percent": 0
+        }),
+    );
+    let database_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    let proxy = load_global_network_proxy(&database_path)?;
+    let mut client_builder =
+        reqwest::Client::builder().connect_timeout(Duration::from_secs(API_CONNECT_TIMEOUT_SECS));
+    if !proxy.trim().is_empty() {
+        client_builder = client_builder.proxy(
+            reqwest::Proxy::all(proxy.trim())
+                .map_err(|error| format!("初始化秒传 JSON 下载代理失败：{error}"))?,
+        );
+    }
+    let client = client_builder
+        .build()
+        .map_err(|error| format!("创建秒传 JSON 下载客户端失败：{error}"))?;
+    let total_files = files.len();
+    let mut outcomes = stream::iter(files.into_iter().enumerate())
+        .map(|(index, entry)| {
+            let app = app.clone();
+            let client = client.clone();
+            let token = token.clone();
+            let device_id = device_id.clone();
+            let downloaded_bytes = downloaded_bytes.clone();
+            let completed_files = completed_files.clone();
+            async move {
+                hash_cloud_selection_entry(
+                    &app,
+                    &client,
+                    &token,
+                    &device_id,
+                    entry,
+                    downloaded_bytes,
+                    completed_files,
+                    progress_total,
+                    total_files,
+                )
+                .await
+                .map(|file| (index, file))
+            }
+        })
+        .buffer_unordered(3)
+        .try_collect::<Vec<_>>()
+        .await?;
+    outcomes.sort_by_key(|(index, _)| *index);
+    let hashed_files = outcomes
+        .into_iter()
+        .map(|(_, file)| file)
+        .collect::<Vec<_>>();
+    let export = GeneratedGcidExport {
+        script_version: "guangya-gcid-export-2.0".to_string(),
+        export_version: "2.0".to_string(),
+        source: "guangya".to_string(),
+        hash_type: "gcid".to_string(),
+        uses_gcid_in_export: true,
+        uses_cid_in_export: true,
+        uses_base62_etags_in_export: false,
+        common_path: single_folder
+            .as_ref()
+            .map(|entry| entry.name.clone())
+            .unwrap_or_default(),
+        source_folder_id: single_folder
+            .as_ref()
+            .map(|entry| entry.file_id.clone())
+            .unwrap_or_default(),
+        source_folder_name: single_folder
+            .as_ref()
+            .map(|entry| entry.name.clone())
+            .unwrap_or_default(),
+        total_files_count: hashed_files.len(),
+        total_size: u64::try_from(total_size)
+            .map(Value::from)
+            .unwrap_or_else(|_| Value::String(total_size.to_string())),
+        formatted_total_size: format_export_bytes(total_size),
+        generated_at: unix_timestamp(),
+        scanned_folders_count: scanned_folders,
+        skipped_files_count: 0,
+        skipped_files: Vec::new(),
+        files: hashed_files,
+    };
+    let bytes = serde_json::to_vec_pretty(&export)
+        .map_err(|error| format!("生成秒传 JSON 失败：{error}"))?;
+    tokio::fs::write(&save_path, bytes)
+        .await
+        .map_err(|error| format!("保存秒传 JSON 失败：{error}"))?;
+    emit(
+        &app,
+        json!({
+            "type": "gcid-export-progress",
+            "stage": "秒传 JSON 已生成",
+            "current_path": "",
+            "completed_files": export.total_files_count,
+            "total_files": export.total_files_count,
+            "downloaded_bytes": total_size.to_string(),
+            "total_bytes": total_size.to_string(),
+            "percent": 100
+        }),
+    );
+    Ok(GeneratedGcidExportResult {
+        cancelled: false,
+        saved_path: Some(save_path.to_string_lossy().to_string()),
+        file_name: suggested_name,
+        total_files: export.total_files_count,
+        total_size: total_size.to_string(),
+    })
 }
 
 #[tauri::command]
@@ -11209,6 +12036,424 @@ async fn create_share(
     Ok(data)
 }
 
+#[derive(Debug)]
+struct OfflineNameRestore {
+    task_id: String,
+    original_name: String,
+    attempts: i64,
+    updated_at: i64,
+}
+
+fn pending_offline_name_restore_count(path: &Path) -> Result<i64, String> {
+    open_database(path)?
+        .query_row(
+            "SELECT COUNT(*) FROM offline_name_restores WHERE status = 'pending'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("读取待恢复离线任务失败：{error}"))
+}
+
+fn offline_filename_obfuscation_enabled(path: &Path) -> Result<bool, String> {
+    Ok(load_app_state(path, "offline_filename_obfuscation")?.as_deref() == Some("true"))
+}
+
+fn offline_settings_for_path(path: &Path) -> Result<OfflineSettings, String> {
+    Ok(OfflineSettings {
+        filename_obfuscation_enabled: offline_filename_obfuscation_enabled(path)?,
+        pending_restores: pending_offline_name_restore_count(path)?,
+    })
+}
+
+#[tauri::command]
+fn get_offline_settings(state: tauri::State<'_, SharedState>) -> Result<OfflineSettings, String> {
+    let db_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    offline_settings_for_path(&db_path)
+}
+
+#[tauri::command]
+fn update_offline_settings(
+    state: tauri::State<'_, SharedState>,
+    filename_obfuscation_enabled: bool,
+) -> Result<OfflineSettings, String> {
+    let db_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    save_app_state(
+        &db_path,
+        "offline_filename_obfuscation",
+        if filename_obfuscation_enabled {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    offline_settings_for_path(&db_path)
+}
+
+fn offline_resolved_name(data: &Value) -> String {
+    let info = data
+        .get("urlResInfo")
+        .or_else(|| data.get("btResInfo"))
+        .or_else(|| data.get("emuleResInfo"))
+        .or_else(|| data.get("resourceInfo"))
+        .unwrap_or(data);
+    ["fileName", "name", "title"]
+        .into_iter()
+        .find_map(|key| {
+            info.get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn ed2k_file_name(source: &str) -> String {
+    if !source.to_ascii_lowercase().starts_with("ed2k://|file|") {
+        return String::new();
+    }
+    let encoded = source
+        .split('|')
+        .nth(2)
+        .unwrap_or_default()
+        .replace('+', "%20");
+    percent_decode_str(&encoded)
+        .decode_utf8_lossy()
+        .trim()
+        .to_string()
+}
+
+fn magnet_display_name(source: &str) -> String {
+    if !source.to_ascii_lowercase().starts_with("magnet:?") {
+        return String::new();
+    }
+    source
+        .split_once('?')
+        .map(|(_, query)| query)
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .find_map(|parameter| {
+            let (key, value) = parameter.split_once('=').unwrap_or((parameter, ""));
+            let key = percent_decode_str(key).decode_utf8_lossy();
+            key.eq_ignore_ascii_case("dn").then(|| {
+                percent_decode_str(&value.replace('+', "%20"))
+                    .decode_utf8_lossy()
+                    .trim()
+                    .to_string()
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn offline_source_name(source: &str) -> String {
+    let magnet_name = magnet_display_name(source);
+    if magnet_name.is_empty() {
+        ed2k_file_name(source)
+    } else {
+        magnet_name
+    }
+}
+
+fn offline_temporary_name(original_name: &str, source: &str) -> String {
+    let extension = if source.to_ascii_lowercase().starts_with("ed2k:") {
+        Path::new(original_name)
+            .extension()
+            .and_then(|value| value.to_str())
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 16
+                    && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+            .map(|value| format!(".{value}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    format!(
+        "gy_{}{}",
+        &Uuid::new_v4().simple().to_string()[..20],
+        extension
+    )
+}
+
+fn protected_offline_source(source: &str, temporary_name: &str) -> String {
+    if source.to_ascii_lowercase().starts_with("magnet:?") {
+        let Some((base, query)) = source.split_once('?') else {
+            return source.to_string();
+        };
+        let parameters = query
+            .split('&')
+            .filter(|parameter| {
+                let key = parameter.split_once('=').map_or(*parameter, |(key, _)| key);
+                !percent_decode_str(key)
+                    .decode_utf8_lossy()
+                    .eq_ignore_ascii_case("dn")
+            })
+            .collect::<Vec<_>>();
+        return if parameters.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}?{}", parameters.join("&"))
+        };
+    }
+    if source.to_ascii_lowercase().starts_with("ed2k://|file|") {
+        let mut parts = source.split('|').collect::<Vec<_>>();
+        if parts.len() > 4 {
+            parts[2] = temporary_name;
+        }
+        return parts.join("|");
+    }
+    source.to_string()
+}
+
+fn save_offline_name_restore(
+    path: &Path,
+    task_id: &str,
+    original_name: &str,
+    temporary_name: &str,
+) -> Result<(), String> {
+    let now = unix_timestamp();
+    open_database(path)?
+        .execute(
+            "INSERT INTO offline_name_restores
+               (task_id, original_name, temporary_name, status, attempts, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4)
+             ON CONFLICT(task_id) DO UPDATE SET
+               original_name = excluded.original_name,
+               temporary_name = excluded.temporary_name,
+               file_id = NULL,
+               status = 'pending',
+               attempts = 0,
+               last_error = NULL,
+               updated_at = excluded.updated_at",
+            params![task_id, original_name, temporary_name, now],
+        )
+        .map_err(|error| format!("保存离线文件名恢复任务失败：{error}"))?;
+    Ok(())
+}
+
+fn remove_offline_name_restores(path: &Path, task_ids: &[String]) -> Result<(), String> {
+    let mut connection = open_database(path)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开始清理离线恢复任务失败：{error}"))?;
+    {
+        let mut statement = transaction
+            .prepare("DELETE FROM offline_name_restores WHERE task_id = ?1")
+            .map_err(|error| format!("准备清理离线恢复任务失败：{error}"))?;
+        for task_id in task_ids {
+            statement
+                .execute(params![task_id])
+                .map_err(|error| format!("清理离线恢复任务失败：{error}"))?;
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("提交离线恢复任务清理失败：{error}"))
+}
+
+fn annotate_offline_name_restores(path: &Path, data: &mut Value) -> Result<(), String> {
+    let list_key = if data.get("list").and_then(Value::as_array).is_some() {
+        "list"
+    } else {
+        "taskList"
+    };
+    let Some(list) = data.get_mut(list_key).and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    let connection = open_database(path)?;
+    let mut statement = connection
+        .prepare("SELECT original_name, status, last_error FROM offline_name_restores WHERE task_id = ?1")
+        .map_err(|error| format!("准备读取离线恢复状态失败：{error}"))?;
+    for task in list {
+        let task_id = task
+            .get("taskId")
+            .or_else(|| task.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if task_id.is_empty() {
+            continue;
+        }
+        let restore = statement
+            .query_row(params![task_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                ))
+            })
+            .optional()
+            .map_err(|error| format!("读取离线恢复状态失败：{error}"))?;
+        let Some((original_name, restore_status, last_error)) = restore else {
+            continue;
+        };
+        let Some(object) = task.as_object_mut() else {
+            continue;
+        };
+        let public_status = if restore_status == "completed" {
+            "restored"
+        } else if last_error.is_empty() {
+            "pending"
+        } else {
+            "failed"
+        };
+        object.insert("nameRestoreStatus".to_string(), json!(public_status));
+        object.insert("nameRestoreError".to_string(), json!(last_error));
+        object.insert("originalName".to_string(), json!(original_name));
+        if restore_status == "completed" {
+            object.insert("fileName".to_string(), json!(original_name));
+        }
+    }
+    Ok(())
+}
+
+fn offline_task_status(task: &Value) -> Option<i64> {
+    task.get("status")
+        .or_else(|| task.get("taskStatus"))
+        .or_else(|| task.get("state"))
+        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+}
+
+async fn reconcile_offline_name_restores(
+    state: &SharedState,
+    supplied_data: Option<Value>,
+) -> Result<Value, String> {
+    let (token, device_id, db_path) = {
+        let guard = state.lock().map_err(|error| error.to_string())?;
+        let Some(token) = guard.token.clone() else {
+            return Ok(supplied_data.unwrap_or_else(|| json!({})));
+        };
+        (token, guard.device_id.clone(), guard.db_path.clone())
+    };
+    if pending_offline_name_restore_count(&db_path)? == 0 {
+        let mut data = supplied_data.unwrap_or_else(|| json!({}));
+        annotate_offline_name_restores(&db_path, &mut data)?;
+        return Ok(data);
+    }
+    if OFFLINE_RESTORE_RECONCILING
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        let mut data = supplied_data.unwrap_or_else(|| json!({}));
+        annotate_offline_name_restores(&db_path, &mut data)?;
+        return Ok(data);
+    }
+    let result = async {
+        let mut data = match supplied_data {
+            Some(data) => data,
+            None => api_post(
+                &token,
+                &device_id,
+                "/cloudcollection/v1/list_task",
+                json!({ "cursor": "", "pageSize": DEFAULT_API_PAGE_SIZE }),
+                &[],
+            )
+            .await?
+            .data
+            .unwrap_or_else(|| json!({ "list": [] })),
+        };
+        let tasks = data
+            .get("list")
+            .and_then(Value::as_array)
+            .or_else(|| data.get("taskList").and_then(Value::as_array))
+            .into_iter()
+            .flatten()
+            .filter_map(|task| {
+                let task_id = task
+                    .get("taskId")
+                    .or_else(|| task.get("id"))
+                    .and_then(Value::as_str)?
+                    .to_string();
+                Some((task_id, task.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+        let pending = {
+            let connection = open_database(&db_path)?;
+            let mut statement = connection
+                .prepare("SELECT task_id, original_name, attempts, updated_at FROM offline_name_restores WHERE status = 'pending'")
+                .map_err(|error| format!("准备读取离线恢复任务失败：{error}"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(OfflineNameRestore {
+                        task_id: row.get(0)?,
+                        original_name: row.get(1)?,
+                        attempts: row.get(2)?,
+                        updated_at: row.get(3)?,
+                    })
+                })
+                .map_err(|error| format!("读取离线恢复任务失败：{error}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("解析离线恢复任务失败：{error}"))?
+        };
+        let now = unix_timestamp();
+        for restore in pending {
+            let Some(task) = tasks.get(&restore.task_id) else {
+                continue;
+            };
+            if offline_task_status(task) != Some(2) {
+                continue;
+            }
+            let file_id = task.get("fileId").and_then(Value::as_str).unwrap_or_default();
+            if file_id.is_empty() {
+                continue;
+            }
+            let current_name = task.get("fileName").and_then(Value::as_str).unwrap_or_default();
+            let restore_result = if current_name == restore.original_name {
+                Ok(())
+            } else if restore.attempts > 0 && now - restore.updated_at < OFFLINE_RESTORE_RETRY_SECS {
+                continue;
+            } else {
+                rename_remote(&token, &device_id, file_id, &restore.original_name).await
+            };
+            let connection = open_database(&db_path)?;
+            match restore_result {
+                Ok(()) => {
+                    connection
+                        .execute(
+                            "UPDATE offline_name_restores SET file_id = ?1, status = 'completed', last_error = NULL, updated_at = ?2 WHERE task_id = ?3",
+                            params![file_id, now, restore.task_id],
+                        )
+                        .map_err(|error| format!("完成离线文件名恢复任务失败：{error}"))?;
+                }
+                Err(error) => {
+                    connection
+                        .execute(
+                            "UPDATE offline_name_restores SET file_id = ?1, attempts = attempts + 1, last_error = ?2, updated_at = ?3 WHERE task_id = ?4",
+                            params![file_id, error.chars().take(500).collect::<String>(), now, restore.task_id],
+                        )
+                        .map_err(|database_error| format!("记录离线文件名恢复失败：{database_error}"))?;
+                }
+            }
+        }
+        open_database(&db_path)?
+            .execute(
+                "DELETE FROM offline_name_restores WHERE status = 'completed' AND updated_at < ?1",
+                params![now - 30 * 86_400],
+            )
+            .map_err(|error| format!("清理旧离线恢复记录失败：{error}"))?;
+        annotate_offline_name_restores(&db_path, &mut data)?;
+        Ok(data)
+    }
+    .await;
+    OFFLINE_RESTORE_RECONCILING.store(0, Ordering::Release);
+    result
+}
+
+async fn offline_name_restore_loop(state: SharedState) {
+    loop {
+        sleep(Duration::from_secs(OFFLINE_RESTORE_POLL_SECS)).await;
+        let _ = reconcile_offline_name_restores(&state, None).await;
+    }
+}
+
 fn normalize_offline_url(url: &str) -> Result<String, String> {
     let url = url.trim();
     if url.is_empty() {
@@ -11343,15 +12588,66 @@ async fn create_offline_task(
     url: String,
     parent_id: String,
     new_name: Option<String>,
+    restore_name: Option<String>,
     file_indexes: Option<Vec<u64>>,
 ) -> Result<Value, String> {
+    let source = normalize_offline_url(&url)?;
+    let (token, device_id) = auth_context(&state)?;
+    let db_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    let should_obfuscate = offline_filename_obfuscation_enabled(&db_path)?
+        && (source.to_ascii_lowercase().starts_with("magnet:")
+            || source.to_ascii_lowercase().starts_with("ed2k://"));
+    let requested_name = new_name.as_deref().unwrap_or_default().trim();
+    let mut original_name = requested_name.to_string();
+    if should_obfuscate && original_name.is_empty() {
+        original_name = restore_name
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+    }
+    if should_obfuscate && original_name.is_empty() {
+        original_name = offline_source_name(&source);
+    }
+    if should_obfuscate && original_name.is_empty() {
+        let resolved = api_post(
+            &token,
+            &device_id,
+            "/cloudcollection/v1/resolve_res",
+            offline_resolve_request(&source)?,
+            &[],
+        )
+        .await?
+        .data
+        .unwrap_or_else(|| json!({}));
+        original_name = offline_resolved_name(&resolved);
+    }
+    if should_obfuscate {
+        original_name = normalize_remote_name(&original_name)
+            .map_err(|_| "待恢复文件名格式无效".to_string())?;
+    }
+    let temporary_name = should_obfuscate
+        .then(|| offline_temporary_name(&original_name, &source))
+        .unwrap_or_default();
+    let submitted_source = if should_obfuscate {
+        protected_offline_source(&source, &temporary_name)
+    } else {
+        source.clone()
+    };
     let request = offline_task_request(
-        &url,
+        &submitted_source,
         &parent_id,
-        new_name.as_deref().unwrap_or_default(),
+        if should_obfuscate {
+            &temporary_name
+        } else {
+            requested_name
+        },
         file_indexes.as_deref(),
     )?;
-    let (token, device_id) = auth_context(&state)?;
     let response = api_post(
         &token,
         &device_id,
@@ -11360,7 +12656,20 @@ async fn create_offline_task(
         &[],
     )
     .await?;
-    response.data.ok_or_else(|| "光鸭没有返回离线任务".into())
+    let mut data = response
+        .data
+        .ok_or_else(|| "光鸭没有返回离线任务".to_string())?;
+    if should_obfuscate {
+        let task_id = operation_task_id(&data).ok_or_else(|| {
+            "离线任务已提交，但光鸭没有返回 taskId，无法自动恢复文件名".to_string()
+        })?;
+        save_offline_name_restore(&db_path, &task_id, &original_name, &temporary_name)?;
+        if let Some(object) = data.as_object_mut() {
+            object.insert("nameRestoreStatus".to_string(), json!("pending"));
+            object.insert("originalName".to_string(), json!(original_name));
+        }
+    }
+    Ok(data)
 }
 
 #[tauri::command]
@@ -11381,7 +12690,11 @@ async fn list_offline_tasks(
         &[],
     )
     .await?;
-    Ok(response.data.unwrap_or_else(|| json!({ "list": [] })))
+    reconcile_offline_name_restores(
+        state.inner(),
+        Some(response.data.unwrap_or_else(|| json!({ "list": [] }))),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -11408,7 +12721,8 @@ async fn delete_offline_task_records(
     state: &tauri::State<'_, SharedState>,
     task_ids: &[String],
 ) -> Result<Value, String> {
-    let request = offline_task_ids_request(task_ids)?;
+    let normalized_task_ids = normalize_id_list(task_ids, "离线任务")?;
+    let request = json!({ "taskIds": &normalized_task_ids });
     let (token, device_id) = auth_context(state)?;
     let response = api_post(
         &token,
@@ -11418,6 +12732,12 @@ async fn delete_offline_task_records(
         &[],
     )
     .await?;
+    let db_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    remove_offline_name_restores(&db_path, &normalized_task_ids)?;
     Ok(response.data.unwrap_or_else(|| json!({})))
 }
 
@@ -13056,6 +14376,263 @@ fn list_developer_transfers(
     Ok(json!({ "list": list_developer_transfer_jobs(&database_path, limit)? }))
 }
 
+fn developer_name_mutation_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn developer_temporary_name(original_name: &str, folder: bool) -> String {
+    let extension = if folder {
+        String::new()
+    } else {
+        Path::new(original_name)
+            .extension()
+            .and_then(|value| value.to_str())
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 16
+                    && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+            .map(|value| format!(".{value}"))
+            .unwrap_or_default()
+    };
+    format!(
+        "gy_{}{}",
+        &Uuid::new_v4().simple().to_string()[..20],
+        extension
+    )
+}
+
+async fn acquire_developer_name_obfuscation(
+    app: &tauri::AppHandle,
+    database_path: &Path,
+    token: &str,
+    device_id: &str,
+    job: &DeveloperTransferJob,
+) -> Result<usize, String> {
+    let _mutation_guard = developer_name_mutation_lock().lock().await;
+    let (entries, _, _) =
+        collect_cloud_selection_entries(token, device_id, &job.file_ids, &job.file_names, true)
+            .await?;
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let now = unix_timestamp();
+    let pending = {
+        let mut connection = open_database(database_path)?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("开始保存预审文件名失败：{error}"))?;
+        let mut pending = Vec::new();
+        for entry in &entries {
+            let own = transaction
+                .query_row(
+                    "SELECT original_name, temporary_name
+                     FROM developer_transfer_name_restores
+                     WHERE job_id = ?1 AND file_id = ?2",
+                    params![job.id, entry.file_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(|error| format!("读取预审文件名记录失败：{error}"))?;
+            let shared = if own.is_some() {
+                None
+            } else {
+                transaction
+                    .query_row(
+                        "SELECT original_name, temporary_name
+                         FROM developer_transfer_name_restores
+                         WHERE file_id = ?1 AND status = 'active'
+                         ORDER BY created_at LIMIT 1",
+                        params![entry.file_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()
+                    .map_err(|error| format!("读取并发预审文件名记录失败：{error}"))?
+            };
+            let existing = own.or(shared);
+            let original_name = existing
+                .as_ref()
+                .map(|value| value.0.clone())
+                .unwrap_or_else(|| entry.name.clone());
+            let temporary_name = existing
+                .as_ref()
+                .map(|value| value.1.clone())
+                .unwrap_or_else(|| developer_temporary_name(&original_name, entry.folder));
+            transaction
+                .execute(
+                    "INSERT INTO developer_transfer_name_restores
+                       (job_id, file_id, original_name, temporary_name, status,
+                        last_error, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, 'active', NULL, ?5, ?5)
+                     ON CONFLICT(job_id, file_id) DO UPDATE SET
+                       status = 'active', last_error = NULL, updated_at = excluded.updated_at",
+                    params![job.id, entry.file_id, original_name, temporary_name, now],
+                )
+                .map_err(|error| format!("保存预审文件名记录失败：{error}"))?;
+            if existing.is_none() {
+                pending.push((entry.file_id.clone(), temporary_name));
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("提交预审文件名记录失败：{error}"))?;
+        pending
+    };
+    update_and_emit_developer_job(app, database_path, &job.id, |current| {
+        current.status = "auditing".to_string();
+        current.phase = "obfuscating".to_string();
+        current.message = Some(format!(
+            "正在并发混淆 {} 个源文件名，随后开始预审",
+            entries.len()
+        ));
+    })?;
+    let outcomes = stream::iter(pending.into_iter())
+        .map(|(file_id, temporary_name)| {
+            let token = token.to_string();
+            let device_id = device_id.to_string();
+            async move { rename_remote(&token, &device_id, &file_id, &temporary_name).await }
+        })
+        .buffer_unordered(8)
+        .collect::<Vec<_>>()
+        .await;
+    if let Some(error) = outcomes.into_iter().find_map(Result::err) {
+        return Err(format!("预审前混淆源文件名失败：{error}"));
+    }
+    Ok(entries.len())
+}
+
+async fn release_developer_name_obfuscation(
+    database_path: &Path,
+    token: &str,
+    device_id: &str,
+    job_id: &str,
+) -> Result<(usize, usize, usize), String> {
+    let _mutation_guard = developer_name_mutation_lock().lock().await;
+    let (restorable, deferred) = {
+        let connection = open_database(database_path)?;
+        let rows = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT file_id, original_name
+                     FROM developer_transfer_name_restores
+                     WHERE job_id = ?1 AND status IN ('active', 'released', 'restore_failed')",
+                )
+                .map_err(|error| format!("读取待恢复预审文件名失败：{error}"))?;
+            let mapped = statement
+                .query_map(params![job_id], |row| {
+                    Ok(DeveloperNameRestore {
+                        file_id: row.get(0)?,
+                        original_name: row.get(1)?,
+                    })
+                })
+                .map_err(|error| format!("读取待恢复预审文件名失败：{error}"))?;
+            let rows = mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("解析待恢复预审文件名失败：{error}"))?;
+            rows
+        };
+        if rows.is_empty() {
+            return Ok((0, 0, 0));
+        }
+        connection
+            .execute(
+                "UPDATE developer_transfer_name_restores
+                 SET status = 'released', updated_at = ?2
+                 WHERE job_id = ?1 AND status = 'active'",
+                params![job_id, unix_timestamp()],
+            )
+            .map_err(|error| format!("释放预审文件名记录失败：{error}"))?;
+        let mut restorable = Vec::new();
+        let mut deferred = 0_usize;
+        for row in rows {
+            let active = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM developer_transfer_name_restores
+                     WHERE file_id = ?1 AND status = 'active'",
+                    params![row.file_id],
+                    |result| result.get::<_, i64>(0),
+                )
+                .map_err(|error| format!("检查并发预审文件名失败：{error}"))?;
+            if active > 0 {
+                deferred += 1;
+            } else {
+                restorable.push(row);
+            }
+        }
+        (restorable, deferred)
+    };
+    let outcomes = stream::iter(restorable.into_iter())
+        .map(|row| {
+            let token = token.to_string();
+            let device_id = device_id.to_string();
+            async move {
+                let current_name = cloud_selection_entry_detail(
+                    &token,
+                    &device_id,
+                    &row.file_id,
+                    &row.original_name,
+                )
+                .await
+                .ok()
+                .map(|entry| entry.name)
+                .unwrap_or_default();
+                let result = if current_name == row.original_name {
+                    Ok(())
+                } else {
+                    rename_remote(&token, &device_id, &row.file_id, &row.original_name).await
+                };
+                (row, result)
+            }
+        })
+        .buffer_unordered(8)
+        .collect::<Vec<_>>()
+        .await;
+    let connection = open_database(database_path)?;
+    let mut restored = 0_usize;
+    let mut failed = 0_usize;
+    for (row, outcome) in outcomes {
+        match outcome {
+            Ok(()) => {
+                restored += 1;
+                connection
+                    .execute(
+                        "UPDATE developer_transfer_name_restores
+                         SET status = 'completed', last_error = NULL, updated_at = ?2
+                         WHERE file_id = ?1 AND status <> 'active'",
+                        params![row.file_id, unix_timestamp()],
+                    )
+                    .map_err(|error| format!("完成预审文件名恢复失败：{error}"))?;
+            }
+            Err(error) => {
+                failed += 1;
+                connection
+                    .execute(
+                        "UPDATE developer_transfer_name_restores
+                         SET status = 'restore_failed', last_error = ?2, updated_at = ?3
+                         WHERE file_id = ?1 AND status <> 'active'",
+                        params![
+                            row.file_id,
+                            error.chars().take(500).collect::<String>(),
+                            unix_timestamp()
+                        ],
+                    )
+                    .map_err(|database_error| {
+                        format!("保存预审文件名恢复错误失败：{database_error}")
+                    })?;
+            }
+        }
+    }
+    connection
+        .execute(
+            "DELETE FROM developer_transfer_name_restores
+             WHERE status = 'completed' AND updated_at < ?1",
+            params![unix_timestamp() - 30 * 86_400],
+        )
+        .map_err(|error| format!("清理预审文件名记录失败：{error}"))?;
+    Ok((restored, deferred, failed))
+}
+
 #[tauri::command]
 async fn test_developer_credentials(
     state: tauri::State<'_, SharedState>,
@@ -13440,6 +15017,37 @@ async fn run_developer_transfer_job(app: tauri::AppHandle, state: SharedState, j
                 })
             }
             Err(error) if error.code == Some(18011) => {
+                let (business_token, device_id) = state
+                    .lock()
+                    .map_err(|lock_error| DeveloperApiError {
+                        message: format!("读取登录态失败：{lock_error}"),
+                        code: None,
+                        retryable: false,
+                    })
+                    .and_then(|guard| {
+                        guard
+                            .token
+                            .clone()
+                            .map(|token| (token, guard.device_id.clone()))
+                            .ok_or_else(|| DeveloperApiError {
+                                message: "预审混淆文件名需要先登录光鸭云盘".to_string(),
+                                code: None,
+                                retryable: false,
+                            })
+                    })?;
+                acquire_developer_name_obfuscation(
+                    &app,
+                    &database_path,
+                    &business_token,
+                    &device_id,
+                    &job,
+                )
+                .await
+                .map_err(|message| DeveloperApiError {
+                    message,
+                    code: None,
+                    retryable: false,
+                })?;
                 let payload = developer_post_with_retry(
                     &client_id,
                     &client_secret,
@@ -13479,13 +15087,76 @@ async fn run_developer_transfer_job(app: tauri::AppHandle, state: SharedState, j
         }
     }
     .await;
-    if let Err(error) = result {
+    if let Err(ref error) = result {
         let _ = update_and_emit_developer_job(&app, &database_path, &job_id, |job| {
             job.status = "failed".to_string();
             job.phase = "failed".to_string();
             job.error_code = error.code;
             job.message = Some(error.message.clone());
         });
+    }
+    let has_restores = open_database(&database_path)
+        .and_then(|connection| {
+            connection
+                .query_row(
+                    "SELECT 1 FROM developer_transfer_name_restores
+                     WHERE job_id = ?1 AND status IN ('active', 'released', 'restore_failed')
+                     LIMIT 1",
+                    params![job_id],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map(|value| value.unwrap_or(false))
+                .map_err(|error| format!("检查待恢复预审文件名失败：{error}"))
+        })
+        .unwrap_or(false);
+    if has_restores {
+        let auth = state.lock().ok().and_then(|guard| {
+            guard
+                .token
+                .clone()
+                .map(|token| (token, guard.device_id.clone()))
+        });
+        let restore_result = match auth {
+            Some((token, device_id)) => {
+                release_developer_name_obfuscation(&database_path, &token, &device_id, &job_id)
+                    .await
+            }
+            None => Err("登录态不可用，源文件名将在下次登录后继续恢复".to_string()),
+        };
+        match restore_result {
+            Ok((_restored, _, failed)) if failed > 0 => {
+                let _ = update_and_emit_developer_job(&app, &database_path, &job_id, |job| {
+                    job.message = Some(format!(
+                        "{}；{failed} 个源文件名恢复失败，请稍后重试",
+                        job.message
+                            .clone()
+                            .unwrap_or_else(|| "小号互传已结束".to_string())
+                    ));
+                });
+            }
+            Ok((restored, _, 0)) if restored > 0 => {
+                let _ = update_and_emit_developer_job(&app, &database_path, &job_id, |job| {
+                    job.message = Some(format!(
+                        "{}，源文件名已恢复",
+                        job.message
+                            .clone()
+                            .unwrap_or_else(|| "小号互传已结束".to_string())
+                    ));
+                });
+            }
+            Err(error) => {
+                let _ = update_and_emit_developer_job(&app, &database_path, &job_id, |job| {
+                    job.message = Some(format!(
+                        "{}；{error}",
+                        job.message
+                            .clone()
+                            .unwrap_or_else(|| "小号互传已结束".to_string())
+                    ));
+                });
+            }
+            _ => {}
+        }
     }
     if let Ok(mut guard) = state.lock() {
         guard.developer_transfer_running.remove(&job_id);
@@ -13536,7 +15207,44 @@ fn resume_developer_transfer_jobs(app: tauri::AppHandle, state: SharedState) -> 
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("解析未完成小号互传任务失败：{error}"))?;
     drop(statement);
+    let mut restore_statement = connection
+        .prepare(
+            "SELECT DISTINCT restores.job_id
+             FROM developer_transfer_name_restores AS restores
+             JOIN developer_transfer_jobs AS jobs ON jobs.id = restores.job_id
+             WHERE restores.status IN ('active', 'released', 'restore_failed')
+               AND jobs.status IN ('success', 'failed')",
+        )
+        .map_err(|error| format!("读取待恢复预审文件名失败：{error}"))?;
+    let restore_ids = restore_statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("读取待恢复预审文件名失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析待恢复预审文件名失败：{error}"))?;
+    drop(restore_statement);
     drop(connection);
+    let auth = state.lock().ok().and_then(|guard| {
+        guard
+            .token
+            .clone()
+            .map(|token| (token, guard.device_id.clone()))
+    });
+    if let Some((token, device_id)) = auth {
+        for restore_id in restore_ids {
+            let database_path = database_path.clone();
+            let token = token.clone();
+            let device_id = device_id.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = release_developer_name_obfuscation(
+                    &database_path,
+                    &token,
+                    &device_id,
+                    &restore_id,
+                )
+                .await;
+            });
+        }
+    }
     for id in ids {
         spawn_developer_transfer_job(app.clone(), state.clone(), id);
     }
@@ -13552,17 +15260,35 @@ async fn start_developer_transfer(
     file_names: Option<Vec<String>>,
 ) -> Result<DeveloperTransferJob, String> {
     let target_id = normalize_api_id(&target_id, "小号配置 ID")?;
-    let mut file_ids = normalize_id_list(&file_ids, "文件或文件夹")?;
+    let file_ids = normalize_id_list(&file_ids, "文件或文件夹")?;
     if file_ids.len() > 20 {
         return Err("开发者接口一次最多互传 20 项".to_string());
     }
     ensure_developer_mode_for_current_account(&state, file_ids.first().map(String::as_str)).await?;
-    file_ids.sort();
-    let file_names = file_names
+    let normalized_names = file_names
         .unwrap_or_default()
         .into_iter()
         .take(file_ids.len())
         .map(|value| value.chars().take(255).collect::<String>())
+        .collect::<Vec<_>>();
+    let mut pairs = file_ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, file_id)| {
+            (
+                file_id,
+                normalized_names.get(index).cloned().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    pairs.sort_by(|left, right| left.0.cmp(&right.0));
+    let file_ids = pairs
+        .iter()
+        .map(|(file_id, _)| file_id.clone())
+        .collect::<Vec<_>>();
+    let file_names = pairs
+        .into_iter()
+        .map(|(_, file_name)| file_name)
         .collect::<Vec<_>>();
     let database_path = state
         .lock()
@@ -13607,7 +15333,7 @@ async fn start_developer_transfer(
             "INSERT INTO developer_transfer_jobs
                (id, target_id, target_name, file_ids_json, file_names_json,
                 status, phase, total_count, message, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', 'queued', ?6, ?7, ?8, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, 'direct', 'direct', ?6, ?7, ?8, ?8)",
             params![
                 id,
                 target_id,
@@ -13615,7 +15341,7 @@ async fn start_developer_transfer(
                 file_ids_json,
                 serde_json::to_string(&file_names).map_err(|error| error.to_string())?,
                 file_ids.len() as i64,
-                "已加入小号互传队列",
+                "正在并发启动小号秒传",
                 now,
             ],
         )
@@ -14290,6 +16016,7 @@ fn run() {
             ));
             tauri::async_runtime::spawn(auto_share_loop(app_handle.clone(), state.clone()));
             tauri::async_runtime::spawn(token_refresh_loop(app_handle.clone(), state.clone()));
+            tauri::async_runtime::spawn(offline_name_restore_loop(state.clone()));
             tauri::async_runtime::spawn(virtual_library_refresh_loop(
                 app_handle.clone(),
                 state.clone(),
@@ -14330,6 +16057,7 @@ fn run() {
             create_folder,
             get_file_detail,
             list_recent_actions,
+            export_gcid_json,
             select_gcid_import_file,
             stage_gcid_import_text,
             prepare_gcid_import,
@@ -14372,6 +16100,8 @@ fn run() {
             cancel_offline_tasks,
             retry_offline_tasks,
             get_offline_statistics,
+            get_offline_settings,
+            update_offline_settings,
             save_share_link,
             remove_share_link,
             open_login,
@@ -15447,34 +17177,39 @@ mod tests {
     }
 
     #[test]
-    fn file_gcid_cache_is_reused_only_for_an_unchanged_file_stamp() {
+    fn file_hash_cache_is_reused_only_for_an_unchanged_file_stamp() {
         let root = std::env::temp_dir().join(format!("guangya-gcid-cache-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("create gcid cache test root");
         let database = root.join("state.sqlite3");
         let file = root.join("movie.mkv");
         init_database(&database).expect("initialize gcid cache database");
         fs::write(&file, b"fixture").expect("write gcid fixture");
-        let gcid = "0123456789ABCDEF0123456789ABCDEF01234567";
+        let hashes = FileHashes {
+            gcid: "0123456789ABCDEF0123456789ABCDEF01234567".to_string(),
+            cid: "89ABCDEF0123456789ABCDEF0123456789ABCDEF".to_string(),
+        };
         let policy = CacheSettings {
             enabled: true,
             max_entries: DEFAULT_CACHE_MAX_ENTRIES,
         };
 
         assert_eq!(
-            load_cached_file_gcid(&database, &file, 7, 100, policy).expect("load empty cache"),
+            load_cached_file_hashes(&database, &file, 7, 100, policy).expect("load empty cache"),
             None
         );
-        save_cached_file_gcid(&database, &file, 7, 100, gcid, policy).expect("save gcid cache");
+        save_cached_file_hashes(&database, &file, 7, 100, &hashes, policy)
+            .expect("save hash cache");
         assert_eq!(
-            load_cached_file_gcid(&database, &file, 7, 100, policy).expect("load cached gcid"),
-            Some(gcid.to_string())
+            load_cached_file_hashes(&database, &file, 7, 100, policy).expect("load cached hashes"),
+            Some(hashes.clone())
         );
         assert_eq!(
-            load_cached_file_gcid(&database, &file, 7, 101, policy).expect("reject changed mtime"),
+            load_cached_file_hashes(&database, &file, 7, 101, policy)
+                .expect("reject changed mtime"),
             None
         );
         assert_eq!(
-            load_cached_file_gcid(&database, &file, 8, 100, policy).expect("reject changed size"),
+            load_cached_file_hashes(&database, &file, 8, 100, policy).expect("reject changed size"),
             None
         );
 
@@ -15492,14 +17227,18 @@ mod tests {
             enabled: true,
             max_entries: MIN_CACHE_MAX_ENTRIES,
         };
+        let hashes = FileHashes {
+            gcid: "0123456789ABCDEF0123456789ABCDEF01234567".to_string(),
+            cid: "89ABCDEF0123456789ABCDEF0123456789ABCDEF".to_string(),
+        };
 
         for index in 0..105_u64 {
-            save_cached_file_gcid(
+            save_cached_file_hashes(
                 &database,
                 &root.join(format!("cached-{index}.bin")),
                 index + 1,
                 u128::from(index),
-                "0123456789ABCDEF0123456789ABCDEF01234567",
+                &hashes,
                 enabled,
             )
             .expect("save bounded fingerprint");
@@ -15529,17 +17268,10 @@ mod tests {
             max_entries: MIN_CACHE_MAX_ENTRIES,
         };
         let disabled_path = root.join("disabled.bin");
-        save_cached_file_gcid(
-            &database,
-            &disabled_path,
-            1,
-            1,
-            "89ABCDEF0123456789ABCDEF0123456789ABCDEF",
-            disabled,
-        )
-        .expect("disabled cache write is a no-op");
+        save_cached_file_hashes(&database, &disabled_path, 1, 1, &hashes, disabled)
+            .expect("disabled cache write is a no-op");
         assert!(
-            load_cached_file_gcid(&database, &disabled_path, 1, 1, disabled)
+            load_cached_file_hashes(&database, &disabled_path, 1, 1, disabled)
                 .expect("disabled cache read is a no-op")
                 .is_none()
         );
@@ -15592,15 +17324,12 @@ mod tests {
             enabled: true,
             max_entries: DEFAULT_CACHE_MAX_ENTRIES,
         };
-        save_cached_file_gcid(
-            &database,
-            &file,
-            7,
-            100,
-            "0123456789ABCDEF0123456789ABCDEF01234567",
-            policy,
-        )
-        .expect("save fingerprint cache");
+        let hashes = FileHashes {
+            gcid: "0123456789ABCDEF0123456789ABCDEF01234567".to_string(),
+            cid: "89ABCDEF0123456789ABCDEF0123456789ABCDEF".to_string(),
+        };
+        save_cached_file_hashes(&database, &file, 7, 100, &hashes, policy)
+            .expect("save fingerprint cache");
         let upload = UploadItem {
             mapping_id: "mapping-cache-test".to_string(),
             file_path: file.clone(),
@@ -15641,7 +17370,7 @@ mod tests {
             HashMap::from([(String::new(), String::new())])
         );
         assert!(file.exists());
-        assert!(load_cached_file_gcid(&database, &file, 7, 100, policy)
+        assert!(load_cached_file_hashes(&database, &file, 7, 100, policy)
             .expect("read cleared fingerprint")
             .is_none());
         assert!(load_upload_history(&database)
@@ -15948,6 +17677,63 @@ mod tests {
             preferred_oss_endpoint(&token).as_deref(),
             Some("https://bucket.oss-cn.example.com")
         );
+    }
+
+    #[test]
+    fn offline_name_obfuscation_preserves_extension_and_persists_restore_state() {
+        assert_eq!(
+            ed2k_file_name("ed2k://|file|Original%20Movie.mkv|1|ABC|/"),
+            "Original Movie.mkv"
+        );
+        let temporary = offline_temporary_name(
+            "Original Movie.mkv",
+            "ed2k://|file|Original%20Movie.mkv|1|ABC|/",
+        );
+        assert!(temporary.starts_with("gy_"));
+        assert!(temporary.ends_with(".mkv"));
+        assert_eq!(temporary.len(), 27);
+        let magnet_temporary = offline_temporary_name(
+            "Original Magnet Folder",
+            "magnet:?xt=urn:btih:0123456789ABCDEF0123456789ABCDEF01234567",
+        );
+        assert!(magnet_temporary.starts_with("gy_"));
+        assert_eq!(magnet_temporary.len(), 23);
+        assert!(!magnet_temporary.contains('.'));
+        let magnet_source = "magnet:?xt=urn:btih:0123456789ABCDEF0123456789ABCDEF01234567&dn=Original%20Magnet+Folder&xl=1024";
+        assert_eq!(magnet_display_name(magnet_source), "Original Magnet Folder");
+        assert_eq!(offline_source_name(magnet_source), "Original Magnet Folder");
+        assert_eq!(
+            protected_offline_source(magnet_source, &magnet_temporary),
+            "magnet:?xt=urn:btih:0123456789ABCDEF0123456789ABCDEF01234567&xl=1024"
+        );
+        assert_eq!(
+            protected_offline_source("ed2k://|file|Original%20Movie.mkv|1|ABC|/", &temporary),
+            format!("ed2k://|file|{temporary}|1|ABC|/")
+        );
+        assert_eq!(
+            offline_resolved_name(&json!({
+                "resType": 3,
+                "emuleResInfo": { "fileName": "Original Movie.mkv" }
+            })),
+            "Original Movie.mkv"
+        );
+
+        let directory = std::env::temp_dir().join(format!(
+            "guangya-offline-restore-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let database = directory.join("state.sqlite3");
+        init_database(&database).expect("initialize offline restore database");
+        assert!(!offline_filename_obfuscation_enabled(&database).unwrap());
+        save_app_state(&database, "offline_filename_obfuscation", "true").unwrap();
+        assert!(offline_filename_obfuscation_enabled(&database).unwrap());
+        save_offline_name_restore(&database, "task-1", "Original Movie.mkv", &temporary).unwrap();
+        let settings = offline_settings_for_path(&database).unwrap();
+        assert!(settings.filename_obfuscation_enabled);
+        assert_eq!(settings.pending_restores, 1);
+        remove_offline_name_restores(&database, &["task-1".to_string()]).unwrap();
+        assert_eq!(pending_offline_name_restore_count(&database).unwrap(), 0);
+        fs::remove_dir_all(directory).expect("remove offline restore test directory");
     }
 
     #[test]
@@ -16303,11 +18089,173 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_adds_cid_to_legacy_flash_fingerprint_tables() {
+        let root =
+            std::env::temp_dir().join(format!("guangya-cid-migration-test-{}", Uuid::new_v4()));
+        let database = root.join("state.sqlite3");
+        let file = root.join("movie.mkv");
+        fs::create_dir_all(&root).expect("migration directory");
+        let connection = open_database(&database).expect("legacy database");
+        connection
+            .execute_batch(
+                "CREATE TABLE file_fingerprints (
+                   file_path TEXT NOT NULL,
+                   size INTEGER NOT NULL,
+                   modified_ms TEXT NOT NULL,
+                   gcid TEXT NOT NULL,
+                   computed_at INTEGER NOT NULL,
+                   PRIMARY KEY (file_path, size, modified_ms)
+                 );
+                 CREATE TABLE gcid_import_files (
+                   job_id TEXT NOT NULL,
+                   path TEXT NOT NULL,
+                   folder_path TEXT NOT NULL,
+                   file_name TEXT NOT NULL,
+                   file_size INTEGER NOT NULL,
+                   gcid TEXT NOT NULL,
+                   status TEXT NOT NULL DEFAULT 'pending',
+                   attempts INTEGER NOT NULL DEFAULT 0,
+                   task_id TEXT,
+                   file_id TEXT,
+                   error TEXT,
+                   updated_at INTEGER NOT NULL,
+                   PRIMARY KEY (job_id, path)
+                 );",
+            )
+            .expect("legacy hash tables");
+        connection
+            .execute(
+                "INSERT INTO file_fingerprints
+                   (file_path, size, modified_ms, gcid, computed_at)
+                 VALUES (?1, 7, '100', ?2, 1)",
+                params![
+                    file.to_string_lossy().as_ref(),
+                    "0123456789ABCDEF0123456789ABCDEF01234567"
+                ],
+            )
+            .expect("legacy fingerprint row");
+        drop(connection);
+
+        init_database(&database).expect("legacy hash tables should migrate");
+        let connection = open_database(&database).expect("migrated database");
+        for table in ["file_fingerprints", "gcid_import_files"] {
+            let mut statement = connection
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .expect("table info");
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("column query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("columns");
+            assert!(columns.iter().any(|column| column == "cid"));
+        }
+        drop(connection);
+        let policy = CacheSettings {
+            enabled: true,
+            max_entries: DEFAULT_CACHE_MAX_ENTRIES,
+        };
+        assert!(load_cached_file_hashes(&database, &file, 7, 100, policy)
+            .expect("legacy row should remain readable")
+            .is_none());
+        let hashes = FileHashes {
+            gcid: "0123456789ABCDEF0123456789ABCDEF01234567".to_string(),
+            cid: "89ABCDEF0123456789ABCDEF0123456789ABCDEF".to_string(),
+        };
+        save_cached_file_hashes(&database, &file, 7, 100, &hashes, policy)
+            .expect("migrated cache should accept CID");
+        assert_eq!(
+            load_cached_file_hashes(&database, &file, 7, 100, policy).expect("migrated hashes"),
+            Some(hashes)
+        );
+        fs::remove_dir_all(root).expect("migration fixture cleanup");
+    }
+
+    #[test]
+    fn guangya_gcid_and_cid_match_the_current_web_uploader_algorithm() {
+        let content = (0..600_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let ranges = cid_byte_ranges(content.len() as u64);
+        let mut gcid_hasher = Sha1::new();
+        let mut cid_hasher = Sha1::new();
+        let mut position = 0_u64;
+        let mut sampled = 0_u64;
+        for chunk in content.chunks(gcid_chunk_size(content.len() as u64)) {
+            gcid_hasher.update(Sha1::digest(chunk));
+            sampled += update_cid_hasher(&mut cid_hasher, &ranges, position, chunk)
+                .expect("CID sample should be valid");
+            position += chunk.len() as u64;
+        }
+        assert_eq!(sampled, 60 * 1024);
+        assert_eq!(
+            hex::encode_upper(gcid_hasher.finalize()),
+            "3FC0617C331816DA4EE9C19C6F532F2D6D4FD6CC"
+        );
+        assert_eq!(
+            hex::encode_upper(cid_hasher.finalize()),
+            "ECDDF55803ED503C4DF219A5C9C847860A438CB8"
+        );
+    }
+
+    #[test]
+    fn streamed_guangya_hashes_ignore_network_chunk_boundaries() {
+        let content = (0..900_123)
+            .map(|index| ((index * 17) % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut accumulator = FlashHashAccumulator::new(content.len() as u64);
+        let mut offset = 0_usize;
+        for requested in [1_usize, 31_337, 262_143, 7, 400_001, 99_999, content.len()] {
+            if offset >= content.len() {
+                break;
+            }
+            let end = offset.saturating_add(requested).min(content.len());
+            accumulator
+                .update(&content[offset..end])
+                .expect("stream chunk should hash");
+            offset = end;
+        }
+        if offset < content.len() {
+            accumulator
+                .update(&content[offset..])
+                .expect("remaining stream chunk should hash");
+        }
+        let streamed = accumulator.finish().expect("stream should finish");
+
+        let mut gcid = Sha1::new();
+        let mut cid = Sha1::new();
+        let ranges = cid_byte_ranges(content.len() as u64);
+        let mut position = 0_u64;
+        for chunk in content.chunks(gcid_chunk_size(content.len() as u64)) {
+            gcid.update(Sha1::digest(chunk));
+            update_cid_hasher(&mut cid, &ranges, position, chunk).expect("CID sample");
+            position += chunk.len() as u64;
+        }
+        assert_eq!(streamed.gcid, hex::encode_upper(gcid.finalize()));
+        assert_eq!(streamed.cid, hex::encode_upper(cid.finalize()));
+    }
+
+    #[test]
+    fn developer_pre_audit_names_are_random_and_keep_safe_file_extensions() {
+        let first = developer_temporary_name("电影.2026.mkv", false);
+        let second = developer_temporary_name("电影.2026.mkv", false);
+        assert!(first.starts_with("gy_"));
+        assert!(first.ends_with(".mkv"));
+        assert_ne!(first, second);
+        assert!(!developer_temporary_name("资料.目录", true).ends_with(".目录"));
+    }
+
+    #[test]
+    fn generated_export_size_matches_the_reference_json_format() {
+        assert_eq!(format_export_bytes(889_837_161_511), "828.73 GB");
+    }
+
+    #[test]
     fn gcid_export_parser_accepts_numbers_and_strings() {
         let raw = br#"{
           "source": "guangya",
           "hashType": "gcid",
           "usesGcidInExport": true,
+          "usesCidInExport": true,
           "commonPath": "H:/Media",
           "totalFilesCount": 2,
           "totalSize": "30",
@@ -16315,12 +18263,14 @@ mod tests {
             {
               "path": "Movies/Film.mkv",
               "size": 10,
-              "gcid": "0123456789ABCDEF0123456789ABCDEF01234567"
+              "gcid": "0123456789ABCDEF0123456789ABCDEF01234567",
+              "cid": "89ABCDEF0123456789ABCDEF0123456789ABCDEF"
             },
             {
               "path": "Shows\\Episode.mkv",
               "size": "20",
-              "gcid": "89abcdef0123456789abcdef0123456789abcdef"
+              "gcid": "89abcdef0123456789abcdef0123456789abcdef",
+              "cid": "0123456789abcdef0123456789abcdef01234567"
             }
           ]
         }"#;
@@ -16330,6 +18280,7 @@ mod tests {
         assert_eq!(files[0].folder_path, "Movies");
         assert_eq!(files[0].name, "Film.mkv");
         assert_eq!(files[0].gcid, "0123456789ABCDEF0123456789ABCDEF01234567");
+        assert_eq!(files[0].cid, "89ABCDEF0123456789ABCDEF0123456789ABCDEF");
         assert_eq!(files[1].path, "Shows/Episode.mkv");
         assert_eq!(total_size, 30);
         assert_eq!(common_path, "H:/Media");
@@ -16341,10 +18292,12 @@ mod tests {
           "source": "guangya",
           "hashType": "gcid",
           "usesGcidInExport": true,
+          "usesCidInExport": true,
           "files": [{
             "path": "../secret.mkv",
             "size": 1,
-            "gcid": "0123456789abcdef0123456789abcdef01234567"
+            "gcid": "0123456789abcdef0123456789abcdef01234567",
+            "cid": "89abcdef0123456789abcdef0123456789abcdef"
           }]
         }"#;
         assert!(parse_gcid_export(unsafe_raw)
@@ -16355,16 +18308,19 @@ mod tests {
           "source": "guangya",
           "hashType": "gcid",
           "usesGcidInExport": true,
+          "usesCidInExport": true,
           "files": [
             {
               "path": "Movies/Film.mkv",
               "size": 1,
-              "gcid": "0123456789abcdef0123456789abcdef01234567"
+              "gcid": "0123456789abcdef0123456789abcdef01234567",
+              "cid": "89abcdef0123456789abcdef0123456789abcdef"
             },
             {
               "path": "Movies\\Film.mkv",
               "size": 1,
-              "gcid": "89abcdef0123456789abcdef0123456789abcdef"
+              "gcid": "89abcdef0123456789abcdef0123456789abcdef",
+              "cid": "0123456789abcdef0123456789abcdef01234567"
             }
           ]
         }"#;
@@ -16395,12 +18351,14 @@ mod tests {
           "source": "guangya",
           "hashType": "gcid",
           "usesGcidInExport": true,
+          "usesCidInExport": true,
           "totalFilesCount": 1,
           "totalSize": 10,
           "files": [{
             "path": "Movies/Film.mkv",
             "size": 10,
-            "gcid": "0123456789abcdef0123456789abcdef01234567"
+            "gcid": "0123456789abcdef0123456789abcdef01234567",
+            "cid": "89abcdef0123456789abcdef0123456789abcdef"
           }]
         }"#;
         let job_id = prepare_gcid_import_database(&database, raw, &source, "", "Media Library")

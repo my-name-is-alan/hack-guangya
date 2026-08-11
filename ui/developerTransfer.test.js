@@ -49,6 +49,7 @@ test('developer transfer is wired through the active UI and both runtime bridges
     'delete_developer_target',
     'list_developer_transfers',
     'start_developer_transfer',
+    'export_gcid_json',
   ]) {
     assert.match(bridge, new RegExp(`command === '${command}'`));
     assert.match(rust, new RegExp(`\\b${command}\\b`));
@@ -56,6 +57,7 @@ test('developer transfer is wired through the active UI and both runtime bridges
 
   assert.match(server, /\/api\/developer\/transfers/);
   assert.match(server, /\/api\/developer\/mode/);
+  assert.match(server, /\/api\/files\/export-gcid/);
   assert.match(server, /apiFileReadWithDeveloperFallback/);
   assert.match(server, /verifyDeveloperAccountOwnership/);
   assert.match(server, /developer_verified_client_id/);
@@ -81,4 +83,45 @@ test('direct upload falls back to pre-audit only for business code 18011', async
   assert.match(rust, /error\.code == Some\(18011\)/);
   assert.match(rust, /"\/developer\/v1\/pre_upload"/);
   assert.match(rust, /"\/developer\/v1\/upload_status"/);
+});
+
+test('pre-audit obfuscates names concurrently and restores them after transfer', async () => {
+  const [server, rust, cloud, selectionBar] = await Promise.all([
+    read('../server/server.mjs'),
+    read('../src-tauri/src/main.rs'),
+    read('./views/CloudView.vue'),
+    read('./components/files/FileSelectionBar.vue'),
+  ]);
+
+  for (const source of [server, rust]) {
+    assert.match(source, /developer_transfer_name_restores/);
+    assert.match(source, /obfuscat/i);
+    assert.match(source, /restore_failed/);
+    assert.match(source, /buffer_unordered\(8\)|mapConcurrent\(pendingRenames, 8/);
+  }
+  assert.ok(server.indexOf('acquireDeveloperNameObfuscation(job)') < server.indexOf("'/developer/v1/pre_upload'", server.indexOf('acquireDeveloperNameObfuscation(job)')));
+  assert.ok(rust.indexOf('acquire_developer_name_obfuscation(') < rust.indexOf('"/developer/v1/pre_upload"', rust.indexOf('Err(error) if error.code == Some(18011)')));
+  assert.match(cloud, /临时混淆所选内容的文件名/);
+  assert.match(selectionBar, /exportGcid/);
+});
+
+test('selected cloud files and folders can export a GCID plus CID JSON with a traffic warning', async () => {
+  const [server, rust, cloud, bridge] = await Promise.all([
+    read('../server/server.mjs'),
+    read('../src-tauri/src/main.rs'),
+    read('./views/CloudView.vue'),
+    read('./bridge.js'),
+  ]);
+
+  assert.match(cloud, /会递归读取所选文件及文件夹内的全部文件/);
+  assert.match(cloud, /大量下行流量/);
+  assert.match(cloud, /export_gcid_json/);
+  assert.match(server, /calculateGuangyaStreamHashes/);
+  assert.match(server, /buffer_unordered|mapConcurrent\(files, 3/);
+  assert.match(server, /guangya-gcid-export-2\.0/);
+  assert.match(server, /entry\.path\.slice\(rootPrefix\.length\)/);
+  assert.match(rust, /FlashHashAccumulator/);
+  assert.match(rust, /buffer_unordered\(3\)/);
+  assert.match(rust, /guangya-gcid-export-2\.0/);
+  assert.match(bridge, /command === 'export_gcid_json'/);
 });

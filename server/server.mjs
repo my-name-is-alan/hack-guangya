@@ -12,6 +12,7 @@ import { fetch as undiciFetch } from 'undici';
 import { autoShareTargetFor, shareFilePayload, signHdhiveRequest } from './auto-share.mjs';
 import { createAccessControl } from './access-control.mjs';
 import { createDirectoryCache } from './directory-cache.mjs';
+import { calculateGuangyaFileHashes, calculateGuangyaStreamHashes } from './guangya-file-hashes.mjs';
 import {
   buildAccountHeaders,
   buildBusinessHeaders,
@@ -191,6 +192,7 @@ database.exec(`
     size INTEGER NOT NULL,
     modified_ms TEXT NOT NULL,
     gcid TEXT NOT NULL,
+    cid TEXT NOT NULL DEFAULT '',
     updated_at INTEGER NOT NULL
   );
   CREATE TABLE IF NOT EXISTS auto_share_targets (
@@ -268,12 +270,39 @@ database.exec(`
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS developer_transfer_name_restores (
+    job_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    original_name TEXT NOT NULL,
+    temporary_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (job_id, file_id)
+  );
+  CREATE TABLE IF NOT EXISTS offline_name_restores (
+    task_id TEXT PRIMARY KEY,
+    original_name TEXT NOT NULL,
+    temporary_name TEXT NOT NULL,
+    file_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
   CREATE INDEX IF NOT EXISTS developer_transfer_jobs_status
     ON developer_transfer_jobs(status, updated_at);
+  CREATE INDEX IF NOT EXISTS developer_transfer_name_restores_status
+    ON developer_transfer_name_restores(status, file_id, updated_at);
+  CREATE INDEX IF NOT EXISTS offline_name_restores_status
+    ON offline_name_restores(status, updated_at);
 `);
 if (!database.prepare("PRAGMA table_info(auth_session)").all().some((column) => column.name === 'refresh_token')) database.exec('ALTER TABLE auth_session ADD COLUMN refresh_token TEXT');
 if (!database.prepare("PRAGMA table_info(auto_share_events)").all().some((column) => column.name === 'notification_status')) database.exec('ALTER TABLE auto_share_events ADD COLUMN notification_status TEXT');
 if (!database.prepare("PRAGMA table_info(auto_share_events)").all().some((column) => column.name === 'error_code')) database.exec('ALTER TABLE auto_share_events ADD COLUMN error_code TEXT');
+if (!database.prepare("PRAGMA table_info(file_fingerprints)").all().some((column) => column.name === 'cid')) database.exec("ALTER TABLE file_fingerprints ADD COLUMN cid TEXT NOT NULL DEFAULT ''");
 if (!database.prepare("PRAGMA table_info(uploaded_files)").all().some((column) => column.name === 'status')) {
   database.exec("ALTER TABLE uploaded_files ADD COLUMN status TEXT");
 }
@@ -376,6 +405,7 @@ let cacheMaxEntries = Number.isInteger(storedCacheMaxEntries)
   ? storedCacheMaxEntries
   : defaultCacheMaxEntries;
 let hdhiveEnabled = appStateValue('hdhive_enabled') !== 'false';
+let offlineFilenameObfuscationEnabled = appStateValue('offline_filename_obfuscation') === 'true';
 let hdhiveGeneration = 0;
 saveAppStateValue('transfer_upload_concurrency', uploadConcurrency);
 saveAppStateValue('transfer_download_concurrency', downloadConcurrency);
@@ -388,6 +418,7 @@ const deviceId = normalizeDeviceId(storedDevice?.value);
 database.prepare("INSERT INTO app_state (key, value, updated_at) VALUES ('device_id', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at").run(deviceId, Math.floor(Date.now() / 1000));
 const clients = new Set();
 const developerTransferRunning = new Set();
+let developerNameMutationChain = Promise.resolve();
 const watchers = new Map();
 const queue = new Map();
 const flashPreflightCache = new Map();
@@ -528,6 +559,22 @@ function updateTransferSettings(body) {
   pump();
   return transferSettings();
 }
+function pendingOfflineNameRestoreCount() {
+  return Number(database.prepare("SELECT COUNT(*) AS count FROM offline_name_restores WHERE status = 'pending'").get()?.count || 0);
+}
+function offlineSettings() {
+  return {
+    filename_obfuscation_enabled: offlineFilenameObfuscationEnabled,
+    pending_restores: pendingOfflineNameRestoreCount(),
+  };
+}
+function updateOfflineSettings(body) {
+  const requested = body.filename_obfuscation_enabled ?? body.filenameObfuscationEnabled;
+  if (typeof requested !== 'boolean') throw new Error('文件名混淆开关必须是布尔值');
+  offlineFilenameObfuscationEnabled = requested;
+  saveAppStateValue('offline_filename_obfuscation', String(requested));
+  return offlineSettings();
+}
 function cacheSettings() {
   return { enabled: cacheEnabled, max_entries: cacheMaxEntries };
 }
@@ -570,11 +617,12 @@ function updateCacheSettings(body) {
   return cacheSettings();
 }
 function cacheState() {
-  const fingerprints = database.prepare('SELECT file_path, modified_ms, gcid FROM file_fingerprints').all();
+  const fingerprints = database.prepare('SELECT file_path, modified_ms, gcid, cid FROM file_fingerprints').all();
   const fingerprintBytes = fingerprints.reduce((total, row) => total
     + Buffer.byteLength(String(row.file_path))
     + Buffer.byteLength(String(row.modified_ms))
-    + Buffer.byteLength(String(row.gcid)) + 24, 0);
+    + Buffer.byteLength(String(row.gcid))
+    + Buffer.byteLength(String(row.cid)) + 24, 0);
   const remoteEntries = [...remoteCache.entries()].filter(([key]) => key !== '');
   const remoteBytes = remoteEntries.reduce((total, [key, value]) => total
     + Buffer.byteLength(String(key)) + Buffer.byteLength(String(value)), 0);
@@ -929,6 +977,181 @@ function developerCounts(data = {}) {
   };
 }
 
+async function withDeveloperNameMutationLock(callback) {
+  const previous = developerNameMutationChain;
+  let release;
+  developerNameMutationChain = new Promise((resolve) => { release = resolve; });
+  await previous;
+  try { return await callback(); }
+  finally { release(); }
+}
+
+async function mapConcurrent(values, concurrency, callback) {
+  const list = Array.from(values || []);
+  const results = new Array(list.length);
+  const errors = [];
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < list.length && !errors.length) {
+      const index = cursor;
+      cursor += 1;
+      try { results[index] = await callback(list[index], index); }
+      catch (error) { errors.push(error); }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, concurrency), list.length) }, worker));
+  if (errors.length) throw errors[0];
+  return results;
+}
+
+function cloudDetailRecord(data) {
+  const value = data && typeof data === 'object' ? data : {};
+  return value.fileInfo || value.file_info || value.resourceInfo || value.resource_info || value.file || value;
+}
+
+function cloudEntryFromRecord(record, fallbackId = '', fallbackName = '') {
+  const value = cloudDetailRecord(record);
+  const fileId = String(value.fileId ?? value.file_id ?? value.id ?? fallbackId ?? '').trim();
+  const name = String(value.fileName ?? value.file_name ?? value.name ?? fallbackName ?? '').trim();
+  const resType = Number(value.resType ?? value.res_type ?? value.type ?? 0);
+  const folder = resType === 2 || value.isFolder === true || value.is_folder === true || value.isDir === true;
+  const rawSize = value.fileSize ?? value.file_size ?? value.totalSize ?? value.total_size ?? value.size ?? 0;
+  const size = Number(rawSize || 0);
+  if (!fileId || !name) throw new Error('光鸭返回的文件详情缺少文件 ID 或名称');
+  if (!folder && (!Number.isSafeInteger(size) || size < 0)) throw new Error(`文件大小无效：${name}`);
+  return { fileId, name, folder, size: folder ? 0 : size };
+}
+
+function safeCloudPathSegment(value) {
+  const segment = String(value || '').replace(/[\\/]/g, '_').replace(/[\u0000-\u001f\u007f]/g, '').trim();
+  return segment || '未命名文件';
+}
+
+async function cloudEntryDetail(fileId, fallbackName = '') {
+  const response = await apiPost('/userres/v1/file/get_file_detail', { fileId });
+  return cloudEntryFromRecord(response.data || {}, fileId, fallbackName);
+}
+
+async function collectCloudSelectionEntries(fileIds, fallbackNames = [], includeFolders = false) {
+  const roots = await mapConcurrent(fileIds, 8, (fileId, index) => cloudEntryDetail(fileId, fallbackNames[index]));
+  const entries = [];
+  const visited = new Set();
+  const queue = roots.map((entry) => ({ entry, relativePath: safeCloudPathSegment(entry.name) }));
+  let queueIndex = 0;
+  let scannedFolders = 0;
+  while (queueIndex < queue.length) {
+    const current = queue[queueIndex];
+    queueIndex += 1;
+    if (visited.has(current.entry.fileId)) continue;
+    visited.add(current.entry.fileId);
+    if (current.entry.folder) {
+      scannedFolders += 1;
+      if (includeFolders) entries.push({ ...current.entry, path: current.relativePath });
+      const children = await organizerListCloudChildren(current.entry.fileId);
+      for (const child of children) {
+        const entry = cloudEntryFromRecord(child);
+        queue.push({
+          entry,
+          relativePath: `${current.relativePath}/${safeCloudPathSegment(entry.name)}`,
+        });
+      }
+    } else {
+      entries.push({ ...current.entry, path: current.relativePath });
+    }
+    if (visited.size + queue.length - queueIndex > 100_000) throw new Error('一次最多处理 100000 个云端文件或文件夹');
+  }
+  return { entries, roots, scannedFolders };
+}
+
+function developerTemporaryName(originalName, folder) {
+  const extension = folder ? '' : path.extname(originalName);
+  const safeExtension = /^\.[A-Za-z0-9]{1,16}$/.test(extension) ? extension : '';
+  return `gy_${crypto.randomUUID().replaceAll('-', '').slice(0, 20)}${safeExtension}`;
+}
+
+async function acquireDeveloperNameObfuscation(job) {
+  return withDeveloperNameMutationLock(async () => {
+    const { entries } = await collectCloudSelectionEntries(job.file_ids, job.file_names, true);
+    if (!entries.length) return 0;
+    const now = Math.floor(Date.now() / 1000);
+    const findShared = database.prepare(
+      "SELECT original_name, temporary_name FROM developer_transfer_name_restores WHERE file_id = ? AND status = 'active' ORDER BY created_at LIMIT 1",
+    );
+    const save = database.prepare(`INSERT INTO developer_transfer_name_restores
+      (job_id, file_id, original_name, temporary_name, status, last_error, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'active', NULL, ?, ?)
+      ON CONFLICT(job_id, file_id) DO UPDATE SET status = 'active', last_error = NULL, updated_at = excluded.updated_at`);
+    const pendingRenames = [];
+    database.exec('BEGIN IMMEDIATE');
+    try {
+      for (const entry of entries) {
+        const own = database.prepare('SELECT original_name, temporary_name FROM developer_transfer_name_restores WHERE job_id = ? AND file_id = ?').get(job.id, entry.fileId);
+        const shared = own || findShared.get(entry.fileId);
+        const originalName = String(shared?.original_name || entry.name);
+        const temporaryName = String(shared?.temporary_name || developerTemporaryName(originalName, entry.folder));
+        save.run(job.id, entry.fileId, originalName, temporaryName, now, now);
+        if (!shared) pendingRenames.push({ ...entry, originalName, temporaryName });
+      }
+      database.exec('COMMIT');
+    } catch (error) {
+      database.exec('ROLLBACK');
+      throw error;
+    }
+    updateDeveloperTransferJob(job.id, {
+      status: 'auditing',
+      phase: 'obfuscating',
+      message: `正在并发混淆 ${entries.length} 个源文件名，随后开始预审`,
+    });
+    try {
+      await mapConcurrent(pendingRenames, 8, (entry) => renameRemote(entry.fileId, entry.temporaryName));
+    } catch (error) {
+      throw new Error(`预审前混淆源文件名失败：${error?.message || error}`);
+    }
+    remoteCache.clear();
+    remoteCache.set('', '');
+    return entries.length;
+  });
+}
+
+async function releaseDeveloperNameObfuscation(jobId) {
+  return withDeveloperNameMutationLock(async () => {
+    const rows = database.prepare("SELECT file_id, original_name, temporary_name FROM developer_transfer_name_restores WHERE job_id = ? AND status IN ('active', 'released', 'restore_failed')").all(jobId);
+    if (!rows.length) return { restored: 0, deferred: 0, failed: 0 };
+    const now = Math.floor(Date.now() / 1000);
+    database.prepare("UPDATE developer_transfer_name_restores SET status = 'released', updated_at = ? WHERE job_id = ? AND status = 'active'").run(now, jobId);
+    const restorable = [];
+    let deferred = 0;
+    for (const row of rows) {
+      const active = Number(database.prepare("SELECT COUNT(*) AS count FROM developer_transfer_name_restores WHERE file_id = ? AND status = 'active'").get(row.file_id)?.count || 0);
+      if (active) deferred += 1;
+      else restorable.push(row);
+    }
+    const outcomes = await mapConcurrent(restorable, 8, async (row) => {
+      try {
+        let currentName = '';
+        try { currentName = (await cloudEntryDetail(String(row.file_id))).name; } catch {}
+        if (currentName !== String(row.original_name)) {
+          await renameRemote(String(row.file_id), String(row.original_name));
+        }
+        database.prepare("UPDATE developer_transfer_name_restores SET status = 'completed', last_error = NULL, updated_at = ? WHERE file_id = ? AND status <> 'active'").run(Math.floor(Date.now() / 1000), row.file_id);
+        return true;
+      } catch (error) {
+        database.prepare("UPDATE developer_transfer_name_restores SET status = 'restore_failed', last_error = ?, updated_at = ? WHERE file_id = ? AND status <> 'active'")
+          .run(String(error?.message || error || '恢复原文件名失败').slice(0, 500), Math.floor(Date.now() / 1000), row.file_id);
+        return false;
+      }
+    });
+    database.prepare("DELETE FROM developer_transfer_name_restores WHERE status = 'completed' AND updated_at < ?").run(now - 30 * 86_400);
+    remoteCache.clear();
+    remoteCache.set('', '');
+    return {
+      restored: outcomes.filter(Boolean).length,
+      deferred,
+      failed: outcomes.filter((value) => !value).length,
+    };
+  });
+}
+
 async function finishDeveloperUpload(client, jobId, taskId) {
   updateDeveloperTransferJob(jobId, { status: 'running', phase: 'upload', upload_task_id: taskId, message: '小号正在接收文件' });
   for (let index = 0; index < 400; index += 1) {
@@ -998,6 +1221,7 @@ async function runDeveloperTransferJob(jobId) {
         return;
       }
       if (!(error instanceof DeveloperApiError) || error.apiCode !== 18011) throw error;
+      await acquireDeveloperNameObfuscation(job);
       const payload = await developerPostWithRetry(client, '/developer/v1/pre_upload', {
         token_id: target.token_id,
         file_ids: job.file_ids,
@@ -1016,6 +1240,25 @@ async function runDeveloperTransferJob(jobId) {
       message: String(error?.message || error || '小号互传失败'),
     });
   } finally {
+    try {
+      const restored = await releaseDeveloperNameObfuscation(jobId);
+      if (restored.failed) {
+        const current = loadDeveloperTransferJob(jobId);
+        updateDeveloperTransferJob(jobId, {
+          message: `${current?.message || '小号互传已结束'}；${restored.failed} 个源文件名恢复失败，请稍后重试`,
+        });
+      } else if (restored.restored) {
+        const current = loadDeveloperTransferJob(jobId);
+        updateDeveloperTransferJob(jobId, {
+          message: `${current?.message || '小号互传已结束'}，源文件名已恢复`,
+        });
+      }
+    } catch (restoreError) {
+      const current = loadDeveloperTransferJob(jobId);
+      updateDeveloperTransferJob(jobId, {
+        message: `${current?.message || '小号互传已结束'}；恢复源文件名时出错：${restoreError?.message || restoreError}`,
+      });
+    }
     developerTransferRunning.delete(jobId);
   }
 }
@@ -1024,6 +1267,14 @@ function resumeDeveloperTransfers() {
   const binding = developerBinding();
   const credentials = developerCredentials();
   if (!binding.requestedEnabled || !binding.accountId || binding.verifiedAt <= 0 || binding.verifiedClientId !== credentials.clientId) return;
+  const restoreJobs = database.prepare(`SELECT DISTINCT restores.job_id
+    FROM developer_transfer_name_restores AS restores
+    JOIN developer_transfer_jobs AS jobs ON jobs.id = restores.job_id
+    WHERE restores.status IN ('active', 'released', 'restore_failed')
+      AND jobs.status IN ('success', 'failed')`).all();
+  for (const row of restoreJobs) {
+    setImmediate(() => void releaseDeveloperNameObfuscation(String(row.job_id)).catch(() => {}));
+  }
   const rows = database.prepare("SELECT id FROM developer_transfer_jobs WHERE status IN ('queued', 'direct', 'auditing', 'copying', 'running') ORDER BY created_at").all();
   for (const row of rows) setImmediate(() => void runDeveloperTransferJob(String(row.id)));
 }
@@ -1038,15 +1289,19 @@ async function startDeveloperTransfer(body) {
   const fileNames = Array.isArray(body.file_names ?? body.fileNames)
     ? (body.file_names ?? body.fileNames).slice(0, fileIds.length).map((value) => String(value || '').slice(0, 255))
     : [];
-  const identity = JSON.stringify([...fileIds].sort());
+  const pairs = fileIds.map((fileId, index) => ({ fileId, fileName: fileNames[index] || '' }))
+    .sort((left, right) => left.fileId.localeCompare(right.fileId));
+  const sortedFileIds = pairs.map((item) => item.fileId);
+  const sortedFileNames = pairs.map((item) => item.fileName);
+  const identity = JSON.stringify(sortedFileIds);
   const duplicate = database.prepare("SELECT * FROM developer_transfer_jobs WHERE target_id = ? AND file_ids_json = ? AND status IN ('queued', 'direct', 'auditing', 'copying', 'running') ORDER BY created_at DESC LIMIT 1").get(targetId, identity);
   if (duplicate) return { ...developerTransferJob(duplicate), reused: true };
   const id = crypto.randomUUID();
   const now = Math.floor(Date.now() / 1000);
   database.prepare(`INSERT INTO developer_transfer_jobs
     (id, target_id, target_name, file_ids_json, file_names_json, status, phase, total_count, message, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?)`)
-    .run(id, targetId, target.name, identity, JSON.stringify(fileNames), fileIds.length, '已加入小号互传队列', now, now);
+    VALUES (?, ?, ?, ?, ?, 'direct', 'direct', ?, ?, ?, ?)`)
+    .run(id, targetId, target.name, identity, JSON.stringify(sortedFileNames), sortedFileIds.length, '正在并发启动小号秒传', now, now);
   const job = loadDeveloperTransferJob(id);
   setImmediate(() => void runDeveloperTransferJob(id));
   return job;
@@ -1839,6 +2094,119 @@ async function getCloudDownload(body) {
   throw new Error('光鸭打包超过 10 分钟仍未完成，请稍后重试');
 }
 
+function formatExportBytes(value) {
+  const bytes = typeof value === 'bigint' ? value : BigInt(value || 0);
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  let unit = 0;
+  let divisor = 1n;
+  while (unit < units.length - 1 && bytes >= divisor * 1024n) {
+    divisor *= 1024n;
+    unit += 1;
+  }
+  if (!unit) return `${bytes} B`;
+  const hundredths = (bytes * 100n + divisor / 2n) / divisor;
+  return `${hundredths / 100n}.${String(hundredths % 100n).padStart(2, '0')} ${units[unit]}`;
+}
+
+function exportJsonFileName(names) {
+  const raw = names.length === 1 ? safeCloudPathSegment(names[0]) : `光鸭秒传_${names.length}项`;
+  const stem = raw.replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|]/g, '_').slice(0, 120) || '光鸭秒传';
+  return `${stem}_秒传.json`;
+}
+
+async function exportGcidJson(body) {
+  const fileIds = validateFileIds(body.file_ids ?? body.fileIds);
+  const fallbackNames = Array.isArray(body.file_names ?? body.fileNames)
+    ? (body.file_names ?? body.fileNames).slice(0, fileIds.length).map((value) => String(value || '').slice(0, 255))
+    : [];
+  const collected = await collectCloudSelectionEntries(fileIds, fallbackNames, false);
+  const singleFolder = collected.roots.length === 1 && collected.roots[0].folder ? collected.roots[0] : null;
+  const rootPrefix = singleFolder ? `${safeCloudPathSegment(singleFolder.name)}/` : '';
+  const files = collected.entries
+    .filter((entry) => !entry.folder)
+    .map((entry) => ({
+      ...entry,
+      path: rootPrefix && entry.path.startsWith(rootPrefix) ? entry.path.slice(rootPrefix.length) : entry.path,
+    }));
+  if (!files.length) throw new Error('所选内容中没有可生成秒传 JSON 的文件');
+  const totalSize = files.reduce((total, entry) => total + BigInt(entry.size), 0n);
+  let downloadedBytes = 0n;
+  let completedFiles = 0;
+  let lastPublishAt = 0;
+  const publishProgress = (stage, currentPath, force = false) => {
+    const now = Date.now();
+    if (!force && now - lastPublishAt < 250) return;
+    lastPublishAt = now;
+    const percent = totalSize > 0n ? Number(downloadedBytes * 100n / totalSize) : Math.floor(completedFiles * 100 / files.length);
+    publish({
+      type: 'gcid-export-progress',
+      stage,
+      current_path: currentPath,
+      completed_files: completedFiles,
+      total_files: files.length,
+      downloaded_bytes: downloadedBytes.toString(),
+      total_bytes: totalSize.toString(),
+      percent: Math.max(0, Math.min(100, percent)),
+    });
+  };
+  publishProgress('正在读取云端文件并计算 GCID / CID', files[0].path, true);
+  const hashed = await mapConcurrent(files, 3, async (entry) => {
+    const download = await getCloudDownload({ file_ids: [entry.fileId], packaged: false });
+    const response = await createProxiedFetch(networkPreferences.proxy_url, undiciFetch)(download.download_url, {
+      method: 'GET',
+      headers: { 'accept-encoding': 'identity' },
+    });
+    if (!response.ok || !response.body) throw new Error(`读取 ${entry.path} 失败（HTTP ${response.status}）`);
+    const declaredLength = Number(response.headers.get('content-length'));
+    if (Number.isSafeInteger(declaredLength) && declaredLength >= 0 && declaredLength !== entry.size) {
+      throw new Error(`文件大小发生变化：${entry.path}`);
+    }
+    let previous = 0;
+    const hashes = await calculateGuangyaStreamHashes(response.body, entry.size, (processed) => {
+      downloadedBytes += BigInt(processed - previous);
+      previous = processed;
+      publishProgress('正在读取云端文件并计算 GCID / CID', entry.path);
+    });
+    completedFiles += 1;
+    publishProgress('正在读取云端文件并计算 GCID / CID', entry.path, true);
+    return {
+      path: entry.path,
+      size: String(entry.size),
+      gcid: hashes.gcid.toLowerCase(),
+      cid: hashes.cid,
+    };
+  });
+  const rootNames = collected.roots.map((entry) => entry.name);
+  const exportData = {
+    scriptVersion: 'guangya-gcid-export-2.0',
+    exportVersion: '2.0',
+    source: 'guangya',
+    hashType: 'gcid',
+    usesGcidInExport: true,
+    usesCidInExport: true,
+    usesBase62EtagsInExport: false,
+    commonPath: singleFolder ? singleFolder.name : '',
+    sourceFolderId: singleFolder ? singleFolder.fileId : '',
+    sourceFolderName: singleFolder ? singleFolder.name : '',
+    totalFilesCount: hashed.length,
+    totalSize: totalSize <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(totalSize) : totalSize.toString(),
+    formattedTotalSize: formatExportBytes(totalSize),
+    generatedAt: Math.floor(Date.now() / 1000),
+    scannedFoldersCount: collected.scannedFolders,
+    skippedFilesCount: 0,
+    skippedFiles: [],
+    files: hashed,
+  };
+  publishProgress('秒传 JSON 已生成', '', true);
+  return {
+    cancelled: false,
+    file_name: exportJsonFileName(rootNames),
+    total_files: hashed.length,
+    total_size: totalSize.toString(),
+    export: exportData,
+  };
+}
+
 function autoShareTarget(item) {
   return autoShareTargetFor(item.relative_path, item.mapping_id);
 }
@@ -2510,50 +2878,34 @@ async function waitTask(taskId, eventPath, cancelled = () => false) {
   throw error;
 }
 async function waitOperation(taskId) { if (!taskId) return; for (let index = 0; index < 90; index += 1) { const response = await apiPost('/userres/v1/get_task_status', { taskId }); const statusCode = Number(response.data?.status); const detail = response.data?.detail || {}; if ([2, 3].includes(statusCode) && detail.code && Number(detail.code) !== 0) throw new Error(detail.msg || '文件操作失败'); if (statusCode === 2) return; if (statusCode === 3) throw new Error(detail.msg || '文件操作失败'); await new Promise((resolve) => setTimeout(resolve, 1000)); } throw new Error('文件操作长时间未完成'); }
-function gcidChunkSize(size) { if (size <= 0x08000000) return 256 * 1024; if (size <= 0x10000000) return 512 * 1024; if (size <= 0x20000000) return 1024 * 1024; return 2 * 1024 * 1024; }
 async function calculateFileHash(filePath, algorithm) {
   const hash = crypto.createHash(algorithm);
   const stream = fs.createReadStream(filePath, { highWaterMark: 2 * 1024 * 1024 });
   for await (const chunk of stream) hash.update(chunk);
   return hash.digest('hex');
 }
-async function calculateFileGcid(filePath, size, modifiedMs, eventPath) {
+async function calculateFileFlashHashes(filePath, size, modifiedMs, eventPath) {
   const resolvedPath = path.resolve(filePath);
   const modified = String(modifiedMs);
   const cached = cacheEnabled
-    ? database.prepare('SELECT gcid FROM file_fingerprints WHERE file_path = ? AND size = ? AND modified_ms = ?')
+    ? database.prepare('SELECT gcid, cid FROM file_fingerprints WHERE file_path = ? AND size = ? AND modified_ms = ?')
       .get(resolvedPath, size, modified)
     : null;
-  if (cached?.gcid) {
+  if (/^[0-9A-F]{40}$/i.test(cached?.gcid || '') && /^[0-9A-F]{40}$/i.test(cached?.cid || '')) {
     publish({ type: 'progress', file_path: eventPath, percent: 0, bytes_per_second: 0, stage: '已复用秒传指纹' });
-    return cached.gcid;
+    return { gcid: cached.gcid.toUpperCase(), cid: cached.cid.toUpperCase() };
   }
-  const handle = await fsp.open(resolvedPath, 'r');
-  const chunkSize = gcidChunkSize(size);
-  const buffer = Buffer.allocUnsafe(chunkSize);
-  const outer = crypto.createHash('sha1');
-  let position = 0;
-  try {
-    while (position < size) {
-      const length = Math.min(chunkSize, size - position);
-      const { bytesRead } = await handle.read(buffer, 0, length, position);
-      if (!bytesRead) break;
-      outer.update(crypto.createHash('sha1').update(buffer.subarray(0, bytesRead)).digest());
-      position += bytesRead;
-      publish({ type: 'progress', file_path: eventPath, percent: 0, bytes_per_second: 0, stage: `正在计算秒传指纹 ${size ? Math.floor(position * 100 / size) : 100}%` });
-    }
-  } finally {
-    await handle.close();
-  }
-  const gcid = outer.digest('hex').toUpperCase();
+  const hashes = await calculateGuangyaFileHashes(resolvedPath, size, (percent) => {
+    publish({ type: 'progress', file_path: eventPath, percent: 0, bytes_per_second: 0, stage: `正在计算秒传指纹 ${percent}%` });
+  });
   if (cacheEnabled) {
-    database.prepare(`INSERT INTO file_fingerprints (file_path, size, modified_ms, gcid, updated_at)
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(file_path) DO UPDATE SET size = excluded.size, modified_ms = excluded.modified_ms, gcid = excluded.gcid, updated_at = excluded.updated_at`)
-      .run(resolvedPath, size, modified, gcid, Math.floor(Date.now() / 1000));
+    database.prepare(`INSERT INTO file_fingerprints (file_path, size, modified_ms, gcid, cid, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(file_path) DO UPDATE SET size = excluded.size, modified_ms = excluded.modified_ms, gcid = excluded.gcid, cid = excluded.cid, updated_at = excluded.updated_at`)
+      .run(resolvedPath, size, modified, hashes.gcid, hashes.cid, Math.floor(Date.now() / 1000));
     trimFileFingerprintCache();
   }
-  return gcid;
+  return hashes;
 }
 class FileBusyError extends Error {
   constructor() {
@@ -2654,9 +3006,9 @@ async function preflightFlashUpload(item) {
   let instantUpload = response.code === 156;
   if (!instantUpload && stat.size >= 1024 * 1024) {
     try {
-      const gcid = await calculateFileGcid(item.file_path, stat.size, stat.mtimeMs, eventPath);
+      const { gcid, cid } = await calculateFileFlashHashes(item.file_path, stat.size, stat.mtimeMs, eventPath);
       assertUploadRunnable(key);
-      const flash = await apiPost('/userres/v1/check_can_flash_upload', { taskId, gcid });
+      const flash = await apiPost('/userres/v1/check_can_flash_upload', { taskId, gcid, cid });
       instantUpload = flash.data?.canFlashUpload === true;
       if (instantUpload && flash.data?.taskId) taskId = String(flash.data.taskId);
     } catch (error) {
@@ -2732,8 +3084,8 @@ async function upload(item) {
   let instantUpload = response?.code === 156;
   if (!instantUpload && !checkpoint && !flashPrechecked && stat.size >= 1024 * 1024) {
     try {
-      const gcid = await calculateFileGcid(item.file_path, stat.size, stat.mtimeMs, eventPath);
-      const flash = await apiPost('/userres/v1/check_can_flash_upload', { taskId, gcid });
+      const { gcid, cid } = await calculateFileFlashHashes(item.file_path, stat.size, stat.mtimeMs, eventPath);
+      const flash = await apiPost('/userres/v1/check_can_flash_upload', { taskId, gcid, cid });
       instantUpload = flash.data?.canFlashUpload === true;
       if (instantUpload && flash.data?.taskId) taskId = String(flash.data.taskId);
     } catch (error) {
@@ -3529,6 +3881,119 @@ function validateOfflineFileIndexes(value, source) {
   if (fileIndexes.length && !/^magnet:/i.test(source)) throw new Error('只有 Magnet 资源支持选择文件序号');
   return fileIndexes;
 }
+function offlineResolvedName(payload) {
+  const data = payload?.data || payload || {};
+  const info = data.urlResInfo || data.btResInfo || data.emuleResInfo || data.resourceInfo || data;
+  return String(info?.fileName || info?.name || info?.title || '').trim();
+}
+function ed2kFileName(source) {
+  if (!/^ed2k:\/\/\|file\|/i.test(source)) return '';
+  const encoded = String(source).split('|')[2] || '';
+  try { return decodeURIComponent(encoded.replaceAll('+', '%20')).trim(); }
+  catch { return encoded.trim(); }
+}
+function magnetDisplayName(source) {
+  if (!/^magnet:\?/i.test(source)) return '';
+  try { return String(new URLSearchParams(source.slice(source.indexOf('?') + 1)).get('dn') || '').trim(); }
+  catch { return ''; }
+}
+function offlineSourceName(source) {
+  return magnetDisplayName(source) || ed2kFileName(source);
+}
+function offlineTemporaryName(originalName, source) {
+  const extension = /^ed2k:/i.test(source) ? path.extname(originalName) : '';
+  const safeExtension = /^\.[A-Za-z0-9]{1,16}$/.test(extension) ? extension : '';
+  return `gy_${crypto.randomUUID().replaceAll('-', '').slice(0, 20)}${safeExtension}`;
+}
+function protectedOfflineSource(source, temporaryName) {
+  if (/^magnet:\?/i.test(source)) {
+    const separator = source.indexOf('?');
+    const base = source.slice(0, separator);
+    const parameters = source.slice(separator + 1).split('&').filter((parameter) => {
+      const rawKey = parameter.split('=', 1)[0] || '';
+      try { return decodeURIComponent(rawKey).toLowerCase() !== 'dn'; }
+      catch { return rawKey.toLowerCase() !== 'dn'; }
+    });
+    return parameters.length ? `${base}?${parameters.join('&')}` : base;
+  }
+  if (/^ed2k:\/\/\|file\|/i.test(source)) {
+    const parts = source.split('|');
+    if (parts.length > 4) parts[2] = temporaryName;
+    return parts.join('|');
+  }
+  return source;
+}
+function saveOfflineNameRestore(taskId, originalName, temporaryName) {
+  const now = Math.floor(Date.now() / 1000);
+  database.prepare(`INSERT INTO offline_name_restores
+      (task_id, original_name, temporary_name, status, attempts, created_at, updated_at)
+    VALUES (?, ?, ?, 'pending', 0, ?, ?)
+    ON CONFLICT(task_id) DO UPDATE SET
+      original_name = excluded.original_name,
+      temporary_name = excluded.temporary_name,
+      file_id = NULL,
+      status = 'pending',
+      attempts = 0,
+      last_error = NULL,
+      updated_at = excluded.updated_at`)
+    .run(taskId, originalName, temporaryName, now, now);
+}
+function removeOfflineNameRestores(taskIds) {
+  const statement = database.prepare('DELETE FROM offline_name_restores WHERE task_id = ?');
+  for (const taskId of taskIds) statement.run(taskId);
+}
+function annotateOfflineNameRestores(data) {
+  const list = Array.isArray(data?.list) ? data.list : Array.isArray(data?.taskList) ? data.taskList : [];
+  if (!list.length) return data;
+  const query = database.prepare('SELECT original_name, temporary_name, status, last_error FROM offline_name_restores WHERE task_id = ?');
+  for (const task of list) {
+    const taskId = String(task?.taskId || task?.id || '').trim();
+    if (!taskId) continue;
+    const restore = query.get(taskId);
+    if (!restore) continue;
+    task.nameRestoreStatus = restore.status === 'completed' ? 'restored' : (restore.last_error ? 'failed' : 'pending');
+    task.nameRestoreError = restore.last_error || '';
+    task.originalName = restore.original_name;
+    if (restore.status === 'completed') task.fileName = restore.original_name;
+  }
+  return data;
+}
+let offlineRestoreReconcileRunning = false;
+async function reconcileOfflineNameRestores(suppliedData) {
+  if (offlineRestoreReconcileRunning || !token || !pendingOfflineNameRestoreCount()) return annotateOfflineNameRestores(suppliedData);
+  offlineRestoreReconcileRunning = true;
+  try {
+    const data = suppliedData || (await apiPost('/cloudcollection/v1/list_task', { cursor: '', pageSize: 100 })).data || {};
+    const list = Array.isArray(data.list) ? data.list : Array.isArray(data.taskList) ? data.taskList : [];
+    const tasks = new Map(list.map((task) => [String(task?.taskId || task?.id || ''), task]));
+    const pending = database.prepare("SELECT task_id, original_name, temporary_name, attempts, updated_at FROM offline_name_restores WHERE status = 'pending'").all();
+    const complete = database.prepare("UPDATE offline_name_restores SET file_id = ?, status = 'completed', last_error = NULL, updated_at = ? WHERE task_id = ?");
+    const failed = database.prepare("UPDATE offline_name_restores SET file_id = ?, attempts = attempts + 1, last_error = ?, updated_at = ? WHERE task_id = ?");
+    const now = Math.floor(Date.now() / 1000);
+    for (const restore of pending) {
+      const task = tasks.get(String(restore.task_id));
+      if (!task || Number(task.status ?? task.taskStatus ?? task.state) !== 2) continue;
+      const fileId = String(task.fileId || '').trim();
+      if (!fileId) continue;
+      if (String(task.fileName || '').trim() === restore.original_name) {
+        complete.run(fileId, now, restore.task_id);
+        continue;
+      }
+      if (restore.attempts > 0 && now - Number(restore.updated_at || 0) < 15) continue;
+      try {
+        await renameRemote(fileId, restore.original_name);
+        complete.run(fileId, now, restore.task_id);
+        task.fileName = restore.original_name;
+      } catch (error) {
+        failed.run(fileId, String(error?.message || error || '恢复原文件名失败').slice(0, 500), now, restore.task_id);
+      }
+    }
+    database.prepare("DELETE FROM offline_name_restores WHERE status = 'completed' AND updated_at < ?").run(now - 30 * 86_400);
+    return annotateOfflineNameRestores(data);
+  } finally {
+    offlineRestoreReconcileRunning = false;
+  }
+}
 async function executeFileTask(endpoint, payload) {
   const result = await apiPost(endpoint, payload);
   await waitOperation(result.data?.taskId);
@@ -4049,6 +4514,11 @@ async function routeApiV2(request, response, url) {
     const transfer = updateTransferSettings(body);
     return json(response, 200, { ...transfer, transfer });
   }
+  if (request.method === 'GET' && url.pathname === '/api/settings/offline') return json(response, 200, offlineSettings());
+  if (request.method === 'POST' && url.pathname === '/api/settings/offline') {
+    const body = await readBody(request, { maxBytes: 4 * 1024 });
+    return json(response, 200, updateOfflineSettings(body));
+  }
   if (request.method === 'GET' && url.pathname === '/api/settings/cache') return json(response, 200, cacheSettings());
   if (request.method === 'POST' && url.pathname === '/api/settings/cache') {
     const body = await readBody(request);
@@ -4203,6 +4673,10 @@ async function routeApiV2(request, response, url) {
     return json(response, 200, await executeFileTask('/userres/v1/file/clear_recycle_bin', {}));
   }
   if (request.method === 'POST' && url.pathname === '/api/files/rename-batch') { const body = await readBody(request); return json(response, 200, await batchRename(body.renames)); }
+  if (request.method === 'POST' && url.pathname === '/api/files/export-gcid') {
+    const body = await readBody(request, { maxBytes: 64 * 1024 });
+    return json(response, 200, await exportGcidJson(body), { 'cache-control': 'no-store' });
+  }
   if (request.method === 'POST' && url.pathname === '/api/files/download') { const body = await readBody(request); return json(response, 200, await getCloudDownload(body)); }
   if (request.method === 'POST' && url.pathname === '/api/share') { const body = await readBody(request); return json(response, 200, await createManualShare(body)); }
   if (request.method === 'GET' && url.pathname === '/api/shares') return json(response, 200, await listAllShares());
@@ -4257,7 +4731,9 @@ async function routeApiV2(request, response, url) {
     const body = { cursor, pageSize };
     const status = queryIntegerList(url, 'status', 'statuses', { maximum: 5 });
     if (status.length) body.status = status;
-    return json(response, 200, await apiPost('/cloudcollection/v1/list_task', body));
+    const result = await apiPost('/cloudcollection/v1/list_task', body);
+    result.data = await reconcileOfflineNameRestores(result.data || {});
+    return json(response, 200, result);
   }
   if (request.method === 'POST' && url.pathname === '/api/offline/resolve') {
     const body = await readBody(request);
@@ -4275,12 +4751,48 @@ async function routeApiV2(request, response, url) {
     };
     if (fileIndexes.length) payload.fileIndexes = fileIndexes;
     const rawNewName = body.new_name ?? body.newName;
-    if (rawNewName != null && String(rawNewName).trim()) payload.newName = validateCloudName(rawNewName, '离线任务名称');
-    return json(response, 200, await apiPost('/cloudcollection/v1/create_task', payload));
+    const requestedName = rawNewName != null && String(rawNewName).trim()
+      ? validateCloudName(rawNewName, '离线任务名称')
+      : '';
+    const shouldObfuscate = offlineFilenameObfuscationEnabled && /^(?:magnet:|ed2k:\/\/)/i.test(source);
+    let originalName = requestedName;
+    let temporaryName = '';
+    if (shouldObfuscate) {
+      const suppliedRestoreName = body.restore_name ?? body.restoreName;
+      if (!originalName && suppliedRestoreName != null && String(suppliedRestoreName).trim()) {
+        originalName = validateCloudName(suppliedRestoreName, '待恢复文件名');
+      }
+      if (!originalName) originalName = offlineSourceName(source);
+      if (!originalName) {
+        const resolved = await apiPost('/cloudcollection/v1/resolve_res', { url: source });
+        originalName = offlineResolvedName(resolved);
+      }
+      originalName = validateCloudName(originalName, '待恢复文件名');
+      temporaryName = offlineTemporaryName(originalName, source);
+      payload.url = protectedOfflineSource(source, temporaryName);
+      payload.newName = temporaryName;
+    } else if (requestedName) {
+      payload.newName = requestedName;
+    }
+    const result = await apiPost('/cloudcollection/v1/create_task', payload);
+    if (shouldObfuscate) {
+      const taskId = String(result.data?.taskId || result.data?.id || '').trim();
+      if (!taskId) throw new Error('离线任务已提交，但光鸭没有返回 taskId，无法自动恢复文件名');
+      saveOfflineNameRestore(taskId, originalName, temporaryName);
+      result.data = {
+        ...(result.data || {}),
+        nameRestoreStatus: 'pending',
+        originalName,
+      };
+      void reconcileOfflineNameRestores().catch(() => {});
+    }
+    return json(response, 200, result);
   }
   if (request.method === 'POST' && ['/api/offline/cancel', '/api/offline/delete'].includes(url.pathname)) {
     const body = await readBody(request);
-    const result = await apiPost('/cloudcollection/v2/delete_task', { taskIds: validateTaskIds(body.task_ids ?? body.taskIds) });
+    const taskIds = validateTaskIds(body.task_ids ?? body.taskIds);
+    const result = await apiPost('/cloudcollection/v2/delete_task', { taskIds });
+    removeOfflineNameRestores(taskIds);
     return json(response, 200, result.data || {});
   }
   if (request.method === 'POST' && url.pathname === '/api/offline/retry') {
@@ -4533,3 +5045,8 @@ setInterval(() => {
     status('warning', `自动续期失败，将稍后重试：${error.message}`);
   });
 }, tokenRefreshIntervalMs);
+
+setInterval(() => {
+  if (!token || !pendingOfflineNameRestoreCount()) return;
+  void reconcileOfflineNameRestores().catch(() => {});
+}, 5_000);

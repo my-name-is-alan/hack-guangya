@@ -1,11 +1,11 @@
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
 import { message, Modal } from 'antdv-next';
 import { DeleteOutlined, DownloadOutlined, FolderOpenOutlined, InboxOutlined, RedoOutlined, ReloadOutlined, StopOutlined } from '@antdv-next/icons';
 import CloudFolderPicker from '../components/cloud/CloudFolderPicker.vue';
 import { appState } from '../store.js';
 import { bridge } from '../bridge.js';
-import { errorText, formatSize, offlineStatus, pick, unwrapData } from '../formatters.js';
+import { errorText, formatSize, offlineProgress, offlineStatus, pick, unwrapData } from '../formatters.js';
 
 const pageSize = 100;
 const offlineTasks = ref([]);
@@ -21,6 +21,8 @@ const cursorHistory = ref([]);
 const hasMore = ref(false);
 const selectedKeys = ref([]);
 const focusedTaskId = ref('');
+const offlineObfuscationEnabled = ref(false);
+let offlinePollTimer = null;
 const offlineForm = reactive({
   open: false,
   url: '',
@@ -93,20 +95,13 @@ function isTerminalTask(record) {
 }
 
 function displayStatus(record) {
+  if (record?.nameRestoreStatus === 'failed') return ['名称恢复失败', 'error'];
+  if (record?.nameRestoreStatus === 'pending' && numericStatus(record) === 2) return ['恢复名称中', 'processing'];
   return isPartialTask(record) ? ['部分完成', 'warning'] : offlineStatus(record);
 }
 
 function offlineError(record) {
-  return String(pick(record, ['errMsg', 'errorMsg', 'errorMessage', 'msg', 'message', 'error'], '') || '').trim();
-}
-
-function offlineProgress(record) {
-  const raw = Number(pick(record, ['progress', 'percent', 'progressPercent', 'downloadProgress'], Number.NaN));
-  if (Number.isFinite(raw)) return Math.max(0, Math.min(100, raw <= 1 && raw > 0 ? raw * 100 : raw));
-  const done = Number(pick(record, ['downloadedSize', 'downloadSize', 'completedSize', 'currentSize'], 0));
-  const total = Number(pick(record, ['totalSize', 'fileSize', 'size'], 0));
-  if (done > 0 && total > 0) return Math.max(0, Math.min(100, (done / total) * 100));
-  return numericStatus(record) === 2 ? 100 : null;
+  return String(pick(record, ['nameRestoreError', 'errMsg', 'errorMsg', 'errorMessage', 'msg', 'message', 'error'], '') || '').trim();
 }
 
 const selectedRecords = computed(() => {
@@ -120,13 +115,35 @@ const rowSelection = computed(() => ({
   selectedRowKeys: selectedKeys.value,
   onChange: (keys) => { selectedKeys.value = keys; },
 }));
+
+function offlineSourceName(source) {
+  const value = String(source || '').trim();
+  if (/^magnet:\?/i.test(value)) {
+    try {
+      return String(new URLSearchParams(value.slice(value.indexOf('?') + 1)).get('dn') || '').trim();
+    } catch {
+      return '';
+    }
+  }
+  if (/^ed2k:\/\/\|file\|/i.test(value)) {
+    const encoded = value.split('|')[2] || '';
+    try { return decodeURIComponent(encoded.replaceAll('+', '%20')).trim(); }
+    catch { return encoded.trim(); }
+  }
+  return '';
+}
+
 const resolvedResource = computed(() => {
   const data = unwrapData(offlineForm.resolved);
   const info = data.urlResInfo || data.btResInfo || data.emuleResInfo || data.resourceInfo || data;
   return info && typeof info === 'object' ? info : {};
 });
-const resolvedResourceName = computed(() => pick(resolvedResource.value, ['fileName', 'name', 'title'], '资源已识别'));
+const resolvedResourceOriginalName = computed(() => String(pick(resolvedResource.value, ['fileName', 'name', 'title'], '') || '').trim()
+  || offlineSourceName(offlineForm.url));
+const resolvedResourceName = computed(() => resolvedResourceOriginalName.value || '资源已识别');
 const resolvedResourceSize = computed(() => Number(pick(resolvedResource.value, ['totalSize', 'fileSize', 'size'], 0)) || 0);
+const shouldObfuscateCurrentSource = computed(() => offlineObfuscationEnabled.value
+  && /^(?:magnet:|ed2k:\/\/)/i.test(offlineForm.url.trim()));
 const statisticsSummary = computed(() => {
   const data = unwrapData(offlineStatistics.value);
   const total = Number(pick(data, ['totalTimes', 'total_times'], 0));
@@ -217,6 +234,15 @@ async function loadOfflineStatistics() {
   }
 }
 
+async function loadOfflineSettings() {
+  try {
+    const data = unwrapData(await bridge.invoke('get_offline_settings'));
+    offlineObfuscationEnabled.value = data.filename_obfuscation_enabled === true;
+  } catch {
+    offlineObfuscationEnabled.value = false;
+  }
+}
+
 async function refreshOffline(cursor = currentCursor.value) {
   await Promise.all([loadOffline(cursor), loadOfflineStatistics()]);
 }
@@ -245,14 +271,20 @@ async function submitOffline() {
   }
   offlineSubmitting.value = true;
   try {
-    const resolved = unwrapData(await resolveOfflineResource({ showMessage: false }));
+    const protectedSubmission = shouldObfuscateCurrentSource.value;
+    const resolved = protectedSubmission ? {} : unwrapData(await resolveOfflineResource({ showMessage: false }));
     const info = resolved.urlResInfo || resolved.btResInfo || resolved.emuleResInfo || resolved.resourceInfo || resolved;
     const resolvedUrl = String(pick(resolved, ['url'], '') || pick(info, ['url', 'downloadUrl', 'download_url', 'resourceUrl'], '') || '').trim();
+    const submittedSource = resolvedUrl || offlineForm.url.trim();
+    const shouldRestoreName = offlineObfuscationEnabled.value && /^(?:magnet:|ed2k:\/\/)/i.test(submittedSource);
+    const restoreName = offlineForm.newName.trim() || resolvedResourceOriginalName.value;
+    if (shouldRestoreName && !restoreName) throw new Error('链接中没有可识别的原名称，请填写“恢复名称”后再提交');
     const fileIndexes = collectResolvedFileIndexes(resolved);
     await bridge.invoke('create_offline_task', {
-      url: resolvedUrl || offlineForm.url.trim(),
+      url: submittedSource,
       parent_id: offlineForm.targetId,
       new_name: offlineForm.newName.trim() || undefined,
+      restore_name: restoreName || undefined,
       file_indexes: fileIndexes.length ? fileIndexes : undefined,
     });
     offlineForm.url = '';
@@ -262,7 +294,7 @@ async function submitOffline() {
     cursorHistory.value = [];
     currentCursor.value = '';
     await refreshOffline('');
-    message.success('离线任务已创建');
+    message.success(shouldRestoreName ? '离线任务已创建，将在完成后自动恢复原名称' : '离线任务已创建');
   } catch (error) {
     message.error(errorText(error));
   } finally {
@@ -363,7 +395,18 @@ function taskRowProps(record, index) {
 }
 
 defineExpose({ loadOffline });
-onMounted(() => refreshOffline());
+onMounted(() => {
+  void Promise.all([refreshOffline(), loadOfflineSettings()]);
+  offlinePollTimer = window.setInterval(() => {
+    if (offlineLoading.value || offlineActionBusy.value || offlineForm.open || selectedKeys.value.length) return;
+    if (!offlineTasks.value.some((record) => isRunningTask(record) || record?.nameRestoreStatus === 'pending' || record?.nameRestoreStatus === 'failed')) return;
+    void refreshOffline();
+  }, 5_000);
+});
+onBeforeUnmount(() => {
+  if (offlinePollTimer !== null) window.clearInterval(offlinePollTimer);
+  offlinePollTimer = null;
+});
 </script>
 
 <template>
@@ -427,28 +470,41 @@ onMounted(() => refreshOffline());
       </a-space>
     </div>
 
-    <a-modal v-model:open="offlineForm.open" title="新建离线任务" :confirm-loading="offlineSubmitting || offlineForm.resolving" ok-text="解析并开始下载" cancel-text="取消" @ok="submitOffline">
+    <a-modal v-model:open="offlineForm.open" title="新建离线任务" :confirm-loading="offlineSubmitting || offlineForm.resolving" :ok-text="shouldObfuscateCurrentSource ? '保护名称并开始下载' : '解析并开始下载'" cancel-text="取消" @ok="submitOffline">
       <a-form layout="vertical" @submit.prevent="submitOffline">
         <a-form-item label="下载链接">
-          <a-textarea v-model:value="offlineForm.url" aria-label="离线下载链接" :rows="3" placeholder="支持 HTTP/HTTPS、磁力和 ED2K 链接" @input="resetResolvedResource" @blur="offlineForm.url.trim() && resolveOfflineResource({ showMessage: false }).catch(() => {})" />
+          <a-textarea v-model:value="offlineForm.url" aria-label="离线下载链接" :rows="3" placeholder="支持 HTTP/HTTPS、磁力和 ED2K 链接" @input="resetResolvedResource" @blur="offlineForm.url.trim() && !shouldObfuscateCurrentSource && resolveOfflineResource({ showMessage: false }).catch(() => {})" />
           <div class="resolve-line">
-            <span>提交前会先由光鸭识别资源</span>
-            <a-button type="link" size="small" :loading="offlineForm.resolving" @click="resolveOfflineResource().catch(() => {})">立即解析</a-button>
+            <span v-if="shouldObfuscateCurrentSource">保护模式跳过云端预解析，默认保存全部文件</span>
+            <template v-else>
+              <span>提交前会先由光鸭识别资源</span>
+              <a-button type="link" size="small" :loading="offlineForm.resolving" @click="resolveOfflineResource().catch(() => {})">立即解析</a-button>
+            </template>
           </div>
         </a-form-item>
-        <a-alert v-if="offlineForm.resolveError" type="error" show-icon :message="offlineForm.resolveError" />
+        <a-alert v-if="offlineForm.resolveError && !shouldObfuscateCurrentSource" type="error" show-icon :message="offlineForm.resolveError" />
         <a-alert v-else-if="offlineForm.resolved" type="success" show-icon message="资源解析完成">
           <template #description>
             <strong>{{ resolvedResourceName }}</strong><span v-if="resolvedResourceSize"> · {{ formatSize(resolvedResourceSize) }}</span>
           </template>
         </a-alert>
+        <a-alert
+          v-if="shouldObfuscateCurrentSource"
+          class="obfuscation-alert"
+          type="info"
+          show-icon
+          message="已启用离线文件名混淆"
+          :description="resolvedResourceOriginalName
+            ? `将以随机安全名称提交，成功后恢复为：${resolvedResourceOriginalName}`
+            : '将以随机安全名称提交；请在下方填写任务成功后需要恢复的名称。'"
+        />
         <a-form-item label="保存目录">
           <a-input :value="offlineForm.targetLabel" aria-label="离线任务保存目录" readonly @click="offlineForm.pickerOpen = true">
             <template #suffix><FolderOpenOutlined /></template>
           </a-input>
         </a-form-item>
-        <a-form-item label="重命名（可选）">
-          <a-input v-model:value="offlineForm.newName" aria-label="离线任务新名称" maxlength="255" placeholder="留空则使用资源原名称" @press-enter="submitOffline" />
+        <a-form-item :label="shouldObfuscateCurrentSource ? '恢复名称' : '重命名（可选）'">
+          <a-input v-model:value="offlineForm.newName" aria-label="离线任务新名称" maxlength="255" :placeholder="shouldObfuscateCurrentSource ? '留空则使用链接中的原名称' : '留空则使用资源原名称'" @press-enter="submitOffline" />
         </a-form-item>
       </a-form>
     </a-modal>
@@ -465,4 +521,5 @@ onMounted(() => refreshOffline());
 .offline-error { display: block; overflow: hidden; color: var(--danger, #cf1322); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .offline-footer { display: flex; min-height: 42px; align-items: center; justify-content: space-between; color: var(--text-3, #98a2b3); font-size: 12px; }
 .resolve-line { display: flex; align-items: center; justify-content: space-between; color: var(--text-3, #98a2b3); font-size: 12px; }
+.obfuscation-alert { margin-top: 12px; }
 </style>

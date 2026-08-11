@@ -129,6 +129,7 @@ const fileContextMenuItems = computed(() => {
     { key: 'download', icon: () => h(DownloadOutlined), label: '下载' },
     { key: 'share', icon: () => h(ShareAltOutlined), label: '创建分享' },
     { key: 'transferAccount', icon: () => h(SwapOutlined), label: '秒传到小号' },
+    { key: 'exportGcid', icon: () => h(FileTextOutlined), label: '生成秒传 JSON' },
     { key: 'scrape', icon: () => h(TagsOutlined), label: '刮削到媒体库' },
     { type: 'divider' },
     { key: 'delete', icon: () => h(DeleteOutlined), label: '删除 (Del)', danger: true },
@@ -154,6 +155,7 @@ const developerTransfer = reactive({
   targets: [],
   targetId: '',
 });
+const gcidExport = reactive({ running: false, progress: null });
 const scrapeDialog = reactive({ open: false, loading: false, saving: false, targets: [], targetId: '', records: [] });
 const developerTerminalNotified = new Set();
 const gcidImportRunning = computed(() => ['preparing', 'running'].includes(gcidImport.status?.status));
@@ -595,6 +597,59 @@ async function submitDeveloperTransfer() {
   }
 }
 
+function saveGeneratedJsonInBrowser(fileName, payload) {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = String(fileName || '光鸭秒传.json');
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+}
+
+function exportSelectedGcidJson(records = selectedRecords()) {
+  const targets = (Array.isArray(records) ? records : []).filter((item) => fileId(item));
+  if (!targets.length) {
+    message.warning('请先选择要生成秒传 JSON 的文件或文件夹');
+    return;
+  }
+  if (gcidExport.running) {
+    message.info('已有秒传 JSON 正在生成');
+    return;
+  }
+  Modal.confirm({
+    title: '生成秒传 JSON 会读取全部文件内容',
+    content: '为了计算 GCID 和 CID，程序会递归读取所选文件及文件夹内的全部文件，可能产生接近文件总大小的大量下行流量。确认继续吗？',
+    okText: '继续读取并生成',
+    cancelText: '取消',
+    async onOk() {
+      gcidExport.running = true;
+      gcidExport.progress = { stage: '正在扫描所选文件…', percent: 0 };
+      operationBusy.value = true;
+      try {
+        const result = unwrapData(await bridge.invoke('export_gcid_json', {
+          file_ids: targets.map(fileId),
+          file_names: targets.map((item) => String(item.fileName || item.name || '未命名文件')),
+        }));
+        if (result?.cancelled) return;
+        if (result?.export) saveGeneratedJsonInBrowser(result.file_name, result.export);
+        clearSelection();
+        const location = result?.saved_path ? `，已保存到 ${result.saved_path}` : '，浏览器已开始保存';
+        message.success(`秒传 JSON 已生成：${Number(result?.total_files || 0)} 个文件${location}`);
+      } catch (error) {
+        message.error(errorText(error));
+      } finally {
+        gcidExport.running = false;
+        gcidExport.progress = null;
+        operationBusy.value = false;
+      }
+    },
+  });
+}
+
 function cloudPathLabel() {
   const parts = currentPath.value.slice(1).map((item) => String(item.name || item.fileName || '')).filter(Boolean);
   return `/${parts.join('/')}` || '/';
@@ -684,6 +739,7 @@ async function handleFileContextMenuClick({ key }) {
   if (key === 'moveTo') return openFolderPicker('move', targets);
   if (key === 'share') return createCloudShare(targets);
   if (key === 'transferAccount') return openDeveloperTransfer(targets);
+  if (key === 'exportGcid') return exportSelectedGcidJson(targets);
   if (key === 'scrape') return openScrapeSelected(targets);
   if (key === 'delete') return deleteCloudFiles(targets);
 }
@@ -1561,6 +1617,10 @@ onMounted(async () => {
   window.addEventListener('drop', handleWindowDrop);
   window.addEventListener('click', handleWindowClick);
   unlistenDeveloperTransfer = await bridge.subscribe((payload) => {
+    if (payload?.type === 'gcid-export-progress') {
+      gcidExport.progress = payload;
+      return;
+    }
     const job = payload?.type === 'developer-transfer' ? payload.job : null;
     if (!job?.id || !['success', 'failed'].includes(job.status) || developerTerminalNotified.has(job.id)) return;
     developerTerminalNotified.add(job.id);
@@ -1617,6 +1677,7 @@ onBeforeUnmount(() => {
           :selected-count="selectedKeys.length"
           :clipboard-count="fileClipboard.items.length"
           :clipboard-mode="fileClipboard.mode"
+          :export-busy="gcidExport.running"
           @copy="setFileClipboard('copy')"
           @cut="setFileClipboard('move')"
           @move="openFolderPicker('move', selectedRecords())"
@@ -1625,12 +1686,14 @@ onBeforeUnmount(() => {
           @share="createCloudShare(selectedRecords())"
           @scrape="openScrapeSelected(selectedRecords())"
           @transfer-account="openDeveloperTransfer(selectedRecords())"
+          @export-gcid="exportSelectedGcidJson(selectedRecords())"
           @delete="deleteCloudFiles(selectedRecords())"
           @paste="pasteFileClipboard"
           @clear-selection="clearSelection"
           @clear-clipboard="clearFileClipboard"
         >
           <template #status>
+            <a-tag v-if="gcidExport.running" color="processing">{{ gcidExport.progress?.stage || '正在生成秒传 JSON' }} {{ Number(gcidExport.progress?.percent || 0) }}%</a-tag>
             <GcidImportStatus v-if="gcidImportRunning" v-model:open="gcidImport.detailsOpen" :status="gcidImport.status" :percent="gcidImportProgress" />
           </template>
         </FileSelectionBar>
@@ -1641,6 +1704,7 @@ onBeforeUnmount(() => {
             <CompactFileBreadcrumb :segments="currentPath" @navigate="jumpToPath($event.index)" />
           </a-flex>
           <a-flex align="center" gap="small" class="file-primary-actions">
+            <a-tag v-if="gcidExport.running" color="processing">{{ gcidExport.progress?.stage || '正在生成秒传 JSON' }} {{ Number(gcidExport.progress?.percent || 0) }}%</a-tag>
             <GcidImportStatus v-if="gcidImportRunning" v-model:open="gcidImport.detailsOpen" :status="gcidImport.status" :percent="gcidImportProgress" />
             <a-button v-if="isTauri && !gcidImportRunning" :disabled="!appState.logged_in" @click="openGcidImport"><template #icon><FileAddOutlined /></template>JSON 秒传</a-button>
             <a-button :disabled="!appState.logged_in" @click="openNewFolderModal"><template #icon><FolderAddOutlined /></template>新建文件夹</a-button>
@@ -1862,7 +1926,7 @@ onBeforeUnmount(() => {
     >
       <a-alert type="info" show-icon class="developer-transfer-note">
         <template #message>服务端直接复制，不下载文件</template>
-        <template #description>若文件还未通过开发者预审，应用会自动提交预审，并在通过后继续传输。</template>
+        <template #description>若文件尚未通过预审，应用会先并发临时混淆所选内容的文件名，预审和秒传完成后自动恢复；多个互传任务可同时执行。</template>
       </a-alert>
       <a-form layout="vertical">
         <a-form-item label="接收小号" required>

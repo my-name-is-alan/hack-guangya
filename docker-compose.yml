@@ -1,6 +1,6 @@
 services:
   guangya-sync:
-    image: ${GUANGYA_IMAGE:-94xhzy/guangya-sync:0.1.28}
+    image: ${GUANGYA_IMAGE:-94xhzy/guangya-sync:0.1.29}
     pull_policy: always
     container_name: guangya-sync
     restart: unless-stopped

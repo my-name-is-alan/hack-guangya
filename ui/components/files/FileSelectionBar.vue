@@ -6,6 +6,7 @@ import {
   DeleteOutlined,
   DownloadOutlined,
   EditOutlined,
+  FileTextOutlined,
   ScissorOutlined,
   ShareAltOutlined,
   SwapOutlined,
@@ -16,6 +17,7 @@ defineProps<{
   selectedCount: number
   clipboardCount: number
   clipboardMode: 'copy' | 'move' | ''
+  exportBusy?: boolean
 }>()
 
 defineEmits<{
@@ -27,6 +29,7 @@ defineEmits<{
   share: []
   scrape: []
   transferAccount: []
+  exportGcid: []
   delete: []
   paste: []
   clearSelection: []
@@ -51,6 +54,7 @@ defineEmits<{
       <a-button type="text" size="small" @click="$emit('share')"><template #icon><ShareAltOutlined /></template>分享</a-button>
       <a-button type="text" size="small" @click="$emit('scrape')"><template #icon><TagsOutlined /></template>刮削到媒体库</a-button>
       <a-button type="text" size="small" @click="$emit('transferAccount')"><template #icon><SwapOutlined /></template>小号秒传</a-button>
+      <a-button type="text" size="small" :loading="exportBusy" @click="$emit('exportGcid')"><template #icon><FileTextOutlined /></template>生成秒传 JSON</a-button>
       <a-button type="text" size="small" danger title="删除 (Delete)" @click="$emit('delete')"><template #icon><DeleteOutlined /></template>删除 <kbd>Del</kbd></a-button>
     </div>
     <slot name="status" />

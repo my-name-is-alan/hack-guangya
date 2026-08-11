@@ -138,6 +138,7 @@ export const bridge = isTauri ? {
     if (command === 'permanently_delete_files') return webRequest('/api/recycle/delete', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'clear_recycle_bin') return webRequest('/api/recycle/clear', { method: 'POST', body: '{}' });
     if (command === 'batch_rename_files') return webRequest('/api/files/rename-batch', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'export_gcid_json') return webRequest('/api/files/export-gcid', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'get_cloud_download') return webRequest('/api/files/download', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'create_share') return webRequest('/api/share', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'list_shares') return webRequest('/api/shares');
@@ -190,6 +191,8 @@ export const bridge = isTauri ? {
     if (command === 'retry_upload') return webRequest('/api/uploads/retry', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'get_transfer_settings') return webRequest('/api/settings');
     if (command === 'update_transfer_settings') return webRequest('/api/settings/transfer', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'get_offline_settings') return webRequest('/api/settings/offline');
+    if (command === 'update_offline_settings') return webRequest('/api/settings/offline', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'get_network_preferences') return webRequest('/api/settings/network');
     if (command === 'update_network_preferences') return webRequest('/api/settings/network', { method: 'POST', body: JSON.stringify(args.input || args) });
     if (command === 'test_network') return webRequest('/api/network/test', { method: 'POST', body: JSON.stringify(args.input || args) });
