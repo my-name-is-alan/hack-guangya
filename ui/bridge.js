@@ -137,7 +137,7 @@ export const bridge = isTauri ? {
     }
     if (command === 'restore_files') return webRequest('/api/recycle/restore', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'permanently_delete_files') return webRequest('/api/recycle/delete', { method: 'POST', body: JSON.stringify(args) });
-    if (command === 'clear_recycle_bin') return webRequest('/api/recycle/clear', { method: 'POST', body: '{}' });
+    if (command === 'clear_recycle_bin') return webRequest('/api/recycle/clear', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'batch_rename_files') return webRequest('/api/files/rename-batch', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'export_gcid_json') return webRequest('/api/files/export-gcid', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'get_cloud_download') return webRequest('/api/files/download', { method: 'POST', body: JSON.stringify(args) });

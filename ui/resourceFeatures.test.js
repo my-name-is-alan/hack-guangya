@@ -13,6 +13,7 @@ test('文件工作区接入新建、详情、最近记录和回收站闭环', ()
   const cloud = read('views', 'CloudView.vue');
   const recycle = read('components', 'files', 'RecycleBinPanel.vue');
   const recent = read('components', 'files', 'RecentFilesPanel.vue');
+  const bridge = read('bridge.js');
 
   assert.match(router, /FilesWorkspaceView\.vue/);
   assert.match(workspace, /key="recent"/);
@@ -24,6 +25,16 @@ test('文件工作区接入新建、详情、最近记录和回收站闭环', ()
   assert.match(recycle, /'restore_files'/);
   assert.match(recycle, /'permanently_delete_files'/);
   assert.match(recycle, /'clear_recycle_bin'/);
+  assert.match(recycle, /requestRecycleBinClear/);
+  assert.match(recycle, /subscribeRecycleBinClear/);
+  assert.match(recycle, /waitForRecycleBinClear/);
+  assert.match(recycle, /result\?\.pending/);
+  assert.match(recycle, /\['pending', 'unknown'\]/);
+  assert.match(recycle, /onOk\(\)\s*\{\s*void runRecycleBinClear\(forceRetry\)/);
+  assert.match(recycle, /force_retry: forceRetry/);
+  assert.match(recycle, /强制重新提交可能连同此后新进入回收站的文件一起永久删除/);
+  assert.match(bridge, /command === 'clear_recycle_bin'[\s\S]*?JSON\.stringify\(args\)/);
+  assert.doesNotMatch(recycle, /await bridge\.invoke\('clear_recycle_bin'\);[\s\S]*?await loadRecycle\(0\)/);
   assert.match(recycle, /无法恢复/);
   assert.match(recent, /'list_recent_actions'/);
   assert.match(recent, /nextCursor/);

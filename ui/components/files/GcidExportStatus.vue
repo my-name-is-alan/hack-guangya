@@ -64,7 +64,7 @@ const byteLabel = computed(() => {
         <div><span>源文件总大小</span><strong>{{ sourceBytes ? formatSize(sourceBytes) : '计算中' }}</strong></div>
       </div>
       <a-alert v-if="failed" type="error" show-icon message="生成失败" :description="props.progress?.error || '请稍后重试'" />
-      <a-alert v-else type="info" show-icon message="通常每个大文件只读取头、中、尾各 20 KB；若云端不支持分段或缺少 GCID，才会回退完整校验。" />
+      <a-alert v-else type="info" show-icon message="最多并发处理 20 个文件；通常每个大文件只读取头、中、尾各 20 KB，单分段失败会独立重试（最多 3 次）；若云端不支持分段或缺少 GCID，才会回退完整校验，完整校验也支持重签重试（最多 3 次）。" />
     </div>
   </a-drawer>
 </template>

@@ -6,7 +6,10 @@ mod organizer_core;
 mod virtual_library;
 mod webdav;
 
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use futures_util::{stream, StreamExt, TryStreamExt};
 use hmac::{Hmac, Mac};
 use md5::Md5;
@@ -44,7 +47,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
-        watch, Semaphore,
+        watch, Notify, Semaphore,
     },
     time::{sleep, Duration, Instant},
 };
@@ -99,9 +102,14 @@ const DEFAULT_WEBDAV_USERNAME: &str = "guangya";
 const MAX_GCID_IMPORT_CONCURRENCY: usize = 32;
 const MAX_GCID_IMPORT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_GCID_IMPORT_ATTEMPTS: i64 = 5;
-const GCID_EXPORT_FILE_CONCURRENCY: usize = 8;
+const GCID_EXPORT_FILE_CONCURRENCY: usize = 20;
 const GCID_EXPORT_RANGE_CONCURRENCY: usize = 3;
-const GCID_EXPORT_SAMPLE_ATTEMPTS: usize = 3;
+const GCID_EXPORT_RANGE_ATTEMPTS: usize = 3;
+const GCID_EXPORT_FULL_ATTEMPTS: usize = 3;
+const GCID_EXPORT_REQUEST_TIMEOUT_SECS: u64 = 30;
+const GCID_EXPORT_READ_IDLE_TIMEOUT_SECS: u64 = 45;
+const CLEAR_RECYCLE_BIN_DEADLINE_SECS: u64 = 120;
+const CLEAR_RECYCLE_BIN_POLL_INTERVAL_SECS: u64 = 1;
 const DEVELOPER_NAME_RENAME_CONCURRENCY: usize = 2;
 const DEVELOPER_NAME_RENAME_ATTEMPTS: usize = 5;
 const DEVELOPER_PRE_AUDIT_BATCH_SIZE: usize = 20;
@@ -155,6 +163,33 @@ const CLOUD_FILE_TYPE_AUDIO: u8 = 3;
 const CLOUD_FILE_TYPE_DOCUMENT: u8 = 4;
 const CLOUD_FILE_TYPE_ARCHIVE: u8 = 5;
 type SharedState = Arc<Mutex<RuntimeState>>;
+
+#[derive(Default)]
+struct RecycleBinClearFlightState {
+    generation: u64,
+    running: bool,
+    result: Option<(u64, Result<Value, String>)>,
+}
+
+#[derive(Default)]
+struct RecycleBinClearFlight {
+    state: tokio::sync::Mutex<RecycleBinClearFlightState>,
+    notify: Notify,
+}
+
+static CLEAR_RECYCLE_BIN_FLIGHTS: OnceLock<Mutex<HashMap<String, Arc<RecycleBinClearFlight>>>> =
+    OnceLock::new();
+
+fn recycle_bin_clear_flight(account_scope: &str) -> Arc<RecycleBinClearFlight> {
+    let flights = CLEAR_RECYCLE_BIN_FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut flights) = flights.lock() else {
+        return Arc::new(RecycleBinClearFlight::default());
+    };
+    flights
+        .entry(account_scope.to_string())
+        .or_insert_with(|| Arc::new(RecycleBinClearFlight::default()))
+        .clone()
+}
 
 #[derive(Default)]
 struct PendingAppUpdate(Mutex<Option<Update>>);
@@ -273,6 +308,16 @@ struct Snapshot {
     auto_share_receipts: Vec<AutoShareReceipt>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct UploadReplacement {
+    old_file_id: String,
+    original_name: String,
+    temporary_name: String,
+    backup_name: String,
+    previous_size: u64,
+    previous_modified_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct UploadItem {
     mapping_id: String,
     file_path: PathBuf,
@@ -282,6 +327,8 @@ struct UploadItem {
     change_kind: String,
     size: u64,
     modified_ms: u128,
+    #[serde(default)]
+    replacement: Option<UploadReplacement>,
 }
 #[derive(Debug, Clone)]
 struct FsEvent {
@@ -317,6 +364,7 @@ struct Stamp {
 struct RuntimeState {
     token: Option<String>,
     refresh_token: Option<String>,
+    auth_account_scope: Option<String>,
     config_path: PathBuf,
     db_path: PathBuf,
     mappings: Vec<Mapping>,
@@ -336,6 +384,8 @@ struct RuntimeState {
     remote_cache: HashMap<String, String>,
     remote_cache_generation: u64,
     remote_cache_gates: Arc<RemoteCacheGates>,
+    upload_replacement_gates: Arc<RemoteCacheGates>,
+    active_upload_replacements: HashSet<String>,
     watchers: HashMap<String, RecommendedWatcher>,
     event_tx: UnboundedSender<FsEvent>,
     paused: bool,
@@ -663,6 +713,7 @@ struct PersistedUploadCheckpoint {
 struct AuthSession {
     access_token: Option<String>,
     refresh_token: Option<String>,
+    account_scope: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1525,6 +1576,7 @@ fn init_database(path: &Path) -> Result<(), String> {
                id INTEGER PRIMARY KEY CHECK (id = 1),
                access_token TEXT,
                refresh_token TEXT,
+               account_scope TEXT,
                updated_at INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS uploaded_files (
@@ -1539,6 +1591,7 @@ fn init_database(path: &Path) -> Result<(), String> {
                remote_dir TEXT NOT NULL DEFAULT '',
                relative_path TEXT NOT NULL DEFAULT '',
                change_kind TEXT NOT NULL DEFAULT 'added',
+               replacement_json TEXT,
                uploaded_at INTEGER NOT NULL,
                PRIMARY KEY (mapping_id, file_path)
              );
@@ -1696,6 +1749,14 @@ fn init_database(path: &Path) -> Result<(), String> {
                last_error TEXT,
                created_at INTEGER NOT NULL,
                updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS recycle_bin_clear_operations (
+               account_scope TEXT PRIMARY KEY,
+               state TEXT NOT NULL,
+               task_id TEXT,
+               last_error TEXT,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL
              );",
         )
         .map_err(|e| format!("初始化 SQLite 失败：{e}"))?;
@@ -1709,6 +1770,8 @@ fn init_database(path: &Path) -> Result<(), String> {
                ON developer_transfer_name_restores(status, file_id, updated_at);
              CREATE INDEX IF NOT EXISTS offline_name_restores_status
                ON offline_name_restores(status, updated_at);
+             CREATE INDEX IF NOT EXISTS recycle_bin_clear_operations_updated
+               ON recycle_bin_clear_operations(updated_at);
              UPDATE gcid_import_files
                SET status = 'pending', error = '应用上次退出，已等待继续'
                WHERE status = 'processing';
@@ -1726,11 +1789,13 @@ fn init_database(path: &Path) -> Result<(), String> {
         [],
     );
     for migration in [
+        "ALTER TABLE auth_session ADD COLUMN account_scope TEXT",
         "ALTER TABLE uploaded_files ADD COLUMN upload_state TEXT NOT NULL DEFAULT 'cloud_confirmed'",
         "ALTER TABLE uploaded_files ADD COLUMN remote_parent_id TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE uploaded_files ADD COLUMN remote_dir TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE uploaded_files ADD COLUMN relative_path TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE uploaded_files ADD COLUMN change_kind TEXT NOT NULL DEFAULT 'added'",
+        "ALTER TABLE uploaded_files ADD COLUMN replacement_json TEXT",
         "ALTER TABLE file_fingerprints ADD COLUMN cid TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE gcid_import_files ADD COLUMN cid TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE developer_transfer_jobs ADD COLUMN work_total_count INTEGER NOT NULL DEFAULT 0",
@@ -2120,12 +2185,13 @@ fn load_auth_session(path: &Path) -> Result<AuthSession, String> {
     let connection = open_database(path)?;
     connection
         .query_row(
-            "SELECT access_token, refresh_token FROM auth_session WHERE id = 1",
+            "SELECT access_token, refresh_token, account_scope FROM auth_session WHERE id = 1",
             [],
             |row| {
                 Ok(AuthSession {
                     access_token: row.get(0)?,
                     refresh_token: row.get(1)?,
+                    account_scope: row.get(2)?,
                 })
             },
         )
@@ -2134,6 +2200,7 @@ fn load_auth_session(path: &Path) -> Result<AuthSession, String> {
             value.unwrap_or(AuthSession {
                 access_token: None,
                 refresh_token: None,
+                account_scope: None,
             })
         })
         .map_err(|e| format!("读取登录状态失败：{e}"))
@@ -2163,17 +2230,19 @@ fn replace_auth_session(
     path: &Path,
     access_token: Option<&str>,
     refresh_token: Option<&str>,
+    account_scope: Option<&str>,
 ) -> Result<(), String> {
     let connection = open_database(path)?;
     connection
         .execute(
-            "INSERT INTO auth_session (id, access_token, refresh_token, updated_at)
-             VALUES (1, ?1, ?2, ?3)
+            "INSERT INTO auth_session (id, access_token, refresh_token, account_scope, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET
                access_token = excluded.access_token,
                refresh_token = excluded.refresh_token,
+               account_scope = excluded.account_scope,
                updated_at = excluded.updated_at",
-            params![access_token, refresh_token, unix_timestamp()],
+            params![access_token, refresh_token, account_scope, unix_timestamp()],
         )
         .map_err(|e| format!("替换登录状态失败：{e}"))?;
     Ok(())
@@ -2195,7 +2264,7 @@ fn clear_persisted_auth_session(path: &Path) -> Result<(), String> {
     connection
         .execute(
             "UPDATE auth_session
-             SET access_token = NULL, refresh_token = NULL, updated_at = ?1
+             SET access_token = NULL, refresh_token = NULL, account_scope = NULL, updated_at = ?1
              WHERE id = 1",
             params![unix_timestamp()],
         )
@@ -2208,6 +2277,7 @@ fn invalidate_auth_session(app: &tauri::AppHandle, state: &SharedState) -> Resul
         let mut guard = state.lock().map_err(|e| e.to_string())?;
         guard.token = None;
         guard.refresh_token = None;
+        guard.auth_account_scope = None;
         reset_runtime_remote_cache(&mut guard);
         guard.db_path.clone()
     };
@@ -2298,7 +2368,7 @@ fn load_pending_uploads(path: &Path) -> Result<Vec<PendingUpload>, String> {
     let mut statement = connection
         .prepare(
             "SELECT mapping_id, file_path, size, modified_ms, task_id,
-                    remote_parent_id, remote_dir, relative_path, change_kind
+                    remote_parent_id, remote_dir, relative_path, change_kind, replacement_json
              FROM uploaded_files
              WHERE upload_state = ?1 AND task_id IS NOT NULL AND TRIM(task_id) <> ''",
         )
@@ -2316,6 +2386,9 @@ fn load_pending_uploads(path: &Path) -> Result<Vec<PendingUpload>, String> {
                     remote_dir: row.get(6)?,
                     relative_path: row.get(7)?,
                     change_kind: row.get(8)?,
+                    replacement: row
+                        .get::<_, Option<String>>(9)?
+                        .and_then(|value| serde_json::from_str(&value).ok()),
                 },
                 task_id: row.get(4)?,
             })
@@ -2489,12 +2562,19 @@ fn save_upload_record(
     upload_state: &str,
 ) -> Result<(), String> {
     let connection = open_database(path)?;
+    let replacement_json = item
+        .replacement
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| format!("序列化安全替换状态失败：{error}"))?;
     connection
         .execute(
             "INSERT INTO uploaded_files
                (mapping_id, file_path, size, modified_ms, task_id, remote_file_id,
-                upload_state, remote_parent_id, remote_dir, relative_path, change_kind, uploaded_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                upload_state, remote_parent_id, remote_dir, relative_path, change_kind,
+                replacement_json, uploaded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(mapping_id, file_path) DO UPDATE SET
                size = excluded.size,
                modified_ms = excluded.modified_ms,
@@ -2505,6 +2585,7 @@ fn save_upload_record(
                remote_dir = excluded.remote_dir,
                relative_path = excluded.relative_path,
                change_kind = excluded.change_kind,
+               replacement_json = excluded.replacement_json,
                uploaded_at = excluded.uploaded_at",
             params![
                 item.mapping_id,
@@ -2518,6 +2599,7 @@ fn save_upload_record(
                 item.remote_dir,
                 item.relative_path,
                 item.change_kind,
+                replacement_json,
                 unix_timestamp()
             ],
         )
@@ -2555,7 +2637,7 @@ fn confirm_pending_record(
         .execute(
             "UPDATE uploaded_files SET remote_file_id = ?1, upload_state = ?2,
                     remote_parent_id = ?3, remote_dir = ?4, relative_path = ?5,
-                    change_kind = ?6, uploaded_at = ?7
+                    change_kind = ?6, replacement_json = NULL, uploaded_at = ?7
              WHERE mapping_id = ?8 AND file_path = ?9 AND task_id = ?10
                AND upload_state = ?11",
             params![
@@ -2600,8 +2682,26 @@ fn remember_confirmed_upload(
 
 fn delete_pending_upload(path: &Path, pending: &PendingUpload) -> Result<bool, String> {
     let connection = open_database(path)?;
-    connection
-        .execute(
+    let changed = if let Some(replacement) = pending.item.replacement.as_ref() {
+        connection.execute(
+            "UPDATE uploaded_files
+             SET size = ?1, modified_ms = ?2, task_id = NULL, remote_file_id = ?3,
+                 upload_state = ?4, replacement_json = NULL, uploaded_at = ?5
+             WHERE mapping_id = ?6 AND file_path = ?7 AND task_id = ?8 AND upload_state = ?9",
+            params![
+                replacement.previous_size,
+                replacement.previous_modified_ms.to_string(),
+                replacement.old_file_id,
+                UPLOAD_STATE_CLOUD_CONFIRMED,
+                unix_timestamp(),
+                pending.item.mapping_id,
+                pending.item.file_path.to_string_lossy(),
+                pending.task_id,
+                UPLOAD_STATE_OSS_COMPLETE
+            ],
+        )
+    } else {
+        connection.execute(
             "DELETE FROM uploaded_files
              WHERE mapping_id = ?1 AND file_path = ?2 AND task_id = ?3 AND upload_state = ?4",
             params![
@@ -2611,6 +2711,8 @@ fn delete_pending_upload(path: &Path, pending: &PendingUpload) -> Result<bool, S
                 UPLOAD_STATE_OSS_COMPLETE
             ],
         )
+    };
+    changed
         .map(|changed| changed > 0)
         .map_err(|e| format!("清理待确认上传记录失败：{e}"))
 }
@@ -4510,6 +4612,282 @@ async fn find_remote_file(
         }
     }
     Ok(None)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplacementRemoteEntry {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UploadReplacementState {
+    Conflict,
+    OldRenamedExternally(String),
+    StageOld,
+    PromoteNew { old_exists: bool },
+    Promoted { old_exists: bool },
+}
+
+fn upload_replacement_state(
+    entries: &[ReplacementRemoteEntry],
+    replacement: &UploadReplacement,
+    new_file_id: &str,
+) -> UploadReplacementState {
+    if entries.iter().any(|entry| {
+        entry.name == replacement.original_name
+            && entry.id != replacement.old_file_id
+            && entry.id != new_file_id
+    }) {
+        return UploadReplacementState::Conflict;
+    }
+    let old = entries
+        .iter()
+        .find(|entry| entry.id == replacement.old_file_id);
+    if entries
+        .iter()
+        .any(|entry| entry.id == new_file_id && entry.name == replacement.original_name)
+    {
+        return UploadReplacementState::Promoted {
+            old_exists: old.is_some(),
+        };
+    }
+    match old {
+        Some(entry) if entry.name == replacement.original_name => UploadReplacementState::StageOld,
+        Some(entry) if entry.name == replacement.backup_name => {
+            UploadReplacementState::PromoteNew { old_exists: true }
+        }
+        Some(entry) => UploadReplacementState::OldRenamedExternally(entry.name.clone()),
+        None => UploadReplacementState::PromoteNew { old_exists: false },
+    }
+}
+
+async fn list_upload_replacement_entries(
+    token: &str,
+    device_id: &str,
+    parent_id: &str,
+) -> Result<Vec<ReplacementRemoteEntry>, String> {
+    let mut entries = Vec::new();
+    for page in 0..1000_u64 {
+        let response = api_post(
+            token,
+            device_id,
+            "/userres/v1/file/get_file_list",
+            json!({
+                "page": page,
+                "pageSize": 100,
+                "parentId": parent_id,
+                "orderBy": 0,
+                "sortType": 0,
+                "needSubFolderStat": true
+            }),
+            &[],
+        )
+        .await?;
+        let data = response.data.unwrap_or_default();
+        let list = data
+            .get("list")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let count = list.len();
+        entries.extend(list.into_iter().filter_map(|entry| {
+            let id = entry.get("fileId")?.as_str()?.to_string();
+            let name = entry.get("fileName")?.as_str()?.to_string();
+            (!id.is_empty() && !name.is_empty()).then_some(ReplacementRemoteEntry { id, name })
+        }));
+        match value_as_u64(data.get("total")) {
+            Some(total) if entries.len() as u64 >= total => break,
+            None if count < 100 => break,
+            _ if count == 0 => break,
+            _ => {}
+        }
+    }
+    Ok(entries)
+}
+
+async fn rename_upload_replacement_entry(
+    token: &str,
+    device_id: &str,
+    file_id: &str,
+    new_name: &str,
+) -> Result<(), String> {
+    let response = api_post(
+        token,
+        device_id,
+        "/userres/v1/file/rename",
+        json!({ "fileId": file_id, "newName": new_name }),
+        &[],
+    )
+    .await?;
+    finish_operation_response(token, device_id, response)
+        .await
+        .map(|_| ())
+}
+
+async fn delete_upload_replacement_entry(
+    token: &str,
+    device_id: &str,
+    file_id: &str,
+) -> Result<(), String> {
+    let response = api_post(
+        token,
+        device_id,
+        "/userres/v1/file/delete_file",
+        json!({ "fileIds": [file_id] }),
+        &[],
+    )
+    .await?;
+    finish_operation_response(token, device_id, response)
+        .await
+        .map(|_| ())
+}
+
+async fn safely_replace_uploaded_file(
+    token: &str,
+    device_id: &str,
+    parent_id: &str,
+    replacement: &UploadReplacement,
+    new_file_id: &str,
+) -> Result<(), String> {
+    if new_file_id.is_empty() {
+        return Err("新文件已入库，但缺少文件 ID，无法安全覆盖".into());
+    }
+    if new_file_id == replacement.old_file_id {
+        return Ok(());
+    }
+    let entries = list_upload_replacement_entries(token, device_id, parent_id).await?;
+    let mut state = upload_replacement_state(&entries, replacement, new_file_id);
+    match &state {
+        UploadReplacementState::Conflict => {
+            return Err(format!(
+                "云端“{}”已被其他文件占用；新版本保留为临时文件，未覆盖现有文件",
+                replacement.original_name
+            ));
+        }
+        UploadReplacementState::OldRenamedExternally(name) => {
+            return Err(format!(
+                "原云端文件已被改名为“{name}”；新版本保留为临时文件，未覆盖外部改动"
+            ));
+        }
+        UploadReplacementState::StageOld => {
+            rename_upload_replacement_entry(
+                token,
+                device_id,
+                &replacement.old_file_id,
+                &replacement.backup_name,
+            )
+            .await?;
+            state = UploadReplacementState::PromoteNew { old_exists: true };
+        }
+        _ => {}
+    }
+    let old_exists = match state {
+        UploadReplacementState::Promoted { old_exists } => old_exists,
+        UploadReplacementState::PromoteNew { old_exists } => {
+            if let Err(error) = rename_upload_replacement_entry(
+                token,
+                device_id,
+                new_file_id,
+                &replacement.original_name,
+            )
+            .await
+            {
+                if old_exists {
+                    if let Err(rollback) = rename_upload_replacement_entry(
+                        token,
+                        device_id,
+                        &replacement.old_file_id,
+                        &replacement.original_name,
+                    )
+                    .await
+                    {
+                        return Err(format!("{error}；恢复旧文件名也失败：{rollback}"));
+                    }
+                }
+                return Err(error);
+            }
+            old_exists
+        }
+        UploadReplacementState::Conflict
+        | UploadReplacementState::OldRenamedExternally(_)
+        | UploadReplacementState::StageOld => unreachable!("replacement state handled above"),
+    };
+    if old_exists {
+        delete_upload_replacement_entry(token, device_id, &replacement.old_file_id).await?;
+    }
+    Ok(())
+}
+
+struct ActiveUploadReplacement {
+    state: SharedState,
+    key: String,
+}
+
+impl Drop for ActiveUploadReplacement {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.active_upload_replacements.remove(&self.key);
+        }
+    }
+}
+
+async fn complete_upload_replacement(
+    app: &tauri::AppHandle,
+    state: &SharedState,
+    token: &str,
+    device_id: &str,
+    item: &UploadItem,
+    outcome: &UploadOutcome,
+) -> Result<(), String> {
+    let Some(replacement) = item.replacement.as_ref() else {
+        return Ok(());
+    };
+    let key = item_key(&item.mapping_id, &item.file_path);
+    let gate_pool = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .upload_replacement_gates
+        .clone();
+    let gate = gate_pool.gate(&key);
+    let _gate = gate.lock().await;
+    {
+        let mut guard = state.lock().map_err(|error| error.to_string())?;
+        if guard.cancelled_uploads.contains_key(&key) {
+            return Err(UPLOAD_CANCELLED_MESSAGE.into());
+        }
+        guard.active_upload_replacements.insert(key.clone());
+    }
+    let _active = ActiveUploadReplacement {
+        state: state.clone(),
+        key,
+    };
+    let new_file_id = outcome
+        .remote_file_id
+        .as_deref()
+        .ok_or_else(|| "新文件已入库，但缺少文件 ID，无法安全覆盖".to_string())?;
+    emit(
+        app,
+        json!({
+            "type": "progress",
+            "file_path": item.file_path.to_string_lossy(),
+            "percent": 100,
+            "uploaded_bytes": item.size,
+            "total_bytes": item.size,
+            "bytes_per_second": 0,
+            "stage": "新版本已入库，正在安全替换旧文件"
+        }),
+    );
+    let parent_id = ensure_remote_path(
+        app,
+        state,
+        token,
+        device_id,
+        &item.remote_parent_id,
+        &item.remote_dir,
+    )
+    .await?;
+    safely_replace_uploaded_file(token, device_id, &parent_id, replacement, new_file_id).await
 }
 
 async fn wait_gcid_import_task(
@@ -6507,7 +6885,75 @@ fn file_available_for_upload(path: &Path) -> Result<bool, String> {
         .map_err(|error| format!("读取源文件失败：{error}"))
 }
 
-async fn prepare_upload_item(item: &UploadItem) -> Result<Option<UploadItem>, String> {
+fn hydrate_upload_replacement(path: &Path, item: &mut UploadItem) -> Result<(), String> {
+    if item.replacement.is_some()
+        || item.change_kind != "changed"
+        || item.mapping_id.is_empty()
+        || item.mapping_id.starts_with("__")
+    {
+        return Ok(());
+    }
+    let original_name = Path::new(&item.relative_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "无法确定安全覆盖的原文件名".to_string())?;
+    let previous = open_database(path)?
+        .query_row(
+            "SELECT size, modified_ms, remote_file_id
+             FROM uploaded_files
+             WHERE mapping_id = ?1 AND file_path = ?2 AND upload_state = ?3
+               AND remote_parent_id = ?4 AND remote_dir = ?5 AND relative_path = ?6",
+            params![
+                item.mapping_id,
+                item.file_path.to_string_lossy(),
+                UPLOAD_STATE_CLOUD_CONFIRMED,
+                item.remote_parent_id,
+                item.remote_dir,
+                item.relative_path
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取待替换云端文件失败：{error}"))?;
+    let Some((previous_size, previous_modified_ms, Some(old_file_id))) = previous else {
+        return Ok(());
+    };
+    if old_file_id.trim().is_empty() {
+        return Ok(());
+    }
+    item.replacement = Some(UploadReplacement {
+        old_file_id,
+        original_name: original_name.to_string(),
+        temporary_name: format!(".__gy_replace_{}", Uuid::new_v4().simple()),
+        backup_name: format!(".__gy_replace_backup_{}", Uuid::new_v4().simple()),
+        previous_size,
+        previous_modified_ms: previous_modified_ms.parse().unwrap_or_default(),
+    });
+    Ok(())
+}
+
+fn upload_remote_name(item: &UploadItem) -> Result<String, String> {
+    if let Some(replacement) = item.replacement.as_ref() {
+        return Ok(replacement.temporary_name.clone());
+    }
+    item.file_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| "无法读取文件名".to_string())
+}
+
+async fn prepare_upload_item(
+    state: &SharedState,
+    item: &UploadItem,
+) -> Result<Option<UploadItem>, String> {
     if !file_available_for_upload(&item.file_path)? {
         return Ok(None);
     }
@@ -6528,6 +6974,12 @@ async fn prepare_upload_item(item: &UploadItem) -> Result<Option<UploadItem>, St
     let mut ready = item.clone();
     ready.size = second.len();
     ready.modified_ms = modified_ms(&second);
+    let db_path = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .db_path
+        .clone();
+    hydrate_upload_replacement(&db_path, &mut ready)?;
     Ok(Some(ready))
 }
 
@@ -6697,11 +7149,7 @@ async fn preflight_flash_upload(
         &item.remote_dir,
     )
     .await?;
-    let name = item
-        .file_path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| "无法读取文件名".to_string())?;
+    let name = upload_remote_name(item)?;
     let mut res = json!({ "fileSize": item.size });
     if item.size < OSS_MIB {
         emit(
@@ -6901,11 +7349,7 @@ async fn upload_item(
         &item.remote_dir,
     )
     .await?;
-    let name = item
-        .file_path
-        .file_name()
-        .and_then(|v| v.to_str())
-        .ok_or_else(|| "无法读取文件名".to_string())?;
+    let name = upload_remote_name(item)?;
     emit(
         app,
         json!({ "type": "progress", "file_path": item.file_path.to_string_lossy(), "percent": 0, "uploaded_bytes": 0, "total_bytes": item.size, "stage": "正在申请上传凭证" }),
@@ -7237,6 +7681,15 @@ async fn upload_item(
             .and_then(Value::as_str)
             .map(str::to_owned),
     };
+    complete_upload_replacement(app, state, &token, &device_id, item, &outcome)
+        .await
+        .map_err(|message| {
+            if message == UPLOAD_CANCELLED_MESSAGE {
+                message
+            } else {
+                format!("新版本已入库，但安全替换尚未完成；后台将继续恢复：{message}")
+            }
+        })?;
     remember_confirmed_upload(state, item, &outcome)
         .map_err(|message| format!("云端已入库，但更新本地确认状态失败：{message}"))?;
     Ok(outcome)
@@ -7264,6 +7717,7 @@ pub(crate) async fn organizer_upload_bytes(
         change_kind: "added".to_string(),
         size: metadata.len(),
         modified_ms: modified_ms(&metadata),
+        replacement: None,
     };
     let state = app.state::<SharedState>();
     let result = upload_item(app, state.inner(), &item).await;
@@ -7676,7 +8130,7 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
         tauri::async_runtime::spawn(async move {
             let upload_key = item_key(&item.mapping_id, &item.file_path);
             let mut item = item;
-            let result = match prepare_upload_item(&item).await {
+            let result = match prepare_upload_item(&state2, &item).await {
                 Ok(Some(ready)) => {
                     item = ready;
                     interruptible_upload_step(
@@ -7869,6 +8323,24 @@ fn drain_flash_preflight(app: tauri::AppHandle, state: SharedState) {
                                         .and_then(Value::as_str)
                                         .map(str::to_owned),
                                 };
+                                if let Err(message) = complete_upload_replacement(
+                                    &confirm_app,
+                                    &confirm_state,
+                                    &token,
+                                    &device_id,
+                                    &confirm_item,
+                                    &outcome,
+                                )
+                                .await
+                                {
+                                    status(
+                                         &confirm_app,
+                                         "warning",
+                                         format!("新版本已入库，但安全替换尚未完成；后台将继续恢复：{message}"),
+                                     );
+                                    emit_state(&confirm_app, &confirm_state);
+                                    return;
+                                }
                                 match remember_confirmed_upload(
                                     &confirm_state,
                                     &confirm_item,
@@ -8053,7 +8525,7 @@ fn drain_queue(app: tauri::AppHandle, state: SharedState) {
         tauri::async_runtime::spawn(async move {
             let upload_key = item_key(&item.mapping_id, &item.file_path);
             let mut item = item;
-            let result = match prepare_upload_item(&item).await {
+            let result = match prepare_upload_item(&state2, &item).await {
                 Ok(Some(ready)) => {
                     item = ready;
                     interruptible_upload_step(
@@ -8329,6 +8801,7 @@ async fn enqueue_path(app: &tauri::AppHandle, state: &SharedState, event: FsEven
         change_kind: "added".to_string(),
         size: meta.len(),
         modified_ms: modified_ms(&meta),
+        replacement: None,
     };
     if let Ok(guard) = state.lock() {
         if upload_already_scheduled(
@@ -8709,6 +9182,20 @@ async fn recover_pending_upload(app: tauri::AppHandle, state: SharedState, pendi
                     .and_then(Value::as_str)
                     .map(str::to_owned),
             };
+            if let Err(message) =
+                complete_upload_replacement(&app, &state, &token, &device_id, &item, &outcome).await
+            {
+                status(
+                    &app,
+                    "warning",
+                    format!("新版本已入库，但安全替换尚未完成；后台将继续恢复：{message}"),
+                );
+                if let Ok(mut guard) = state.lock() {
+                    guard.recovering_pending.remove(&key);
+                }
+                emit_state(&app, &state);
+                return;
+            }
             match remember_confirmed_upload(&state, &item, &outcome) {
                 Ok(()) => {
                     finalize_successful_upload(&app, &state, &item, &outcome).await;
@@ -9317,6 +9804,351 @@ fn recycle_file_list_request(page: Option<u64>) -> Value {
 
 fn clear_recycle_bin_request() -> (&'static str, Value) {
     ("/userres/v1/file/clear_recycle_bin", json!({}))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecycleBinClearOperation {
+    Unknown { updated_at: i64 },
+    Task { task_id: String, updated_at: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecycleBinClearAction {
+    Submit,
+    ProtectUnknown,
+    ResumeTask,
+}
+
+fn jwt_account_identity(token: &str) -> Option<String> {
+    let mut parts = token.split('.');
+    let header = parts.next()?;
+    let payload = parts.next()?;
+    let signature = parts.next()?;
+    if header.is_empty() || payload.is_empty() || signature.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| URL_SAFE.decode(payload))
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    let account_id = [
+        "sub",
+        "accountId",
+        "account_id",
+        "userId",
+        "user_id",
+        "uid",
+        "id",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        let value = value_as_id(claims.get(key));
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })?;
+    let issuer = claims
+        .get("iss")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(API_BASE);
+    Some(format!("{issuer}\0{account_id}"))
+}
+
+fn stable_account_scope_from_token(token: &str) -> Option<String> {
+    jwt_account_identity(token).map(|identity| {
+        format!(
+            "account:{}",
+            hex::encode(Sha256::digest(identity.as_bytes()))
+        )
+    })
+}
+
+fn new_auth_account_scope(token: &str) -> String {
+    stable_account_scope_from_token(token)
+        .unwrap_or_else(|| format!("session:{}", Uuid::new_v4().simple()))
+}
+
+fn persist_auth_account_scope(database: &Path, account_scope: &str) -> Result<(), String> {
+    open_database(database)?
+        .execute(
+            "UPDATE auth_session SET account_scope = ?1, updated_at = ?2 WHERE id = 1",
+            params![account_scope, unix_timestamp()],
+        )
+        .map_err(|error| format!("保存登录账号范围失败：{error}"))?;
+    Ok(())
+}
+
+fn ensure_auth_account_scope(database: &Path, session: &mut AuthSession) -> Result<(), String> {
+    if session.access_token.is_none() || session.account_scope.is_some() {
+        return Ok(());
+    }
+    let account_scope = new_auth_account_scope(session.access_token.as_deref().unwrap_or_default());
+    persist_auth_account_scope(database, &account_scope)?;
+    session.account_scope = Some(account_scope);
+    Ok(())
+}
+
+fn load_recycle_bin_clear_operation(
+    database: &Path,
+    account_scope: &str,
+) -> Result<Option<RecycleBinClearOperation>, String> {
+    open_database(database)?
+        .query_row(
+            "SELECT state, task_id, updated_at
+             FROM recycle_bin_clear_operations WHERE account_scope = ?1",
+            params![account_scope],
+            |row| {
+                let state: String = row.get(0)?;
+                let task_id: Option<String> = row.get(1)?;
+                let updated_at: i64 = row.get(2)?;
+                Ok((state, task_id, updated_at))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取清空回收站任务状态失败：{error}"))?
+        .map(|(state, task_id, updated_at)| match state.as_str() {
+            "unknown" => Ok(RecycleBinClearOperation::Unknown { updated_at }),
+            "task" => task_id
+                .filter(|value| !value.trim().is_empty())
+                .map(|task_id| RecycleBinClearOperation::Task {
+                    task_id,
+                    updated_at,
+                })
+                .ok_or_else(|| "清空回收站任务状态损坏：缺少 taskId".to_string()),
+            _ => Err(format!("清空回收站任务状态损坏：{state}")),
+        })
+        .transpose()
+}
+
+fn save_recycle_bin_clear_operation(
+    database: &Path,
+    account_scope: &str,
+    operation: &RecycleBinClearOperation,
+) -> Result<(), String> {
+    let (state, task_id, updated_at) = match operation {
+        RecycleBinClearOperation::Unknown { updated_at } => ("unknown", None, *updated_at),
+        RecycleBinClearOperation::Task {
+            task_id,
+            updated_at,
+        } => ("task", Some(task_id.as_str()), *updated_at),
+    };
+    open_database(database)?
+        .execute(
+            "INSERT INTO recycle_bin_clear_operations
+               (account_scope, state, task_id, last_error, created_at, updated_at)
+             VALUES (?1, ?2, ?3, NULL, ?4, ?4)
+             ON CONFLICT(account_scope) DO UPDATE SET
+               state = excluded.state,
+               task_id = excluded.task_id,
+               last_error = NULL,
+               updated_at = excluded.updated_at",
+            params![account_scope, state, task_id, updated_at],
+        )
+        .map_err(|error| format!("保存清空回收站任务状态失败：{error}"))?;
+    Ok(())
+}
+
+fn clear_recycle_bin_operation(database: &Path, account_scope: &str) -> Result<(), String> {
+    open_database(database)?
+        .execute(
+            "DELETE FROM recycle_bin_clear_operations WHERE account_scope = ?1",
+            params![account_scope],
+        )
+        .map_err(|error| format!("清理清空回收站任务状态失败：{error}"))?;
+    Ok(())
+}
+
+fn plan_recycle_bin_clear(
+    operation: Option<&RecycleBinClearOperation>,
+    force_retry: bool,
+) -> RecycleBinClearAction {
+    match operation {
+        None => RecycleBinClearAction::Submit,
+        Some(RecycleBinClearOperation::Task { .. }) => RecycleBinClearAction::ResumeTask,
+        Some(RecycleBinClearOperation::Unknown { .. }) if force_retry => {
+            RecycleBinClearAction::Submit
+        }
+        Some(RecycleBinClearOperation::Unknown { .. }) => RecycleBinClearAction::ProtectUnknown,
+    }
+}
+
+fn recycle_bin_clear_pending(state: &str, task_id: Option<&str>, message: String) -> Value {
+    json!({
+        "completed": false,
+        "pending": true,
+        "state": state,
+        "taskId": task_id,
+        "message": message,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecycleBinTaskStatus {
+    Pending,
+    Succeeded,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitialRecycleBinClearResponseClass {
+    Accepted,
+    Ambiguous,
+    DefinitiveRejection,
+}
+
+fn transient_recycle_bin_clear_business_code(code: i64) -> bool {
+    matches!(code, 100 | 101 | 102 | 103 | 408 | 429 | 18010 | 18013)
+}
+
+fn classify_initial_recycle_bin_clear_response(
+    http_status: u16,
+    business_code: i64,
+) -> InitialRecycleBinClearResponseClass {
+    if business_auth_expired(http_status, business_code) {
+        return InitialRecycleBinClearResponseClass::DefinitiveRejection;
+    }
+    if (200..300).contains(&http_status) && business_code == 0 {
+        return InitialRecycleBinClearResponseClass::Accepted;
+    }
+    if matches!(http_status, 408 | 425 | 429)
+        || http_status >= 500
+        || transient_recycle_bin_clear_business_code(business_code)
+    {
+        return InitialRecycleBinClearResponseClass::Ambiguous;
+    }
+    if (400..500).contains(&http_status)
+        || ((200..300).contains(&http_status) && business_code != 0)
+    {
+        return InitialRecycleBinClearResponseClass::DefinitiveRejection;
+    }
+    InitialRecycleBinClearResponseClass::Ambiguous
+}
+
+fn initial_recycle_bin_clear_error(http_status: u16, response: &ApiResponse) -> String {
+    if business_auth_expired(http_status, response.code) {
+        "登录态已失效，请重新打开官方登录页".to_string()
+    } else if response.msg.trim().is_empty() {
+        format!("光鸭接口失败：HTTP {http_status}/{}", response.code)
+    } else {
+        response.msg.clone()
+    }
+}
+
+fn classify_recycle_bin_task_status(data: &Value) -> RecycleBinTaskStatus {
+    let status_code = data.get("status").and_then(Value::as_i64).unwrap_or(0);
+    let detail = data.get("detail").cloned().unwrap_or_default();
+    let detail_code = detail.get("code").and_then(Value::as_i64).unwrap_or(0);
+    let message = || {
+        detail
+            .get("msg")
+            .and_then(Value::as_str)
+            .unwrap_or("清空回收站失败")
+            .to_string()
+    };
+    if [2, 3].contains(&status_code) && detail_code != 0 {
+        RecycleBinTaskStatus::Failed(message())
+    } else if status_code == 2 {
+        RecycleBinTaskStatus::Succeeded
+    } else if status_code == 3 {
+        RecycleBinTaskStatus::Failed(message())
+    } else {
+        RecycleBinTaskStatus::Pending
+    }
+}
+
+async fn wait_recycle_bin_clear_task(
+    token: &str,
+    device_id: &str,
+    task_id: &str,
+    deadline: Instant,
+) -> Result<RecycleBinTaskStatus, String> {
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let response = tokio::time::timeout(
+            remaining,
+            api_post(
+                token,
+                device_id,
+                "/userres/v1/get_task_status",
+                json!({ "taskId": task_id }),
+                &[],
+            ),
+        )
+        .await;
+        let response = match response {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) if error.contains("登录态已失效") => return Err(error),
+            Ok(Err(_)) | Err(_) => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                sleep(
+                    Duration::from_secs(CLEAR_RECYCLE_BIN_POLL_INTERVAL_SECS)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                )
+                .await;
+                continue;
+            }
+        };
+        let data = response.data.unwrap_or_default();
+        let status = classify_recycle_bin_task_status(&data);
+        if !matches!(status, RecycleBinTaskStatus::Pending) {
+            return Ok(status);
+        }
+        sleep(
+            Duration::from_secs(CLEAR_RECYCLE_BIN_POLL_INTERVAL_SECS)
+                .min(deadline.saturating_duration_since(Instant::now())),
+        )
+        .await;
+    }
+    Ok(RecycleBinTaskStatus::Pending)
+}
+
+async fn run_recycle_bin_clear_singleflight<F, Fut>(
+    account_scope: &str,
+    operation: F,
+) -> Result<Value, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Value, String>>,
+{
+    let flight = recycle_bin_clear_flight(account_scope);
+    let generation = {
+        let mut state = flight.state.lock().await;
+        if state.running {
+            state.generation
+        } else {
+            state.running = true;
+            state.generation = state.generation.wrapping_add(1);
+            state.result = None;
+            let generation = state.generation;
+            drop(state);
+            let result = operation().await;
+            let mut state = flight.state.lock().await;
+            state.running = false;
+            state.result = Some((generation, result.clone()));
+            drop(state);
+            flight.notify.notify_waiters();
+            return result;
+        }
+    };
+
+    loop {
+        let notified = flight.notify.notified();
+        if let Some(result) = {
+            let state = flight.state.lock().await;
+            state
+                .result
+                .as_ref()
+                .filter(|(result_generation, _)| *result_generation == generation)
+                .map(|(_, result)| result.clone())
+        } {
+            return result;
+        }
+        notified.await;
+    }
 }
 
 fn create_folder_request(
@@ -10015,31 +10847,168 @@ fn emit_gcid_export_progress(
     );
 }
 
-async fn read_cloud_cid_range(
+#[derive(Debug)]
+struct GcidExportRangeError {
+    message: String,
+    retryable: bool,
+}
+
+impl GcidExportRangeError {
+    fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+}
+
+struct GcidExportProgressAttempt {
+    total: Arc<AtomicU64>,
+    bytes: u64,
+    committed: bool,
+}
+
+impl GcidExportProgressAttempt {
+    fn new(total: Arc<AtomicU64>) -> Self {
+        Self {
+            total,
+            bytes: 0,
+            committed: false,
+        }
+    }
+
+    fn add(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.total.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for GcidExportProgressAttempt {
+    fn drop(&mut self) {
+        if !self.committed && self.bytes != 0 {
+            self.total.fetch_sub(self.bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+fn retryable_gcid_export_range_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 401 | 403 | 408 | 425 | 429) || status.is_server_error()
+}
+
+async fn retry_gcid_export_range<T, F, Fut>(
+    mut operation: F,
+    attempts: usize,
+    base_delay_ms: u64,
+) -> Result<T, String>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<T, GcidExportRangeError>>,
+{
+    let attempts = attempts.max(1);
+    let mut last_error = GcidExportRangeError::retryable("云端分段读取失败");
+    for attempt in 0..attempts {
+        match operation(attempt).await {
+            Ok(value) => return Ok(value),
+            Err(error) => last_error = error,
+        }
+        if !last_error.retryable || attempt + 1 >= attempts {
+            break;
+        }
+        sleep(Duration::from_millis(
+            base_delay_ms.saturating_mul(1_u64 << attempt),
+        ))
+        .await;
+    }
+    Err(last_error.message)
+}
+
+async fn read_bounded_gcid_range_stream<S, B, E>(
+    stream: S,
+    expected: usize,
+    path: &str,
+    idle_timeout: Duration,
+) -> Result<Vec<u8>, GcidExportRangeError>
+where
+    S: futures_util::Stream<Item = Result<B, E>>,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    futures_util::pin_mut!(stream);
+    let mut bytes = Vec::with_capacity(expected);
+    loop {
+        let next = tokio::time::timeout(idle_timeout, stream.next())
+            .await
+            .map_err(|_| {
+                GcidExportRangeError::retryable(format!(
+                    "分段读取 {path} 连续 {}ms 无数据",
+                    idle_timeout.as_millis()
+                ))
+            })?;
+        let Some(chunk) = next else { break };
+        let chunk = chunk.map_err(|error| {
+            GcidExportRangeError::retryable(format!("分段读取 {path} 失败：{error}"))
+        })?;
+        let chunk = chunk.as_ref();
+        if chunk.len() > expected.saturating_sub(bytes.len()) {
+            return Err(GcidExportRangeError::retryable(format!(
+                "分段读取 {path} 返回的字节数超出请求范围"
+            )));
+        }
+        bytes.extend_from_slice(chunk);
+    }
+    if bytes.len() != expected {
+        return Err(GcidExportRangeError::retryable(format!(
+            "分段读取 {path} 的字节数不完整"
+        )));
+    }
+    Ok(bytes)
+}
+
+async fn read_cloud_cid_range_once(
     client: &reqwest::Client,
     download_url: &str,
     path: &str,
     file_size: u64,
     index: usize,
     range: (u64, u64),
-) -> Result<(usize, Vec<u8>), String> {
+) -> Result<(usize, Vec<u8>), GcidExportRangeError> {
     let (start, end) = range;
     if start == end {
         return Ok((index, Vec::new()));
     }
     let expected = end.saturating_sub(start);
-    let response = client
-        .get(download_url)
-        .header("accept-encoding", "identity")
-        .header(RANGE, format!("bytes={start}-{}", end - 1))
-        .send()
-        .await
-        .map_err(|error| format!("分段读取 {path} 失败：{error}"))?;
+    let response = tokio::time::timeout(
+        Duration::from_secs(GCID_EXPORT_REQUEST_TIMEOUT_SECS),
+        client
+            .get(download_url)
+            .header("accept-encoding", "identity")
+            .header(RANGE, format!("bytes={start}-{}", end - 1))
+            .send(),
+    )
+    .await
+    .map_err(|_| GcidExportRangeError::retryable(format!("分段读取 {path} 请求超时")))?
+    .map_err(|error| GcidExportRangeError::retryable(format!("分段读取 {path} 失败：{error}")))?;
     let status = response.status();
     let partial = status == reqwest::StatusCode::PARTIAL_CONTENT;
     let whole_file = start == 0 && end == file_size && status.is_success();
     if !partial && !whole_file {
-        return Err(format!("云端未接受分段读取（HTTP {status}）"));
+        let message = format!("云端未接受分段读取（HTTP {status}）");
+        return Err(if retryable_gcid_export_range_status(status) {
+            GcidExportRangeError::retryable(message)
+        } else {
+            GcidExportRangeError::permanent(message)
+        });
     }
     if partial {
         let expected_content_range = format!("bytes {start}-{}/{file_size}", end - 1);
@@ -10049,28 +11018,74 @@ async fn read_cloud_cid_range(
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
         if !content_range.eq_ignore_ascii_case(&expected_content_range) {
-            return Err("云端返回的分段范围与请求不一致".to_string());
+            return Err(GcidExportRangeError::retryable(
+                "云端返回的分段范围与请求不一致",
+            ));
         }
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| format!("分段读取 {path} 失败：{error}"))?;
-    if bytes.len() as u64 != expected {
-        return Err(format!("分段读取 {path} 的字节数不完整"));
-    }
-    Ok((index, bytes.to_vec()))
+    let expected = usize::try_from(expected)
+        .map_err(|_| GcidExportRangeError::permanent("分段读取的预期字节数超出范围"))?;
+    let bytes = read_bounded_gcid_range_stream(
+        response.bytes_stream(),
+        expected,
+        path,
+        Duration::from_secs(GCID_EXPORT_READ_IDLE_TIMEOUT_SECS),
+    )
+    .await?;
+    Ok((index, bytes))
+}
+
+async fn read_cloud_cid_range_with_retry(
+    client: &reqwest::Client,
+    token: &str,
+    device_id: &str,
+    file_id: &str,
+    initial_download_url: &str,
+    path: &str,
+    file_size: u64,
+    index: usize,
+    range: (u64, u64),
+) -> Result<(usize, Vec<u8>), String> {
+    retry_gcid_export_range(
+        |attempt| async move {
+            let refreshed_download_url;
+            let download_url = if attempt == 0 {
+                initial_download_url
+            } else {
+                refreshed_download_url = cloud_download_url(token, device_id, file_id)
+                    .await
+                    .map_err(GcidExportRangeError::retryable)?;
+                &refreshed_download_url
+            };
+            read_cloud_cid_range_once(client, download_url, path, file_size, index, range).await
+        },
+        GCID_EXPORT_RANGE_ATTEMPTS,
+        250,
+    )
+    .await
 }
 
 async fn sample_cloud_selection_cid(
     client: &reqwest::Client,
+    token: &str,
+    device_id: &str,
     download_url: &str,
     entry: &CloudSelectionEntry,
 ) -> Result<(String, u64), String> {
     let ranges = cid_byte_ranges(entry.size);
     let mut parts = stream::iter(ranges.into_iter().enumerate())
         .map(|(index, range)| {
-            read_cloud_cid_range(client, download_url, &entry.path, entry.size, index, range)
+            read_cloud_cid_range_with_retry(
+                client,
+                token,
+                device_id,
+                &entry.file_id,
+                download_url,
+                &entry.path,
+                entry.size,
+                index,
+                range,
+            )
         })
         .buffer_unordered(GCID_EXPORT_RANGE_CONCURRENCY)
         .try_collect::<Vec<_>>()
@@ -10093,68 +11108,83 @@ async fn sample_cloud_selection_cid_with_retry(
     device_id: &str,
     entry: &CloudSelectionEntry,
 ) -> Result<(String, u64), String> {
-    let mut last_error = "云端分段读取失败".to_string();
-    for attempt in 0..GCID_EXPORT_SAMPLE_ATTEMPTS {
-        let result = match cloud_download_url(token, device_id, &entry.file_id).await {
-            Ok(download_url) => sample_cloud_selection_cid(client, &download_url, entry).await,
-            Err(error) => Err(error),
-        };
-        match result {
-            Ok(value) => return Ok(value),
-            Err(error) => last_error = error,
-        }
-        if attempt + 1 < GCID_EXPORT_SAMPLE_ATTEMPTS {
-            sleep(Duration::from_millis(
-                250_u64.saturating_mul(1_u64 << attempt),
-            ))
-            .await;
-        }
-    }
-    Err(last_error)
+    let download_url = retry_gcid_export_range(
+        |_| async {
+            cloud_download_url(token, device_id, &entry.file_id)
+                .await
+                .map_err(GcidExportRangeError::retryable)
+        },
+        GCID_EXPORT_RANGE_ATTEMPTS,
+        250,
+    )
+    .await?;
+    sample_cloud_selection_cid(client, token, device_id, &download_url, entry).await
 }
 
-async fn hash_cloud_selection_entry_full(
+async fn hash_cloud_selection_entry_full_once(
     app: &tauri::AppHandle,
     client: &reqwest::Client,
     token: &str,
     device_id: &str,
-    entry: CloudSelectionEntry,
+    entry: &CloudSelectionEntry,
     downloaded_bytes: Arc<AtomicU64>,
     completed_files: Arc<AtomicUsize>,
     planned_sample_bytes: u64,
     source_total_bytes: u128,
     total_files: usize,
-) -> Result<GeneratedGcidExportFile, String> {
-    let download_url = cloud_download_url(token, device_id, &entry.file_id).await?;
-    let mut response = client
-        .get(&download_url)
-        .header("accept-encoding", "identity")
-        .send()
+) -> Result<FileHashes, GcidExportRangeError> {
+    let download_url = cloud_download_url(token, device_id, &entry.file_id)
         .await
-        .map_err(|error| format!("读取 {} 失败：{error}", entry.path))?;
+        .map_err(GcidExportRangeError::retryable)?;
+    let mut response = tokio::time::timeout(
+        Duration::from_secs(GCID_EXPORT_REQUEST_TIMEOUT_SECS),
+        client
+            .get(&download_url)
+            .header("accept-encoding", "identity")
+            .send(),
+    )
+    .await
+    .map_err(|_| GcidExportRangeError::retryable(format!("读取 {} 请求超时", entry.path)))?
+    .map_err(|error| {
+        GcidExportRangeError::retryable(format!("读取 {} 失败：{error}", entry.path))
+    })?;
     if !response.status().is_success() {
-        return Err(format!(
-            "读取 {} 失败（HTTP {}）",
-            entry.path,
-            response.status()
-        ));
+        let status = response.status();
+        let message = format!("读取 {} 失败（HTTP {status}）", entry.path);
+        return Err(if retryable_gcid_export_range_status(status) {
+            GcidExportRangeError::retryable(message)
+        } else {
+            GcidExportRangeError::permanent(message)
+        });
     }
     if response
         .content_length()
         .is_some_and(|length| length != entry.size)
     {
-        return Err(format!("文件大小发生变化：{}", entry.path));
+        return Err(GcidExportRangeError::permanent(format!(
+            "文件大小发生变化：{}",
+            entry.path
+        )));
     }
     let mut accumulator = FlashHashAccumulator::new(entry.size);
+    let mut progress_attempt = GcidExportProgressAttempt::new(downloaded_bytes.clone());
     let mut previous = 0_u64;
     let mut last_emit = Instant::now();
-    while let Some(chunk) = response
-        .chunk()
+    loop {
+        let chunk = tokio::time::timeout(
+            Duration::from_secs(GCID_EXPORT_READ_IDLE_TIMEOUT_SECS),
+            response.chunk(),
+        )
         .await
-        .map_err(|error| format!("读取 {} 失败：{error}", entry.path))?
-    {
-        let processed = accumulator.update(&chunk)?;
-        downloaded_bytes.fetch_add(processed.saturating_sub(previous), Ordering::Relaxed);
+        .map_err(|_| GcidExportRangeError::retryable(format!("读取 {} 等待数据超时", entry.path)))?
+        .map_err(|error| {
+            GcidExportRangeError::retryable(format!("读取 {} 失败：{error}", entry.path))
+        })?;
+        let Some(chunk) = chunk else { break };
+        let processed = accumulator
+            .update(&chunk)
+            .map_err(GcidExportRangeError::permanent)?;
+        progress_attempt.add(processed.saturating_sub(previous));
         previous = processed;
         if last_emit.elapsed() >= Duration::from_millis(250) {
             emit_gcid_export_progress(
@@ -10170,7 +11200,67 @@ async fn hash_cloud_selection_entry_full(
             last_emit = Instant::now();
         }
     }
-    let hashes = accumulator.finish()?;
+    let hashes = accumulator
+        .finish()
+        .map_err(GcidExportRangeError::retryable)?;
+    progress_attempt.commit();
+    Ok(hashes)
+}
+
+async fn hash_cloud_selection_entry_full(
+    app: &tauri::AppHandle,
+    client: &reqwest::Client,
+    token: &str,
+    device_id: &str,
+    entry: CloudSelectionEntry,
+    downloaded_bytes: Arc<AtomicU64>,
+    completed_files: Arc<AtomicUsize>,
+    planned_sample_bytes: u64,
+    source_total_bytes: u128,
+    total_files: usize,
+) -> Result<GeneratedGcidExportFile, String> {
+    let hashes = retry_gcid_export_range(
+        |attempt| {
+            let entry = &entry;
+            let downloaded_bytes = downloaded_bytes.clone();
+            let completed_files = completed_files.clone();
+            async move {
+                let result = hash_cloud_selection_entry_full_once(
+                    app,
+                    client,
+                    token,
+                    device_id,
+                    entry,
+                    downloaded_bytes.clone(),
+                    completed_files.clone(),
+                    planned_sample_bytes,
+                    source_total_bytes,
+                    total_files,
+                )
+                .await;
+                if result.is_err() {
+                    emit_gcid_export_progress(
+                        app,
+                        if attempt + 1 < GCID_EXPORT_FULL_ATTEMPTS {
+                            "完整校验读取失败，正在重试"
+                        } else {
+                            "完整校验失败"
+                        },
+                        &entry.path,
+                        completed_files.load(Ordering::Relaxed),
+                        total_files,
+                        downloaded_bytes.load(Ordering::Relaxed),
+                        planned_sample_bytes,
+                        source_total_bytes,
+                    );
+                }
+                result
+            }
+        },
+        GCID_EXPORT_FULL_ATTEMPTS,
+        250,
+    )
+    .await?;
     let completed = completed_files.fetch_add(1, Ordering::Relaxed) + 1;
     let downloaded = downloaded_bytes.load(Ordering::Relaxed);
     emit_gcid_export_progress(
@@ -10706,6 +11796,7 @@ fn queue_upload_paths(
                 change_kind: "added".to_string(),
                 size: metadata.len(),
                 modified_ms: modified_ms(&metadata),
+                replacement: None,
             };
             let key = item_key(&item.mapping_id, &item.file_path);
             guard.cancelled_uploads.remove(&key);
@@ -12483,12 +13574,142 @@ async fn permanently_delete_files(
     Ok(result)
 }
 
-#[tauri::command]
-async fn clear_recycle_bin(state: tauri::State<'_, SharedState>) -> Result<Value, String> {
-    let (endpoint, request) = clear_recycle_bin_request();
-    let (token, device_id) = auth_context(&state)?;
-    let response = api_post(&token, &device_id, endpoint, request, &[]).await?;
-    finish_operation_response(&token, &device_id, response).await
+async fn clear_recycle_bin_inner(
+    token: &str,
+    device_id: &str,
+    database: &Path,
+    account_scope: &str,
+    force_retry: bool,
+) -> Result<Value, String> {
+    let deadline = Instant::now() + Duration::from_secs(CLEAR_RECYCLE_BIN_DEADLINE_SECS);
+
+    let mut operation = load_recycle_bin_clear_operation(database, account_scope)?;
+    match plan_recycle_bin_clear(operation.as_ref(), force_retry) {
+        RecycleBinClearAction::ProtectUnknown => {
+            return Ok(recycle_bin_clear_pending(
+                "unknown",
+                None,
+                "上次清空请求的结果无法确认，程序不会自动重发；请先刷新回收站确认，只有显式强制重试才会重新提交"
+                    .to_string(),
+            ));
+        }
+        RecycleBinClearAction::Submit if operation.is_some() => {
+            clear_recycle_bin_operation(database, account_scope)?;
+            operation = None;
+        }
+        RecycleBinClearAction::Submit | RecycleBinClearAction::ResumeTask => {}
+    }
+
+    if operation.is_none() {
+        save_recycle_bin_clear_operation(
+            database,
+            account_scope,
+            &RecycleBinClearOperation::Unknown {
+                updated_at: unix_timestamp(),
+            },
+        )?;
+        let (endpoint, request) = clear_recycle_bin_request();
+        let response = match tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            api_post_response(token, device_id, endpoint, request),
+        )
+        .await
+        {
+            Ok(Ok((http_status, response))) => {
+                match classify_initial_recycle_bin_clear_response(http_status, response.code) {
+                    InitialRecycleBinClearResponseClass::Accepted => response,
+                    InitialRecycleBinClearResponseClass::Ambiguous => {
+                        return Ok(recycle_bin_clear_pending(
+                            "unknown",
+                            None,
+                            "云端返回了暂时无法确定执行结果的响应，程序不会自动重发；请先刷新回收站确认，只有显式强制重试才会重新提交"
+                                .to_string(),
+                        ));
+                    }
+                    InitialRecycleBinClearResponseClass::DefinitiveRejection => {
+                        clear_recycle_bin_operation(database, account_scope)?;
+                        return Err(initial_recycle_bin_clear_error(http_status, &response));
+                    }
+                }
+            }
+            Ok(Err(_)) | Err(_) => {
+                return Ok(recycle_bin_clear_pending(
+                    "unknown",
+                    None,
+                    "清空请求结果无法确认，程序不会自动重发；请先刷新回收站确认，只有显式强制重试才会重新提交"
+                        .to_string(),
+                ));
+            }
+        };
+        let data = response.data.unwrap_or_else(|| json!({}));
+        let Some(task_id) = operation_task_id(&data) else {
+            clear_recycle_bin_operation(database, account_scope)?;
+            return Ok(json!({
+                "completed": true,
+                "pending": false,
+                "state": "completed",
+                "data": data,
+            }));
+        };
+        let task = RecycleBinClearOperation::Task {
+            task_id,
+            updated_at: unix_timestamp(),
+        };
+        save_recycle_bin_clear_operation(database, account_scope, &task)?;
+        operation = Some(task);
+    }
+
+    let RecycleBinClearOperation::Task { task_id, .. } = operation.expect("operation created")
+    else {
+        unreachable!("unknown operations return before task polling")
+    };
+    match wait_recycle_bin_clear_task(token, device_id, &task_id, deadline).await? {
+        RecycleBinTaskStatus::Succeeded => {
+            clear_recycle_bin_operation(database, account_scope)?;
+            Ok(json!({
+                "completed": true,
+                "pending": false,
+                "state": "completed",
+                "taskId": task_id,
+            }))
+        }
+        RecycleBinTaskStatus::Failed(message) => {
+            clear_recycle_bin_operation(database, account_scope)?;
+            Err(message)
+        }
+        RecycleBinTaskStatus::Pending => Ok(recycle_bin_clear_pending(
+            "pending",
+            Some(&task_id),
+            "云端仍在清空回收站，再次点击将继续查询同一个任务，不会重复提交".to_string(),
+        )),
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn clear_recycle_bin(
+    state: tauri::State<'_, SharedState>,
+    force_retry: Option<bool>,
+) -> Result<Value, String> {
+    let (token, device_id, database, account_scope) = {
+        let guard = state.lock().map_err(|error| error.to_string())?;
+        (
+            guard
+                .token
+                .clone()
+                .ok_or_else(|| "请先登录光鸭云盘".to_string())?,
+            guard.device_id.clone(),
+            guard.db_path.clone(),
+            guard
+                .auth_account_scope
+                .clone()
+                .ok_or_else(|| "登录会话缺少账号范围，请重新登录".to_string())?,
+        )
+    };
+    let force_retry = force_retry.unwrap_or(false);
+    run_recycle_bin_clear_singleflight(&account_scope, || async {
+        clear_recycle_bin_inner(&token, &device_id, &database, &account_scope, force_retry).await
+    })
+    .await
 }
 
 #[tauri::command]
@@ -13862,16 +15083,23 @@ async fn login_with_sms(
     let access_token = account_payload_string(&login_payload, &["access_token"])
         .ok_or_else(|| "登录接口没有返回 access_token".to_string())?;
     let refresh_token = account_payload_string(&login_payload, &["refresh_token"]);
+    let account_scope = new_auth_account_scope(&access_token);
     let db_path = state
         .lock()
         .map_err(|error| error.to_string())?
         .db_path
         .clone();
-    replace_auth_session(&db_path, Some(&access_token), refresh_token.as_deref())?;
+    replace_auth_session(
+        &db_path,
+        Some(&access_token),
+        refresh_token.as_deref(),
+        Some(&account_scope),
+    )?;
     {
         let mut guard = state.lock().map_err(|error| error.to_string())?;
         guard.token = Some(access_token);
         guard.refresh_token = refresh_token;
+        guard.auth_account_scope = Some(account_scope);
         guard.sms_verifications.remove(verification_id);
         reset_runtime_remote_cache(&mut guard);
     }
@@ -13992,15 +15220,21 @@ async fn poll_device_login(
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
     if let Some(token) = token {
+        let account_scope = new_auth_account_scope(&token);
         let db_path = {
             let mut guard = state.lock().map_err(|e| e.to_string())?;
             guard.token = Some(token.clone());
             guard.refresh_token = refresh_token.clone();
+            guard.auth_account_scope = Some(account_scope.clone());
             reset_runtime_remote_cache(&mut guard);
             guard.db_path.clone()
         };
-        if let Err(message) = replace_auth_session(&db_path, Some(&token), refresh_token.as_deref())
-        {
+        if let Err(message) = replace_auth_session(
+            &db_path,
+            Some(&token),
+            refresh_token.as_deref(),
+            Some(&account_scope),
+        ) {
             status(&app, "error", message);
         }
         status(&app, "success", "扫码登录成功，可以开始使用云盘和备份任务");
@@ -14046,6 +15280,7 @@ async fn capture_token(
     if token.len() < 20 {
         return Ok(());
     }
+    let account_scope = new_auth_account_scope(&token);
     let db_path = {
         let mut guard = state.lock().map_err(|e| e.to_string())?;
         if guard.token.as_deref() == Some(token.as_str()) && guard.refresh_token.is_none() {
@@ -14053,10 +15288,11 @@ async fn capture_token(
         }
         guard.token = Some(token.clone());
         guard.refresh_token = None;
+        guard.auth_account_scope = Some(account_scope.clone());
         reset_runtime_remote_cache(&mut guard);
         guard.db_path.clone()
     };
-    if let Err(message) = replace_auth_session(&db_path, Some(&token), None) {
+    if let Err(message) = replace_auth_session(&db_path, Some(&token), None, Some(&account_scope)) {
         status(&app, "error", message);
     }
     status(&app, "success", "已捕获官方登录态，可以开始监控上传");
@@ -14460,6 +15696,7 @@ async fn backfill_auto_shares(
             change_kind: "added".to_string(),
             size,
             modified_ms: modified_raw.parse().unwrap_or_default(),
+            replacement: None,
         };
         let outcome = UploadOutcome {
             task_id: String::new(),
@@ -14804,6 +16041,12 @@ fn cancel_upload(
                     value.item.clone(),
                 );
             }
+        }
+        if matched
+            .keys()
+            .any(|key| guard.active_upload_replacements.contains(key))
+        {
+            return Err("新版本已经入库，正在安全替换旧文件，此阶段不能取消".into());
         }
         for (key, item) in &matched {
             guard.cancelled_uploads.insert(
@@ -16695,7 +17938,8 @@ fn run() {
             let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
             init_database(&db_path)?;
             let organizer_state = organizer::initialize(app.handle().clone(), db_path.clone())?;
-            let auth_session = load_auth_session(&db_path)?;
+            let mut auth_session = load_auth_session(&db_path)?;
+            ensure_auth_account_scope(&db_path, &mut auth_session)?;
             let upload_history = load_upload_history(&db_path)?;
             let pending_cloud = pending_upload_stamps(&db_path)?;
             let device_id = load_or_create_device_id(&db_path)?;
@@ -16791,6 +18035,7 @@ fn run() {
             let state = Arc::new(Mutex::new(RuntimeState {
                 token: auth_session.access_token,
                 refresh_token: auth_session.refresh_token,
+                auth_account_scope: auth_session.account_scope,
                 config_path,
                 db_path,
                 mappings: mappings.clone(),
@@ -16810,6 +18055,8 @@ fn run() {
                 remote_cache,
                 remote_cache_generation,
                 remote_cache_gates: Arc::new(RemoteCacheGates::default()),
+                upload_replacement_gates: Arc::new(RemoteCacheGates::default()),
+                active_upload_replacements: HashSet::new(),
                 watchers: HashMap::new(),
                 event_tx,
                 paused: false,
@@ -17276,6 +18523,373 @@ mod tests {
     }
 
     #[test]
+    fn recycle_bin_clear_planner_never_reposts_unknown_without_explicit_force() {
+        assert_eq!(
+            plan_recycle_bin_clear(None, false),
+            RecycleBinClearAction::Submit
+        );
+        assert_eq!(
+            plan_recycle_bin_clear(
+                Some(&RecycleBinClearOperation::Task {
+                    task_id: "clear-task-1".to_string(),
+                    updated_at: 1,
+                }),
+                false,
+            ),
+            RecycleBinClearAction::ResumeTask
+        );
+        for updated_at in [i64::MIN / 2, 1, 950, i64::MAX / 2] {
+            let unknown = RecycleBinClearOperation::Unknown { updated_at };
+            assert_eq!(
+                plan_recycle_bin_clear(Some(&unknown), false),
+                RecycleBinClearAction::ProtectUnknown,
+                "unknown state must never age into an automatic repost"
+            );
+            assert_eq!(
+                plan_recycle_bin_clear(Some(&unknown), true),
+                RecycleBinClearAction::Submit,
+                "only explicit force_retry may clear unknown and submit again"
+            );
+        }
+    }
+
+    #[test]
+    fn recycle_bin_clear_state_is_persistent_and_account_scoped() {
+        let root = std::env::temp_dir().join(format!(
+            "guangya-recycle-clear-state-{}",
+            Uuid::new_v4().simple()
+        ));
+        let database = root.join("state.sqlite3");
+        init_database(&database).expect("initialize recycle clear database");
+        let account_a = "session:account-a".to_string();
+        let account_b = "session:account-b".to_string();
+        assert_ne!(account_a, account_b);
+
+        save_recycle_bin_clear_operation(
+            &database,
+            &account_a,
+            &RecycleBinClearOperation::Unknown { updated_at: 10 },
+        )
+        .expect("save unknown marker");
+        assert_eq!(
+            load_recycle_bin_clear_operation(&database, &account_a).expect("load unknown marker"),
+            Some(RecycleBinClearOperation::Unknown { updated_at: 10 })
+        );
+        assert_eq!(
+            load_recycle_bin_clear_operation(&database, &account_b)
+                .expect("load other account state"),
+            None
+        );
+
+        save_recycle_bin_clear_operation(
+            &database,
+            &account_a,
+            &RecycleBinClearOperation::Task {
+                task_id: "clear-task-1".to_string(),
+                updated_at: 20,
+            },
+        )
+        .expect("promote unknown marker to task");
+        assert_eq!(
+            load_recycle_bin_clear_operation(&database, &account_a).expect("load task marker"),
+            Some(RecycleBinClearOperation::Task {
+                task_id: "clear-task-1".to_string(),
+                updated_at: 20,
+            })
+        );
+        clear_recycle_bin_operation(&database, &account_a).expect("clear completed marker");
+        assert_eq!(
+            load_recycle_bin_clear_operation(&database, &account_a).expect("load cleared marker"),
+            None
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recycle_bin_clear_scope_survives_token_refresh_for_the_same_jwt_subject() {
+        let make_token = |claims: Value, signature: &str| {
+            let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+            let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+            format!("{header}.{payload}.{signature}")
+        };
+        let old_token = make_token(
+            json!({ "iss": "https://account.guangyapan.com", "sub": "account-1", "exp": 1 }),
+            "old-signature",
+        );
+        let refreshed_token = make_token(
+            json!({ "iss": "https://account.guangyapan.com", "sub": "account-1", "exp": 2 }),
+            "new-signature",
+        );
+        let other_account_token = make_token(
+            json!({ "iss": "https://account.guangyapan.com", "sub": "account-2", "exp": 2 }),
+            "other-signature",
+        );
+        let account_scope = new_auth_account_scope(&old_token);
+        assert_eq!(account_scope, new_auth_account_scope(&refreshed_token));
+        assert_ne!(account_scope, new_auth_account_scope(&other_account_token));
+
+        let root = std::env::temp_dir().join(format!(
+            "guangya-recycle-refresh-scope-{}",
+            Uuid::new_v4().simple()
+        ));
+        let database = root.join("state.sqlite3");
+        init_database(&database).expect("initialize refreshed token state database");
+        save_recycle_bin_clear_operation(
+            &database,
+            &account_scope,
+            &RecycleBinClearOperation::Task {
+                task_id: "clear-task-before-refresh".to_string(),
+                updated_at: 10,
+            },
+        )
+        .expect("persist task before token refresh");
+        let refreshed_operation =
+            load_recycle_bin_clear_operation(&database, &new_auth_account_scope(&refreshed_token))
+                .expect("load task after token refresh");
+        assert_eq!(
+            plan_recycle_bin_clear(refreshed_operation.as_ref(), false),
+            RecycleBinClearAction::ResumeTask
+        );
+        assert_eq!(
+            load_recycle_bin_clear_operation(
+                &database,
+                &new_auth_account_scope(&other_account_token),
+            )
+            .expect("load isolated account state"),
+            None
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opaque_access_token_refresh_keeps_session_scope_and_explicit_login_isolates_accounts() {
+        let root = std::env::temp_dir().join(format!(
+            "guangya-opaque-auth-scope-{}",
+            Uuid::new_v4().simple()
+        ));
+        let database = root.join("state.sqlite3");
+        init_database(&database).expect("initialize opaque auth scope database");
+        let first_scope = new_auth_account_scope("opaque-access-token-a");
+        replace_auth_session(
+            &database,
+            Some("opaque-access-token-a"),
+            Some("opaque-refresh-token"),
+            Some(&first_scope),
+        )
+        .expect("persist explicit opaque login");
+        save_recycle_bin_clear_operation(
+            &database,
+            &first_scope,
+            &RecycleBinClearOperation::Task {
+                task_id: "clear-task-before-opaque-refresh".to_string(),
+                updated_at: 10,
+            },
+        )
+        .expect("persist clear task for opaque login");
+
+        save_auth_session(&database, Some("opaque-access-token-refreshed"), None)
+            .expect("refresh only access token");
+        let refreshed = load_auth_session(&database).expect("load refreshed opaque login");
+        assert_eq!(
+            refreshed.account_scope.as_deref(),
+            Some(first_scope.as_str())
+        );
+        assert_eq!(
+            load_recycle_bin_clear_operation(
+                &database,
+                refreshed
+                    .account_scope
+                    .as_deref()
+                    .expect("persisted account scope"),
+            )
+            .expect("load clear task after opaque refresh"),
+            Some(RecycleBinClearOperation::Task {
+                task_id: "clear-task-before-opaque-refresh".to_string(),
+                updated_at: 10,
+            })
+        );
+
+        let second_scope = new_auth_account_scope("opaque-access-token-b");
+        assert_ne!(first_scope, second_scope);
+        replace_auth_session(
+            &database,
+            Some("opaque-access-token-b"),
+            Some("other-refresh-token"),
+            Some(&second_scope),
+        )
+        .expect("persist explicit account switch");
+        let switched = load_auth_session(&database).expect("load switched account");
+        assert_eq!(
+            switched.account_scope.as_deref(),
+            Some(second_scope.as_str())
+        );
+        assert_eq!(
+            load_recycle_bin_clear_operation(&database, &second_scope)
+                .expect("new account has isolated clear state"),
+            None
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recycle_bin_task_status_only_completes_on_terminal_success() {
+        assert_eq!(
+            classify_recycle_bin_task_status(&json!({ "status": 1 })),
+            RecycleBinTaskStatus::Pending
+        );
+        assert_eq!(
+            classify_recycle_bin_task_status(&json!({
+                "status": 2,
+                "detail": { "code": 0 }
+            })),
+            RecycleBinTaskStatus::Succeeded
+        );
+        assert_eq!(
+            classify_recycle_bin_task_status(&json!({
+                "status": 2,
+                "detail": { "code": 500, "msg": "clear failed" }
+            })),
+            RecycleBinTaskStatus::Failed("clear failed".to_string())
+        );
+    }
+
+    #[test]
+    fn initial_recycle_bin_clear_response_classification_preserves_ambiguous_posts() {
+        use InitialRecycleBinClearResponseClass::{Accepted, Ambiguous, DefinitiveRejection};
+
+        let cases = [
+            (200, 0, Accepted, "normal success"),
+            (
+                408,
+                0,
+                Ambiguous,
+                "request timeout may follow cloud acceptance",
+            ),
+            (429, 0, Ambiguous, "rate limit may follow cloud acceptance"),
+            (
+                500,
+                0,
+                Ambiguous,
+                "gateway failure may follow cloud acceptance",
+            ),
+            (
+                503,
+                0,
+                Ambiguous,
+                "service failure may follow cloud acceptance",
+            ),
+            (200, 100, Ambiguous, "temporary business failure"),
+            (200, 103, Ambiguous, "temporary business failure"),
+            (200, 18010, Ambiguous, "explicit busy business response"),
+            (400, 0, DefinitiveRejection, "invalid request"),
+            (403, 0, DefinitiveRejection, "permission rejection"),
+            (
+                200,
+                9001,
+                DefinitiveRejection,
+                "permanent business rejection",
+            ),
+            (401, 0, DefinitiveRejection, "HTTP authentication failure"),
+            (
+                200,
+                110,
+                DefinitiveRejection,
+                "business authentication failure",
+            ),
+        ];
+        for (http_status, business_code, expected, label) in cases {
+            assert_eq!(
+                classify_initial_recycle_bin_clear_response(http_status, business_code),
+                expected,
+                "{label}: HTTP {http_status}, business code {business_code}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recycle_bin_clear_singleflight_shares_one_operation_result() {
+        let account_scope = format!("singleflight-{}", Uuid::new_v4().simple());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_calls = Arc::clone(&calls);
+        let second_calls = Arc::clone(&calls);
+        let first = run_recycle_bin_clear_singleflight(&account_scope, || async move {
+            first_calls.fetch_add(1, Ordering::Relaxed);
+            sleep(Duration::from_millis(25)).await;
+            Ok(json!({ "completed": true, "source": "first" }))
+        });
+        let second = run_recycle_bin_clear_singleflight(&account_scope, || async move {
+            second_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(json!({ "completed": true, "source": "second" }))
+        });
+
+        let (first_result, second_result) = futures_util::future::join(first, second).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            first_result.expect("first clear result"),
+            json!({ "completed": true, "source": "first" })
+        );
+        assert_eq!(
+            second_result.expect("joined clear result"),
+            json!({ "completed": true, "source": "first" })
+        );
+    }
+
+    #[tokio::test]
+    async fn opaque_token_refresh_during_clear_stays_in_the_same_singleflight() {
+        let root = std::env::temp_dir().join(format!(
+            "guangya-opaque-clear-flight-{}",
+            Uuid::new_v4().simple()
+        ));
+        let database = root.join("state.sqlite3");
+        init_database(&database).expect("initialize opaque clear flight database");
+        let account_scope = new_auth_account_scope("opaque-access-token-before-refresh");
+        replace_auth_session(
+            &database,
+            Some("opaque-access-token-before-refresh"),
+            Some("opaque-refresh-token"),
+            Some(&account_scope),
+        )
+        .expect("persist opaque login before clear");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_calls = Arc::clone(&calls);
+        let second_calls = Arc::clone(&calls);
+        let first_scope = account_scope.clone();
+        let first = async move {
+            run_recycle_bin_clear_singleflight(&first_scope, || async move {
+                first_calls.fetch_add(1, Ordering::Relaxed);
+                sleep(Duration::from_millis(30)).await;
+                Ok(json!({ "completed": true, "source": "before-refresh" }))
+            })
+            .await
+        };
+        let second = async {
+            sleep(Duration::from_millis(5)).await;
+            save_auth_session(&database, Some("opaque-access-token-after-refresh"), None)
+                .expect("persist refreshed access token during clear");
+            let refreshed = load_auth_session(&database).expect("reload refreshed session");
+            let refreshed_scope = refreshed.account_scope.expect("scope survives refresh");
+            run_recycle_bin_clear_singleflight(&refreshed_scope, || async move {
+                second_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(json!({ "completed": true, "source": "after-refresh" }))
+            })
+            .await
+        };
+
+        let (first_result, second_result) = futures_util::future::join(first, second).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            first_result.expect("first clear result"),
+            json!({ "completed": true, "source": "before-refresh" })
+        );
+        assert_eq!(
+            second_result.expect("refreshed clear joins existing result"),
+            json!({ "completed": true, "source": "before-refresh" })
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn api_id_lists_are_trimmed_deduplicated_and_bounded() {
         assert_eq!(
             normalize_id_list(
@@ -17444,6 +19058,7 @@ mod tests {
             change_kind: "added".to_string(),
             size: 1,
             modified_ms: 1,
+            replacement: None,
         };
         let episode = UploadItem {
             relative_path: "tvname/season 1/s01.mkv".to_string(),
@@ -17480,6 +19095,7 @@ mod tests {
             change_kind: "added".to_string(),
             size: 1024,
             modified_ms: 123,
+            replacement: None,
         };
         save_upload_record(
             &database,
@@ -17651,6 +19267,7 @@ mod tests {
             change_kind: "added".to_string(),
             size: 128,
             modified_ms: 42,
+            replacement: None,
         };
         let history = HashMap::new();
         let mut pending_cloud = HashMap::new();
@@ -17787,6 +19404,7 @@ mod tests {
             change_kind: "added".into(),
             size: metadata.len(),
             modified_ms: modified_ms(&metadata),
+            replacement: None,
         };
         assert!(!source_changed_since_upload(&item));
         fs::OpenOptions::new()
@@ -17796,6 +19414,199 @@ mod tests {
             .expect("grow fixture");
         assert!(source_changed_since_upload(&item));
         fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn upload_replacement_stages_the_old_file_before_promoting_the_new_version() {
+        let replacement = UploadReplacement {
+            old_file_id: "old".into(),
+            original_name: "movie.mkv".into(),
+            temporary_name: ".__gy_replace_new".into(),
+            backup_name: ".__gy_replace_backup_old".into(),
+            previous_size: 10,
+            previous_modified_ms: 20,
+        };
+        assert_eq!(
+            upload_replacement_state(
+                &[
+                    ReplacementRemoteEntry {
+                        id: "old".into(),
+                        name: "movie.mkv".into(),
+                    },
+                    ReplacementRemoteEntry {
+                        id: "new".into(),
+                        name: replacement.temporary_name.clone(),
+                    },
+                ],
+                &replacement,
+                "new",
+            ),
+            UploadReplacementState::StageOld
+        );
+        assert_eq!(
+            upload_replacement_state(
+                &[
+                    ReplacementRemoteEntry {
+                        id: "old".into(),
+                        name: replacement.backup_name.clone(),
+                    },
+                    ReplacementRemoteEntry {
+                        id: "new".into(),
+                        name: replacement.temporary_name.clone(),
+                    },
+                ],
+                &replacement,
+                "new",
+            ),
+            UploadReplacementState::PromoteNew { old_exists: true }
+        );
+    }
+
+    #[test]
+    fn upload_replacement_refuses_to_overwrite_an_external_cloud_change() {
+        let replacement = UploadReplacement {
+            old_file_id: "old".into(),
+            original_name: "movie.mkv".into(),
+            temporary_name: ".__gy_replace_new".into(),
+            backup_name: ".__gy_replace_backup_old".into(),
+            previous_size: 10,
+            previous_modified_ms: 20,
+        };
+        assert_eq!(
+            upload_replacement_state(
+                &[
+                    ReplacementRemoteEntry {
+                        id: "old".into(),
+                        name: replacement.backup_name.clone(),
+                    },
+                    ReplacementRemoteEntry {
+                        id: "new".into(),
+                        name: replacement.temporary_name.clone(),
+                    },
+                    ReplacementRemoteEntry {
+                        id: "external".into(),
+                        name: "movie.mkv".into(),
+                    },
+                ],
+                &replacement,
+                "new",
+            ),
+            UploadReplacementState::Conflict
+        );
+    }
+
+    #[test]
+    fn cancelled_pending_replacement_restores_the_previous_confirmed_record() {
+        let root =
+            std::env::temp_dir().join(format!("guangya-upload-replacement-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create replacement fixture");
+        let database = root.join("state.sqlite3");
+        init_database(&database).expect("initialize replacement database");
+        let item = UploadItem {
+            mapping_id: "mapping-1".into(),
+            file_path: root.join("movie.mkv"),
+            remote_parent_id: "parent".into(),
+            remote_dir: String::new(),
+            relative_path: "movie.mkv".into(),
+            change_kind: "changed".into(),
+            size: 20,
+            modified_ms: 30,
+            replacement: Some(UploadReplacement {
+                old_file_id: "old-file".into(),
+                original_name: "movie.mkv".into(),
+                temporary_name: ".__gy_replace_new".into(),
+                backup_name: ".__gy_replace_backup_old".into(),
+                previous_size: 10,
+                previous_modified_ms: 20,
+            }),
+        };
+        save_upload_record(
+            &database,
+            &item,
+            &UploadOutcome {
+                task_id: "task-new".into(),
+                remote_file_id: None,
+            },
+            UPLOAD_STATE_OSS_COMPLETE,
+        )
+        .expect("save pending replacement");
+        let pending = load_pending_uploads(&database)
+            .expect("load pending replacement")
+            .pop()
+            .expect("pending replacement exists");
+        assert!(delete_pending_upload(&database, &pending).expect("restore prior record"));
+        let row = open_database(&database)
+            .unwrap()
+            .query_row(
+                "SELECT size, modified_ms, remote_file_id, upload_state, replacement_json FROM uploaded_files",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, 10);
+        assert_eq!(row.1, "20");
+        assert_eq!(row.2, "old-file");
+        assert_eq!(row.3, UPLOAD_STATE_CLOUD_CONFIRMED);
+        assert_eq!(row.4, None);
+        fs::remove_dir_all(root).expect("remove replacement fixture");
+    }
+
+    #[test]
+    fn changed_upload_uses_a_persisted_unique_remote_name() {
+        let root = std::env::temp_dir().join(format!(
+            "guangya-upload-replacement-hydrate-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create replacement hydration fixture");
+        let database = root.join("state.sqlite3");
+        init_database(&database).expect("initialize replacement hydration database");
+        let file_path = root.join("movie.mkv");
+        let original = UploadItem {
+            mapping_id: "mapping-1".into(),
+            file_path: file_path.clone(),
+            remote_parent_id: "parent".into(),
+            remote_dir: "movies".into(),
+            relative_path: "movie.mkv".into(),
+            change_kind: "added".into(),
+            size: 10,
+            modified_ms: 20,
+            replacement: None,
+        };
+        save_upload_record(
+            &database,
+            &original,
+            &UploadOutcome {
+                task_id: "old-task".into(),
+                remote_file_id: Some("old-file".into()),
+            },
+            UPLOAD_STATE_CLOUD_CONFIRMED,
+        )
+        .expect("save original confirmed upload");
+        let mut changed = UploadItem {
+            change_kind: "changed".into(),
+            size: 20,
+            modified_ms: 30,
+            ..original
+        };
+        hydrate_upload_replacement(&database, &mut changed).expect("hydrate replacement");
+        let replacement = changed.replacement.as_ref().expect("replacement exists");
+        assert_eq!(replacement.old_file_id, "old-file");
+        assert_eq!(replacement.previous_size, 10);
+        assert_eq!(replacement.previous_modified_ms, 20);
+        assert!(replacement.temporary_name.starts_with(".__gy_replace_"));
+        assert_eq!(
+            upload_remote_name(&changed).unwrap(),
+            replacement.temporary_name
+        );
+        fs::remove_dir_all(root).expect("remove replacement hydration fixture");
     }
 
     #[test]
@@ -17881,6 +19692,7 @@ mod tests {
             change_kind: "added".into(),
             size: metadata.len(),
             modified_ms: modified_ms(&metadata),
+            replacement: None,
         };
         init_database(&database).expect("initialize upload checkpoint database");
         let checkpoint = OssUploadCheckpoint {
@@ -18334,6 +20146,7 @@ mod tests {
             change_kind: "added".to_string(),
             size: 7,
             modified_ms: 100,
+            replacement: None,
         };
         save_upload_record(
             &database,
@@ -18963,6 +20776,7 @@ mod tests {
         let auth = load_auth_session(&database).expect("auth should load");
         assert_eq!(auth.access_token.as_deref(), Some("access-token"));
         assert_eq!(auth.refresh_token.as_deref(), Some("refresh-token"));
+        assert!(auth.account_scope.is_none());
         save_auth_session(&database, Some("refreshed-access-token"), None)
             .expect("refresh should retain a non-rotated refresh token");
         let refreshed_auth = load_auth_session(&database).expect("refreshed auth should load");
@@ -18974,18 +20788,29 @@ mod tests {
             refreshed_auth.refresh_token.as_deref(),
             Some("refresh-token")
         );
-        replace_auth_session(&database, Some("new-login-access-token"), None)
-            .expect("a fresh login should replace the complete session");
+        assert!(refreshed_auth.account_scope.is_none());
+        replace_auth_session(
+            &database,
+            Some("new-login-access-token"),
+            None,
+            Some("session:new-login"),
+        )
+        .expect("a fresh login should replace the complete session");
         let replaced_auth = load_auth_session(&database).expect("replacement auth should load");
         assert_eq!(
             replaced_auth.access_token.as_deref(),
             Some("new-login-access-token")
         );
         assert!(replaced_auth.refresh_token.is_none());
+        assert_eq!(
+            replaced_auth.account_scope.as_deref(),
+            Some("session:new-login")
+        );
         clear_persisted_auth_session(&database).expect("expired auth should clear");
         let cleared_auth = load_auth_session(&database).expect("cleared auth should load");
         assert!(cleared_auth.access_token.is_none());
         assert!(cleared_auth.refresh_token.is_none());
+        assert!(cleared_auth.account_scope.is_none());
         let device_id = load_or_create_device_id(&database).expect("device id should persist");
         assert_eq!(device_id.len(), 32);
         assert!(device_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
@@ -19003,6 +20828,7 @@ mod tests {
             change_kind: "added".to_string(),
             size: 128,
             modified_ms: 42,
+            replacement: None,
         };
         save_upload_record(
             &database,
@@ -19241,6 +21067,143 @@ mod tests {
             hex::encode_upper(cid_hasher.finalize()),
             "ECDDF55803ED503C4DF219A5C9C847860A438CB8"
         );
+    }
+
+    #[tokio::test]
+    async fn gcid_export_retries_only_the_failed_range_with_twenty_file_workers() {
+        assert_eq!(GCID_EXPORT_FILE_CONCURRENCY, 20);
+        assert_eq!(GCID_EXPORT_RANGE_ATTEMPTS, 3);
+        assert_eq!(GCID_EXPORT_FULL_ATTEMPTS, 3);
+        let calls = Arc::new(Mutex::new([0_usize; 3]));
+        let outcomes = stream::iter(0..3_usize)
+            .map(|index| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    retry_gcid_export_range(
+                        |_| {
+                            let calls = Arc::clone(&calls);
+                            async move {
+                                let call = {
+                                    let mut guard = calls.lock().expect("range call counts");
+                                    guard[index] += 1;
+                                    guard[index]
+                                };
+                                if index == 1 && call == 1 {
+                                    Err(GcidExportRangeError::retryable("temporary range failure"))
+                                } else {
+                                    Ok(index)
+                                }
+                            }
+                        },
+                        GCID_EXPORT_RANGE_ATTEMPTS,
+                        0,
+                    )
+                    .await
+                }
+            })
+            .buffer_unordered(GCID_EXPORT_RANGE_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(outcomes.iter().all(Result::is_ok));
+        assert_eq!(*calls.lock().expect("final range call counts"), [1, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn gcid_export_does_not_retry_an_explicit_range_rejection() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let result: Result<(), String> = retry_gcid_export_range(
+            |_| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Err(GcidExportRangeError::permanent("range unsupported"))
+                }
+            },
+            GCID_EXPORT_RANGE_ATTEMPTS,
+            0,
+        )
+        .await;
+
+        assert_eq!(
+            result.expect_err("range rejection must fail"),
+            "range unsupported"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn gcid_export_range_body_accepts_exact_short_chunks_and_rejects_short_total() {
+        let exact = stream::iter(vec![Ok::<Vec<u8>, std::io::Error>(vec![1]), Ok(vec![2, 3])]);
+        assert_eq!(
+            read_bounded_gcid_range_stream(exact, 3, "exact.bin", Duration::from_secs(1))
+                .await
+                .expect("exact fragmented range body"),
+            vec![1, 2, 3]
+        );
+
+        let short = stream::iter(vec![Ok::<Vec<u8>, std::io::Error>(vec![1, 2])]);
+        let error = read_bounded_gcid_range_stream(short, 3, "short.bin", Duration::from_secs(1))
+            .await
+            .expect_err("short range body must fail");
+        assert!(error.message.contains("字节数不完整"));
+    }
+
+    #[tokio::test]
+    async fn gcid_export_range_body_stops_on_the_first_oversized_chunk() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let stream_polls = Arc::clone(&polls);
+        let oversized = futures_util::stream::poll_fn(move |_| {
+            let call = stream_polls.fetch_add(1, Ordering::Relaxed);
+            match call {
+                0 => std::task::Poll::Ready(Some(Ok::<Vec<u8>, std::io::Error>(vec![1, 2, 3, 4]))),
+                _ => panic!("oversized range body must be dropped without polling its tail"),
+            }
+        });
+        let error =
+            read_bounded_gcid_range_stream(oversized, 3, "oversized.bin", Duration::from_secs(1))
+                .await
+                .expect_err("oversized range body must fail");
+        assert!(error.message.contains("超出请求范围"));
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn gcid_export_range_body_uses_an_idle_timeout_per_chunk() {
+        let chunks = stream::unfold(0_u8, |index| async move {
+            if index == 3 {
+                return None;
+            }
+            sleep(Duration::from_millis(20)).await;
+            Some((Ok::<Vec<u8>, std::io::Error>(vec![index]), index + 1))
+        });
+        let started_at = Instant::now();
+        assert_eq!(
+            read_bounded_gcid_range_stream(chunks, 3, "slow.bin", Duration::from_millis(50),)
+                .await
+                .expect("continuous chunks must reset the idle timeout"),
+            vec![0, 1, 2]
+        );
+        assert!(started_at.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn gcid_export_failed_full_attempt_rolls_back_only_its_progress() {
+        let total = Arc::new(AtomicU64::new(7));
+        {
+            let mut attempt = GcidExportProgressAttempt::new(total.clone());
+            attempt.add(11);
+            attempt.add(13);
+            assert_eq!(total.load(Ordering::Relaxed), 31);
+        }
+        assert_eq!(total.load(Ordering::Relaxed), 7);
+
+        {
+            let mut attempt = GcidExportProgressAttempt::new(total.clone());
+            attempt.add(17);
+            attempt.commit();
+        }
+        assert_eq!(total.load(Ordering::Relaxed), 24);
     }
 
     #[test]

@@ -1,16 +1,24 @@
 <script setup>
-import { computed, nextTick, onMounted, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue';
 import { message, Modal } from 'antdv-next';
 import { DeleteOutlined, FileOutlined, ReloadOutlined, RollbackOutlined } from '@antdv-next/icons';
 import { bridge } from '../../bridge.js';
 import { errorText, fileId, formatSize, formatTime, pick, unwrapData } from '../../formatters.js';
+import {
+  requestRecycleBinClear,
+  subscribeRecycleBinClear,
+  waitForRecycleBinClear,
+} from '../../recycleBinClearOperation.js';
 
 const pageSize = 100;
 const records = ref([]);
 const total = ref(0);
 const page = ref(0);
 const loading = ref(false);
-const actionBusy = ref(false);
+const mutationBusy = ref(false);
+const clearBusy = ref(false);
+const clearUnknown = ref(false);
+const actionBusy = computed(() => mutationBusy.value || clearBusy.value);
 const loadError = ref('');
 const selectedKeys = ref([]);
 const focusedRowId = ref('');
@@ -57,6 +65,7 @@ async function loadRecycle(nextPage = page.value, preferredFocus = '') {
   loading.value = true;
   loadError.value = '';
   try {
+    await waitForRecycleBinClear();
     const data = unwrapData(await bridge.invoke('list_recycle_files', { page: normalizedPage, page_size: pageSize }));
     const list = data.list || data.files || data.items || data.restoreList || [];
     records.value = Array.isArray(list) ? list : [];
@@ -81,7 +90,7 @@ async function restoreRowFocus() {
 }
 
 async function executeAction(command, ids, successText, preferredFocus = '') {
-  actionBusy.value = true;
+  mutationBusy.value = true;
   try {
     await bridge.invoke(command, { file_ids: [...new Set(ids.filter(Boolean))] });
     const shouldGoPrevious = records.value.length <= ids.length && page.value > 0;
@@ -91,7 +100,7 @@ async function executeAction(command, ids, successText, preferredFocus = '') {
     message.error(errorText(error));
     throw error;
   } finally {
-    actionBusy.value = false;
+    mutationBusy.value = false;
   }
 }
 
@@ -126,27 +135,45 @@ function confirmPermanentDelete(targets) {
   });
 }
 
+async function runRecycleBinClear(forceRetry = false) {
+  const request = requestRecycleBinClear(() => bridge.invoke('clear_recycle_bin', { force_retry: forceRetry }));
+  try {
+    const result = unwrapData(await request.promise);
+    if (!request.started) return;
+    const clearState = String(result?.status ?? result?.state ?? '');
+    if (result?.pending || ['pending', 'unknown'].includes(clearState)) {
+      clearUnknown.value = clearState === 'unknown';
+      message.warning(result?.message || (clearState === 'unknown'
+        ? '上一次清空请求结果未知，系统不会自动重复提交。请刷新确认；如仍需清空，可再次点击并进行强制确认。'
+        : '清空任务仍在云端执行；再次点击清空时会继续查询同一个任务，不会重复提交。'));
+      void loadRecycle(0);
+      return;
+    }
+    records.value = [];
+    total.value = 0;
+    page.value = 0;
+    selectedKeys.value = [];
+    focusedRowId.value = '';
+    clearUnknown.value = false;
+    message.success('回收站已清空');
+    void loadRecycle(0);
+  } catch (error) {
+    if (request.started) message.error(errorText(error));
+  }
+}
+
 function clearRecycleBin() {
   if (!records.value.length && !total.value) return;
+  const forceRetry = clearUnknown.value;
   Modal.confirm({
-    title: '清空回收站',
-    content: `回收站中的 ${total.value || records.value.length} 项将被永久删除，且无法恢复。`,
-    okText: '清空回收站',
+    title: forceRetry ? '强制重新提交清空' : '清空回收站',
+    content: forceRetry
+      ? '上一次清空请求是否已被云端接收仍无法确认。强制重新提交可能连同此后新进入回收站的文件一起永久删除。请先刷新列表确认；仍要强制提交吗？'
+      : `回收站中的 ${total.value || records.value.length} 项将被永久删除，且无法恢复。`,
+    okText: forceRetry ? '仍要强制提交' : '清空回收站',
     okButtonProps: { danger: true },
     cancelText: '取消',
-    async onOk() {
-      actionBusy.value = true;
-      try {
-        await bridge.invoke('clear_recycle_bin');
-        await loadRecycle(0);
-        message.success('回收站已清空');
-      } catch (error) {
-        message.error(errorText(error));
-        throw error;
-      } finally {
-        actionBusy.value = false;
-      }
-    },
+    onOk() { void runRecycleBinClear(forceRetry); },
   });
 }
 
@@ -186,7 +213,12 @@ function rowProps(record, index) {
   };
 }
 
-onMounted(() => loadRecycle());
+let unsubscribeClear = () => {};
+onMounted(() => {
+  unsubscribeClear = subscribeRecycleBinClear((active) => { clearBusy.value = active; });
+  void loadRecycle();
+});
+onUnmounted(() => unsubscribeClear());
 </script>
 
 <template>
@@ -205,7 +237,7 @@ onMounted(() => loadRecycle());
           <a-button :loading="actionBusy" @click="confirmRestore(selectedRecords())"><template #icon><RollbackOutlined /></template>恢复</a-button>
           <a-button danger :loading="actionBusy" @click="confirmPermanentDelete(selectedRecords())"><template #icon><DeleteOutlined /></template>彻底删除</a-button>
         </template>
-        <a-button danger :disabled="(!records.length && !total) || actionBusy" @click="clearRecycleBin">清空回收站</a-button>
+        <a-button danger :loading="clearBusy" :disabled="(!records.length && !total) || mutationBusy" @click="clearRecycleBin">{{ clearUnknown ? '强制重新清空' : '清空回收站' }}</a-button>
         <a-button :loading="loading" :disabled="actionBusy" aria-label="刷新回收站" @click="loadRecycle(page)"><template #icon><ReloadOutlined /></template>刷新</a-button>
       </a-space>
     </div>

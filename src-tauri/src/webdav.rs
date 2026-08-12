@@ -1160,6 +1160,7 @@ async fn put_file(
             },
             size: metadata.len(),
             modified_ms,
+            replacement: None,
         };
         let uploaded = upload_item(&context.app, &context.state, &item)
             .await

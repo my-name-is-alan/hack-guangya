@@ -1513,16 +1513,35 @@ test('Web 重启后先恢复未确认任务，再重新上传期间变化的源�
   let cloudConfirmed = false;
   let uploadTokenRequests = 0;
   let confirmRequests = 0;
+  const taskNames = new Map();
+  const cloudFiles = [];
   const apiServer = http.createServer(async (request, response) => {
     const body = JSON.parse(await new Promise((resolve) => { let value = ''; request.on('data', (chunk) => { value += chunk; }); request.on('end', () => resolve(value || '{}')); }));
     response.setHeader('content-type', 'application/json');
     if (request.url === '/userres/v1/get_res_center_token') {
       uploadTokenRequests += 1;
-      response.end(JSON.stringify({ code: 156, data: { taskId: `pending-task-${uploadTokenRequests}` } }));
+      const taskId = `pending-task-${uploadTokenRequests}`;
+      taskNames.set(taskId, body.name);
+      response.end(JSON.stringify({ code: 156, data: { taskId } }));
     } else if (request.url === '/userres/v1/file/get_info_by_task_id') {
       assert.match(body.taskId, /^pending-task-\d+$/);
       confirmRequests += 1;
+      if (cloudConfirmed && !cloudFiles.some((entry) => entry.fileId === `confirmed-${body.taskId}`)) {
+        cloudFiles.push({ fileId: `confirmed-${body.taskId}`, fileName: taskNames.get(body.taskId), resType: 1 });
+      }
       response.end(JSON.stringify(cloudConfirmed ? { code: 0, data: { fileId: `confirmed-${body.taskId}` } } : { code: 147, msg: '文件上传中' }));
+    } else if (request.url === '/userres/v1/file/get_file_list') {
+      response.end(JSON.stringify({ code: 0, data: { list: cloudFiles, total: cloudFiles.length } }));
+    } else if (request.url === '/userres/v1/file/rename') {
+      const entry = cloudFiles.find((candidate) => candidate.fileId === body.fileId);
+      if (entry) entry.fileName = body.newName;
+      response.end(JSON.stringify({ code: 0, data: {} }));
+    } else if (request.url === '/userres/v1/file/delete_file') {
+      for (const fileId of body.fileIds || []) {
+        const index = cloudFiles.findIndex((candidate) => candidate.fileId === fileId);
+        if (index >= 0) cloudFiles.splice(index, 1);
+      }
+      response.end(JSON.stringify({ code: 0, data: {} }));
     } else { response.statusCode = 404; response.end(JSON.stringify({ code: 404, msg: 'not found' })); }
   });
   apiServer.listen(0, '127.0.0.1');
@@ -1578,6 +1597,7 @@ test('Web 重启后先恢复未确认任务，再重新上传期间变化的源�
     const confirmed = confirmedDb.prepare('SELECT status, remote_file_id FROM uploaded_files').get();
     assert.equal(confirmed.status, 'cloud_confirmed');
     assert.equal(confirmed.remote_file_id, 'confirmed-pending-task-2');
+    assert.deepEqual(cloudFiles, [{ fileId: 'confirmed-pending-task-2', fileName: 'pending.txt', resType: 1 }]);
     confirmedDb.close();
   } finally {
     if (running) await stopServer(running.child);
@@ -1596,6 +1616,8 @@ test('Web 源文件在云端确认前继续增长时不会提前完成，而是�
   await fsp.writeFile(sourceFile, 'partial');
   let uploadTokenRequests = 0;
   let firstConfirmRequests = 0;
+  const taskNames = new Map();
+  const cloudFiles = [];
   let releaseFirstConfirmation;
   const firstConfirmation = new Promise((resolve) => { releaseFirstConfirmation = resolve; });
   const apiServer = http.createServer(async (request, response) => {
@@ -1607,13 +1629,30 @@ test('Web 源文件在云端确认前继续增长时不会提前完成，而是�
     response.setHeader('content-type', 'application/json');
     if (request.url === '/userres/v1/get_res_center_token') {
       uploadTokenRequests += 1;
-      response.end(JSON.stringify({ code: 156, data: { taskId: `growing-task-${uploadTokenRequests}` } }));
+      const taskId = `growing-task-${uploadTokenRequests}`;
+      taskNames.set(taskId, body.name);
+      response.end(JSON.stringify({ code: 156, data: { taskId } }));
     } else if (request.url === '/userres/v1/file/get_info_by_task_id') {
       if (body.taskId === 'growing-task-1') {
         firstConfirmRequests += 1;
         await firstConfirmation;
       }
+      if (!cloudFiles.some((entry) => entry.fileId === `confirmed-${body.taskId}`)) {
+        cloudFiles.push({ fileId: `confirmed-${body.taskId}`, fileName: taskNames.get(body.taskId), resType: 1 });
+      }
       response.end(JSON.stringify({ code: 0, data: { fileId: `confirmed-${body.taskId}` } }));
+    } else if (request.url === '/userres/v1/file/get_file_list') {
+      response.end(JSON.stringify({ code: 0, data: { list: cloudFiles, total: cloudFiles.length } }));
+    } else if (request.url === '/userres/v1/file/rename') {
+      const entry = cloudFiles.find((candidate) => candidate.fileId === body.fileId);
+      if (entry) entry.fileName = body.newName;
+      response.end(JSON.stringify({ code: 0, data: {} }));
+    } else if (request.url === '/userres/v1/file/delete_file') {
+      for (const fileId of body.fileIds || []) {
+        const index = cloudFiles.findIndex((candidate) => candidate.fileId === fileId);
+        if (index >= 0) cloudFiles.splice(index, 1);
+      }
+      response.end(JSON.stringify({ code: 0, data: {} }));
     } else {
       response.statusCode = 404;
       response.end(JSON.stringify({ code: 404, msg: 'not found' }));
@@ -1673,6 +1712,7 @@ test('Web 源文件在云端确认前继续增长时不会提前完成，而是�
     assert.equal(uploaded.size, sourceStat.size);
     assert.equal(uploaded.status, 'cloud_confirmed');
     assert.equal(uploaded.remote_file_id, 'confirmed-growing-task-2');
+    assert.deepEqual(cloudFiles, [{ fileId: 'confirmed-growing-task-2', fileName: 'growing.txt', resType: 1 }]);
   } finally {
     releaseFirstConfirmation();
     child.kill();

@@ -52,7 +52,7 @@ pnpm tauri dev
 pnpm tauri build
 ```
 
-安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.33_x64-setup.exe`
+安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.34_x64-setup.exe`
 
 正式更新包必须使用长期保存的同一把 Tauri 私钥签名。构建机设置 `TAURI_SIGNING_PRIVATE_KEY`（可填私钥内容或私钥文件路径）和可选的 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 后执行构建，再生成 GitHub Release 所需文件：
 
@@ -123,7 +123,7 @@ WebDAV 是在线文件系统，不是离线镜像。打开大文件时由系统 
 Docker Hub 镜像：[`94xhzy/guangya-sync`](https://hub.docker.com/r/94xhzy/guangya-sync)，推荐固定使用版本标签：
 
 ```bash
-docker pull 94xhzy/guangya-sync:0.1.33
+docker pull 94xhzy/guangya-sync:0.1.34
 ```
 
 先准备管理账号。用户名默认是 `admin`；请生成独立的强随机密码，复制 `.env.example` 为 `.env` 并填入 `GUANGYA_ADMIN_PASSWORD`：
@@ -207,7 +207,7 @@ pnpm web
 pnpm package:ubuntu
 ```
 
-输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.33.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
+输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.34.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
 
 ## 接口边界
 

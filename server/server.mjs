@@ -11,13 +11,33 @@ import OSS from 'ali-oss';
 import { fetch as undiciFetch } from 'undici';
 import { autoShareTargetFor, shareFilePayload, signHdhiveRequest } from './auto-share.mjs';
 import { createAccessControl } from './access-control.mjs';
+import {
+  accountIdFromAuthPayload,
+  createAuthSessionScopeStore,
+  jwtAccountIdentity,
+} from './auth-session-scope.mjs';
 import { createDirectoryCache } from './directory-cache.mjs';
+import { createRecycleClearTaskCoordinator } from './recycle-clear-task.mjs';
 import {
   calculateGuangyaCidSamples,
   calculateGuangyaFileHashes,
   calculateGuangyaStreamHashes,
   cidByteRanges,
 } from './guangya-file-hashes.mjs';
+import {
+  GCID_EXPORT_FILE_CONCURRENCY,
+  GCID_EXPORT_FULL_ATTEMPTS,
+  GCID_EXPORT_READ_IDLE_TIMEOUT_MS,
+  GCID_EXPORT_RANGE_CONCURRENCY,
+  GCID_EXPORT_REQUEST_TIMEOUT_MS,
+  GcidExportRangeError,
+  readGcidExportRangeBody,
+  retryableGcidExportRangeStatus,
+  retryGcidExportFull,
+  retryGcidExportRange,
+  withGcidExportAttemptProgress,
+  withGcidExportReadTimeout,
+} from './gcid-export-retry.mjs';
 import {
   buildAccountHeaders,
   buildBusinessHeaders,
@@ -41,6 +61,12 @@ import {
   reconcileRemoteDirectoryCache as reconcileRemoteDirectoryCacheEntries,
 } from './remote-directory-cache.mjs';
 import { uploadPartSize } from './upload-parts.mjs';
+import {
+  createUploadReplacementContext,
+  restorePreviousUploadRecord,
+  safelyReplaceUploadedFile,
+  uploadRemoteName,
+} from './upload-replacement.mjs';
 import { createVirtualLibraryService } from './virtual-library.mjs';
 import { createWebDavHandler, normalizeWebDavEntry, WebDavError } from './webdav.mjs';
 import { parseGuangyaShareLink } from '../ui/shareLink.js';
@@ -136,6 +162,9 @@ const maxJsonBodyBytes = envInteger('GUANGYA_MAX_JSON_BODY_BYTES', 64 * 1024, 4 
 const maxShareTrafficBytes = 1024 * 1024 ** 4;
 const requestTimeoutMs = envInteger('GUANGYA_REQUEST_TIMEOUT_MS', 30_000, 5_000, 120_000);
 const fileListRequestTimeoutMs = Math.min(requestTimeoutMs, 12_000);
+const recycleClearDeadlineMs = envInteger('GUANGYA_RECYCLE_CLEAR_DEADLINE_MS', 120_000, 1_000, 300_000);
+const recycleClearPollMs = envInteger('GUANGYA_RECYCLE_CLEAR_POLL_MS', 1_000, 10, 5_000);
+const recycleClearUnknownGuardMs = envInteger('GUANGYA_RECYCLE_CLEAR_UNKNOWN_GUARD_MS', 120_000, 1_000, 600_000);
 const hdhiveAllowedHosts = new Set(String(process.env.HDHIVE_ALLOWED_HOSTS || '')
   .split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
 function normalizeHdhiveBaseUrl(value) {
@@ -348,6 +377,9 @@ function saveAppStateValue(key, value) {
   database.prepare('INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
     .run(key, String(value), Math.floor(Date.now() / 1000));
 }
+function deleteAppStateValue(key) {
+  database.prepare('DELETE FROM app_state WHERE key = ?').run(key);
+}
 for (const [column, definition] of [
   ['work_total_count', 'INTEGER NOT NULL DEFAULT 0'],
   ['processed_count', 'INTEGER NOT NULL DEFAULT 0'],
@@ -452,6 +484,7 @@ const queue = new Map();
 const flashPreflightCache = new Map();
 const history = new Map(database.prepare("SELECT mapping_id, file_path, size, modified_ms FROM uploaded_files WHERE status = 'cloud_confirmed'").all().map((row) => [`${row.mapping_id}::${path.resolve(row.file_path)}`, `${row.size}:${row.modified_ms}`]));
 const pendingUploads = new Map(database.prepare("SELECT mapping_id, file_path, size, modified_ms, task_id, item_json, remote_parent_id, remote_dir, relative_path FROM uploaded_files WHERE status = 'oss_complete'").all().map((row) => [`${row.mapping_id}::${path.resolve(row.file_path)}`, row]));
+const activeUploadReplacements = new Map();
 const inflight = new Map();
 const inflightItems = new Map();
 const waitingFiles = new Map();
@@ -502,6 +535,12 @@ const storedAuth = database.prepare('SELECT access_token, refresh_token FROM aut
 let token = process.env.GUANGYA_TOKEN || storedAuth?.access_token || null;
 let refreshToken = storedAuth?.refresh_token || null;
 let refreshPromise = null;
+const authSessionScope = createAuthSessionScopeStore({
+  loadValue: () => appStateValue('auth_session_scope_v1'),
+  saveValue: (value) => saveAppStateValue('auth_session_scope_v1', value),
+  issuer: accountBase,
+});
+authSessionScope.initialize(token);
 const smsChallenges = new Map();
 let paused = false;
 let active = 0;
@@ -1574,6 +1613,7 @@ function replaceAuthSession(accessToken, nextRefreshToken = null) { database.pre
 function invalidateAuthSession() {
   token = null;
   refreshToken = null;
+  authSessionScope.clearCurrent();
   resetRemoteDirectoryCache();
   synchronizeWebDavCacheScope();
   replaceAuthSession(null, null);
@@ -1724,7 +1764,14 @@ function confirmPendingUploadRecord(key, taskId, remoteFileId) {
 function clearPendingUpload(key) {
   const row = pendingUploads.get(key);
   if (!row) return;
-  database.prepare("DELETE FROM uploaded_files WHERE mapping_id = ? AND file_path = ? AND status = 'oss_complete'").run(row.mapping_id, row.file_path);
+  const previous = restorePreviousUploadRecord(row);
+  if (previous) {
+    database.prepare("UPDATE uploaded_files SET size = ?, modified_ms = ?, task_id = NULL, remote_file_id = ?, status = 'cloud_confirmed', item_json = NULL, uploaded_at = ? WHERE mapping_id = ? AND file_path = ? AND status = 'oss_complete'")
+      .run(previous.size, previous.modifiedMs, previous.remoteFileId, Math.floor(Date.now() / 1000), row.mapping_id, row.file_path);
+    history.set(key, `${previous.size}:${previous.modifiedMs}`);
+  } else {
+    database.prepare("DELETE FROM uploaded_files WHERE mapping_id = ? AND file_path = ? AND status = 'oss_complete'").run(row.mapping_id, row.file_path);
+  }
   pendingUploads.delete(key);
 }
 function pendingUploadItem(row) {
@@ -1752,6 +1799,9 @@ async function cancelUploadTask(filePath, mappingId = '') {
   for (const [key, row] of pendingUploads) {
     const item = pendingUploadItem(row);
     if (matches(item)) matched.set(key, item);
+  }
+  if ([...matched.keys()].some((key) => activeUploadReplacements.has(key))) {
+    throw httpError(409, '新版本已经入库，正在安全替换旧文件，此阶段不能取消');
   }
 
   const cleanup = [];
@@ -2118,7 +2168,14 @@ async function parseResponse(response, endpoint) {
   if (!raw.trim() && response.ok) return { code: 0, data: {} };
   try { return JSON.parse(raw.replace(/^\uFEFF/, '')); } catch (error) { throw httpError(502, `光鸭接口 ${endpoint} 返回了非 JSON 响应（HTTP ${response.status}）：${raw.slice(0, 240)}（${error.message}）`); }
 }
-async function apiPost(endpoint, body, allowed = [], allowRefresh = true, timeoutMs = requestTimeoutMs) {
+async function apiPost(
+  endpoint,
+  body,
+  allowed = [],
+  allowRefresh = true,
+  timeoutMs = requestTimeoutMs,
+  invalidateOnAuthFailure = true,
+) {
   let response;
   try {
     response = await fetch(`${apiBase}${endpoint}`, { method: 'POST', headers: headers(), body: JSON.stringify(body || {}), signal: AbortSignal.timeout(timeoutMs) });
@@ -2135,9 +2192,9 @@ async function apiPost(endpoint, body, allowed = [], allowRefresh = true, timeou
   if (response.status === 401 || isAuthExpiredBusinessCode(code)) {
     if (allowRefresh && refreshToken) {
       await refreshSavedSession();
-      return apiPost(endpoint, body, allowed, false, timeoutMs);
+      return apiPost(endpoint, body, allowed, false, timeoutMs, invalidateOnAuthFailure);
     }
-    invalidateAuthSession();
+    if (invalidateOnAuthFailure) invalidateAuthSession();
     throw httpError(401, '登录态已失效，且自动续期失败，请重新扫码登录');
   }
   if (!response.ok || code === null || (code !== 0 && !allowed.includes(code))) {
@@ -2356,66 +2413,125 @@ async function exportGcidJson(body) {
     });
   };
   const fetchCloud = createProxiedFetch(networkPreferences.proxy_url, undiciFetch);
-  const fullHash = async (entry) => {
+  const fullHash = async (entry) => retryGcidExportFull(async (attempt) => {
     const download = await getCloudDownload({ file_ids: [entry.fileId], packaged: false });
-    const response = await fetchCloud(download.download_url, {
-      method: 'GET',
-      headers: { 'accept-encoding': 'identity' },
-    });
-    if (!response.ok || !response.body) throw new Error(`读取 ${entry.path} 失败（HTTP ${response.status}）`);
-    const declaredLength = Number(response.headers.get('content-length'));
-    if (Number.isSafeInteger(declaredLength) && declaredLength >= 0 && declaredLength !== entry.size) {
-      throw new Error(`文件大小发生变化：${entry.path}`);
-    }
-    let previous = 0;
-    const hashes = await calculateGuangyaStreamHashes(response.body, entry.size, (processed) => {
-      readBytes += BigInt(processed - previous);
-      previous = processed;
-      publishProgress('分段读取不可用，正在完整校验', entry.path);
-    });
-    return hashes;
-  };
-  const rangeHash = async (entry) => {
-    const download = await getCloudDownload({ file_ids: [entry.fileId], packaged: false });
-    const ranges = cidByteRanges(entry.size);
-    const parts = await mapConcurrent(ranges, 3, async (range) => {
-      if (range.start === range.end) return Buffer.alloc(0);
-      const response = await fetchCloud(download.download_url, {
+    const controller = new AbortController();
+    const requestTimeout = setTimeout(() => {
+      controller.abort(new GcidExportRangeError(`读取 ${entry.path} 请求超时`));
+    }, GCID_EXPORT_REQUEST_TIMEOUT_MS);
+    let response;
+    try {
+      response = await fetchCloud(download.download_url, {
         method: 'GET',
-        headers: {
-          'accept-encoding': 'identity',
-          range: `bytes=${range.start}-${range.end - 1}`,
-        },
+        headers: { 'accept-encoding': 'identity' },
+        signal: controller.signal,
       });
+    }
+    catch (error) {
+      throw controller.signal.reason instanceof GcidExportRangeError ? controller.signal.reason : error;
+    }
+    finally {
+      clearTimeout(requestTimeout);
+    }
+    if (!response.ok || !response.body) {
+      const error = new GcidExportRangeError(`读取 ${entry.path} 失败（HTTP ${response.status}）`, {
+        retryable: retryableGcidExportRangeStatus(response.status),
+      });
+      controller.abort(error);
+      throw error;
+    }
+    const contentLength = response.headers.get('content-length');
+    const declaredLength = contentLength == null ? null : Number(contentLength);
+    if (declaredLength != null && Number.isSafeInteger(declaredLength) && declaredLength >= 0 && declaredLength !== entry.size) {
+      const error = new GcidExportRangeError(`文件大小发生变化：${entry.path}`, { retryable: false });
+      controller.abort(error);
+      throw error;
+    }
+    const stream = withGcidExportReadTimeout(response.body, {
+      timeoutMs: GCID_EXPORT_READ_IDLE_TIMEOUT_MS,
+      abort: (error) => controller.abort(error),
+    });
+    try {
+      return await withGcidExportAttemptProgress(
+        (report) => calculateGuangyaStreamHashes(stream, entry.size, (processed) => {
+          report(processed);
+          publishProgress('分段读取不可用，正在完整校验', entry.path);
+        }),
+        (delta) => { readBytes += delta; },
+      );
+    }
+    catch (error) {
+      publishProgress(attempt + 1 < GCID_EXPORT_FULL_ATTEMPTS ? '完整校验读取失败，正在重试' : '完整校验失败', entry.path, true);
+      throw error;
+    }
+  }, { attempts: GCID_EXPORT_FULL_ATTEMPTS });
+  const rangeHash = async (entry, initialDownloadUrl) => {
+    const ranges = cidByteRanges(entry.size);
+    const parts = await mapConcurrent(ranges, GCID_EXPORT_RANGE_CONCURRENCY, async (range) => retryGcidExportRange(async (attempt) => {
+      if (range.start === range.end) return Buffer.alloc(0);
+      const downloadUrl = attempt === 0
+        ? initialDownloadUrl
+        : (await getCloudDownload({ file_ids: [entry.fileId], packaged: false })).download_url;
+      const controller = new AbortController();
+      const requestTimeout = setTimeout(() => {
+        controller.abort(new GcidExportRangeError(`分段读取 ${entry.path} 请求超时`));
+      }, GCID_EXPORT_REQUEST_TIMEOUT_MS);
+      let response;
+      try {
+        response = await fetchCloud(downloadUrl, {
+          method: 'GET',
+          headers: {
+            'accept-encoding': 'identity',
+            range: `bytes=${range.start}-${range.end - 1}`,
+          },
+          signal: controller.signal,
+        });
+      }
+      catch (error) {
+        throw controller.signal.reason instanceof GcidExportRangeError ? controller.signal.reason : error;
+      }
+      finally {
+        clearTimeout(requestTimeout);
+      }
       const partial = response.status === 206;
       const wholeFile = range.start === 0 && range.end === entry.size && response.ok;
-      if (!partial && !wholeFile) throw new Error(`云端未接受分段读取（HTTP ${response.status}）`);
-      if (partial && String(response.headers.get('content-range') || '').toLowerCase() !== `bytes ${range.start}-${range.end - 1}/${entry.size}`) {
-        throw new Error('云端返回的分段范围与请求不一致');
+      if (!partial && !wholeFile) {
+        const error = new GcidExportRangeError(`云端未接受分段读取（HTTP ${response.status}）`, {
+          retryable: retryableGcidExportRangeStatus(response.status),
+        });
+        controller.abort(error);
+        throw error;
       }
-      const bytes = Buffer.from(await response.arrayBuffer());
-      if (bytes.length !== range.end - range.start) throw new Error(`分段读取 ${entry.path} 的字节数不完整`);
+      if (partial && String(response.headers.get('content-range') || '').toLowerCase() !== `bytes ${range.start}-${range.end - 1}/${entry.size}`) {
+        const error = new GcidExportRangeError('云端返回的分段范围与请求不一致');
+        controller.abort(error);
+        throw error;
+      }
+      let bytes;
+      try {
+        bytes = await readGcidExportRangeBody(response.body, range.end - range.start, {
+          timeoutMs: GCID_EXPORT_READ_IDLE_TIMEOUT_MS,
+          abort: (error) => controller.abort(error),
+        });
+      }
+      catch (error) {
+        throw controller.signal.reason instanceof GcidExportRangeError ? controller.signal.reason : error;
+      }
       return bytes;
-    });
+    }));
     return {
       cid: calculateGuangyaCidSamples(parts, entry.size),
       sampled: parts.reduce((total, bytes) => total + BigInt(bytes.length), 0n),
     };
   };
   const rangeHashWithRetry = async (entry) => {
-    let lastError = new Error('云端分段读取失败');
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        return await rangeHash(entry);
-      } catch (error) {
-        lastError = error;
-        if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250 * (2 ** attempt)));
-      }
-    }
-    throw lastError;
+    const download = await retryGcidExportRange(
+      () => getCloudDownload({ file_ids: [entry.fileId], packaged: false }),
+    );
+    return rangeHash(entry, download.download_url);
   };
   publishProgress('正在扫描所选文件', files[0].path, true);
-  const outcomes = await mapConcurrent(files, 8, async (entry) => {
+  const outcomes = await mapConcurrent(files, GCID_EXPORT_FILE_CONCURRENCY, async (entry) => {
     try {
       publishProgress('正在读取云端 GCID 并采样 CID', entry.path, true);
       let gcid = String(entry.gcid || '').trim();
@@ -2854,6 +2970,25 @@ async function accountGet(endpoint, allowRefresh = true) {
   if (!response.ok) throw httpError(response.status >= 500 ? 502 : response.status, payload.msg || `账号接口失败 ${response.status}`);
   return payload;
 }
+async function probeAccountProfileForScope(accessToken) {
+  if (!String(accessToken || '').trim() || jwtAccountIdentity(accessToken, accountBase)) return null;
+  try {
+    const response = await fetch(`${accountBase}/v1/user/me`, {
+      headers: accountRequestHeaders({ authorization: `Bearer ${accessToken}` }),
+      signal: AbortSignal.timeout(Math.min(requestTimeoutMs, 5_000)),
+    });
+    if (!response.ok) return null;
+    return await parseResponse(response, '/v1/user/me');
+  } catch {
+    return null;
+  }
+}
+async function establishExplicitAuthSessionScope(accessToken, authPayload) {
+  const needsProfile = !jwtAccountIdentity(accessToken, accountBase)
+    && !accountIdFromAuthPayload(authPayload);
+  const profile = needsProfile ? await probeAccountProfileForScope(accessToken) : authPayload;
+  return authSessionScope.establish(accessToken, profile);
+}
 async function accountPost(endpoint, body, extraHeaders = {}) {
   let response;
   try {
@@ -2998,6 +3133,7 @@ async function completeSmsLogin(body) {
   if (!accessToken) throw new Error('手机号登录没有返回 access_token');
   token = accessToken;
   refreshToken = nextRefreshToken || null;
+  await establishExplicitAuthSessionScope(token, credentials.payload);
   resetRemoteDirectoryCache();
   synchronizeWebDavCacheScope();
   replaceAuthSession(token, refreshToken);
@@ -3030,6 +3166,7 @@ async function pollDeviceLogin(deviceCode) {
   if (accessToken) {
     token = String(accessToken);
     refreshToken = nextRefreshToken ? String(nextRefreshToken) : null;
+    await establishExplicitAuthSessionScope(token, payload);
     resetRemoteDirectoryCache();
     synchronizeWebDavCacheScope();
     replaceAuthSession(token, refreshToken);
@@ -3077,6 +3214,7 @@ async function refreshSavedSession() {
     if (!accessToken) throw new Error('刷新登录状态时没有返回 access_token');
     token = String(accessToken);
     if (nextRefreshToken) refreshToken = String(nextRefreshToken);
+    authSessionScope.retainAfterRefresh(token);
     synchronizeWebDavCacheScope();
     saveAuthSession(token, refreshToken);
     publishState();
@@ -3300,7 +3438,28 @@ async function prepareUploadItem(item) {
   const second = await fsp.stat(item.file_path);
   if (first.size !== second.size || first.mtimeMs !== second.mtimeMs
     || Number(first.dev) !== Number(second.dev) || Number(first.ino) !== Number(second.ino)) throw new FileBusyError();
-  return { ...item, size: second.size, mtime: item.history_path ? item.mtime : second.mtimeMs, source_dev: second.dev, source_ino: second.ino };
+  const ready = { ...item, size: second.size, mtime: item.history_path ? item.mtime : second.mtimeMs, source_dev: second.dev, source_ino: second.ino };
+  if (!ready.replacement && ready.change_kind === 'changed' && ready.mapping_id && !ready.mapping_id.startsWith('__')) {
+    const row = database.prepare(`
+      SELECT size, modified_ms, remote_file_id
+      FROM uploaded_files
+      WHERE mapping_id = ? AND file_path = ? AND status = 'cloud_confirmed'
+        AND remote_parent_id = ? AND remote_dir = ? AND relative_path = ?
+    `).get(
+      ready.mapping_id,
+      path.resolve(uploadHistoryPath(ready)),
+      ready.remote_parent_id || '',
+      ready.remote_dir || '',
+      ready.relative_path || '',
+    );
+    ready.replacement = createUploadReplacementContext({
+      oldFileId: row?.remote_file_id,
+      originalName: path.posix.basename(String(ready.relative_path || '').replaceAll('\\', '/')),
+      previousSize: row?.size,
+      previousModifiedMs: row?.modified_ms,
+    });
+  }
+  return ready;
 }
 function scheduleBusyUploadRetry(key, item) {
   if (isUploadCancelled(key)) return;
@@ -3352,7 +3511,7 @@ async function preflightFlashUpload(item) {
   }
   const response = await apiPost('/userres/v1/get_res_center_token', {
     capacity: 2,
-    name: path.basename(item.file_path),
+    name: uploadRemoteName(item),
     res,
     parentId,
   }, [156]);
@@ -3434,7 +3593,7 @@ async function upload(item) {
       publish({ type: 'progress', file_path: eventPath, percent: 0, uploaded_bytes: 0, total_bytes: stat.size, stage: '正在计算秒传 MD5' });
       res.md5 = await calculateFileHash(item.file_path, 'md5');
     }
-    response = await apiPost('/userres/v1/get_res_center_token', { capacity: 2, name: path.basename(item.file_path), res, parentId }, [156]);
+    response = await apiPost('/userres/v1/get_res_center_token', { capacity: 2, name: uploadRemoteName(item), res, parentId }, [156]);
     data = response.data;
   }
   if (!data?.taskId) throw new Error('光鸭没有返回上传任务 ID');
@@ -3653,6 +3812,35 @@ async function finalizeConfirmedUpload(key, item, taskData, recovered = false) {
   if (isUploadCancelled(key)) {
     clearPendingUpload(key);
     return false;
+  }
+  if (!pendingUploads.has(key)) return false;
+  if (item.replacement) {
+    let replacementTask = activeUploadReplacements.get(key);
+    if (!replacementTask) {
+      replacementTask = (async () => {
+        const resolvedParentId = String(item.resolved_remote_parent_id ?? await ensureRemote(item.remote_parent_id || '', item.remote_dir));
+        publish({ type: 'progress', file_path: uploadEventPath(item), percent: 100, uploaded_bytes: item.size, total_bytes: item.size, bytes_per_second: 0, stage: '新版本已入库，正在安全替换旧文件' });
+        await safelyReplaceUploadedFile({
+          replacement: item.replacement,
+          newFileId: taskData.remoteFileId,
+          listEntries: () => fetchWebDavChildren(resolvedParentId),
+          renameEntry: renameRemote,
+          deleteEntry: (fileId) => deleteWebDavEntry({
+            entry: { id: fileId, parentId: resolvedParentId, name: item.replacement.backupName, isDirectory: false },
+          }),
+        });
+      })();
+      activeUploadReplacements.set(key, replacementTask);
+    }
+    try {
+      await replacementTask;
+    } catch (error) {
+      error.replacementPending = true;
+      schedulePendingUploadRecovery();
+      throw error;
+    } finally {
+      if (activeUploadReplacements.get(key) === replacementTask) activeUploadReplacements.delete(key);
+    }
   }
   if (!confirmPendingUploadRecord(key, taskData.taskId, taskData.remoteFileId)) return false;
   const hasResolvedParent = item.resolved_remote_parent_id !== undefined
@@ -3961,6 +4149,12 @@ function pump() {
       if (isFileBusyError(error)) {
         preserveSource = true;
         scheduleBusyUploadRetry(key, item);
+        return;
+      }
+      if (error.replacementPending) {
+        preserveSource = true;
+        status('warning', `新版本已入库，但安全替换尚未完成，将在后台继续：${uploadEventPath(item)}：${error.message}`);
+        publish({ type: 'file', state: 'processing', file_path: uploadEventPath(item), uploaded_bytes: item.size, total_bytes: item.size, stage: '正在等待安全替换旧文件' });
         return;
       }
       if (error.requeueUpload || isTransientUploadError(error)) {
@@ -4473,6 +4667,22 @@ async function batchRename(renames) {
 }
 const webDavDirectoryCache = createDirectoryCache({
   onDirectoryInvalidated: (fileId) => invalidateRemoteDirectoryIds([fileId]),
+});
+const recycleClearTask = createRecycleClearTaskCoordinator({
+  loadState: () => appStateValue('recycle_clear_task_v1'),
+  saveState: (value) => saveAppStateValue('recycle_clear_task_v1', value),
+  clearState: () => deleteAppStateValue('recycle_clear_task_v1'),
+  apiPost: (endpoint, body, { timeoutMs }) => apiPost(endpoint, body, [], false, timeoutMs, false),
+  deadlineMs: recycleClearDeadlineMs,
+  pollMs: recycleClearPollMs,
+  unknownGuardMs: recycleClearUnknownGuardMs,
+  requestTimeoutMs,
+  scope: () => authSessionScope.current(),
+  onTerminal: ({ outcome }) => {
+    resetRemoteDirectoryCache();
+    webDavDirectoryCache.clear();
+    publishCloudDirectoryInvalidated([], { all: true, source: `recycle-clear-${outcome}` });
+  },
 });
 const webDavDirectoryRefreshTimer = setInterval(() => {
   if (!token) return;
@@ -5003,6 +5213,7 @@ async function routeApiV2(request, response, url) {
     const body = await readBody(request);
     token = String(body.token || '').trim().replace(/^Bearer\s+/i, '') || null;
     refreshToken = null;
+    await establishExplicitAuthSessionScope(token);
     resetRemoteDirectoryCache();
     synchronizeWebDavCacheScope();
     replaceAuthSession(token, null);
@@ -5133,8 +5344,10 @@ async function routeApiV2(request, response, url) {
     return json(response, 200, await executeFileTask('/userres/v1/file/delete_file', { fileIds: validateFileIds(body.file_ids) }));
   }
   if (request.method === 'POST' && url.pathname === '/api/recycle/clear') {
-    await readBody(request);
-    return json(response, 200, await executeFileTask('/userres/v1/file/clear_recycle_bin', {}));
+    const body = await readBody(request);
+    const forceRetry = body.force_retry ?? body.forceRetry ?? false;
+    if (typeof forceRetry !== 'boolean') throw new Error('force_retry 必须是布尔值');
+    return json(response, 200, await recycleClearTask.clearRecycleBin({ forceRetry }), { 'cache-control': 'no-store' });
   }
   if (request.method === 'POST' && url.pathname === '/api/files/rename-batch') { const body = await readBody(request); return json(response, 200, await batchRename(body.renames)); }
   if (request.method === 'POST' && url.pathname === '/api/files/export-gcid') {

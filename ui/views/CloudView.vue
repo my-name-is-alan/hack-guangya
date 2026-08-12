@@ -695,7 +695,7 @@ function exportSelectedGcidJson(records = selectedRecords()) {
   }
   Modal.confirm({
     title: '并发生成秒传 JSON',
-    content: '程序会复用云端已有 GCID，并并发读取每个大文件的头、中、尾各 20 KB 来计算 CID（通常约 60 KB/文件）。仅在云端缺少 GCID 或不支持分段读取时，才回退完整校验。',
+    content: '程序会复用云端已有 GCID，最多同时并发处理 20 个文件；每个大文件只读取头、中、尾各 20 KB 来计算 CID（通常约 60 KB/文件）。任一分段读取失败会只重试该分段，最多 3 次。仅在云端缺少 GCID 或不支持分段读取时，才回退完整校验；完整校验失败也会重签地址并最多重试 3 次。',
     okText: '开始生成',
     cancelText: '取消',
     onOk() {
