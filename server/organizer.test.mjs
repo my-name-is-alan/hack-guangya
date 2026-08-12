@@ -14,6 +14,7 @@ import {
   renderNfo,
   normalizeOrganizerCloudEntry,
   cloudCandidateFingerprint,
+  planCloudScrapeCandidates,
   resolveMediaCategory,
   renderOrganizerPathTemplate,
   scoreTmdbCandidate,
@@ -207,6 +208,38 @@ test('ambiguous cloud sidecars stay unbound instead of following an unrelated pr
   assert.equal(analysis.sidecars[0].video_source, null);
 });
 
+test('large mixed cloud folders are split into stable movie and series boundaries', () => {
+  const planned = planCloudScrapeCandidates({
+    candidate: { id: 'root', name: 'Downloads', path: 'Downloads', is_directory: true },
+    entries: [
+      { id: 'show', parent_id: 'root', name: 'Foundation', path: 'Downloads/Foundation', is_directory: true },
+      { id: 'season', parent_id: 'show', name: 'Season 1', path: 'Downloads/Foundation/Season 1', is_directory: true },
+      { id: 'show-e1', parent_id: 'season', name: 'E01.mkv', path: 'Downloads/Foundation/Season 1/E01.mkv' },
+      { id: 'show-e2', parent_id: 'season', name: 'E02.mkv', path: 'Downloads/Foundation/Season 1/E02.mkv' },
+      { id: 'movie-a', parent_id: 'root', name: 'The.Matrix.1999', path: 'Downloads/The.Matrix.1999', is_directory: true },
+      { id: 'movie-a-file', parent_id: 'movie-a', name: 'The.Matrix.1999.mkv', path: 'Downloads/The.Matrix.1999/The.Matrix.1999.mkv' },
+      { id: 'movie-b', parent_id: 'root', name: 'Arrival.2016', path: 'Downloads/Arrival.2016', is_directory: true },
+      { id: 'movie-b-file', parent_id: 'movie-b', name: 'Arrival.2016.mkv', path: 'Downloads/Arrival.2016/Arrival.2016.mkv' },
+      { id: 'loose-a', parent_id: 'root', name: 'Alpha.S01E01.mkv', path: 'Downloads/Alpha.S01E01.mkv' },
+      { id: 'loose-b', parent_id: 'root', name: 'Beta.S01E02.mkv', path: 'Downloads/Beta.S01E02.mkv' },
+    ],
+  });
+  assert.deepEqual(planned.map((item) => item.id).sort(), ['loose-a', 'loose-b', 'movie-a', 'movie-b', 'show']);
+  assert.equal(planned.find((item) => item.id === 'show').suggested_media_type, 'tv');
+});
+
+test('a title folder with direct episodes remains one TV candidate', () => {
+  const planned = planCloudScrapeCandidates({
+    candidate: { id: 'show', name: 'Foundation', path: 'Foundation', is_directory: true },
+    entries: [
+      { id: 'e1', parent_id: 'show', name: 'Foundation.S01E01.mkv', path: 'Foundation/Foundation.S01E01.mkv' },
+      { id: 'e2', parent_id: 'show', name: 'Foundation.S01E02.mkv', path: 'Foundation/Foundation.S01E02.mkv' },
+    ],
+  });
+  assert.deepEqual(planned.map((item) => item.id), ['show']);
+  assert.equal(planned[0].reason, 'episode-folder');
+});
+
 test('candidate scoring favors exact title and year', () => {
   assert.equal(titleSimilarity('The Matrix', 'The.Matrix'), 1);
   const exact = scoreTmdbCandidate({ title: 'The Matrix', year: 1999 }, { title: 'The Matrix', release_date: '1999-03-30', popularity: 50 });
@@ -329,6 +362,9 @@ test('cloud-native organizer moves A to B, scrapes selected types and creates a 
   const database = new DatabaseSync(':memory:');
   const events = [];
   const shares = [];
+  const batchMoves = [];
+  let activeRenames = 0;
+  let maximumConcurrentRenames = 0;
   const nodes = new Map([
     ['a', { id: 'a', name: 'A', parent_id: '', is_directory: true, size: 0, modified_ms: '1' }],
     ['b', { id: 'b', name: 'B', parent_id: '', is_directory: true, size: 0, modified_ms: '1' }],
@@ -354,7 +390,17 @@ test('cloud-native organizer moves A to B, scrapes selected types and creates a 
       return { ...copy };
     },
     moveEntry: async (id, parentId) => { nodes.get(id).parent_id = parentId; },
-    renameEntry: async (id, name) => { nodes.get(id).name = name; },
+    moveEntries: async (ids, parentId) => {
+      batchMoves.push([...ids]);
+      for (const id of ids) nodes.get(id).parent_id = parentId;
+    },
+    renameEntry: async (id, name) => {
+      activeRenames += 1;
+      maximumConcurrentRenames = Math.max(maximumConcurrentRenames, activeRenames);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      nodes.get(id).name = name;
+      activeRenames -= 1;
+    },
     deleteEntry: async (id) => { nodes.delete(id); },
     uploadBuffer: async (parentId, name, bytes) => {
       const id = `upload-${++sequence}`;
@@ -404,6 +450,23 @@ test('cloud-native organizer moves A to B, scrapes selected types and creates a 
   assert.throws(() => service.updateSettings({ recognition_words: String.raw`Show(?=\.S\d+) => Series` }), /第 1 行.*不支持|第 1 行.*正则/);
   assert.throws(() => service.updateSettings({ recognition_words: '@?{season=1} => Series' }), /尚未支持的 @\? 条件规则/);
   assert.deepEqual(await service.testConnection(), { success: true, message: 'TMDB 连接成功' });
+  nodes.set('show-dir', { id: 'show-dir', name: 'Foundation.2021', parent_id: 'a', is_directory: true, size: 0, modified_ms: '2' });
+  nodes.set('season-dir', { id: 'season-dir', name: 'Season 1', parent_id: 'show-dir', is_directory: true, size: 0, modified_ms: '2' });
+  nodes.set('season-episode', { id: 'season-episode', name: 'E01.mkv', parent_id: 'season-dir', is_directory: false, size: 12, modified_ms: '3' });
+  const seasonSubmission = await service.scrapeSelected({
+    target_id: 'library-b',
+    files: [{ id: 'season-dir', parent_id: 'show-dir', name: 'Season 1', parent_path: '/A/Foundation.2021' }],
+  });
+  assert.equal(seasonSubmission.jobs.length, 1);
+  assert.equal(seasonSubmission.jobs[0].media_type, 'tv');
+  assert.equal(seasonSubmission.jobs[0].query_title, 'Foundation');
+  await waitFor(() => {
+    const job = service.state().jobs.find((item) => item.id === seasonSubmission.jobs[0].id);
+    return job && job.status !== 'recognizing' && job.status !== 'running' ? job : null;
+  });
+  nodes.delete('season-episode');
+  nodes.delete('season-dir');
+  nodes.delete('show-dir');
   await assert.rejects(service.addMapping({ source_dir_id: 'a', target_dir_id: 'a', source_path: '/A', target_path: '/A' }), /不能相同/);
   await assert.rejects(service.addMapping({ source_dir_id: 'a', target_dir_id: 'other', source_path: '/A', target_path: '/Other' }), /刮削输出/);
   await assert.rejects(service.addMapping({ source_dir_id: 'a', target_dir_id: 'b', source_path: '/A', target_path: '/B', transfer_type: 'move' }), /分享失效风险/);
@@ -439,6 +502,8 @@ test('cloud-native organizer moves A to B, scrapes selected types and creates a 
   const completed = await waitFor(() => service.state().jobs.find((job) => job.id === ready.id && job.status === 'completed_warning'));
   assert.equal(completed.status, 'completed_warning');
   assert.equal(completed.result.transferred, 2);
+  assert.deepEqual(batchMoves, [['movie-file', 'subtitle-file']]);
+  assert.ok(maximumConcurrentRenames >= 2);
   assert.equal(completed.result.scraped, 2);
   assert.equal(completed.result.share.share_url, 'https://share.example/fresh-b');
   assert.equal(shares.length, 1);

@@ -832,6 +832,125 @@ export function analyzeCloudMediaCandidate({ candidate, entries = [] }, override
   };
 }
 
+const GENERIC_MEDIA_CONTAINER_NAMES = new Set([
+  'download', 'downloads', 'media', 'library', 'movies', 'movie', 'tv', 'shows', 'series',
+  '下载', '下载目录', '媒体', '媒体库', '电影', '电视剧', '剧集', '视频',
+]);
+
+function isSeasonContainerName(value) {
+  const normalized = cleanText(value);
+  return /^(?:season|s)[ ._\-]?\d{1,3}$/i.test(normalized)
+    || /^第\s*\d{1,3}\s*季$/i.test(normalized);
+}
+
+function isTechnicalContainerName(value) {
+  return /^(?:bdmv|stream|video(?:_ts)?|disc|disk|cd|part)[ ._\-]?\d*$/i.test(cleanText(value));
+}
+
+function usefulContextTitle(value, settings = DEFAULT_ORGANIZER_SETTINGS) {
+  const segments = cleanText(value).replaceAll('\\', '/').split('/').filter(Boolean).reverse();
+  for (const segment of segments) {
+    const normalized = normalizeSearchTitle(segment);
+    if (!normalized || GENERIC_MEDIA_CONTAINER_NAMES.has(normalized) || isSeasonContainerName(segment) || isTechnicalContainerName(segment)) continue;
+    const parsed = parseMediaName(segment, { ...auxiliaryParserOptions(settings), media_type: 'tv' });
+    if (parsed.title) return parsed.title;
+  }
+  return '';
+}
+
+/**
+ * Splits a recursively loaded cloud directory into conservative media boundaries.
+ * The returned entries are real cloud files/directories, so every candidate can be
+ * processed by the existing organizer without inventing a synthetic manifest.
+ */
+export function planCloudScrapeCandidates({ candidate, entries = [] }, settings = DEFAULT_ORGANIZER_SETTINGS) {
+  const root = normalizeOrganizerCloudEntry(candidate, candidate?.path || candidate?.name);
+  if (!root.id) return [];
+  if (!root.is_directory) {
+    if (!VIDEO_EXTENSIONS.has(path.posix.extname(root.name).toLowerCase()) || isSamplePath(root.path)) return [];
+    const parsed = parseMediaName(root.name, auxiliaryParserOptions(settings));
+    return [{ ...root, suggested_media_type: parsed.media_type, suggested_title: '', video_count: 1, reason: 'video-file' }];
+  }
+
+  const nodes = new Map([[root.id, root]]);
+  for (const raw of entries) {
+    const entry = normalizeOrganizerCloudEntry(raw, raw?.path || raw?.name);
+    if (entry.id) nodes.set(entry.id, entry);
+  }
+  const children = new Map();
+  for (const entry of nodes.values()) {
+    if (entry.id === root.id) continue;
+    const list = children.get(entry.parent_id) || [];
+    list.push(entry);
+    children.set(entry.parent_id, list);
+  }
+  for (const list of children.values()) list.sort((left, right) => left.path.localeCompare(right.path, 'zh-CN', { numeric: true }));
+
+  const videoCountMemo = new Map();
+  function videoCount(node) {
+    if (videoCountMemo.has(node.id)) return videoCountMemo.get(node.id);
+    const count = node.is_directory
+      ? (children.get(node.id) || []).reduce((total, child) => total + videoCount(child), 0)
+      : (VIDEO_EXTENSIONS.has(path.posix.extname(node.name).toLowerCase()) && !isSamplePath(node.path) ? 1 : 0);
+    videoCountMemo.set(node.id, count);
+    return count;
+  }
+
+  const recognition = auxiliaryParserOptions(settings);
+  function directEpisodeProfile(files) {
+    const parsed = files.map((entry) => parseMediaName(entry.name, { ...recognition, media_type: 'tv' }));
+    const episodic = parsed.filter((item) => item.episode != null || item.season != null);
+    const identities = new Set(episodic.map((item) => normalizeSearchTitle(item.title)).filter(Boolean));
+    return { all_episodic: files.length > 0 && episodic.length === files.length, identities };
+  }
+
+  function candidateResult(node, reason, mediaType = '') {
+    const suggestedTitle = isSeasonContainerName(node.name)
+      ? usefulContextTitle(path.posix.dirname(node.path), settings)
+      : '';
+    return [{
+      ...node,
+      suggested_media_type: mediaType || (isSeasonContainerName(node.name) ? 'tv' : ''),
+      suggested_title: suggestedTitle,
+      video_count: videoCount(node),
+      reason,
+    }];
+  }
+
+  function plan(node) {
+    const nestedCount = videoCount(node);
+    if (!nestedCount) return [];
+    if (!node.is_directory) return candidateResult(node, 'video-file');
+    const directChildren = children.get(node.id) || [];
+    const directVideos = directChildren.filter((entry) => !entry.is_directory && videoCount(entry) > 0);
+    const mediaDirectories = directChildren.filter((entry) => entry.is_directory && videoCount(entry) > 0);
+    const episodeProfile = directEpisodeProfile(directVideos);
+    const seasonDirectories = mediaDirectories.filter((entry) => isSeasonContainerName(entry.name));
+
+    if (isSeasonContainerName(node.name)) return candidateResult(node, 'season-folder', 'tv');
+    if (mediaDirectories.length > 0
+      && seasonDirectories.length === mediaDirectories.length
+      && (directVideos.length === 0 || (episodeProfile.all_episodic && episodeProfile.identities.size <= 1))) {
+      return candidateResult(node, 'series-with-seasons', 'tv');
+    }
+    if (mediaDirectories.length === 0) {
+      if (directVideos.length === 1) return candidateResult(node, 'single-video-folder');
+      if (episodeProfile.all_episodic && episodeProfile.identities.size <= 1) return candidateResult(node, 'episode-folder', 'tv');
+      return directVideos.flatMap((entry) => candidateResult(entry, 'loose-video'));
+    }
+    if (directVideos.length === 0 && mediaDirectories.length === 1
+      && (isSeasonContainerName(mediaDirectories[0].name) || isTechnicalContainerName(mediaDirectories[0].name))) {
+      return candidateResult(node, 'media-container');
+    }
+    return [
+      ...directVideos.flatMap((entry) => candidateResult(entry, 'mixed-loose-video')),
+      ...mediaDirectories.flatMap(plan),
+    ];
+  }
+
+  return plan(root);
+}
+
 function normalizeTmdbCandidate(item, mediaType, query, imageUrl) {
   const type = item.media_type === 'tv' || item.media_type === 'movie' ? item.media_type : mediaType;
   const title = type === 'tv' ? item.name : item.title;

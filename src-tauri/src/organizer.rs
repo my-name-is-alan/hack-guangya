@@ -9,6 +9,7 @@ use crate::{
     organizer_upload_bytes, poll_hdhive_receipt, publish_cloud_mutation, save_auto_share_event,
     share_file_payload, share_id_for_hdhive, PendingAutoShare, SharedState,
 };
+use futures_util::{stream, StreamExt};
 use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,10 @@ use uuid::Uuid;
 const POLL_INTERVAL_SECONDS: u64 = 15;
 const MAX_CLOUD_ITEMS: usize = 20_000;
 const MAX_CLOUD_DEPTH: usize = 64;
+const MAX_SCRAPE_CANDIDATES: usize = 1_000;
+const SCRAPE_RECOGNITION_CONCURRENCY: usize = 4;
+const SCRAPE_EXECUTION_CONCURRENCY: usize = 3;
+const ORGANIZER_RENAME_CONCURRENCY: usize = 4;
 const MAX_JOB_LIST: i64 = 100;
 const MOVIE_PATH_TEMPLATE: &str = "{category}/{country}/{year}/{title} ({year}) [tmdb-{tmdb_id}]/{title} ({year}){edition}{quality}{part}.{ext}";
 const TV_PATH_TEMPLATE: &str = "{category}/{country}/{year}/{title} ({year}) [tmdb-{tmdb_id}]/Season {season:02}/{title}.S{season:02}E{episode:02}{episode_end}.{ext}";
@@ -466,8 +471,6 @@ struct SelectedScrapeFile {
     id: String,
     #[serde(alias = "parentId")]
     parent_id: String,
-    #[serde(default, alias = "fileName", alias = "file_name")]
-    name: Option<String>,
     #[serde(default, alias = "parentPath")]
     parent_path: Option<String>,
     #[serde(default)]
@@ -517,6 +520,15 @@ struct LoadedCandidate {
     candidate: CloudEntry,
     entries: Vec<CloudEntry>,
     fingerprint: CandidateFingerprint,
+}
+
+#[derive(Debug, Clone)]
+struct CloudScrapeCandidate {
+    entry: CloudEntry,
+    suggested_media_type: String,
+    suggested_title: String,
+    video_count: usize,
+    reason: &'static str,
 }
 
 fn now_seconds() -> i64 {
@@ -2116,13 +2128,17 @@ async fn create_cloud_directory(
     Ok(created)
 }
 
-async fn cloud_copy(app: &tauri::AppHandle, id: &str, parent_id: &str) -> Result<(), String> {
+async fn cloud_copy_many(
+    app: &tauri::AppHandle,
+    ids: &[String],
+    parent_id: &str,
+) -> Result<(), String> {
     let (token, device_id) = auth_context(app)?;
     let response = api_post(
         &token,
         &device_id,
         "/userres/v1/file/copy_file",
-        json!({ "fileIds": [id], "parentId": parent_id }),
+        json!({ "fileIds": ids, "parentId": parent_id }),
         &[],
     )
     .await?;
@@ -2139,12 +2155,20 @@ async fn cloud_copy(app: &tauri::AppHandle, id: &str, parent_id: &str) -> Result
 }
 
 async fn cloud_move(app: &tauri::AppHandle, id: &str, parent_id: &str) -> Result<(), String> {
+    cloud_move_many(app, &[id.to_string()], parent_id).await
+}
+
+async fn cloud_move_many(
+    app: &tauri::AppHandle,
+    ids: &[String],
+    parent_id: &str,
+) -> Result<(), String> {
     let (token, device_id) = auth_context(app)?;
     let response = api_post(
         &token,
         &device_id,
         "/userres/v1/file/move_file",
-        json!({ "fileIds": [id], "parentId": parent_id }),
+        json!({ "fileIds": ids, "parentId": parent_id }),
         &[],
     )
     .await?;
@@ -2153,7 +2177,7 @@ async fn cloud_move(app: &tauri::AppHandle, id: &str, parent_id: &str) -> Result
         app,
         app.state::<SharedState>().inner(),
         [parent_id.to_string()],
-        &[id.to_string()],
+        ids,
         true,
         "organizer-move",
     );
@@ -2202,6 +2226,30 @@ async fn cloud_rename(app: &tauri::AppHandle, id: &str, name: &str) -> Result<()
         "organizer-rename",
     );
     Ok(())
+}
+
+async fn cloud_rename_many(
+    app: &tauri::AppHandle,
+    renames: Vec<(String, String)>,
+) -> Result<(), String> {
+    let results = stream::iter(renames)
+        .map(|(id, name)| async move {
+            cloud_rename(app, &id, &name)
+                .await
+                .map_err(|error| format!("{name}：{error}"))
+        })
+        .buffer_unordered(ORGANIZER_RENAME_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let errors = results
+        .into_iter()
+        .filter_map(Result::err)
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("并发重命名失败：{}", errors.join("；")))
+    }
 }
 
 fn video_extension(value: &str) -> bool {
@@ -2256,6 +2304,269 @@ fn candidate_fingerprint(candidate: &CloudEntry, entries: &[CloudEntry]) -> Cand
             .filter(|entry| video_extension(&entry.name))
             .count() as i64,
     }
+}
+
+fn season_container_name(value: &str) -> bool {
+    Regex::new(r"(?i)^(?:season|s)[ ._\-]?\d{1,3}$")
+        .expect("season container regex")
+        .is_match(value.trim())
+        || Regex::new(r"^第\s*\d{1,3}\s*季$")
+            .expect("Chinese season container regex")
+            .is_match(value.trim())
+}
+
+fn technical_container_name(value: &str) -> bool {
+    Regex::new(r"(?i)^(?:bdmv|stream|video(?:_ts)?|disc|disk|cd|part)[ ._\-]?\d*$")
+        .expect("technical container regex")
+        .is_match(value.trim())
+}
+
+fn useful_context_title(value: &str, settings: &NativeSettings) -> String {
+    let generic = [
+        "download",
+        "downloads",
+        "media",
+        "library",
+        "movies",
+        "movie",
+        "tv",
+        "shows",
+        "series",
+        "下载",
+        "下载目录",
+        "媒体",
+        "媒体库",
+        "电影",
+        "电视剧",
+        "剧集",
+        "视频",
+    ];
+    for segment in value.replace('\\', "/").split('/').rev() {
+        if segment.trim().is_empty()
+            || season_container_name(segment)
+            || technical_container_name(segment)
+        {
+            continue;
+        }
+        let normalized = crate::organizer_core::normalize_search_title(segment);
+        if normalized.is_empty() || generic.contains(&normalized.as_str()) {
+            continue;
+        }
+        let parsed = parse_media_name_with_settings(
+            segment,
+            &RecognitionOverrides {
+                media_type: Some("tv".to_string()),
+                ..Default::default()
+            },
+            settings,
+        );
+        if !parsed.title.trim().is_empty() {
+            return parsed.title;
+        }
+    }
+    String::new()
+}
+
+fn scrape_video_count(
+    node: &CloudEntry,
+    nodes: &HashMap<String, CloudEntry>,
+    children: &HashMap<String, Vec<String>>,
+    memo: &mut HashMap<String, usize>,
+) -> usize {
+    if let Some(count) = memo.get(&node.id) {
+        return *count;
+    }
+    let count = if node.is_directory {
+        children
+            .get(&node.id)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| nodes.get(id))
+            .map(|child| scrape_video_count(child, nodes, children, memo))
+            .sum()
+    } else if video_extension(&node.name) && !ignored_sample(&node.logical_path) {
+        1
+    } else {
+        0
+    };
+    memo.insert(node.id.clone(), count);
+    count
+}
+
+fn push_scrape_candidate(
+    output: &mut Vec<CloudScrapeCandidate>,
+    node: &CloudEntry,
+    reason: &'static str,
+    media_type: &str,
+    video_count: usize,
+    settings: &NativeSettings,
+) {
+    output.push(CloudScrapeCandidate {
+        entry: node.clone(),
+        suggested_media_type: if media_type.is_empty() && season_container_name(&node.name) {
+            "tv".to_string()
+        } else {
+            media_type.to_string()
+        },
+        suggested_title: if season_container_name(&node.name) {
+            useful_context_title(&path_parent(&node.logical_path), settings)
+        } else {
+            String::new()
+        },
+        video_count,
+        reason,
+    });
+}
+
+fn plan_cloud_scrape_node(
+    node: &CloudEntry,
+    nodes: &HashMap<String, CloudEntry>,
+    children: &HashMap<String, Vec<String>>,
+    counts: &mut HashMap<String, usize>,
+    settings: &NativeSettings,
+    output: &mut Vec<CloudScrapeCandidate>,
+) {
+    let nested_count = scrape_video_count(node, nodes, children, counts);
+    if nested_count == 0 {
+        return;
+    }
+    if !node.is_directory {
+        push_scrape_candidate(output, node, "video-file", "", nested_count, settings);
+        return;
+    }
+    let direct = children.get(&node.id).cloned().unwrap_or_default();
+    let direct_videos = direct
+        .iter()
+        .filter_map(|id| nodes.get(id))
+        .filter(|entry| {
+            !entry.is_directory && scrape_video_count(entry, nodes, children, counts) > 0
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let media_directories = direct
+        .iter()
+        .filter_map(|id| nodes.get(id))
+        .filter(|entry| {
+            entry.is_directory && scrape_video_count(entry, nodes, children, counts) > 0
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let parsed = direct_videos
+        .iter()
+        .map(|entry| {
+            parse_media_name_with_settings(
+                &entry.name,
+                &RecognitionOverrides {
+                    media_type: Some("tv".to_string()),
+                    ..Default::default()
+                },
+                settings,
+            )
+        })
+        .collect::<Vec<_>>();
+    let episodic = parsed
+        .iter()
+        .filter(|item| item.episode.is_some() || item.season.is_some())
+        .collect::<Vec<_>>();
+    let identities = episodic
+        .iter()
+        .map(|item| crate::organizer_core::normalize_search_title(&item.title))
+        .filter(|value| !value.is_empty())
+        .collect::<HashSet<_>>();
+    let all_episodic = !direct_videos.is_empty() && episodic.len() == direct_videos.len();
+    let season_directories = media_directories
+        .iter()
+        .filter(|entry| season_container_name(&entry.name))
+        .count();
+
+    if season_container_name(&node.name) {
+        push_scrape_candidate(output, node, "season-folder", "tv", nested_count, settings);
+    } else if !media_directories.is_empty()
+        && season_directories == media_directories.len()
+        && (direct_videos.is_empty() || (all_episodic && identities.len() <= 1))
+    {
+        push_scrape_candidate(
+            output,
+            node,
+            "series-with-seasons",
+            "tv",
+            nested_count,
+            settings,
+        );
+    } else if media_directories.is_empty() {
+        if direct_videos.len() == 1 {
+            push_scrape_candidate(
+                output,
+                node,
+                "single-video-folder",
+                "",
+                nested_count,
+                settings,
+            );
+        } else if all_episodic && identities.len() <= 1 {
+            push_scrape_candidate(output, node, "episode-folder", "tv", nested_count, settings);
+        } else {
+            for entry in &direct_videos {
+                push_scrape_candidate(output, entry, "loose-video", "", 1, settings);
+            }
+        }
+    } else if direct_videos.is_empty()
+        && media_directories.len() == 1
+        && (season_container_name(&media_directories[0].name)
+            || technical_container_name(&media_directories[0].name))
+    {
+        push_scrape_candidate(output, node, "media-container", "", nested_count, settings);
+    } else {
+        for entry in &direct_videos {
+            push_scrape_candidate(output, entry, "mixed-loose-video", "", 1, settings);
+        }
+        for directory in &media_directories {
+            plan_cloud_scrape_node(directory, nodes, children, counts, settings, output);
+        }
+    }
+}
+
+fn plan_cloud_scrape_candidates(
+    loaded: &LoadedCandidate,
+    settings: &NativeSettings,
+) -> Vec<CloudScrapeCandidate> {
+    let mut nodes = HashMap::from([(loaded.candidate.id.clone(), loaded.candidate.clone())]);
+    for entry in &loaded.entries {
+        nodes.insert(entry.id.clone(), entry.clone());
+    }
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in nodes.values() {
+        if entry.id != loaded.candidate.id {
+            children
+                .entry(entry.parent_id.clone())
+                .or_default()
+                .push(entry.id.clone());
+        }
+    }
+    for ids in children.values_mut() {
+        ids.sort_by(|left, right| {
+            let left_path = nodes
+                .get(left)
+                .map(|entry| entry.logical_path.as_str())
+                .unwrap_or("");
+            let right_path = nodes
+                .get(right)
+                .map(|entry| entry.logical_path.as_str())
+                .unwrap_or("");
+            left_path.cmp(right_path)
+        });
+    }
+    let mut counts = HashMap::new();
+    let mut output = Vec::new();
+    plan_cloud_scrape_node(
+        &loaded.candidate,
+        &nodes,
+        &children,
+        &mut counts,
+        settings,
+        &mut output,
+    );
+    output
 }
 
 async fn load_candidate(
@@ -2516,6 +2827,106 @@ mod cloud_sidecar_tests {
             .all(|video| video.parsed.season == Some(2)));
         assert_eq!(analysis.videos[0].parsed.episode, Some(1));
         assert_eq!(analysis.videos[1].parsed.episode, Some(2));
+    }
+
+    #[test]
+    fn mixed_large_folder_is_split_without_breaking_a_whole_series() {
+        let root = CloudEntry {
+            id: "root".to_string(),
+            name: "Downloads".to_string(),
+            logical_path: "Downloads".to_string(),
+            is_directory: true,
+            ..Default::default()
+        };
+        let entry =
+            |id: &str, parent: &str, name: &str, logical_path: &str, is_directory| CloudEntry {
+                id: id.to_string(),
+                parent_id: parent.to_string(),
+                name: name.to_string(),
+                logical_path: logical_path.to_string(),
+                is_directory,
+                ..Default::default()
+            };
+        let entries = vec![
+            entry("show", "root", "Foundation", "Downloads/Foundation", true),
+            entry(
+                "season",
+                "show",
+                "Season 1",
+                "Downloads/Foundation/Season 1",
+                true,
+            ),
+            entry(
+                "show-e1",
+                "season",
+                "E01.mkv",
+                "Downloads/Foundation/Season 1/E01.mkv",
+                false,
+            ),
+            entry(
+                "show-e2",
+                "season",
+                "E02.mkv",
+                "Downloads/Foundation/Season 1/E02.mkv",
+                false,
+            ),
+            entry(
+                "movie-a",
+                "root",
+                "The.Matrix.1999",
+                "Downloads/The.Matrix.1999",
+                true,
+            ),
+            entry(
+                "movie-a-file",
+                "movie-a",
+                "The.Matrix.1999.mkv",
+                "Downloads/The.Matrix.1999/The.Matrix.1999.mkv",
+                false,
+            ),
+            entry(
+                "movie-b",
+                "root",
+                "Arrival.2016",
+                "Downloads/Arrival.2016",
+                true,
+            ),
+            entry(
+                "movie-b-file",
+                "movie-b",
+                "Arrival.2016.mkv",
+                "Downloads/Arrival.2016/Arrival.2016.mkv",
+                false,
+            ),
+            entry(
+                "loose-a",
+                "root",
+                "Alpha.S01E01.mkv",
+                "Downloads/Alpha.S01E01.mkv",
+                false,
+            ),
+            entry(
+                "loose-b",
+                "root",
+                "Beta.S01E02.mkv",
+                "Downloads/Beta.S01E02.mkv",
+                false,
+            ),
+        ];
+        let loaded = LoadedCandidate {
+            candidate: root.clone(),
+            fingerprint: candidate_fingerprint(&root, &entries),
+            entries,
+        };
+        let mut ids = plan_cloud_scrape_candidates(&loaded, &NativeSettings::default())
+            .into_iter()
+            .map(|item| item.entry.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["loose-a", "loose-b", "movie-a", "movie-b", "show"]
+        );
     }
 }
 
@@ -3210,7 +3621,19 @@ async fn ensure_target_directory(
             }
             parent_id = entry.id;
         } else {
-            parent_id = create_cloud_directory(app, &parent_id, part).await?.id;
+            let create_result = create_cloud_directory(app, &parent_id, part).await;
+            let refreshed = list_cloud_children(app, &parent_id).await?;
+            if let Some(entry) = refreshed
+                .into_iter()
+                .find(|entry| entry.name == part || entry.name.eq_ignore_ascii_case(part))
+            {
+                if !entry.is_directory {
+                    return Err(format!("目标路径包含同名文件：{part}"));
+                }
+                parent_id = entry.id;
+            } else {
+                parent_id = create_result?.id;
+            }
         }
     }
     Ok(parent_id)
@@ -3803,34 +4226,6 @@ struct TransferStep {
     backup: Option<(String, String)>,
 }
 
-async fn locate_transferred(
-    app: &tauri::AppHandle,
-    parent_id: &str,
-    source_id: &str,
-    source_name: &str,
-    before: &HashSet<String>,
-    operation: &str,
-) -> Result<CloudEntry, String> {
-    let children = list_cloud_children(app, parent_id).await?;
-    let found = if operation == "move" {
-        children.into_iter().find(|entry| entry.id == source_id)
-    } else {
-        children
-            .into_iter()
-            .find(|entry| entry.name == source_name && !before.contains(&entry.id))
-    };
-    found.ok_or_else(|| {
-        format!(
-            "云端{}已完成，但无法定位目标资源",
-            if operation == "move" {
-                "移动"
-            } else {
-                "复制"
-            }
-        )
-    })
-}
-
 async fn rollback_transfers(app: &tauri::AppHandle, steps: &[TransferStep]) -> Vec<String> {
     let mut warnings = Vec::new();
     for step in steps.iter().rev() {
@@ -3863,6 +4258,7 @@ async fn execute_transfers(
     preview: &CloudPreview,
 ) -> Result<(usize, usize, Vec<String>), String> {
     let mut transaction = Vec::new();
+    let mut unattached_backups: Vec<(String, String)> = Vec::new();
     let mut transferred = 0usize;
     let mut skipped = 0usize;
     let candidates = preview
@@ -3879,118 +4275,118 @@ async fn execute_transfers(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let mut groups: HashMap<String, Vec<CloudPreviewItem>> = HashMap::new();
     for item in candidates {
-        let source_id = item.source_id.clone().unwrap_or_default();
-        let target_parent_id =
-            match ensure_target_directory(app, mapping, &item.target_parent_relative).await {
-                Ok(value) => value,
-                Err(error) => {
-                    let rollback = rollback_transfers(app, &transaction).await;
-                    return Err(format_with_rollback(error, rollback));
+        groups
+            .entry(item.target_parent_relative.clone())
+            .or_default()
+            .push(item);
+    }
+    let operation = mapping.transfer_type.as_str();
+    let outcome = async {
+        for (target_parent_relative, items) in groups {
+            let target_parent_id =
+                ensure_target_directory(app, mapping, &target_parent_relative).await?;
+            let mut prepared = Vec::new();
+            for item in items {
+                let existing = resolve_target(app, mapping, &item.target_relative).await?;
+                if item.action == "skip" && existing.is_some() {
+                    skipped += 1;
+                    continue;
                 }
-            };
-        let existing = match resolve_target(app, mapping, &item.target_relative).await {
-            Ok(value) => value,
-            Err(error) => {
-                let rollback = rollback_transfers(app, &transaction).await;
-                return Err(format_with_rollback(error, rollback));
+                if item.action == "create" && existing.is_some() {
+                    return Err(format!("预览后目标已出现同名项目：{}", item.target));
+                }
+                let backup = if let Some(existing) = existing {
+                    let backup_name = format!(".__gy_org_backup_{}", Uuid::new_v4().simple());
+                    cloud_rename(app, &existing.id, &backup_name).await?;
+                    let backup = (existing.id, existing.name);
+                    unattached_backups.push(backup.clone());
+                    Some(backup)
+                } else {
+                    None
+                };
+                prepared.push((item, backup));
             }
-        };
-        if item.action == "skip" && existing.is_some() {
-            skipped += 1;
-            continue;
+            if prepared.is_empty() {
+                continue;
+            }
+            let before = list_cloud_children(app, &target_parent_id)
+                .await?
+                .into_iter()
+                .map(|entry| entry.id)
+                .collect::<HashSet<_>>();
+            let source_ids = prepared
+                .iter()
+                .filter_map(|(item, _)| item.source_id.clone())
+                .collect::<Vec<_>>();
+            if operation == "move" {
+                cloud_move_many(app, &source_ids, &target_parent_id).await?;
+            } else {
+                cloud_copy_many(app, &source_ids, &target_parent_id).await?;
+            }
+            let after = list_cloud_children(app, &target_parent_id).await?;
+            let mut available_copies = after
+                .iter()
+                .filter(|entry| !before.contains(&entry.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut renames = Vec::new();
+            for (item, backup) in prepared {
+                let source_id = item.source_id.clone().unwrap_or_default();
+                let source_name = item
+                    .source_name
+                    .clone()
+                    .unwrap_or_else(|| path_name(item.source.as_deref().unwrap_or_default()));
+                let created = if operation == "move" {
+                    after.iter().find(|entry| entry.id == source_id).cloned()
+                } else {
+                    available_copies
+                        .iter()
+                        .position(|entry| entry.name == source_name)
+                        .map(|index| available_copies.remove(index))
+                }
+                .ok_or_else(|| {
+                    format!(
+                        "云端{}已完成，但无法定位目标资源：{source_name}",
+                        if operation == "move" {
+                            "移动"
+                        } else {
+                            "复制"
+                        }
+                    )
+                })?;
+                if created.name != item.target_name {
+                    renames.push((created.id.clone(), item.target_name.clone()));
+                }
+                if let Some((backup_id, _)) = &backup {
+                    unattached_backups.retain(|(id, _)| id != backup_id);
+                }
+                transaction.push(TransferStep {
+                    operation: operation.to_string(),
+                    created_id: created.id,
+                    source_parent_id: item.source_parent_id.unwrap_or_default(),
+                    source_name,
+                    target_name: item.target_name,
+                    backup,
+                });
+            }
+            cloud_rename_many(app, renames).await?;
+            transferred += source_ids.len();
         }
-        if item.action == "create" && existing.is_some() {
-            let rollback = rollback_transfers(app, &transaction).await;
-            return Err(format_with_rollback(
-                format!("预览后目标已出现同名项目：{}", item.target),
-                rollback,
-            ));
-        }
-        let mut backup = None;
-        if let Some(existing) = existing {
-            let backup_name = format!(".__gy_org_backup_{}", Uuid::new_v4().simple());
-            if let Err(error) = cloud_rename(app, &existing.id, &backup_name).await {
-                let rollback = rollback_transfers(app, &transaction).await;
-                return Err(format_with_rollback(
-                    format!("覆盖前备份已有目标失败：{error}"),
-                    rollback,
+        Ok::<(), String>(())
+    }
+    .await;
+    if let Err(error) = outcome {
+        let mut warnings = rollback_transfers(app, &transaction).await;
+        for (backup_id, original_name) in unattached_backups {
+            if let Err(rollback_error) = cloud_rename(app, &backup_id, &original_name).await {
+                warnings.push(format!(
+                    "恢复覆盖备份 {original_name} 失败：{rollback_error}"
                 ));
             }
-            backup = Some((existing.id, existing.name));
         }
-        let before = list_cloud_children(app, &target_parent_id)
-            .await
-            .map(|children| {
-                children
-                    .into_iter()
-                    .map(|entry| entry.id)
-                    .collect::<HashSet<_>>()
-            });
-        let before = match before {
-            Ok(value) => value,
-            Err(error) => {
-                let rollback = rollback_transfers(app, &transaction).await;
-                return Err(format_with_rollback(error, rollback));
-            }
-        };
-        let operation = mapping.transfer_type.as_str();
-        let operation_result = if operation == "move" {
-            cloud_move(app, &source_id, &target_parent_id).await
-        } else {
-            cloud_copy(app, &source_id, &target_parent_id).await
-        };
-        if let Err(error) = operation_result {
-            let rollback = rollback_transfers(app, &transaction).await;
-            return Err(format_with_rollback(
-                format!(
-                    "{}失败：{error}",
-                    if operation == "move" {
-                        "移动云端文件"
-                    } else {
-                        "复制云端文件"
-                    }
-                ),
-                rollback,
-            ));
-        }
-        let created = match locate_transferred(
-            app,
-            &target_parent_id,
-            &source_id,
-            &item
-                .source_name
-                .clone()
-                .unwrap_or_else(|| path_name(item.source.as_deref().unwrap_or_default())),
-            &before,
-            operation,
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(error) => {
-                let rollback = rollback_transfers(app, &transaction).await;
-                return Err(format_with_rollback(error, rollback));
-            }
-        };
-        if created.name != item.target_name {
-            if let Err(error) = cloud_rename(app, &created.id, &item.target_name).await {
-                let rollback = rollback_transfers(app, &transaction).await;
-                return Err(format_with_rollback(
-                    format!("重命名整理目标失败：{error}"),
-                    rollback,
-                ));
-            }
-        }
-        transaction.push(TransferStep {
-            operation: operation.to_string(),
-            created_id: created.id.clone(),
-            source_parent_id: item.source_parent_id.clone().unwrap_or_default(),
-            source_name: item.source_name.clone().unwrap_or_default(),
-            target_name: item.target_name.clone(),
-            backup,
-        });
-        transferred += 1;
+        return Err(format_with_rollback(error, warnings));
     }
     for step in &transaction {
         if let Some((backup_id, _)) = &step.backup {
@@ -5522,115 +5918,166 @@ pub async fn scrape_selected_files(
     let mut jobs = Vec::new();
     let mut failures = Vec::new();
     let mut queued = Vec::new();
+    let mut candidate_ids = HashSet::new();
+    let selected_count = input.files.len();
+    let _ = list_cloud_children(&app, &target_dir_id).await?;
     for source in input.files.into_iter().take(100) {
         let submitted_id = source.id.clone();
-        let result = (|| {
-            let source_id = source.id.trim().to_string();
-            let source_parent_id = source.parent_id.trim().to_string();
-            if source_id.is_empty() || source_parent_id.is_empty() {
-                return Err("选中项缺少文件 ID 或来源目录".to_string());
-            }
-            let source_path = normalize_cloud_path(
-                source
-                    .parent_path
-                    .as_deref()
-                    .or(source.path.as_deref())
-                    .unwrap_or("/"),
-            );
-            let transfer_type =
-                normalize_transfer_type(transfer_type_input.as_deref().unwrap_or("copy"))?;
-            let risk = share_risk_acknowledged;
-            if transfer_type == "move" && !risk {
-                return Err("移动可能使已有分享失效，请先确认风险".to_string());
-            }
-            let mapping = OrganizerMapping {
-                id: format!("manual:{}", Uuid::new_v4()),
-                source_path,
-                target_path: normalize_cloud_path(&target_path),
-                source_dir_id: source_parent_id,
-                target_dir_id: target_dir_id.clone(),
-                enabled: true,
-                scan_existing: false,
-                monitor_mode: "manual".to_string(),
-                transfer_type,
-                media_type: normalize_media_type(
-                    media_type_input
-                        .as_deref()
-                        .or(source.media_type.as_deref())
-                        .unwrap_or(""),
-                )?,
-                scrape: true,
-                scrape_types: scrape_types.clone(),
-                sync_extras: true,
-                conflict_policy: "skip".to_string(),
-                auto_execute: false,
-                share_after_organize: false,
-                share_risk_acknowledged: risk,
-                settle_seconds: 5,
-                watch_error: None,
-                created_at: now_seconds(),
-                updated_at: now_seconds(),
-            };
-            save_mapping(&path, &mapping)?;
-            let job_id = Uuid::new_v4().to_string();
-            let source_name = source
-                .name
+        let source_id = source.id.trim().to_string();
+        let source_parent_id = source.parent_id.trim().to_string();
+        if source_id.is_empty() || source_parent_id.is_empty() {
+            failures.push(json!({ "id": submitted_id, "message": "选中项缺少文件 ID 或来源目录" }));
+            continue;
+        }
+        let source_path = normalize_cloud_path(
+            source
+                .parent_path
                 .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .or_else(|| {
-                    source.path.as_deref().and_then(|value| {
-                        value
-                            .replace('\\', "/")
-                            .rsplit('/')
-                            .next()
-                            .map(str::trim)
-                            .filter(|item| !item.is_empty())
-                            .map(str::to_string)
-                    })
-                })
-                .unwrap_or_else(|| source_id.clone());
-            let source_display_path = join_relative(&[&mapping.source_path, &source_name]);
+                .or(source.path.as_deref())
+                .unwrap_or("/"),
+        );
+        let transfer_type =
+            normalize_transfer_type(transfer_type_input.as_deref().unwrap_or("copy"))?;
+        if transfer_type == "move" && !share_risk_acknowledged {
+            return Err("移动可能使已有分享失效，请先确认风险".to_string());
+        }
+        let explicit_media_type = normalize_media_type(
+            media_type_input
+                .as_deref()
+                .or(source.media_type.as_deref())
+                .unwrap_or(""),
+        )?;
+        let base_mapping = OrganizerMapping {
+            id: format!("manual:{}", Uuid::new_v4()),
+            source_path: source_path.clone(),
+            target_path: normalize_cloud_path(&target_path),
+            source_dir_id: source_parent_id,
+            target_dir_id: target_dir_id.clone(),
+            enabled: true,
+            scan_existing: false,
+            monitor_mode: "manual".to_string(),
+            transfer_type: transfer_type.clone(),
+            media_type: explicit_media_type.clone(),
+            scrape: true,
+            scrape_types: scrape_types.clone(),
+            sync_extras: true,
+            conflict_policy: "skip".to_string(),
+            auto_execute: false,
+            share_after_organize: false,
+            share_risk_acknowledged,
+            settle_seconds: 5,
+            watch_error: None,
+            created_at: now_seconds(),
+            updated_at: now_seconds(),
+        };
+        let loaded = match load_candidate(&app, &base_mapping, &source_id).await {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                failures.push(json!({ "id": submitted_id, "message": "选中的云端项目已经不存在" }));
+                continue;
+            }
+            Err(error) => {
+                failures.push(json!({ "id": submitted_id, "message": error }));
+                continue;
+            }
+        };
+        let planned = plan_cloud_scrape_candidates(&loaded, &secrets.native);
+        if planned.is_empty() {
+            failures.push(json!({ "id": submitted_id, "message": "没有找到可刮削的视频文件" }));
+            continue;
+        }
+        for candidate in planned {
+            if candidate_ids.contains(&candidate.entry.id) {
+                continue;
+            }
+            if candidate_ids.len() >= MAX_SCRAPE_CANDIDATES {
+                failures.push(json!({
+                    "id": candidate.entry.id,
+                    "message": format!("拆分后超过 {MAX_SCRAPE_CANDIDATES} 个媒体候选，请缩小刮削范围")
+                }));
+                break;
+            }
+            candidate_ids.insert(candidate.entry.id.clone());
+            let parent_path = if candidate.entry.id == loaded.candidate.id {
+                source_path.clone()
+            } else {
+                let parent_logical = path_parent(&candidate.entry.logical_path);
+                let relative_parent = parent_logical
+                    .strip_prefix(loaded.candidate.logical_path.trim_matches('/'))
+                    .unwrap_or(&parent_logical)
+                    .trim_matches('/');
+                normalize_cloud_path(&join_relative(&[
+                    &source_path,
+                    &loaded.candidate.name,
+                    relative_parent,
+                ]))
+            };
+            let mut suggested_title = candidate.suggested_title.clone();
+            if suggested_title.is_empty()
+                && candidate.reason == "season-folder"
+                && candidate.entry.id == loaded.candidate.id
+            {
+                suggested_title = useful_context_title(&source_path, &secrets.native);
+            }
+            let mut mapping = base_mapping.clone();
+            mapping.id = format!("manual:{}", Uuid::new_v4());
+            mapping.source_path = parent_path;
+            mapping.source_dir_id = candidate.entry.parent_id.clone();
+            if mapping.media_type.is_empty() {
+                mapping.media_type = candidate.suggested_media_type.clone();
+            }
+            mapping.created_at = now_seconds();
+            mapping.updated_at = mapping.created_at;
+            if let Err(error) = save_mapping(&path, &mapping) {
+                failures.push(json!({ "id": candidate.entry.id, "name": candidate.entry.name, "message": error }));
+                continue;
+            }
+            let job_id = Uuid::new_v4().to_string();
+            let source_display_path = join_relative(&[&mapping.source_path, &candidate.entry.name]);
             let timestamp = now_seconds();
-            open_database(&path)?
-                .execute(
-                    "INSERT INTO organizer_jobs
-                     (id, mapping_id, source_path, source_id, source_parent_id, source_size,
-                      source_modified_ms, source_file_count, source_signature, share_after_requested,
-                      status, media_type, message, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 0, '0', 0, '', 0, 'recognizing', ?6,
-                             '刮削已提交，等待后台识别', ?7, ?7)",
-                    params![
-                        job_id,
-                        mapping.id,
-                        source_display_path,
-                        source_id,
-                        mapping.source_dir_id,
-                        if mapping.media_type.is_empty() {
-                            None::<String>
-                        } else {
-                            Some(mapping.media_type.clone())
-                        },
-                        timestamp,
-                    ],
-                )
-                .map_err(|error| format!("创建刮削任务失败：{error}"))?;
+            let insert = open_database(&path)?.execute(
+                "INSERT INTO organizer_jobs
+                 (id, mapping_id, source_path, source_id, source_parent_id, source_size,
+                  source_modified_ms, source_file_count, source_signature, share_after_requested,
+                  status, media_type, query_title, message, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, '0', ?6, '', 0, 'recognizing', ?7, ?8,
+                         '刮削已提交，等待后台识别', ?9, ?9)",
+                params![
+                    job_id,
+                    mapping.id,
+                    source_display_path,
+                    candidate.entry.id,
+                    mapping.source_dir_id,
+                    candidate.video_count as i64,
+                    if mapping.media_type.is_empty() {
+                        None::<String>
+                    } else {
+                        Some(mapping.media_type.clone())
+                    },
+                    if suggested_title.is_empty() {
+                        None::<String>
+                    } else {
+                        Some(suggested_title)
+                    },
+                    timestamp,
+                ],
+            );
+            if let Err(error) = insert {
+                failures.push(json!({ "id": candidate.entry.id, "name": candidate.entry.name, "message": format!("创建刮削任务失败：{error}") }));
+                continue;
+            }
             emit(
                 &app,
                 "job-updated",
                 json!({ "job_id": job_id.clone(), "mapping_id": mapping.id.clone(), "status": "recognizing" }),
             );
-            let job =
-                get_job(&path, &job_id)?.ok_or_else(|| "刮削任务创建后无法读取".to_string())?;
-            Ok::<(OrganizerJob, String, String), String>((job, job_id, mapping.id))
-        })();
-        match result {
-            Ok((job, job_id, mapping_id)) => {
-                jobs.push(job);
-                queued.push((job_id, mapping_id));
+            match get_job(&path, &job_id)? {
+                Some(job) => {
+                    jobs.push(job);
+                    queued.push((job_id, mapping.id));
+                }
+                None => failures.push(json!({ "id": candidate.entry.id, "name": candidate.entry.name, "message": "刮削任务创建后无法读取" })),
             }
-            Err(error) => failures.push(json!({ "id": submitted_id, "message": error })),
         }
     }
     if !queued.is_empty() {
@@ -5638,47 +6085,104 @@ pub async fn scrape_selected_files(
         let task_state = state.inner().clone();
         let task_path = path.clone();
         tauri::async_runtime::spawn(async move {
-            for (job_id, mapping_id) in queued {
-                let result = async {
-                    let recognized = recognize_job(
-                        &task_app,
-                        &task_state,
-                        &job_id,
-                        OrganizerJobInput::default(),
-                        false,
-                    )
-                    .await?;
-                    if recognized.status == "ready" {
-                        let _ = execute_job(&task_app, &task_state, &job_id).await?;
+            let recognized = stream::iter(queued)
+                .map(|(job_id, mapping_id)| {
+                    let worker_app = task_app.clone();
+                    let worker_state = task_state.clone();
+                    let worker_path = task_path.clone();
+                    async move {
+                        match recognize_job(
+                            &worker_app,
+                            &worker_state,
+                            &job_id,
+                            OrganizerJobInput::default(),
+                            false,
+                        )
+                        .await
+                        {
+                            Ok(job) if job.status == "ready" => Some(job),
+                            Ok(_) => None,
+                            Err(error) => {
+                                let _ = update_job_fields(
+                                    &worker_path,
+                                    &job_id,
+                                    &[
+                                        ("status", json!("failed")),
+                                        ("error_code", json!("scrape_failed")),
+                                        ("message", json!(error.clone())),
+                                    ],
+                                );
+                                emit(
+                                    &worker_app,
+                                    "job-updated",
+                                    json!({
+                                        "job_id": job_id,
+                                        "mapping_id": mapping_id,
+                                        "status": "failed",
+                                        "message": error,
+                                    }),
+                                );
+                                None
+                            }
+                        }
                     }
-                    Ok::<(), String>(())
-                }
+                })
+                .buffer_unordered(SCRAPE_RECOGNITION_CONCURRENCY)
+                .collect::<Vec<_>>()
                 .await;
-                if let Err(error) = result {
-                    let _ = update_job_fields(
-                        &task_path,
-                        &job_id,
-                        &[
-                            ("status", json!("failed")),
-                            ("error_code", json!("scrape_failed")),
-                            ("message", json!(error.clone())),
-                        ],
-                    );
-                    emit(
-                        &task_app,
-                        "job-updated",
-                        json!({
-                            "job_id": job_id,
-                            "mapping_id": mapping_id,
-                            "status": "failed",
-                            "message": error,
-                        }),
-                    );
-                }
+            let mut target_groups: HashMap<String, Vec<String>> = HashMap::new();
+            for job in recognized.into_iter().flatten() {
+                let key = job
+                    .preview
+                    .as_ref()
+                    .map(|preview| {
+                        format!(
+                            "{}::{}",
+                            preview.target_root_id, preview.media_root_relative
+                        )
+                    })
+                    .unwrap_or_else(|| job.id.clone());
+                target_groups.entry(key).or_default().push(job.id);
             }
+            stream::iter(target_groups.into_values())
+                .map(|group| {
+                    let worker_app = task_app.clone();
+                    let worker_state = task_state.clone();
+                    let worker_path = task_path.clone();
+                    async move {
+                        for job_id in group {
+                            if let Err(error) = execute_job(&worker_app, &worker_state, &job_id).await {
+                                let mapping_id = get_job(&worker_path, &job_id)
+                                    .ok()
+                                    .flatten()
+                                    .map(|job| job.mapping_id)
+                                    .unwrap_or_default();
+                                let _ = update_job_fields(
+                                    &worker_path,
+                                    &job_id,
+                                    &[
+                                        ("status", json!("failed")),
+                                        ("error_code", json!("scrape_failed")),
+                                        ("message", json!(error.clone())),
+                                    ],
+                                );
+                                emit(
+                                    &worker_app,
+                                    "job-updated",
+                                    json!({ "job_id": job_id, "mapping_id": mapping_id, "status": "failed", "message": error }),
+                                );
+                            }
+                        }
+                    }
+                })
+                .buffer_unordered(SCRAPE_EXECUTION_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
         });
     }
-    Ok(json!({ "jobs": jobs, "failures": failures }))
+    Ok(
+        json!({ "jobs": jobs, "failures": failures, "planned": jobs.len(), "selected": selected_count }),
+    )
 }
 
 #[tauri::command]

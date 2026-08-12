@@ -17,6 +17,8 @@ import {
   cloudCandidateFingerprint,
   createTmdbClient,
   normalizeOrganizerCloudEntry,
+  parseMediaName,
+  planCloudScrapeCandidates,
   renderNfo,
   renderOrganizerPathTemplate,
   normalizeCategoryRules,
@@ -33,6 +35,11 @@ const ACTIVE_STATUSES = new Set(['recognizing', 'ready', 'running', 'needs_revie
 const POLL_INTERVAL_MS = 15_000;
 const MAX_CLOUD_ITEMS = 20_000;
 const MAX_CLOUD_DEPTH = 64;
+const MAX_SCRAPE_CANDIDATES = 1_000;
+const SCRAPE_SCAN_CONCURRENCY = 3;
+const SCRAPE_RECOGNITION_CONCURRENCY = 4;
+const SCRAPE_EXECUTION_CONCURRENCY = 3;
+const ORGANIZER_RENAME_CONCURRENCY = 4;
 
 function nowSeconds() {
   return Math.floor(Date.now() / 1000);
@@ -40,6 +47,21 @@ function nowSeconds() {
 
 function cleanText(value) {
   return String(value ?? '').trim();
+}
+
+async function mapWithConcurrency(items, concurrency, worker) {
+  const source = Array.from(items || []);
+  const results = new Array(source.length);
+  let cursor = 0;
+  async function run() {
+    while (cursor < source.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await worker(source[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, concurrency), source.length) }, run));
+  return results;
 }
 
 function booleanValue(value, fallback = false) {
@@ -929,7 +951,10 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     const jobs = [];
     const failures = [];
     const queued = [];
-    for (const source of selected.slice(0, 100)) {
+    const candidateIds = new Set();
+    await listCloudChildren(target.dir_id);
+
+    const plannedSelections = await mapWithConcurrency(selected.slice(0, 100), SCRAPE_SCAN_CONCURRENCY, async (source) => {
       try {
         const normalizedSource = {
           ...source,
@@ -937,42 +962,105 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
           parent_id: cleanText(source.parent_id || source.parentId),
           parent_path: source.parent_path || source.parentPath || source.path,
           transfer_type: input.transfer_type || input.transferType || 'copy',
-          media_type: input.media_type || input.mediaType || '',
+          media_type: input.media_type || input.mediaType || source.media_type || source.mediaType || '',
           scrape_types: input.scrape_types || input.scrapeTypes || settings.default_scrape_types,
           share_risk_acknowledged: input.share_risk_acknowledged === true,
         };
         if (!normalizedSource.id) throw new Error('选中项缺少文件 ID');
-        const mapping = manualMappingFor(target, normalizedSource);
-        saveMapping(mapping);
-        const id = crypto.randomUUID();
-        const timestamp = nowSeconds();
-        const sourceName = cleanText(normalizedSource.name || normalizedSource.file_name || normalizedSource.fileName) || normalizedSource.id;
-        database.prepare(`INSERT INTO organizer_jobs
-          (id, mapping_id, source_path, source_id, source_parent_id, source_size, source_modified_ms, source_file_count,
-           source_signature, share_after_requested, status, media_type, message, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, 0, '0', 0, '', 0, 'recognizing', ?, '刮削已提交，等待后台识别', ?, ?)`)
-          .run(id, mapping.id, `${mapping.source_path.replace(/\/$/, '')}/${sourceName}`, normalizedSource.id,
-            mapping.source_dir_id, mapping.media_type || null, timestamp, timestamp);
-        emit('job-updated', { job_id: id, mapping_id: mapping.id, status: 'recognizing' });
-        jobs.push(getJob(id));
-        queued.push({ id, mapping });
+        const baseMapping = manualMappingFor(target, normalizedSource);
+        const loaded = await loadCloudCandidate(baseMapping, normalizedSource.id);
+        if (!loaded) throw new Error('选中的云端项目已经不存在');
+        const candidates = planCloudScrapeCandidates(loaded, settings);
+        if (!candidates.length) throw new Error('没有找到可刮削的视频文件');
+        return { normalizedSource, baseMapping, loaded, candidates };
       } catch (error) {
         failures.push({ id: cleanText(source.id || source.file_id), message: error.message });
+        return null;
+      }
+    });
+
+    for (const planned of plannedSelections.filter(Boolean)) {
+      const { normalizedSource, baseMapping, loaded } = planned;
+      for (const candidate of planned.candidates) {
+        try {
+          if (candidateIds.has(candidate.id)) continue;
+          if (candidateIds.size >= MAX_SCRAPE_CANDIDATES) {
+            failures.push({ id: candidate.id, name: candidate.name, message: `拆分后超过 ${MAX_SCRAPE_CANDIDATES} 个媒体候选，请缩小刮削范围` });
+            break;
+          }
+          candidateIds.add(candidate.id);
+          const rootPath = cleanText(loaded.candidate.path || loaded.candidate.name).replaceAll('\\', '/').replace(/^\/+|\/+$/g, '');
+          const candidatePath = cleanText(candidate.path || candidate.name).replaceAll('\\', '/').replace(/^\/+|\/+$/g, '');
+          const parentLogical = path.posix.dirname(candidatePath);
+          const relativeParent = candidate.id === loaded.candidate.id ? '' : path.posix.relative(rootPath, parentLogical);
+          const parentPath = candidate.id === loaded.candidate.id
+            ? baseMapping.source_path
+            : normalizeCloudPath([baseMapping.source_path, loaded.candidate.name, relativeParent === '.' ? '' : relativeParent].filter(Boolean).join('/'));
+          let suggestedTitle = cleanText(candidate.suggested_title);
+          if (!suggestedTitle && candidate.reason === 'season-folder' && candidate.id === loaded.candidate.id) {
+            const parentName = path.posix.basename(cleanText(normalizedSource.parent_path || normalizedSource.path).replaceAll('\\', '/'));
+            if (parentName && !/^(?:downloads?|media|library|movies?|tv|shows?|series|下载|媒体库?|电影|电视剧|剧集)$/i.test(parentName)) {
+              suggestedTitle = parseMediaName(parentName, { ...settings, media_type: 'tv' }).title;
+            }
+          }
+          const candidateSource = {
+            ...normalizedSource,
+            id: candidate.id,
+            parent_id: candidate.parent_id || baseMapping.source_dir_id,
+            parent_path: parentPath,
+            path: candidatePath,
+            name: candidate.name,
+            media_type: normalizedSource.media_type || candidate.suggested_media_type || '',
+          };
+          const mapping = manualMappingFor(target, candidateSource);
+          saveMapping(mapping);
+          const id = crypto.randomUUID();
+          const timestamp = nowSeconds();
+          const sourceName = cleanText(candidate.name) || candidate.id;
+          database.prepare(`INSERT INTO organizer_jobs
+            (id, mapping_id, source_path, source_id, source_parent_id, source_size, source_modified_ms, source_file_count,
+             source_signature, share_after_requested, status, media_type, query_title, message, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 0, '0', 0, '', 0, 'recognizing', ?, ?, '刮削已提交，等待后台识别', ?, ?)`)
+            .run(id, mapping.id, `${mapping.source_path.replace(/\/$/, '')}/${sourceName}`, candidate.id,
+              mapping.source_dir_id, mapping.media_type || null, suggestedTitle || null, timestamp, timestamp);
+          emit('job-updated', { job_id: id, mapping_id: mapping.id, status: 'recognizing' });
+          jobs.push(getJob(id));
+          queued.push({ id, mapping });
+        } catch (error) {
+          failures.push({ id: candidate.id, name: candidate.name, message: error.message });
+        }
       }
     }
     void (async () => {
-      for (const task of queued) {
+      const recognized = await mapWithConcurrency(queued, SCRAPE_RECOGNITION_CONCURRENCY, async (task) => {
         try {
-          await validateMapping(task.mapping);
           const result = await previewJob(task.id, {}, false);
-          if (result?.status === 'ready') await executeJob(task.id);
+          return result?.status === 'ready' ? result : null;
         } catch (error) {
           updateJob(task.id, { status: 'failed', error_code: 'scrape_failed', message: error.message });
           emit('job-updated', { job_id: task.id, mapping_id: task.mapping.id, status: 'failed', message: error.message });
+          return null;
         }
+      });
+      const targetGroups = new Map();
+      for (const job of recognized.filter(Boolean)) {
+        const key = `${job.preview?.target_root_id || ''}::${job.preview?.media_root_relative || job.id}`;
+        const group = targetGroups.get(key) || [];
+        group.push(job.id);
+        targetGroups.set(key, group);
       }
+      await mapWithConcurrency(targetGroups.values(), SCRAPE_EXECUTION_CONCURRENCY, async (group) => {
+        for (const id of group) {
+          try { await executeJob(id); }
+          catch (error) {
+            const job = getJob(id);
+            updateJob(id, { status: 'failed', error_code: 'scrape_failed', message: error.message });
+            emit('job-updated', { job_id: id, mapping_id: job?.mapping_id || '', status: 'failed', message: error.message });
+          }
+        }
+      });
     })();
-    return { jobs, failures, state: state() };
+    return { jobs, failures, planned: jobs.length, selected: selected.length, state: state() };
   }
 
   function clearPendingForMapping(id) {
@@ -1115,11 +1203,19 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
           || children.find((item) => item.name.toLocaleLowerCase() === name.toLocaleLowerCase());
         if (entry && !entry.is_directory) throw new Error(`目标路径包含同名文件：${name}`);
         if (!entry) {
-          const created = normalizeOrganizerCloudEntry(await cloud.createDirectory(parentId, name));
+          let created = null;
+          let createError = null;
+          try { created = normalizeOrganizerCloudEntry(await cloud.createDirectory(parentId, name)); }
+          catch (error) { createError = error; }
           cache.delete(parentId);
           children = await list(parentId, true);
-          entry = (created.id && children.find((item) => item.id === created.id)) || children.find((item) => item.name === name);
-          if (!entry?.id || !entry.is_directory) throw new Error(`创建云端目录后无法定位：${name}`);
+          entry = (created?.id && children.find((item) => item.id === created.id))
+            || children.find((item) => item.name === name)
+            || children.find((item) => item.name.toLocaleLowerCase() === name.toLocaleLowerCase());
+          if (!entry?.id || !entry.is_directory) {
+            if (createError) throw createError;
+            throw new Error(`创建云端目录后无法定位：${name}`);
+          }
         }
         parentId = entry.id;
       }
@@ -1212,11 +1308,60 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
   async function executeTransfers(preview, mapping, resolver) {
     const transferItems = preview.data.items.filter((item) => item.success && item.source_id && ['video', 'subtitle', 'audio', 'trailer', 'extra'].includes(item.kind));
     const transaction = [];
+    const unattachedBackups = new Map();
     let transferred = 0;
     let skipped = 0;
     try {
+      const groups = new Map();
       for (const item of transferItems) {
-        const parentId = await resolver.ensureDirectory(item.target_parent_relative);
+        const key = item.target_parent_relative;
+        const group = groups.get(key) || [];
+        group.push(item);
+        groups.set(key, group);
+      }
+      for (const [targetParentRelative, items] of groups) {
+        const parentId = await resolver.ensureDirectory(targetParentRelative);
+        const batchOperation = mapping.transfer_type === 'move' ? cloud.moveEntries : cloud.copyEntries;
+        if (items.length > 1 && typeof batchOperation === 'function') {
+          const prepared = [];
+          for (const item of items) {
+            const existing = await resolver.resolve(item.target_relative, true);
+            if (item.action === 'skip' && existing) { skipped += 1; continue; }
+            if (item.action === 'create' && existing) throw new Error(`预览后目标已出现同名项目：${item.target}`);
+            let backup = null;
+            if (existing) {
+              const backupName = `.__gy_org_backup_${crypto.randomUUID().replaceAll('-', '')}`;
+              await cloud.renameEntry(existing.id, backupName);
+              backup = { id: existing.id, original_name: existing.name, backup_name: backupName };
+              unattachedBackups.set(backup.id, backup);
+              resolver.invalidate(parentId);
+            }
+            prepared.push({ item, backup });
+          }
+          if (!prepared.length) continue;
+          const before = new Set((await resolver.list(parentId, true)).map((entry) => entry.id));
+          await batchOperation.call(cloud, prepared.map(({ item }) => item.source_id), parentId);
+          resolver.invalidate(parentId);
+          const after = await resolver.list(parentId, true);
+          const availableCopies = after.filter((entry) => !before.has(entry.id));
+          for (const { item, backup } of prepared) {
+            const copyIndex = mapping.transfer_type === 'copy'
+              ? availableCopies.findIndex((entry) => entry.name === item.source_name)
+              : -1;
+            const created = mapping.transfer_type === 'move'
+              ? after.find((entry) => entry.id === item.source_id)
+              : (copyIndex >= 0 ? availableCopies.splice(copyIndex, 1)[0] : null);
+            if (!created?.id) throw new Error(`云端${mapping.transfer_type === 'move' ? '移动' : '复制'}已完成，但无法定位目标资源：${item.source_name}`);
+            transaction.push({ operation: mapping.transfer_type, created_id: created.id, source_parent_id: item.source_parent_id, source_name: item.source_name, target_parent_id: parentId, target_name: item.target_name, backup });
+            if (backup) unattachedBackups.delete(backup.id);
+          }
+          await mapWithConcurrency(transaction.slice(-prepared.length).filter((step) => step.source_name !== step.target_name), ORGANIZER_RENAME_CONCURRENCY,
+            (step) => cloud.renameEntry(step.created_id, step.target_name));
+          resolver.invalidate(parentId);
+          transferred += prepared.length;
+          continue;
+        }
+        for (const item of items) {
         let existing = await resolver.resolve(item.target_relative, true);
         if (item.action === 'skip' && existing) { skipped += 1; continue; }
         if (item.action === 'create' && existing) throw new Error(`预览后目标已出现同名项目：${item.target}`);
@@ -1225,6 +1370,7 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
           const backupName = `.__gy_org_backup_${crypto.randomUUID().replaceAll('-', '')}`;
           await cloud.renameEntry(existing.id, backupName);
           backup = { id: existing.id, original_name: existing.name, backup_name: backupName };
+          unattachedBackups.set(backup.id, backup);
           resolver.invalidate(parentId);
         }
         const before = new Set((await resolver.list(parentId, true)).map((entry) => entry.id));
@@ -1234,10 +1380,16 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
         if (created.name !== item.target_name) await cloud.renameEntry(created.id, item.target_name);
         resolver.invalidate(parentId);
         transaction.push({ operation: mapping.transfer_type, created_id: created.id, source_parent_id: item.source_parent_id, source_name: item.source_name, target_parent_id: parentId, target_name: item.target_name, backup });
+        if (backup) unattachedBackups.delete(backup.id);
         transferred += 1;
+      }
       }
     } catch (error) {
       const rollbackWarnings = await rollbackTransfers(transaction, resolver);
+      for (const backup of unattachedBackups.values()) {
+        try { await cloud.renameEntry(backup.id, backup.original_name); }
+        catch (rollbackError) { rollbackWarnings.push(`恢复覆盖备份 ${backup.original_name} 失败：${rollbackError.message}`); }
+      }
       throw new Error(`${error.message}${rollbackWarnings.length ? `；${rollbackWarnings.join('；')}` : ''}`);
     }
     for (const step of transaction) {

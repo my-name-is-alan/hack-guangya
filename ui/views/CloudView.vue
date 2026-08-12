@@ -754,9 +754,12 @@ async function submitScrapeSelected() {
     const result = await bridge.invoke('scrape_selected_files', { input: { files, target_id: scrapeDialog.targetId } });
     const jobs = Array.isArray(result?.jobs) ? result.jobs.length : 0;
     const failures = Array.isArray(result?.failures) ? result.failures.length : 0;
+    const splitHint = jobs > files.length
+      ? `已将 ${files.length} 个选中项自动拆分为 ${jobs} 个媒体任务，`
+      : `已提交 ${jobs} 个刮削任务，`;
     scrapeDialog.open = false;
     clearSelection();
-    message.success(`已提交 ${jobs} 个刮削任务，正在后台识别整理${failures ? `，${failures} 项未提交` : ''}`);
+    message.success(`${splitHint}正在后台并发识别整理${failures ? `，${failures} 项未提交` : ''}`);
   } catch (error) {
     message.error(errorText(error));
   } finally {

@@ -95,7 +95,8 @@ test('manual scrape closes after queueing and tells the user work continues in b
   const submit = sourceBetween(source, 'async function submitScrapeSelected()', 'async function');
   assert.match(submit, /await bridge\.invoke\('scrape_selected_files'/);
   assert.match(submit, /scrapeDialog\.open = false/);
-  assert.match(submit, /正在后台识别整理/);
+  assert.match(submit, /自动拆分为/);
+  assert.match(submit, /正在后台并发识别整理/);
 });
 
 test('desktop download progress exposes concurrent range mode', async () => {

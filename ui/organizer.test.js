@@ -57,14 +57,15 @@ test('organizer naming preview accepts rich double-brace variables', () => {
   assert.match(organizerViewSource, /insertTemplateToken\('tv', item\.token\)/);
 });
 
-test('manual scrape submission queues recognition instead of awaiting the whole organizer pipeline', () => {
+test('manual scrape awaits bounded inventory planning but leaves recognition and execution in background', () => {
   const start = serverOrganizerSource.indexOf('async function scrapeSelected(input = {})');
   const background = serverOrganizerSource.indexOf('void (async () => {', start);
   const finish = serverOrganizerSource.indexOf('function clearPendingForMapping', background);
   assert.ok(start >= 0 && background > start && finish > background);
-  assert.doesNotMatch(serverOrganizerSource.slice(start, background), /\bawait\b/);
+  assert.match(serverOrganizerSource.slice(start, background), /await mapWithConcurrency[\s\S]*planCloudScrapeCandidates/);
+  assert.doesNotMatch(serverOrganizerSource.slice(start, background), /await previewJob|await executeJob/);
   assert.match(serverOrganizerSource.slice(background, finish), /await previewJob[\s\S]*await executeJob/);
-  assert.match(serverOrganizerSource.slice(background, finish), /return \{ jobs, failures, state: state\(\) \}/);
+  assert.match(serverOrganizerSource.slice(background, finish), /return \{ jobs, failures, planned: jobs\.length, selected: selected\.length, state: state\(\) \}/);
 });
 
 test('organizer naming exposes the full movie and TV token sets with Chinese countries', () => {
