@@ -2109,7 +2109,7 @@ onBeforeUnmount(() => {
           </a-flex>
         </a-form-item>
         <a-form-item v-if="!gcidImport.sourcePath" label="或粘贴 JSON 内容">
-          <a-textarea v-model:value="gcidImport.pastedJson" :rows="4" :disabled="gcidImportRunning" placeholder="粘贴完整的光鸭 GCID 导出 JSON" />
+          <a-textarea v-model:value="gcidImport.pastedJson" :rows="4" :disabled="gcidImportRunning" placeholder="粘贴完整的光鸭或 PikPak GCID/CID 导出 JSON" />
           <div v-if="shouldConvertPasteToFile(gcidImport.pastedJson)" class="form-help">内容较大，提交时会先写入本机暂存文件，避免一次性跨进程传输。</div>
         </a-form-item>
         <a-row :gutter="12">

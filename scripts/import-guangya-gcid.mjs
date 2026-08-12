@@ -47,15 +47,21 @@ export function normalizeRelativePath(value) {
   return parts.join('/');
 }
 
+function isSupportedGcidExport(payload) {
+  const source = String(payload?.source || '').toLowerCase();
+  const cidDeclared = payload?.usesCidInExport === true || payload?.containsCid === true;
+  return (source === 'guangya' || source === 'pikpak')
+    && payload?.hashType === 'gcid'
+    && payload?.usesGcidInExport === true
+    && cidDeclared;
+}
+
 export function validateExport(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new Error('导入文件顶层必须是 JSON 对象');
   }
-  if (payload.source !== 'guangya'
-    || payload.hashType !== 'gcid'
-    || payload.usesGcidInExport !== true
-    || payload.usesCidInExport !== true) {
-    throw new Error('只支持同时包含 GCID 与 CID 的光鸭导出格式');
+  if (!isSupportedGcidExport(payload)) {
+    throw new Error('只支持光鸭或 PikPak 的 GCID/CID 导出格式');
   }
   if (!Array.isArray(payload.files) || payload.files.length === 0) {
     throw new Error('导入文件不包含 files 记录');

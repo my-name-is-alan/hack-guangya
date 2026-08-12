@@ -2,6 +2,11 @@
 
 历史版本的说明见 [GitHub Releases](https://github.com/my-name-is-alan/hack-guangya/releases)。
 
+## v0.1.37 - 2026-08-12
+
+- GCID/CID 导入兼容 PikPak 的 `source: "pikpak"` 与 `containsCid: true` 导出格式。
+- 保留路径、文件大小、GCID/CID 格式校验，并同步 Tauri、CLI、界面提示和文档。
+
 ## v0.1.36 - 2026-08-12
 
 本版本是一次大规模的架构整理与缺陷修复：Rust 后端完成模块化拆分，接口层新增统一重试与令牌自动续期，目录缓存/刷新、媒体刮削整理修复了一批高危问题，前端界面全面统一。

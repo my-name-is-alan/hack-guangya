@@ -3265,6 +3265,33 @@
     }
 
     #[test]
+    fn gcid_export_parser_accepts_pikpak_contains_cid_alias() {
+        let raw = br#"{
+          "scriptVersion": "pikpak-gcid-cid-export-2.0",
+          "source": "pikpak",
+          "hashType": "gcid",
+          "usesGcidInExport": true,
+          "containsCid": true,
+          "totalFilesCount": 1,
+          "totalSize": "10",
+          "files": [{
+            "path": "PikPak/clip.mp4",
+            "size": "10",
+            "gcid": "0123456789abcdef0123456789abcdef01234567",
+            "cid": "89abcdef0123456789abcdef0123456789abcdef"
+          }]
+        }"#;
+        let (files, total_size, common_path) =
+            parse_gcid_export(raw).expect("valid PikPak export");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "PikPak/clip.mp4");
+        assert_eq!(files[0].gcid, "0123456789ABCDEF0123456789ABCDEF01234567");
+        assert_eq!(files[0].cid, "89ABCDEF0123456789ABCDEF0123456789ABCDEF");
+        assert_eq!(total_size, 10);
+        assert_eq!(common_path, "");
+    }
+
+    #[test]
     fn gcid_export_parser_rejects_unsafe_and_duplicate_paths() {
         let unsafe_raw = br#"{
           "source": "guangya",

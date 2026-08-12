@@ -99,12 +99,14 @@ pub(crate) fn normalize_gcid_relative_path(value: &str) -> Result<String, String
 pub(crate) fn parse_gcid_export(raw: &[u8]) -> Result<(Vec<GcidImportFile>, u128, String), String> {
     let export: GcidExport =
         serde_json::from_slice(raw).map_err(|error| format!("JSON 格式无效：{error}"))?;
-    if export.source != "guangya"
+    let source = export.source.to_ascii_lowercase();
+    let cid_declared = export.uses_cid_in_export || export.contains_cid;
+    if !matches!(source.as_str(), "guangya" | "pikpak")
         || export.hash_type != "gcid"
         || !export.uses_gcid_in_export
-        || !export.uses_cid_in_export
+        || !cid_declared
     {
-        return Err("只支持同时包含 GCID 与 CID 的光鸭导出格式".to_string());
+        return Err("只支持光鸭或 PikPak 的 GCID/CID 导出格式".to_string());
     }
     if export.files.is_empty() {
         return Err("导入文件不包含 files 记录".to_string());
@@ -888,7 +890,7 @@ pub(crate) async fn run_gcid_import(
 #[tauri::command]
 pub(crate) fn select_gcid_import_file() -> Option<String> {
     rfd::FileDialog::new()
-        .add_filter("光鸭 GCID JSON", &["json"])
+        .add_filter("GCID/CID JSON", &["json"])
         .pick_file()
         .map(|path| path.to_string_lossy().to_string())
 }

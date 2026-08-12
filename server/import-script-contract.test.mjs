@@ -44,11 +44,31 @@ test('standalone GCID importer normalizes exported hashes to upstream uppercase 
   assert.equal(file.cid, '89ABCDEF0123456789ABCDEF0123456789ABCDEF');
 });
 
+test('standalone GCID importer accepts PikPak exports with containsCid metadata', () => {
+  const [file] = validateExport({
+    scriptVersion: 'pikpak-gcid-cid-export-2.0',
+    source: 'pikpak',
+    hashType: 'gcid',
+    usesGcidInExport: true,
+    containsCid: true,
+    totalFilesCount: 1,
+    files: [{
+      path: '主播合集/clip.mp4',
+      size: '10',
+      gcid: '0123456789abcdef0123456789abcdef01234567',
+      cid: '89abcdef0123456789abcdef0123456789abcdef',
+    }],
+  });
+  assert.equal(file.path, '主播合集/clip.mp4');
+  assert.equal(file.gcid, '0123456789ABCDEF0123456789ABCDEF01234567');
+  assert.equal(file.cid, '89ABCDEF0123456789ABCDEF0123456789ABCDEF');
+});
+
 test('standalone GCID importer rejects legacy exports without CID', () => {
   assert.throws(() => validateExport({
     source: 'guangya',
     hashType: 'gcid',
     usesGcidInExport: true,
     files: [],
-  }), /同时包含 GCID 与 CID/);
+  }), /光鸭或 PikPak 的 GCID\/CID/);
 });

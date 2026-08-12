@@ -12,6 +12,8 @@ pub(crate) struct GcidExport {
     #[serde(default)]
     pub(crate) uses_cid_in_export: bool,
     #[serde(default)]
+    pub(crate) contains_cid: bool,
+    #[serde(default)]
     pub(crate) common_path: String,
     #[serde(default)]
     pub(crate) total_files_count: Option<u64>,
