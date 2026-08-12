@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { readRustBackendSource } from './rustBackendSource.js';
 import test from 'node:test';
 import {
   developerTransferIsActive,
@@ -19,7 +20,7 @@ test('developer transfer is wired through the active UI and both runtime bridges
     read('./views/CloudView.vue'),
     read('./bridge.js'),
     read('../server/server.mjs'),
-    read('../src-tauri/src/main.rs'),
+    readRustBackendSource(),
   ]);
 
   assert.match(settingsView, /AccountSettingsPanel/);
@@ -79,7 +80,7 @@ test('developer transfer is wired through the active UI and both runtime bridges
 test('direct upload falls back to pre-audit only for business code 18011', async () => {
   const [server, rust] = await Promise.all([
     read('../server/server.mjs'),
-    read('../src-tauri/src/main.rs'),
+    readRustBackendSource(),
   ]);
 
   assert.match(server, /apiCode !== 18011/);
@@ -94,7 +95,7 @@ test('direct upload falls back to pre-audit only for business code 18011', async
 test('pre-audit submits original file ids without changing source names', async () => {
   const [server, rust, cloud, selectionBar] = await Promise.all([
     read('../server/server.mjs'),
-    read('../src-tauri/src/main.rs'),
+    readRustBackendSource(),
     read('./views/CloudView.vue'),
     read('./components/files/FileSelectionBar.vue'),
   ]);
@@ -127,31 +128,37 @@ test('selected cloud files and folders export GCID plus sampled CID with visible
   const [server, retry, rust, cloud, exportStatus, bridge] = await Promise.all([
     read('../server/server.mjs'),
     read('../server/gcid-export-retry.mjs'),
-    read('../src-tauri/src/main.rs'),
+    readRustBackendSource(),
     read('./views/CloudView.vue'),
     read('./components/files/GcidExportStatus.vue'),
     read('./bridge.js'),
   ]);
 
   assert.match(cloud, /头、中、尾各 20 KB/);
-  assert.match(cloud, /最多同时并发处理 20 个文件/);
-  assert.match(cloud, /只重试该分段，最多 3 次/);
-  assert.match(cloud, /完整校验失败也会重签地址并最多重试 3 次/);
-  assert.match(exportStatus, /单分段失败会独立重试（最多 3 次）/);
+  assert.match(cloud, /最多同时处理 20 个文件/);
+  assert.match(cloud, /只会错峰重试该分段，最多 3 次/);
+  assert.match(cloud, /绝不会下载整文件做完整验证/);
+  assert.match(exportStatus, /单分段失败会独立错峰重试（最多 3 次）/);
   assert.match(cloud, /GcidExportStatus/);
   assert.match(cloud, /DeveloperTransferStatus/);
   assert.match(cloud, /export_gcid_json/);
   assert.match(cloud, /onOk\(\)\s*\{\s*void runGcidExport\(targets\)/);
   assert.match(cloud, /keepFailureVisible/);
+  assert.match(cloud, /export_gcid_diagnostic_log/);
+  assert.match(cloud, /status: 'warning'/);
+  assert.match(exportStatus, /导出诊断日志/);
+  assert.match(exportStatus, /签名地址已脱敏/);
   assert.match(server, /calculateGuangyaCidSamples/);
   assert.match(server, /mapConcurrent\(files, GCID_EXPORT_FILE_CONCURRENCY/);
   assert.match(server, /retryGcidExportRange\(async \(attempt\)/);
-  assert.match(server, /retryGcidExportFull\(async \(attempt\) =>/);
-  assert.match(server, /withGcidExportAttemptProgress/);
-  assert.match(server, /withGcidExportReadTimeout/);
+  assert.doesNotMatch(server, /sample_mode_failed_falling_back/);
+  assert.doesNotMatch(server, /fullHash/);
+  assert.doesNotMatch(server, /GCID_EXPORT_FULL_ATTEMPTS/);
+  assert.match(server, /createGcidExportRangeGate/);
   assert.match(retry, /GCID_EXPORT_FILE_CONCURRENCY = 20/);
+  assert.match(retry, /GCID_EXPORT_SCAN_CONCURRENCY = 24/);
   assert.match(retry, /GCID_EXPORT_RANGE_ATTEMPTS = 3/);
-  assert.match(retry, /GCID_EXPORT_FULL_ATTEMPTS = 3/);
+  assert.match(retry, /GCID_EXPORT_GLOBAL_RANGE_CONCURRENCY = 24/);
   assert.match(server, /rangeHashWithRetry/);
   assert.match(server, /skippedFiles/);
   assert.match(server, /content-range/);
@@ -159,15 +166,25 @@ test('selected cloud files and folders export GCID plus sampled CID with visible
   assert.match(server, /entry\.path\.slice\(rootPrefix\.length\)/);
   assert.match(rust, /FlashHashAccumulator/);
   assert.match(rust, /GCID_EXPORT_FILE_CONCURRENCY: usize = 20/);
+  assert.match(rust, /GCID_EXPORT_SCAN_CONCURRENCY: usize = 24/);
   assert.match(rust, /GCID_EXPORT_RANGE_ATTEMPTS: usize = 3/);
-  assert.match(rust, /GCID_EXPORT_FULL_ATTEMPTS: usize = 3/);
+  assert.match(rust, /GCID_EXPORT_GLOBAL_RANGE_CONCURRENCY: usize = 24/);
   assert.match(rust, /sample_cloud_selection_cid_with_retry/);
-  assert.match(rust, /hash_cloud_selection_entry_full_once/);
-  assert.match(rust, /GcidExportProgressAttempt/);
+  assert.doesNotMatch(rust, /sample_mode_failed_falling_back/);
+  assert.doesNotMatch(rust, /hash_cloud_selection_entry_full/);
+  assert.doesNotMatch(rust, /GCID_EXPORT_FULL_ATTEMPTS/);
+  assert.match(rust, /Semaphore::new\(GCID_EXPORT_GLOBAL_RANGE_CONCURRENCY\)/);
   assert.match(rust, /skipped_files/);
   assert.match(rust, /read_cloud_cid_range_with_retry/);
   assert.match(rust, /guangya-gcid-export-2\.0/);
+  assert.match(server, /gcid_export_snapshots/);
+  assert.match(server, /snapshot_cache_hit/);
+  assert.match(rust, /gcid_export_snapshots/);
+  assert.match(rust, /snapshot_cache_hit/);
   assert.match(bridge, /command === 'export_gcid_json'/);
+  assert.match(bridge, /command === 'export_gcid_diagnostic_log'/);
+  assert.match(server, /\/api\/files\/export-gcid-log/);
+  assert.match(rust, /\bexport_gcid_diagnostic_log\b/);
 });
 
 test('developer transfer progress normalizes persisted and live job payloads', () => {

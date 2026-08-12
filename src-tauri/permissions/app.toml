@@ -33,6 +33,7 @@ commands.allow = [
   "get_file_detail",
   "list_recent_actions",
   "export_gcid_json",
+  "export_gcid_diagnostic_log",
   "select_gcid_import_file",
   "stage_gcid_import_text",
   "prepare_gcid_import",

@@ -119,14 +119,10 @@ onMounted(() => {
 </template>
 
 <style scoped>
-.setting-section { max-width: 760px; padding: 8px 18px 36px 24px; }
-.setting-row { display: flex; align-items: center; justify-content: space-between; gap: 24px; min-height: 54px; margin-bottom: 18px; }
-.setting-row strong, .setting-row span { display: block; }
-.setting-row span { margin-top: 5px; color: var(--text-3, #98a2b3); font-size: 12px; }
-.settings-form { max-width: 520px; }
+/* 骨架样式（setting-section / setting-row / settings-form）已提升为全局类。 */
 .instance-field { display: flex; gap: 8px; }
 .instance-field :deep(.ant-input) { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
-.field-help { margin-top: 6px; color: var(--text-3, #98a2b3); font-size: 12px; line-height: 1.5; }
+.field-help { margin-top: 6px; color: var(--text-3, #737373); font-size: 12px; line-height: 1.5; }
 .setup-guide { max-width: 620px; margin-top: 22px; }
 .setup-guide ol { margin: 8px 0 0; padding-left: 20px; line-height: 1.8; }
 </style>

@@ -49,10 +49,10 @@ async function submit() {
 </template>
 
 <style scoped>
-.access-gate { display: grid; min-height: 100vh; place-items: center; padding: 32px; background: var(--app-bg, #f6f7f9); }
+.access-gate { display: grid; min-height: 100vh; place-items: center; padding: 32px; background: var(--app-bg, #fafafa); }
 .access-panel { width: min(400px, 100%); }
-.access-mark { display: grid; width: 48px; height: 48px; place-items: center; margin-bottom: 28px; border: 2px solid currentColor; border-radius: 16px; color: var(--primary, #52c41a); font-size: 22px; }
+.access-mark { display: grid; width: 48px; height: 48px; place-items: center; margin-bottom: 28px; border: 2px solid currentColor; border-radius: 16px; color: var(--primary, #262626); font-size: 22px; }
 .access-panel h1 { margin: 0; font-size: 28px; letter-spacing: -.02em; }
-.access-panel > p { margin: 8px 0 28px; color: var(--text-2, #667085); }
-.access-panel small { display: block; margin-top: 20px; color: var(--text-3, #98a2b3); text-align: center; }
+.access-panel > p { margin: 8px 0 28px; color: var(--text-2, #525252); }
+.access-panel small { display: block; margin-top: 20px; color: var(--text-3, #737373); text-align: center; }
 </style>

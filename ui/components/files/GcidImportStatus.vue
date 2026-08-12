@@ -78,12 +78,12 @@ const counts = computed(() => ([
 .gcid-task-trigger {
   display: grid;
   min-width: 218px;
-  height: 32px;
+  height: var(--h-md, 28px);
   grid-template-columns: auto minmax(56px, 1fr) auto auto;
   align-items: center;
   gap: 8px;
   padding: 0 9px;
-  border: 1px solid var(--primary-line, #d9d9d9);
+  border: 1px solid var(--primary-line, #e5e5e5);
   border-radius: 8px;
   color: var(--text-2, #525252);
   background: var(--surface, #fff);

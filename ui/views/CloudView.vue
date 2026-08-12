@@ -62,6 +62,7 @@ import {
   filesPageSize,
   filesTotal,
   loadFiles,
+  refreshFilesAfterMutation,
 } from '../store.js';
 import {
   errorText,
@@ -643,9 +644,35 @@ function saveGeneratedJsonInBrowser(fileName, payload) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
 }
 
+function saveGeneratedTextInBrowser(fileName, content) {
+  const blob = new Blob([String(content || '')], { type: 'application/x-ndjson;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = String(fileName || '光鸭秒传诊断日志.jsonl');
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+}
+
+async function exportGcidDiagnosticLog() {
+  try {
+    const result = unwrapData(await bridge.invoke('export_gcid_diagnostic_log'));
+    if (result?.cancelled) return;
+    if (result?.content) saveGeneratedTextInBrowser(result.file_name, result.content);
+    const location = result?.saved_path ? `：${result.saved_path}` : '';
+    message.success(`秒传诊断日志已导出${location}`);
+  }
+  catch (error) {
+    message.error(errorText(error));
+  }
+}
+
 async function runGcidExport(targets) {
   gcidExport.running = true;
-  gcidExport.progress = { status: 'running', stage: '正在扫描所选文件…', percent: 0 };
+  gcidExport.progress = { status: 'running', phase: 'scan', stage: '正在扫描所选文件…', percent: 0 };
   gcidExport.detailsOpen = true;
   operationBusy.value = true;
   let keepFailureVisible = false;
@@ -660,7 +687,17 @@ async function runGcidExport(targets) {
     const total = Number(result?.total_files || 0);
     const skipped = Number(result?.skipped_files_count ?? result?.export?.skippedFilesCount ?? 0);
     const location = result?.saved_path ? `，已保存到 ${result.saved_path}` : '，浏览器已开始保存';
-    if (skipped > 0) message.warning(`秒传 JSON 已生成：${total} 个文件，另有 ${skipped} 个读取失败并已写入跳过清单${location}`);
+    if (skipped > 0) {
+      keepFailureVisible = true;
+      gcidExport.progress = {
+        ...(gcidExport.progress || {}),
+        status: 'warning',
+        stage: '秒传 JSON 已生成，部分文件读取失败',
+        percent: 100,
+      };
+      gcidExport.detailsOpen = true;
+      message.warning(`秒传 JSON 已生成：${total} 个文件，另有 ${skipped} 个读取失败并已写入跳过清单${location}`);
+    }
     else message.success(`秒传 JSON 已生成：${total} 个文件${location}`);
   } catch (error) {
     const reason = errorText(error);
@@ -695,7 +732,7 @@ function exportSelectedGcidJson(records = selectedRecords()) {
   }
   Modal.confirm({
     title: '并发生成秒传 JSON',
-    content: '程序会复用云端已有 GCID，最多同时并发处理 20 个文件；每个大文件只读取头、中、尾各 20 KB 来计算 CID（通常约 60 KB/文件）。任一分段读取失败会只重试该分段，最多 3 次。仅在云端缺少 GCID 或不支持分段读取时，才回退完整校验；完整校验失败也会重签地址并最多重试 3 次。',
+    content: '大库使用每页 1000 条的全库索引扫描；相同选择在 10 分钟内会校验顶层聚合统计并直接复用完整快照，重新扫描时也会复用未变化文件的秒传指纹。文件计算最多同时处理 20 个文件，但全局最多只有 24 个 CDN Range 请求；每个大文件只读取头、中、尾各 20 KB 来计算 CID（通常约 60 KB/文件）。任一分段读取失败只会错峰重试该分段，最多 3 次；最终失败时跳过该文件，绝不会下载整文件做完整验证。',
     okText: '开始生成',
     cancelText: '取消',
     onOk() {
@@ -838,7 +875,7 @@ async function pasteFileClipboard() {
     });
     if (fileClipboard.mode === 'move') clearFileClipboard();
     clearSelection();
-    await loadCloudFiles();
+    await refreshCloudFilesAfterMutation();
     message.success(command === 'move_files' ? '已移动到当前目录' : '已复制到当前目录');
   } catch (error) {
     message.error(errorText(error));
@@ -860,6 +897,17 @@ async function loadCloudFiles(page = filesPage.value, options = {}) {
     reconcileVisibleFileState();
   } catch (error) {
     if (!options.quiet) message.error(errorText(error));
+  }
+}
+
+// 写操作成功后的刷新：走 store 的统一入口（force + preserveCurrent +
+// 取消挂起的失效刷新），避免"闪空列表 + 与失效事件重复请求"。
+async function refreshCloudFilesAfterMutation(page = filesPage.value) {
+  try {
+    await refreshFilesAfterMutation(page);
+    reconcileVisibleFileState();
+  } catch (error) {
+    message.error(errorText(error));
   }
 }
 
@@ -1064,7 +1112,7 @@ async function submitNewFolder() {
       fail_if_name_exist: true,
     }));
     newFolderModal.open = false;
-    await loadCloudFiles(0);
+    await refreshCloudFilesAfterMutation(0);
     const createdId = pick(data, ['fileId', 'file_id', 'id'], '')
       || fileId(files.value.find((item) => isFolder(item) && item.fileName === name));
     if (createdId) {
@@ -1194,7 +1242,7 @@ async function deleteCloudFiles(records) {
       try {
         await bridge.invoke('delete_files', { file_ids: ids });
         selectedKeys.value = [];
-        await loadCloudFiles();
+        await refreshCloudFilesAfterMutation();
         message.success('已移入回收站');
       } catch (error) {
         message.error(errorText(error));
@@ -1279,7 +1327,7 @@ async function submitRename() {
     await bridge.invoke('batch_rename_files', { renames });
     renameModal.open = false;
     clearSelection();
-    await loadCloudFiles();
+    await refreshCloudFilesAfterMutation();
     message.success(`已重命名 ${renames.length} 项`);
   } catch (error) {
     message.error(errorText(error));
@@ -1305,7 +1353,9 @@ async function loadFolderPickerOptions(parentId, page = 0) {
   folderPicker.loading = true;
   try {
     const normalizedPage = Math.max(0, Math.floor(Number(page) || 0));
-    const data = unwrapData(await bridge.invoke('list_files', { page: normalizedPage, parent_id: parentId }));
+    // folders_only（resType:2）保证分页 total 只统计目录；否则文件多目录少的
+    // 目录里页数虚高、翻页出现整页空白。
+    const data = unwrapData(await bridge.invoke('list_files', { page: normalizedPage, parent_id: parentId, folders_only: true }));
     if (requestId !== latestFolderPickerRequest || String(parentId || '') !== String(folderPicker.path.at(-1)?.id || '')) return;
     folderPicker.options = (data.list || []).filter((item) => isFolder(item) && !folderPicker.sourceIds.includes(fileId(item)));
     folderPicker.page = normalizedPage;
@@ -1354,7 +1404,7 @@ async function submitFolderPicker() {
     await bridge.invoke(command, { file_ids: [...new Set(folderPicker.sourceIds)], parent_id: targetId });
     folderPicker.open = false;
     selectedKeys.value = [];
-    await loadCloudFiles();
+    await refreshCloudFilesAfterMutation();
     message.success(folderPicker.action === 'copy' ? '已复制' : '已移动');
   } catch (error) {
     message.error(errorText(error));
@@ -1407,7 +1457,7 @@ function startGcidImportPolling() {
       const previousStatus = gcidImport.status?.status;
       const status = await refreshGcidImportStatus();
       if (['preparing', 'running'].includes(previousStatus) && status && !['preparing', 'running'].includes(status.status)) {
-        await loadCloudFiles();
+        await refreshCloudFilesAfterMutation();
         if (status.status === 'completed') message.success('GCID JSON 秒传导入完成');
         else message.warning(status.error || 'GCID 导入结束，部分记录需要处理');
       }
@@ -1619,7 +1669,7 @@ async function uploadWebFiles(entries) {
     else if (skipped) message.info(`没有需要上传的文件，已跳过 ${skipped} 个`);
     else if (paused) message.info(`已暂停上传：${paused} 个文件`);
     else if (cancelled) message.info(`已取消上传：${cancelled} 个文件`);
-    await loadCloudFiles();
+    await refreshCloudFilesAfterMutation();
   } catch (error) {
     message.error(errorText(error));
   } finally {
@@ -1776,7 +1826,7 @@ onBeforeUnmount(() => {
           @clear-clipboard="clearFileClipboard"
         >
           <template #status>
-            <GcidExportStatus v-if="gcidExport.progress" v-model:open="gcidExport.detailsOpen" :progress="gcidExport.progress" :running="gcidExport.running" />
+            <GcidExportStatus v-if="gcidExport.progress" v-model:open="gcidExport.detailsOpen" :progress="gcidExport.progress" :running="gcidExport.running" @export-log="exportGcidDiagnosticLog" />
             <DeveloperTransferStatus v-model:open="developerTransfer.detailsOpen" :jobs="developerTransfer.jobs" />
             <GcidImportStatus v-if="gcidImportRunning" v-model:open="gcidImport.detailsOpen" :status="gcidImport.status" :percent="gcidImportProgress" />
           </template>
@@ -1788,7 +1838,7 @@ onBeforeUnmount(() => {
             <CompactFileBreadcrumb :segments="currentPath" @navigate="jumpToPath($event.index)" />
           </a-flex>
           <a-flex align="center" gap="small" class="file-primary-actions">
-            <GcidExportStatus v-if="gcidExport.progress" v-model:open="gcidExport.detailsOpen" :progress="gcidExport.progress" :running="gcidExport.running" />
+            <GcidExportStatus v-if="gcidExport.progress" v-model:open="gcidExport.detailsOpen" :progress="gcidExport.progress" :running="gcidExport.running" @export-log="exportGcidDiagnosticLog" />
             <DeveloperTransferStatus v-model:open="developerTransfer.detailsOpen" :jobs="developerTransfer.jobs" />
             <GcidImportStatus v-if="gcidImportRunning" v-model:open="gcidImport.detailsOpen" :status="gcidImport.status" :percent="gcidImportProgress" />
             <a-button v-if="isTauri && !gcidImportRunning" :disabled="!appState.logged_in" @click="openGcidImport"><template #icon><FileAddOutlined /></template>JSON 秒传</a-button>
@@ -2143,7 +2193,7 @@ onBeforeUnmount(() => {
 
 .folder-crumb-button:focus-visible {
   border-radius: 3px;
-  outline: 2px solid var(--primary, #52c41a);
+  outline: 2px solid var(--primary, #262626);
   outline-offset: 2px;
 }
 
@@ -2194,7 +2244,7 @@ onBeforeUnmount(() => {
 .developer-transfer-files {
   max-height: 220px;
   overflow-y: auto;
-  border: 1px solid var(--line, #e5e7eb);
+  border: 1px solid var(--line, #e5e5e5);
   border-radius: 8px;
   background: var(--bg-toolbar, #fafafa);
 }
@@ -2205,7 +2255,7 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 8px;
   padding: 8px 10px;
-  border-bottom: 1px solid var(--line, #e5e7eb);
+  border-bottom: 1px solid var(--line, #e5e5e5);
 }
 
 .developer-transfer-files > div:last-child {

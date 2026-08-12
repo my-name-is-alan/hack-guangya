@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { readRustBackendSourceSync } from './rustBackendSource.js';
 
 const uiRoot = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.dirname(uiRoot);
@@ -41,7 +42,7 @@ function invokedCommands(files) {
 test('活跃 UI 的 bridge 命令在桌面或 Web 端都有明确契约', () => {
   const commands = invokedCommands(activeUiSources());
   const bridgeSource = fs.readFileSync(path.join(uiRoot, 'bridge.js'), 'utf8');
-  const rustSource = fs.readFileSync(path.join(repoRoot, 'src-tauri', 'src', 'main.rs'), 'utf8');
+  const rustSource = readRustBackendSourceSync();
   const permissionSource = fs.readFileSync(path.join(repoRoot, 'src-tauri', 'permissions', 'app.toml'), 'utf8');
   const handlerBlock = rustSource.match(/tauri::generate_handler!\[([\s\S]*?)\]\)/)?.[1] || '';
   const webCommands = new Set([...bridgeSource.matchAll(/command === ['"]([a-z][a-z0-9_]+)['"]/g)].map(match => match[1]));

@@ -36,10 +36,21 @@ function directoryFingerprint(entry) {
   ].join('\0');
 }
 
+function directoryName(entry) {
+  return String(valueOf(entry, 'fileName', 'name') || '');
+}
+
 function directoryMap(records) {
   return new Map((Array.isArray(records) ? records : [])
     .filter(isDirectory)
     .map((entry) => [String(valueOf(entry, 'fileId', 'id') || ''), directoryFingerprint(entry)])
+    .filter(([id]) => id));
+}
+
+function directoryNameMap(records) {
+  return new Map((Array.isArray(records) ? records : [])
+    .filter(isDirectory)
+    .map((entry) => [String(valueOf(entry, 'fileId', 'id') || ''), directoryName(entry)])
     .filter(([id]) => id));
 }
 
@@ -89,15 +100,61 @@ export function createDirectoryCache({
     }
   }
 
+  // 反查条目所在的父目录并精确失效（对齐 Rust 端 invalidate_entries）：
+  // 返回定位到的父目录列表，以及是否所有条目都被定位。
+  function invalidateEntries(entryIds) {
+    const wanted = new Set((Array.isArray(entryIds) ? entryIds : [])
+      .map((id) => String(id || ''))
+      .filter(Boolean));
+    if (!wanted.size) return { parents: [], allLocated: true };
+    const parents = new Set();
+    const located = new Set();
+    for (const [parentId, cached] of entries) {
+      for (const record of Array.isArray(cached.value) ? cached.value : []) {
+        const id = String(valueOf(record, 'fileId', 'id') || '');
+        if (wanted.has(id)) {
+          parents.add(parentId);
+          located.add(id);
+        }
+      }
+    }
+    for (const parentId of parents) invalidate(parentId);
+    for (const id of wanted) invalidateSubtree(id);
+    return { parents: [...parents], allLocated: located.size === wanted.size };
+  }
+
+  // 只把快照标脏（不递增 generation）：下一次读取走 stale-while-revalidate。
+  // 用于"UI 刚读过这个目录"这类读路径，避免打断在途的挂载端加载。
+  function markStale(parentId) {
+    const cached = entries.get(String(parentId || ''));
+    if (cached) cached.fetchedAt = now() - freshMs - 1;
+  }
+
+  // 用一份已知的完整目录快照覆写缓存（generation 不变时才写入）。
+  function overwriteSnapshot(parentId, records) {
+    const key = String(parentId || '');
+    const cached = entries.get(key);
+    store(key, generation(key), records, cached?.loader);
+  }
+
   function store(key, expectedGeneration, value, loader) {
     if (generation(key) !== expectedGeneration) return false;
     const previous = entries.get(key);
     const oldDirectories = directoryMap(previous?.value);
     const nextDirectories = directoryMap(value);
+    const oldNames = directoryNameMap(previous?.value);
+    const nextNames = directoryNameMap(value);
     for (const [id, fingerprint] of oldDirectories) {
       if (nextDirectories.get(id) !== fingerprint) {
+        // 内容指纹（含大小/时间）变化 → 该子目录的列表快照需要重新拉取。
         invalidate(id);
-        try { onDirectoryInvalidated(id); } catch { /* cache observers must not break reads */ }
+        // 但"路径→ID"映射只有在子目录被改名或消失时才会失效；上传过程中
+        // 目录大小持续变化，若也通知观察者会把上传路径缓存反复清掉，
+        // 造成 ensureRemote 的 generation 重试风暴。
+        const renamedOrGone = !nextNames.has(id) || nextNames.get(id) !== oldNames.get(id);
+        if (renamedOrGone) {
+          try { onDirectoryInvalidated(id); } catch { /* cache observers must not break reads */ }
+        }
       }
     }
     const timestamp = now();
@@ -248,7 +305,10 @@ export function createDirectoryCache({
     dispose,
     get,
     invalidate,
+    invalidateEntries,
     invalidateSubtree,
+    markStale,
+    overwriteSnapshot,
     refreshActive,
     setScope,
     stats,

@@ -38,6 +38,16 @@ const navigation = [
 ]
 
 const activeName = computed(() => String(route.name || 'files'))
+const pageTitles: Record<string, string> = {
+  files: '云盘文件',
+  backup: '备份任务',
+  organizer: '媒体整理',
+  transfers: '传输任务',
+  offline: '云添加',
+  shares: '分享管理',
+  settings: '设置',
+}
+const pageTitle = computed(() => pageTitles[activeName.value] || '云盘文件')
 const activeTransferCount = computed(() => activeUploads.value.length + activeDownloads.value.length)
 const networkTestOpen = shallowRef(false)
 const quotaLabel = computed(() => totalSpace.value
@@ -107,6 +117,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleGlobalKeydown)
 
     <section class="workspace">
       <header class="app-topbar">
+        <h1 class="topbar-page-title">{{ pageTitle }}</h1>
+
         <button type="button" class="search-trigger" @click="searchOpen = true">
           <SearchOutlined />
           <span>搜索整个云盘</span>
@@ -154,28 +166,29 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleGlobalKeydown)
 </template>
 
 <style scoped>
-.app-frame { display: grid; min-width: 0; min-height: 100vh; grid-template-columns:74px minmax(0,1fr); color: var(--text-1, #20242c); background: var(--app-bg, #f7f7f8); }
-.nav-rail { display: flex; position: sticky; z-index: 20; top: 0; height: 100vh; flex-direction: column; border-right: 1px solid var(--line, #e4e7ec); background: var(--sidebar-bg, #fff); }
-.home-mark { display: grid; height: 62px; place-items: center; border-bottom: 1px solid var(--line, #e4e7ec); color: var(--text-2, #667085); font-size: 22px; }
+.app-frame { display: grid; min-width: 0; min-height: 100vh; grid-template-columns:74px minmax(0,1fr); color: var(--text-1, #262626); background: var(--app-bg, #fafafa); }
+.nav-rail { display: flex; position: sticky; z-index: 20; top: 0; height: 100vh; flex-direction: column; border-right: 1px solid var(--line, #e5e5e5); background: var(--sidebar-bg, #fff); }
+.home-mark { display: grid; height: 62px; place-items: center; border-bottom: 1px solid var(--line, #e5e5e5); color: var(--text-2, #525252); font-size: 22px; }
 .home-mark.active { color: var(--primary-strong, #171717); }
 .rail-links { display: flex; flex: 1; flex-direction: column; gap: 4px; padding: 10px 7px; }
-.rail-link { display: flex; height: 50px; align-items: center; flex-direction: column; justify-content: center; gap: 3px; border-radius: 10px; color: var(--text-2, #667085); font-size: 11px; font-weight: 600; }
+.rail-link { display: flex; height: 50px; align-items: center; flex-direction: column; justify-content: center; gap: 3px; border-radius: 10px; color: var(--text-2, #525252); font-size: 11px; font-weight: 600; }
 .rail-link :deep(.anticon) { font-size: 18px; }
-.rail-link:hover { color: var(--text-1, #20242c); background: var(--surface-hover, #f3f4f6); }
+.rail-link:hover { color: var(--text-1, #262626); background: var(--surface-hover, #f5f5f5); }
 .rail-link.active { color: var(--primary-strong, #171717); background: var(--primary-soft, #f5f5f5); }
 .rail-settings { margin: 0 7px 10px; }
 .workspace { display: grid; min-width: 0; height: 100vh; grid-template-rows:62px minmax(0,1fr); }
-.app-topbar { display: flex; z-index: 15; align-items: center; justify-content: space-between; gap: 20px; padding: 0 18px; border-bottom: 1px solid var(--line, #e4e7ec); background: color-mix(in srgb, var(--surface, #fff) 94%, transparent); backdrop-filter: blur(12px); }
-.search-trigger { display: flex; width: min(520px, 48vw); height: 36px; align-items: center; gap: 9px; padding: 0 11px; border: 1px solid var(--line, #d9dde5); border-radius: 9px; color: var(--text-3, #98a2b3); background: var(--surface-muted, #f8f9fa); text-align: left; cursor: text; }
+.app-topbar { display: flex; z-index: 15; align-items: center; justify-content: space-between; gap: 20px; padding: 0 18px; border-bottom: 1px solid var(--line, #e5e5e5); background: color-mix(in srgb, var(--surface, #fff) 94%, transparent); backdrop-filter: blur(12px); }
+.topbar-page-title { flex: 0 0 auto; min-width: 64px; margin: 0; font-size: var(--fs-lg, 15px); font-weight: 700; }
+.search-trigger { display: flex; width: min(460px, 42vw); height: var(--h-lg, 34px); align-items: center; gap: 9px; padding: 0 11px; border: 1px solid var(--line, #e5e5e5); border-radius: var(--r-md, 10px); color: var(--text-3, #737373); background: var(--surface-muted, #fafafa); text-align: left; cursor: text; }
 .search-trigger span { flex: 1; }
-.search-trigger kbd { padding: 2px 6px; border: 1px solid var(--line, #d9dde5); border-radius: 4px; background: var(--surface, #fff); font-size: 10px; }
+.search-trigger kbd { padding: 2px 6px; border: 1px solid var(--line, #e5e5e5); border-radius: 4px; background: var(--surface, #fff); font-size: 10px; }
 .top-actions { display: flex; align-items: center; gap: 14px; }
-.network-tools-trigger { display: grid; width: 30px; height: 30px; place-items: center; border: 0; border-radius: 8px; color: var(--text-2, #667085); background: transparent; font-size: 17px; cursor: pointer; }
-.network-tools-trigger:hover { color: var(--text-1, #20242c); background: var(--surface-hover, #f3f4f6); }
-.transfer-summary { display: grid; min-width: 136px; grid-template-columns:1fr auto; align-items: center; gap: 3px 8px; padding: 3px 0; border: 0; color: var(--text-2, #667085); background: transparent; cursor: pointer; }
+.network-tools-trigger { display: grid; width: 30px; height: 30px; place-items: center; border: 0; border-radius: 8px; color: var(--text-2, #525252); background: transparent; font-size: 17px; cursor: pointer; }
+.network-tools-trigger:hover { color: var(--text-1, #262626); background: var(--surface-hover, #f5f5f5); }
+.transfer-summary { display: grid; min-width: 136px; grid-template-columns:1fr auto; align-items: center; gap: 3px 8px; padding: 3px 0; border: 0; color: var(--text-2, #525252); background: transparent; cursor: pointer; }
 .transfer-label { font-size: 11px; text-align: left; }
-.transfer-summary small { grid-column:2; grid-row:1 / span 2; color: var(--text-3, #98a2b3); font-size: 10px; }
-.transfer-bar { display: block; height: 4px; overflow: hidden; border-radius: 99px; background: var(--line, #e4e7ec); }
+.transfer-summary small { grid-column:2; grid-row:1 / span 2; color: var(--text-3, #737373); font-size: 10px; }
+.transfer-bar { display: block; height: 4px; overflow: hidden; border-radius: 99px; background: var(--line, #e5e5e5); }
 .transfer-bar i { display: block; height: 100%; border-radius: inherit; background: var(--primary, #262626); transition: width .2s ease; }
 .account-trigger { display: flex; align-items: center; gap: 8px; padding: 3px 0; border: 0; background: transparent; text-align: left; cursor: pointer; }
 .account-avatar { width: 32px !important; min-width: 32px; height: 32px !important; flex: 0 0 32px; overflow: hidden; border-radius: 50%; }

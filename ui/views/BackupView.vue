@@ -1,6 +1,7 @@
 <script setup>
 import { computed, reactive, ref, watchEffect } from 'vue';
 import { message, Modal } from 'antdv-next';
+import PageHeader from '../components/layout/PageHeader.vue';
 import {
   ArrowLeftOutlined,
   CloudSyncOutlined,
@@ -389,6 +390,7 @@ async function saveAutoOrganizeEditor() {
 
 <template>
   <div class="view-section">
+    <PageHeader title="备份任务" description="监控本地目录变化，按同步范围自动上传到云盘并保留目录结构。" />
     <a-tabs v-model:active-key="backupTab" class="page-tabs">
       <template #rightExtra>
         <a-space>
@@ -620,15 +622,15 @@ async function saveAutoOrganizeEditor() {
 
 <style scoped>
 .activity-list { display: grid; }
-.activity-row { display: grid; grid-template-columns:100px minmax(180px,.8fr) minmax(240px,1.2fr) 160px; align-items: center; gap: 12px; min-height: 48px; border-bottom: 1px solid var(--line, #e7e8eb); }
+.activity-row { display: grid; grid-template-columns:100px minmax(180px,.8fr) minmax(240px,1.2fr) 160px; align-items: center; gap: 12px; min-height: 48px; border-bottom: 1px solid var(--line, #e5e5e5); }
 .activity-row strong, .activity-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.activity-row span, .activity-row time { color: var(--text-3, #98a2b3); font-size: 12px; }
+.activity-row span, .activity-row time { color: var(--text-3, #737373); font-size: 12px; }
 .receipt-list { display: grid; gap: 10px; }
 .global-receipt-list { max-width: 960px; }
 .receipt-card { background: var(--surface, #fff); }
 .receipt-heading { min-width: 0; }
 .receipt-name { min-width: 160px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.receipt-time { margin-left: auto; color: var(--text-3, #98a2b3); font-size: 12px; }
+.receipt-time { margin-left: auto; color: var(--text-3, #737373); font-size: 12px; }
 .receipt-alert { margin-top: 8px; }
 .receipt-actions { margin-top: 8px; }
 .receipt-tmdb { width: 120px; }

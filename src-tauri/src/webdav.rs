@@ -184,6 +184,30 @@ impl DirectoryCache {
         state.generations.insert(parent_id.to_string(), next);
     }
 
+    /// 只把快照标记为"需要再校验"，不递增 generation。
+    ///
+    /// UI 读目录属于读操作：旧实现直接 `invalidate` 会打断正在分页拉取的
+    /// PROPFIND（generation 变化 → put_if_current 失败 → 重试 3 次后 503），
+    /// 还会把该目录踢出后台预热。标脏让下一次挂载端读取走
+    /// stale-while-revalidate，既保证新鲜度又不作废在途请求。
+    fn mark_stale(&self, parent_id: &str) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if let Some(cached) = state.entries.get_mut(parent_id) {
+            let stale_age = Duration::from_secs(DIRECTORY_CACHE_FRESH_SECS + 1);
+            cached.fetched_at = Instant::now()
+                .checked_sub(stale_age)
+                .unwrap_or_else(Instant::now);
+        }
+    }
+
+    /// 用 UI 刚读到的完整目录快照覆写缓存（generation 不变时）。
+    fn overwrite_snapshot(&self, parent_id: &str, entries: Vec<RemoteEntry>) {
+        let generation = self.generation(parent_id);
+        self.put_if_current(parent_id, generation, entries);
+    }
+
     fn invalidate_subtree(&self, root_id: &str) {
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -283,6 +307,26 @@ fn shared_directory_cache() -> Arc<DirectoryCache> {
 
 pub(crate) fn invalidate_directory_cache(parent_id: &str) {
     shared_directory_cache().invalidate(parent_id);
+}
+
+/// UI 成功读取目录后同步挂载端缓存：完整快照直接覆写，分页部分快照只标脏。
+pub(crate) fn refresh_directory_cache_from_listing(parent_id: &str, page: u64, data: &Value) {
+    let cache = shared_directory_cache();
+    let list = data.get("list").and_then(Value::as_array);
+    let total = value_as_u64(data.get("total"));
+    let complete_snapshot = page == 0
+        && list.is_some_and(|list| total.is_some_and(|total| total <= list.len() as u64));
+    if complete_snapshot {
+        let entries = list
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|value| normalize_entry(value, parent_id))
+            .collect::<Vec<_>>();
+        cache.overwrite_snapshot(parent_id, entries);
+    } else {
+        cache.mark_stale(parent_id);
+    }
 }
 
 pub(crate) fn invalidate_directory_cache_entries(entry_ids: &[String]) -> (Vec<String>, bool) {
@@ -397,26 +441,29 @@ fn raw_timestamp_ms(value: &Value) -> u64 {
     now_ms()
 }
 
+fn json_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Number(number)) => number.to_string(),
+        _ => String::new(),
+    }
+}
+
 fn normalize_entry(value: Value, parent_id: &str) -> Option<RemoteEntry> {
-    let id = value
-        .get("fileId")
-        .or_else(|| value.get("id"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let name = value
-        .get("fileName")
-        .or_else(|| value.get("name"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+    // 上游的 fileId/resType 可能返回数字或字符串两种形态，必须都接受，
+    // 否则整条记录会被静默丢弃或目录被当成文件。
+    let id = json_text(value.get("fileId").or_else(|| value.get("id")));
+    let name = json_text(value.get("fileName").or_else(|| value.get("name")));
     if id.is_empty() || name.is_empty() {
         return None;
     }
     let is_directory = value
         .get("resType")
         .or_else(|| value.get("type"))
-        .and_then(Value::as_u64)
+        .and_then(|item| {
+            item.as_u64()
+                .or_else(|| item.as_str().and_then(|text| text.trim().parse().ok()))
+        })
         .is_some_and(|item| item == 2)
         || value
             .get("isDirectory")
@@ -485,11 +532,13 @@ async fn fetch_children(context: &WebDavContext, parent_id: &str) -> DavResult<V
             list.into_iter()
                 .filter_map(|value| normalize_entry(value, parent_id)),
         );
-        let total = data
-            .get("total")
-            .and_then(Value::as_u64)
-            .unwrap_or(records.len() as u64);
-        if page_count == 0 || records.len() as u64 >= total {
+        // total 可能是字符串型数字；用 value_as_u64 兼容，否则超过 100 项的
+        // 目录会在第一页后被误判为"已取完"，把截断列表写进缓存。
+        let total = value_as_u64(data.get("total"));
+        if page_count == 0
+            || total.is_some_and(|total| records.len() as u64 >= total)
+            || (total.is_none() && page_count < 100)
+        {
             break;
         }
     }
@@ -501,10 +550,22 @@ async fn list_children(
     parent_id: &str,
     force_refresh: bool,
 ) -> DavResult<Vec<RemoteEntry>> {
-    let (token, _) = auth_context(&context.state)?;
-    context
-        .directory_cache
-        .ensure_scope(Sha256::digest(token.as_bytes()).as_slice());
+    // 缓存作用域按账号而不是按令牌：令牌每 20 分钟轮换一次，若用令牌哈希
+    // 作 scope，每次刷新登录态都会把整个挂载目录缓存清空。
+    let account_scope = context
+        .state
+        .lock()
+        .ok()
+        .and_then(|guard| guard.auth_account_scope.clone());
+    match account_scope {
+        Some(scope) => context.directory_cache.ensure_scope(scope.as_bytes()),
+        None => {
+            let (token, _) = auth_context(&context.state)?;
+            context
+                .directory_cache
+                .ensure_scope(Sha256::digest(token.as_bytes()).as_slice());
+        }
+    }
     let cached = context.directory_cache.snapshot(parent_id);
     if !force_refresh {
         if let Some((entries, age)) = &cached {

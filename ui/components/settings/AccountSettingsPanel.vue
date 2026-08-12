@@ -75,15 +75,15 @@ async function refreshAccountData() {
 </template>
 
 <style scoped>
-.setting-section { max-width: 980px; padding: 8px 18px 36px 24px; }
+/* 骨架样式已提升为全局类；账号详情较宽，仅覆盖最大宽度。 */
+.setting-section { max-width: 980px; }
 .account-line { display: flex; align-items: center; gap: 14px; }
 .account-summary { min-width: 0; flex: 1; }
-.account-summary strong, .account-summary span, .setting-row strong, .setting-row span { display: block; }
-.account-summary strong { font-size: 16px; }
-.account-summary span, .setting-row span { margin-top: 4px; color: var(--text-3, #98a2b3); font-size: 12px; }
+.account-summary strong, .account-summary span { display: block; }
+.account-summary strong { font-size: var(--fs-lg, 15px); }
+.account-summary span { margin-top: 4px; color: var(--text-3, #737373); font-size: var(--fs-sm, 12px); }
 .account-alert { margin-top: 16px; }
 .account-details { max-width: 620px; }
-.setting-row { display: flex; align-items: center; justify-content: space-between; gap: 24px; min-height: 54px; }
 .quota-progress { width: min(320px, 42vw); }
 @media (max-width: 760px) {
   .account-line { align-items: flex-start; flex-wrap: wrap; }

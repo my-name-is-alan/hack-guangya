@@ -140,6 +140,7 @@ export const bridge = isTauri ? {
     if (command === 'clear_recycle_bin') return webRequest('/api/recycle/clear', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'batch_rename_files') return webRequest('/api/files/rename-batch', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'export_gcid_json') return webRequest('/api/files/export-gcid', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'export_gcid_diagnostic_log') return webRequest('/api/files/export-gcid-log');
     if (command === 'get_cloud_download') return webRequest('/api/files/download', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'create_share') return webRequest('/api/share', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'list_shares') return webRequest('/api/shares');

@@ -65,6 +65,14 @@ export async function loadFiles(page = 0, options = {}) {
   return filesStore.loadFiles(page, options);
 }
 
+// 云端写操作完成后的统一刷新：保留当前列表避免闪空、绕过前后端缓存，
+// 并取消挂起的失效刷新定时器避免重复请求。
+export async function refreshFilesAfterMutation(page = undefined) {
+  return page === undefined
+    ? filesStore.refreshAfterMutation()
+    : filesStore.refreshAfterMutation(page);
+}
+
 export async function refreshState() {
   try { await sessionStore.refreshState(); } catch { /* 忽略 */ }
 }

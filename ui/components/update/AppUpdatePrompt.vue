@@ -64,11 +64,11 @@ async function installNow() {
 
 <style scoped>
 .update-prompt { display: grid; gap: 16px; }
-.version-line { display: flex; align-items: center; gap: 12px; color: var(--text-3, #667085); font-size: 13px; }
+.version-line { display: flex; align-items: center; gap: 12px; color: var(--text-3, #737373); font-size: 13px; }
 .version-badge { padding: 5px 10px; border-radius: 999px; color: #fff; background: #1677ff; font-weight: 700; }
-.release-notes { max-height: 220px; overflow: auto; padding: 14px 16px; border-radius: 10px; color: var(--text-2, #344054); background: var(--fill-2, #f7f8fa); line-height: 1.7; white-space: pre-wrap; }
-.release-notes--empty { color: var(--text-3, #98a2b3); }
-.download-progress { display: grid; gap: 5px; color: var(--text-3, #667085); font-size: 12px; }
+.release-notes { max-height: 220px; overflow: auto; padding: 14px 16px; border-radius: 10px; color: var(--text-2, #525252); background: var(--fill-2, #f7f8fa); line-height: 1.7; white-space: pre-wrap; }
+.release-notes--empty { color: var(--text-3, #737373); }
+.download-progress { display: grid; gap: 5px; color: var(--text-3, #737373); font-size: 12px; }
 .update-actions { display: flex; justify-content: flex-end; gap: 10px; }
-.restart-tip { margin: -7px 0 0; color: var(--text-3, #98a2b3); font-size: 12px; text-align: right; }
+.restart-tip { margin: -7px 0 0; color: var(--text-3, #737373); font-size: 12px; text-align: right; }
 </style>

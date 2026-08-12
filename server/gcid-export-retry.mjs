@@ -1,7 +1,9 @@
 export const GCID_EXPORT_FILE_CONCURRENCY = 20;
+export const GCID_EXPORT_SCAN_CONCURRENCY = 24;
 export const GCID_EXPORT_RANGE_CONCURRENCY = 3;
+export const GCID_EXPORT_GLOBAL_RANGE_CONCURRENCY = 24;
+export const GCID_EXPORT_SCAN_ATTEMPTS = 5;
 export const GCID_EXPORT_RANGE_ATTEMPTS = 3;
-export const GCID_EXPORT_FULL_ATTEMPTS = 3;
 export const GCID_EXPORT_REQUEST_TIMEOUT_MS = 30_000;
 export const GCID_EXPORT_READ_IDLE_TIMEOUT_MS = 45_000;
 
@@ -46,23 +48,44 @@ export async function retryGcidExportRange(
   throw lastError;
 }
 
-export const retryGcidExportFull = retryGcidExportRange;
+export function createGcidExportRangeGate(limit = GCID_EXPORT_GLOBAL_RANGE_CONCURRENCY) {
+  const maximum = Math.max(1, Math.floor(Number(limit) || 1));
+  const waiters = [];
+  let active = 0;
+  return async function acquireRangeSlot() {
+    if (active >= maximum) await new Promise((resolve) => waiters.push(resolve));
+    active += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      active -= 1;
+      waiters.shift()?.();
+    };
+  };
+}
 
-export async function withGcidExportAttemptProgress(operation, onDelta) {
-  let processed = 0n;
-  try {
-    return await operation((nextProcessed) => {
-      const next = BigInt(nextProcessed);
-      if (next < processed) throw new GcidExportRangeError('完整校验进度发生倒退', { retryable: false });
-      const delta = next - processed;
-      processed = next;
-      if (delta) onDelta(delta);
-    });
+export async function retryGcidExportScan(
+  operation,
+  {
+    attempts = GCID_EXPORT_SCAN_ATTEMPTS,
+    baseDelayMs = 400,
+    sleep = (delay) => new Promise((resolve) => setTimeout(resolve, delay)),
+  } = {},
+) {
+  const totalAttempts = Math.max(1, Math.floor(Number(attempts) || 1));
+  let lastError = new Error('云端目录扫描失败');
+  for (let attempt = 0; attempt < totalAttempts; attempt += 1) {
+    try {
+      return await operation(attempt);
+    }
+    catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error || '云端目录扫描失败'));
+      if (lastError.retryable !== true || attempt + 1 >= totalAttempts) break;
+      await sleep(Math.max(0, baseDelayMs) * (2 ** attempt));
+    }
   }
-  catch (error) {
-    if (processed) onDelta(-processed);
-    throw error;
-  }
+  throw lastError;
 }
 
 export async function* withGcidExportReadTimeout(
@@ -70,7 +93,7 @@ export async function* withGcidExportReadTimeout(
   {
     timeoutMs = GCID_EXPORT_READ_IDLE_TIMEOUT_MS,
     abort = () => {},
-    label = '完整校验读取',
+    label = '分段读取',
   } = {},
 ) {
   const iterator = stream[Symbol.asyncIterator]();

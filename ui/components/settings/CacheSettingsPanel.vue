@@ -171,18 +171,12 @@ onMounted(loadCache)
 </template>
 
 <style scoped>
-.setting-section { max-width: 760px; padding: 8px 18px 36px 24px; }
-.section-lead { margin-bottom: 28px; }
-.section-lead strong, .section-lead span, .setting-row strong, .setting-row span { display: block; }
-.section-lead strong { font-size: 18px; }
-.section-lead span, .setting-row span { margin-top: 5px; color: var(--text-3, #98a2b3); font-size: 12px; }
-.setting-row { display: flex; align-items: center; justify-content: space-between; gap: 24px; min-height: 54px; margin-bottom: 18px; }
-.settings-form { max-width: 520px; }
+/* 骨架样式（setting-section / section-lead / setting-row / settings-form）已提升为全局类。 */
 .entries-input { width: 100%; }
-.cache-stats { display: grid; grid-template-columns: repeat(3, 1fr); margin: 28px 0; border-block: 1px solid var(--line, #e7e8eb); }
-.cache-stats > div { padding: 18px 16px; border-right: 1px solid var(--line, #e7e8eb); }
+.cache-stats { display: grid; grid-template-columns: repeat(3, 1fr); margin: 28px 0; border-block: 1px solid var(--line, #e5e5e5); }
+.cache-stats > div { padding: 18px 16px; border-right: 1px solid var(--line, #e5e5e5); }
 .cache-stats > div:last-child { border-right: 0; }
 .cache-stats span, .cache-stats strong { display: block; }
-.cache-stats span { color: var(--text-3, #98a2b3); font-size: 11px; }
+.cache-stats span { color: var(--text-3, #737373); font-size: 11px; }
 .cache-stats strong { margin-top: 5px; font-size: 16px; }
 </style>

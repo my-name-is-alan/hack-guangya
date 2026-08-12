@@ -58,10 +58,5 @@ async function updateAccessCode() {
 </template>
 
 <style scoped>
-.setting-section { max-width: 760px; padding: 8px 18px 36px 24px; }
-.section-lead { margin-bottom: 28px; }
-.section-lead strong, .section-lead span { display: block; }
-.section-lead strong { font-size: 18px; }
-.section-lead span { margin-top: 5px; color: var(--text-3, #98a2b3); font-size: 12px; }
-.settings-form { max-width: 520px; }
+/* 骨架样式（setting-section / section-lead / settings-form）已提升为全局类。 */
 </style>

@@ -76,10 +76,7 @@ async function installNow() {
 </template>
 
 <style scoped>
-.setting-section { max-width: 760px; padding: 8px 18px 36px 24px; }
-.setting-row { display: flex; align-items: center; justify-content: space-between; gap: 24px; min-height: 54px; margin-bottom: 22px; }
-.setting-row strong, .setting-row span { display: block; }
-.setting-row span { margin-top: 5px; color: var(--text-3, #98a2b3); font-size: 12px; }
+/* 骨架样式（setting-section / setting-row）已提升为全局类。 */
 .version-details { max-width: 580px; }
 .update-alert, .update-progress { max-width: 580px; margin-top: 16px; }
 .actions { display: flex; gap: 10px; margin-top: 18px; }

@@ -25,6 +25,8 @@ export const useFilesStore = defineStore('files', () => {
   const files = ref<any[]>([])
   const currentPath = ref<CloudPathItem[]>([{ id: '', name: '全部文件' }])
   const loading = shallowRef(false)
+  // 回收站内容版本号：删除/恢复/彻底删除/清空后自增，回收站面板据此刷新。
+  const recycleBinVersion = shallowRef(0)
   const page = shallowRef(0)
   const total = shallowRef(0)
   const pageSize = 100
@@ -32,11 +34,23 @@ export const useFilesStore = defineStore('files', () => {
   let latestRequestId = 0
   let foregroundRequests = 0
   let invalidationRefreshTimer: ReturnType<typeof setTimeout> | null = null
+  // 失效代际：请求发出后若发生过目录失效，返回的旧数据不允许回写缓存。
+  let invalidationGeneration = 0
+  // 失效刷新去抖：批量写操作会连续发失效事件，纯 debounce 会把刷新无限推
+  // 迟，这里带最大等待时间保证批量期间列表仍会周期性更新。
+  let invalidationRefreshDeadline = 0
+  const INVALIDATION_REFRESH_DELAY_MS = 200
+  const INVALIDATION_REFRESH_MAX_WAIT_MS = 1500
 
   function remember(key: string, value: { files: any[], total: number }) {
     cache.delete(key)
     cache.set(key, value)
     while (cache.size > 50) cache.delete(cache.keys().next().value as string)
+  }
+
+  function cancelInvalidationRefresh() {
+    if (invalidationRefreshTimer) clearTimeout(invalidationRefreshTimer)
+    invalidationRefreshTimer = null
   }
 
   const currentFolderId = computed(() => currentPath.value.at(-1)?.id || '')
@@ -46,8 +60,10 @@ export const useFilesStore = defineStore('files', () => {
     const normalizedPage = Math.max(0, Math.floor(Number(nextPage) || 0))
     const requestedFolderId = currentFolderId.value
     const cacheKey = fileListCacheKey(requestedFolderId, normalizedPage)
-    const cached = cache.get(cacheKey)
+    // 用户点"刷新"时不展示旧缓存，避免"刷新了但内容没变"的错觉。
+    const cached = options.force ? undefined : cache.get(cacheKey)
     const requestId = ++latestRequestId
+    const generationAtStart = invalidationGeneration
     if (!options.background) {
       foregroundRequests += 1
       loading.value = true
@@ -76,7 +92,11 @@ export const useFilesStore = defineStore('files', () => {
       files.value = nextFiles
       page.value = normalizedPage
       total.value = nextTotal
-      remember(cacheKey, { files: nextFiles, total: nextTotal })
+      // 请求在途期间目录被失效过：这份数据可能已经过期，只展示不回写缓存
+      // （随后的失效刷新会拉到新数据并纠正显示）。
+      if (invalidationGeneration === generationAtStart) {
+        remember(cacheKey, { files: nextFiles, total: nextTotal })
+      }
       return files.value
     }
     catch (error) {
@@ -99,15 +119,33 @@ export const useFilesStore = defineStore('files', () => {
 
   function handleDirectoryInvalidation(payload: any = {}) {
     const invalidation = normalizeDirectoryInvalidation(payload)
+    invalidationGeneration += 1
     for (const key of [...cache.keys()]) {
       if (shouldInvalidateFileListCache(key, invalidation)) cache.delete(key)
     }
     if (!invalidation.all && !invalidation.parentIds.includes(currentFolderId.value)) return
-    if (invalidationRefreshTimer) clearTimeout(invalidationRefreshTimer)
+    const now = Date.now()
+    if (!invalidationRefreshTimer) {
+      invalidationRefreshDeadline = now + INVALIDATION_REFRESH_MAX_WAIT_MS
+    }
+    const delay = Math.min(INVALIDATION_REFRESH_DELAY_MS, Math.max(0, invalidationRefreshDeadline - now))
+    cancelInvalidationRefresh()
     invalidationRefreshTimer = setTimeout(() => {
       invalidationRefreshTimer = null
       void loadFiles(page.value, { background: true, preserveCurrent: true }).catch(() => {})
-    }, 150)
+    }, delay)
+  }
+
+  function handleRecycleBinChanged() {
+    recycleBinVersion.value += 1
+  }
+
+  /// 写操作完成后的统一刷新入口：取消挂起的失效刷新（避免重复请求）、
+  /// 保留当前内容避免闪空，并带 force 绕过前后端缓存。
+  async function refreshAfterMutation(nextPage: number = page.value) {
+    cancelInvalidationRefresh()
+    invalidationGeneration += 1
+    return loadFiles(nextPage, { force: true, preserveCurrent: true })
   }
 
   async function enterFolder(record: any) {
@@ -132,9 +170,9 @@ export const useFilesStore = defineStore('files', () => {
 
   function reset() {
     latestRequestId += 1
+    invalidationGeneration += 1
     cache.clear()
-    if (invalidationRefreshTimer) clearTimeout(invalidationRefreshTimer)
-    invalidationRefreshTimer = null
+    cancelInvalidationRefresh()
     foregroundRequests = 0
     loading.value = false
     files.value = []
@@ -150,10 +188,13 @@ export const useFilesStore = defineStore('files', () => {
     page,
     total,
     pageSize,
+    recycleBinVersion,
     currentFolderId,
     currentFolderName,
     loadFiles,
     handleDirectoryInvalidation,
+    handleRecycleBinChanged,
+    refreshAfterMutation,
     enterFolder,
     goBack,
     jumpTo,

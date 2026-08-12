@@ -499,8 +499,9 @@ test('cloud-native organizer moves A to B, scrapes selected types and creates a 
   assert.equal(submitted.id, ready.id);
   assert.equal(Date.now() - rearchiveStartedAt < 500, true);
   assert.equal(service.state().jobs.filter((job) => job.mapping_id === mapping.id && job.source_id === ready.source_id).length, 1);
-  const completed = await waitFor(() => service.state().jobs.find((job) => job.id === ready.id && job.status === 'completed_warning'));
-  assert.equal(completed.status, 'completed_warning');
+  // 移动模式的固定提醒只进 message，不再把任务染成 completed_warning。
+  const completed = await waitFor(() => service.state().jobs.find((job) => job.id === ready.id && job.status === 'completed'));
+  assert.equal(completed.status, 'completed');
   assert.equal(completed.result.transferred, 2);
   assert.deepEqual(batchMoves, [['movie-file', 'subtitle-file']]);
   assert.ok(maximumConcurrentRenames >= 2);
@@ -517,7 +518,8 @@ test('cloud-native organizer moves A to B, scrapes selected types and creates a 
   service.updateSettings({ scrape_targets: [{ id: 'library-b', name: '主媒体库', dir_id: 'b', path: '/媒体库' }] });
   assert.equal(service.state().mappings.find((item) => item.id === mapping.id).target_path, '/媒体库');
   assert.equal(nodes.get('movie-file').parent_id === 'movie-dir', false);
-  assert.equal(completed.result.warnings.some((warning) => warning.includes('已有分享失效')), true);
+  assert.equal(completed.result.warnings.some((warning) => warning.includes('已有分享失效')), false);
+  assert.equal(completed.message.includes('已有分享失效'), true);
   await assert.rejects(service.runJob(completed.id), /已经整理完成/);
   assert.equal(fake.requests.every((request) => request.path.startsWith('/image/') || request.apiKey === 'unit-key'), true);
   assert.equal(events.some((event) => event.type === 'organizer' && event.event === 'job-updated'), true);

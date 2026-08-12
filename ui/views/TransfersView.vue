@@ -15,6 +15,7 @@ import {
   ReloadOutlined,
 } from '@antdv-next/icons'
 import { bridge } from '../bridge.js'
+import PageHeader from '../components/layout/PageHeader.vue'
 import { errorText, formatSize } from '../formatters.js'
 import { useSessionStore } from '../stores/session'
 import { useTransfersStore } from '../stores/transfers'
@@ -93,6 +94,7 @@ watch(tab, value => void router.replace({ query: { ...route.query, tab: value } 
 
 <template>
   <div class="view-section transfers-view">
+    <PageHeader title="传输任务" description="上传与下载队列的进度、暂停恢复与断点续传。" />
     <a-tabs v-model:active-key="tab" class="page-tabs">
       <template #rightExtra>
         <a-space>
@@ -168,14 +170,14 @@ watch(tab, value => void router.replace({ query: { ...route.query, tab: value } 
 
 <style scoped>
 .transfer-list { display: grid; }
-.transfer-row { display: grid; grid-template-columns:38px minmax(260px,1fr) 150px 100px auto; align-items: center; gap: 12px; min-height: 64px; padding: 8px 4px; border-bottom: 1px solid var(--line, #e7e8eb); }
+.transfer-row { display: grid; grid-template-columns:38px minmax(260px,1fr) 150px 100px auto; align-items: center; gap: 12px; min-height: 64px; padding: 8px 4px; border-bottom: 1px solid var(--line, #e5e5e5); }
 .transfer-icon { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 9px; }
-.transfer-icon.upload { color: var(--primary-strong, #237804); background: var(--primary-soft, #f1f8ed); }
-.transfer-icon.download { color: #1769aa; background: #edf5ff; }
+.transfer-icon.upload { color: var(--primary-strong, #171717); background: var(--primary-soft, #f5f5f5); }
+.transfer-icon.download { color: var(--text-2, #525252); background: var(--bg-hover, #f5f5f5); }
 .transfer-main { min-width: 0; }
 .transfer-name { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
 .transfer-name strong, .transfer-name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.transfer-name span, .transfer-speed { color: var(--text-3, #98a2b3); font-size: 11px; }
+.transfer-name span, .transfer-speed { color: var(--text-3, #737373); font-size: 11px; }
 .transfer-speed { text-align: right; }
 .transfer-actions { justify-self: end; }
 </style>

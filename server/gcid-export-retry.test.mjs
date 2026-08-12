@@ -2,17 +2,44 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   GCID_EXPORT_FILE_CONCURRENCY,
-  GCID_EXPORT_FULL_ATTEMPTS,
+  GCID_EXPORT_GLOBAL_RANGE_CONCURRENCY,
+  GCID_EXPORT_SCAN_CONCURRENCY,
+  GCID_EXPORT_SCAN_ATTEMPTS,
   GcidExportRangeError,
+  createGcidExportRangeGate,
   readGcidExportRangeBody,
-  retryGcidExportFull,
   retryGcidExportRange,
-  withGcidExportAttemptProgress,
-  withGcidExportReadTimeout,
+  retryGcidExportScan,
 } from './gcid-export-retry.mjs';
 
 test('GCID export hashes up to twenty files concurrently', () => {
   assert.equal(GCID_EXPORT_FILE_CONCURRENCY, 20);
+  assert.equal(GCID_EXPORT_SCAN_CONCURRENCY, 24);
+});
+
+test('GCID export retries transient scan requests five times but not business failures', async () => {
+  let transientCalls = 0;
+  const recovered = await retryGcidExportScan(async () => {
+    transientCalls += 1;
+    if (transientCalls < 3) {
+      const error = new Error('network disconnected');
+      error.retryable = true;
+      throw error;
+    }
+    return 'ok';
+  }, { baseDelayMs: 0 });
+  assert.equal(recovered, 'ok');
+  assert.equal(transientCalls, 3);
+  assert.equal(GCID_EXPORT_SCAN_ATTEMPTS, 5);
+
+  let businessCalls = 0;
+  await assert.rejects(retryGcidExportScan(async () => {
+    businessCalls += 1;
+    const error = new Error('permission denied');
+    error.retryable = false;
+    throw error;
+  }, { baseDelayMs: 0 }), /permission denied/);
+  assert.equal(businessCalls, 1);
 });
 
 test('GCID export retries only the range that failed', async () => {
@@ -39,36 +66,20 @@ test('GCID export does not retry a server that explicitly rejects ranges', async
   assert.equal(calls, 1);
 });
 
-test('full GCID verification retries three times and rolls failed progress back', async () => {
-  let calls = 0;
-  let progress = 0n;
-  const value = await retryGcidExportFull(async () => withGcidExportAttemptProgress(async (report) => {
-    calls += 1;
-    report(12);
-    if (calls < GCID_EXPORT_FULL_ATTEMPTS) throw new GcidExportRangeError('stream disconnected');
-    report(20);
-    return 'complete';
-  }, (delta) => { progress += delta; }), { baseDelayMs: 0 });
-
-  assert.equal(value, 'complete');
-  assert.equal(calls, 3);
-  assert.equal(progress, 20n);
-});
-
-test('full GCID verification aborts an idle stream so it can be retried', async () => {
-  let aborted = false;
-  const stalled = (async function* generate() {
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    yield Buffer.from('late');
-  }());
-
-  await assert.rejects(async () => {
-    for await (const _chunk of withGcidExportReadTimeout(stalled, {
-      timeoutMs: 1,
-      abort: () => { aborted = true; },
-    })) {}
-  }, /完整校验读取连续 1ms 无数据/);
-  assert.equal(aborted, true);
+test('GCID export globally caps simultaneous CDN range reads', async () => {
+  assert.equal(GCID_EXPORT_GLOBAL_RANGE_CONCURRENCY, 24);
+  const acquire = createGcidExportRangeGate(3);
+  let active = 0;
+  let peak = 0;
+  await Promise.all(Array.from({ length: 12 }, async () => {
+    const release = await acquire();
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    active -= 1;
+    release();
+  }));
+  assert.equal(peak, 3);
 });
 
 test('range body reader accepts an exact response split across short chunks', async () => {

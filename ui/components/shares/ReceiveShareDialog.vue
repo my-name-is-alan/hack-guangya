@@ -234,7 +234,7 @@ async function download() {
 
 <style scoped>
 .received-meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.received-meta span, .modal-hint { color: var(--text-3, #98a2b3); font-size: 12px; }
+.received-meta span, .modal-hint { color: var(--text-3, #737373); font-size: 12px; }
 .folder-toolbar { display: flex; align-items: center; gap: 10px; }
 .breadcrumb-button { padding: 0; border: 0; color: inherit; background: transparent; cursor: pointer; }
 </style>

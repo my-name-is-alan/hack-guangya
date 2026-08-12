@@ -224,12 +224,12 @@ watch(() => [props.open, fileId(props.record)], ([open]) => {
 .details-heading > div:last-child { min-width: 0; }
 .details-heading strong, .details-heading span { display: block; }
 .details-heading strong { max-width: 300px; overflow: hidden; font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }
-.details-heading span { margin-top: 3px; color: var(--text-3, #98a2b3); font-size: 12px; }
+.details-heading span { margin-top: 3px; color: var(--text-3, #737373); font-size: 12px; }
 .details-icon { color: var(--primary, #262626); background: var(--primary-soft, #f5f5f5); }
 .details-grid { overflow-wrap: anywhere; }
 .mono-value { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; }
 .direct-link-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .direct-link-heading strong, .direct-link-heading span { display: block; }
-.direct-link-heading span { margin-top: 3px; color: var(--text-3, #98a2b3); font-size: 12px; }
+.direct-link-heading span { margin-top: 3px; color: var(--text-3, #737373); font-size: 12px; }
 .direct-link-value { margin-top: 12px; }
 </style>

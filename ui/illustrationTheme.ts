@@ -66,7 +66,10 @@ function useIllustrationTheme() {
   const { styles } = useStyles()
 
   return computed<ConfigProviderProps>(() => ({
-    componentSize: 'small',
+    // 桌面端默认控件高度使用 middle（28px）：全局 small（22px）在 Windows
+    // 上过于局促，是"界面太挤"的主要来源；表格等高密度场景仍可显式
+    // size="small"。
+    componentSize: 'middle',
     theme: {
       algorithm: theme.defaultAlgorithm,
       cssVar: true,

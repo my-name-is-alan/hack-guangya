@@ -50,10 +50,25 @@ test('目录变更会失效子目录缓存，写操作失效可阻止旧请求�
   }]);
   await cache.get('folder', async () => [{ fileId: 'old-child', fileName: '旧内容' }]);
 
+  // 内容变化（utime）只失效子目录快照，不通知"路径→ID"观察者：
+  // 名字没变，映射仍然有效；上传期间目录内容持续变化，若也通知观察者
+  // 会造成上传路径解析的 generation 重试风暴。
   now = 21;
   await cache.get('root', async () => [{
     fileId: 'folder',
     fileName: '资料',
+    resType: 2,
+    utime: 2,
+  }], { force: true });
+  assert.equal(cache.stats().entries, 1);
+  assert.deepEqual(invalidatedDirectories, []);
+
+  // 改名才会通知观察者（映射真的失效了）。
+  await cache.get('folder', async () => [{ fileId: 'new-child', fileName: '新内容' }]);
+  now = 42;
+  await cache.get('root', async () => [{
+    fileId: 'folder',
+    fileName: '资料改名',
     resType: 2,
     utime: 2,
   }], { force: true });

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import { normalizeUpdateMetadata } from './updateMetadata.js'
+import { readRustBackendSourceSync } from './rustBackendSource.js'
 
 const read = (path) => readFile(new URL(path, import.meta.url), 'utf8')
 
@@ -41,13 +42,13 @@ test('no-update responses never become a phantom update modal', () => {
 })
 
 test('Tauri updater is signed and points to the latest GitHub release manifest', async () => {
-  const [config, cargo, rust, permissions, packager] = await Promise.all([
+  const [config, cargo, permissions, packager] = await Promise.all([
     read('../src-tauri/tauri.conf.json'),
     read('../src-tauri/Cargo.toml'),
-    read('../src-tauri/src/main.rs'),
     read('../src-tauri/permissions/app.toml'),
     read('../scripts/create-updater-manifest.mjs'),
   ])
+  const rust = readRustBackendSourceSync()
   const parsed = JSON.parse(config)
 
   assert.equal(parsed.bundle.createUpdaterArtifacts, true)

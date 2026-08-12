@@ -79,11 +79,6 @@ onMounted(loadSettings)
 </template>
 
 <style scoped>
-.setting-section { max-width: 760px; padding: 8px 18px 36px 24px; }
-.section-lead { margin-bottom: 28px; }
-.section-lead strong, .section-lead span, .setting-row strong, .setting-row span { display: block; }
-.section-lead strong { font-size: 18px; }
-.section-lead span, .setting-row span { margin-top: 5px; color: var(--text-3, #98a2b3); font-size: 12px; }
-.setting-row { display: flex; min-height: 64px; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 18px; }
+/* 骨架样式（setting-section / section-lead / setting-row）已提升为全局类。 */
 .save-button { margin-top: 22px; }
 </style>

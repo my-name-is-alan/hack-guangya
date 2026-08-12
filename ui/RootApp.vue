@@ -43,5 +43,5 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.boot-screen { display: flex; min-height: 100vh; align-items: center; flex-direction: column; justify-content: center; gap: 16px; color: var(--text-3, #98a2b3); background: var(--app-bg, #f7f7f8); }
+.boot-screen { display: flex; min-height: 100vh; align-items: center; flex-direction: column; justify-content: center; gap: 16px; color: var(--text-3, #737373); background: var(--app-bg, #fafafa); }
 </style>

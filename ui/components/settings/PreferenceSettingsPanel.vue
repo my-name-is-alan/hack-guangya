@@ -49,55 +49,12 @@ const modeDescription = computed(() => (
 </template>
 
 <style scoped>
-.setting-section {
-  max-width: 760px;
-  padding: 8px 18px 36px 24px;
-}
-
-.section-lead {
-  margin-bottom: 28px;
-}
-
-.section-lead strong,
-.section-lead span,
-.setting-copy strong,
-.setting-copy span {
-  display: block;
-}
-
-.section-lead strong {
-  font-size: 18px;
-}
-
-.section-lead span,
-.setting-copy span,
-.mode-description {
-  margin-top: 5px;
-  color: var(--text-3, #98a2b3);
-  font-size: 12px;
-}
-
-.setting-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 24px;
-  min-height: 54px;
-}
-
-.setting-copy {
-  min-width: 0;
-}
-
-.mode-description {
-  padding-top: 12px;
-  border-top: 1px solid var(--line, #e7e8eb);
-}
-
+/* 骨架样式（setting-section / section-lead / setting-row）已提升为全局类。 */
+.setting-copy { min-width: 0; }
+.setting-copy strong, .setting-copy span { display: block; }
+.setting-copy span { margin-top: var(--space-1, 4px); color: var(--text-3, #737373); font-size: var(--fs-sm, 12px); }
+.mode-description { margin-top: var(--space-1, 4px); padding-top: var(--space-3, 12px); border-top: 1px solid var(--line, #e5e5e5); color: var(--text-3, #737373); font-size: var(--fs-sm, 12px); }
 @media (max-width: 720px) {
-  .setting-row {
-    align-items: flex-start;
-    flex-direction: column;
-  }
+  .setting-row { align-items: flex-start; flex-direction: column; }
 }
 </style>

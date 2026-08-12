@@ -1,8 +1,9 @@
 <script setup>
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { message, Modal } from 'antdv-next';
 import { DeleteOutlined, FileOutlined, ReloadOutlined, RollbackOutlined } from '@antdv-next/icons';
 import { bridge } from '../../bridge.js';
+import { useFilesStore } from '../../stores/files.ts';
 import { errorText, fileId, formatSize, formatTime, pick, unwrapData } from '../../formatters.js';
 import {
   requestRecycleBinClear,
@@ -219,6 +220,13 @@ onMounted(() => {
   void loadRecycle();
 });
 onUnmounted(() => unsubscribeClear());
+
+// 文件页删除/其它端清空回收站后，后端会广播回收站变化事件；
+// 已打开的回收站面板据此自动刷新，不再显示旧列表。
+const filesStore = useFilesStore();
+watch(() => filesStore.recycleBinVersion, () => {
+  if (!loading.value && !actionBusy.value) void loadRecycle(page.value);
+});
 </script>
 
 <template>
@@ -282,7 +290,7 @@ onUnmounted(() => unsubscribeClear());
 <style scoped>
 .files-panel { min-height: 0; }
 .panel-summary strong, .panel-summary span { display: block; }
-.panel-summary span { margin-top: 2px; color: var(--text-3, #98a2b3); font-size: 12px; }
+.panel-summary span { margin-top: 2px; color: var(--text-3, #737373); font-size: 12px; }
 .selection-summary { color: var(--text-2, #525252); }
 .panel-alert { margin-bottom: 10px; }
 .recycle-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

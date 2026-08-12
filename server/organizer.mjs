@@ -1466,8 +1466,9 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
       const resolver = createTargetResolver(mapping);
       const transfer = await executeTransfers(job.preview, mapping, resolver);
       const scrape = await executeScrape(job.preview, resolver);
+      // 移动模式的固定说明只进 message，不进 warnings：它不是异常，不应把
+      // 所有移动任务都渲染成 completed_warning（与 Rust 端保持一致）。
       const warnings = [...scrape.warnings];
-      if (mapping.transfer_type === 'move') warnings.push('云端移动会使来源资源的已有分享失效；光鸭没有复用来源分享');
       let share = null;
       const shouldShare = job.share_after_requested || mapping.share_after_organize;
       if (shouldShare) {
@@ -1479,7 +1480,8 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
       }
       const result = { success: true, transferred: transfer.transferred, skipped: transfer.skipped + scrape.skipped, scraped: scrape.scraped, warnings, targets: transfer.targets, share };
       const status = warnings.length ? 'completed_warning' : 'completed';
-      const message = `云盘整理完成：转移 ${result.transferred} 项，刮削 ${result.scraped} 项${share ? '，已从 B 目录重新分享' : ''}${warnings.length ? `；${warnings.length} 项提示` : ''}`;
+      const moveNotice = mapping.transfer_type === 'move' ? '；提醒：云端移动会使来源资源的已有分享失效' : '';
+      const message = `云盘整理完成：转移 ${result.transferred} 项，刮削 ${result.scraped} 项${share ? '，已从 B 目录重新分享' : ''}${warnings.length ? `；${warnings.length} 项提示` : ''}${moveNotice}`;
       updateJob(id, { status, error_code: warnings.length ? 'completed_warning' : null, result_json: JSON.stringify(result), message });
       emit('job-updated', { job_id: id, mapping_id: job.mapping_id, status });
       return getJob(id);

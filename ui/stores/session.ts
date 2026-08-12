@@ -166,6 +166,9 @@ export const useSessionStore = defineStore('session', () => {
         if (payload?.type === 'cloud-directory-invalidated') {
           useFilesStore().handleDirectoryInvalidation(payload)
         }
+        if (payload?.type === 'cloud-recycle-bin-changed') {
+          useFilesStore().handleRecycleBinChanged()
+        }
         transfers.handleSyncEvent(payload)
       })
     }

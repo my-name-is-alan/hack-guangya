@@ -2038,24 +2038,49 @@ fn apply_probe_metadata(
     parsed.media_probed = true;
 }
 
+/// ffprobe 探测并发上限：串行探测时每个视频最长 45 秒超时，24 集剧集在
+/// CDN 不通时会把任务钉在 recognizing 十几分钟。
+const MEDIA_PROBE_CONCURRENCY: usize = 4;
+
 async fn enrich_analysis_with_media_info(
     app: &tauri::AppHandle,
     loaded: &LoadedCandidate,
     analysis: &mut CandidateAnalysis,
 ) -> Vec<String> {
-    let mut warnings = Vec::new();
-    for video in &mut analysis.videos {
-        let Some(entry) = loaded_entry(loaded, &video.source) else {
-            continue;
-        };
-        let result = async {
-            let url = cloud_download_url(app, &entry.id).await?;
-            probe_media_url(app, &url).await
+    let probes = analysis
+        .videos
+        .iter()
+        .enumerate()
+        .filter_map(|(index, video)| {
+            loaded_entry(loaded, &video.source)
+                .map(|entry| (index, entry.id.clone(), entry.name.clone()))
+        })
+        .collect::<Vec<_>>();
+    let mut outcomes = stream::iter(probes.into_iter().map(|(index, entry_id, name)| {
+        let app = app.clone();
+        async move {
+            let result = async {
+                let url = cloud_download_url(&app, &entry_id).await?;
+                probe_media_url(&app, &url).await
+            }
+            .await;
+            (index, name, result)
         }
-        .await;
+    }))
+    .buffer_unordered(MEDIA_PROBE_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    // 结果按视频原始顺序回填，保证告警顺序稳定。
+    outcomes.sort_by_key(|(index, ..)| *index);
+    let mut warnings = Vec::new();
+    for (index, name, result) in outcomes {
         match result {
-            Ok(values) => apply_probe_metadata(&mut video.parsed, values),
-            Err(error) => warnings.push(format!("{}：{error}", entry.name)),
+            Ok(values) => {
+                if let Some(video) = analysis.videos.get_mut(index) {
+                    apply_probe_metadata(&mut video.parsed, values);
+                }
+            }
+            Err(error) => warnings.push(format!("{name}：{error}")),
         }
     }
     warnings
@@ -2610,21 +2635,51 @@ async fn load_candidate(
     }))
 }
 
+/// 样片判定（对齐 Node 端 `isSamplePath`）：目录段必须整段是 sample/samples，
+/// 文件名主干中的 sample 必须以分隔符为界。禁止无边界子串匹配——
+/// 否则 `The Sampler (2019).mkv` 或名为 `Samples Collection` 的父目录会让
+/// 整批正片被当成样片丢弃，直接报"没有找到可整理的视频文件"。
 fn ignored_sample(value: &str) -> bool {
-    value
-        .split('/')
-        .any(|part| part.eq_ignore_ascii_case("sample") || part.to_lowercase().contains("sample"))
+    static DIRECTORY: OnceLock<Regex> = OnceLock::new();
+    static STEM: OnceLock<Regex> = OnceLock::new();
+    let directory = DIRECTORY.get_or_init(|| {
+        Regex::new(r"(?:^|/)(?:sample|samples)(?:/|$)").expect("sample directory regex")
+    });
+    let stem = STEM.get_or_init(|| {
+        Regex::new(r"(?:^|[ ._\-])sample(?:[ ._\-]|$)").expect("sample stem regex")
+    });
+    let normalized = value.replace('\\', "/").to_lowercase();
+    directory.is_match(&normalized) || stem.is_match(&path_stem(&normalized))
 }
 
+/// 附加内容判定（对齐 Node 端 `extraKind`）：trailer 必须是文件名主干中以
+/// 分隔符为界的独立词，或位于 trailers/预告 专用目录内；extra 必须位于
+/// extras/featurettes 等专用目录内。禁止全路径子串匹配——否则剧名
+/// `Trailer Park Boys` 会让整季被判成预告片、跳过全部刮削。
 fn extra_kind(value: &str) -> String {
-    let lower = value.to_lowercase();
-    if lower.contains("trailer") || lower.contains("预告") {
-        "trailer".to_string()
-    } else if lower.contains("extras")
-        || lower.contains("featurette")
-        || lower.contains("behind the scenes")
-        || lower.contains("花絮")
+    static TRAILER_STEM: OnceLock<Regex> = OnceLock::new();
+    static TRAILER_DIRECTORY: OnceLock<Regex> = OnceLock::new();
+    static EXTRA_DIRECTORY: OnceLock<Regex> = OnceLock::new();
+    let trailer_stem = TRAILER_STEM.get_or_init(|| {
+        Regex::new(r"(?:^|[ ._\-])trailer(?:[ ._\-]|$)").expect("trailer stem regex")
+    });
+    let trailer_directory = TRAILER_DIRECTORY.get_or_init(|| {
+        Regex::new(r"(?:^|/)(?:trailers?|预告|预告片)/").expect("trailer directory regex")
+    });
+    let extra_directory = EXTRA_DIRECTORY.get_or_init(|| {
+        Regex::new(
+            r"(?:^|/)(?:extras?|featurettes?|behind the scenes|deleted scenes|interviews?|花絮|幕后)/",
+        )
+        .expect("extra directory regex")
+    });
+    let normalized = value.replace('\\', "/").to_lowercase();
+    let stem = path_stem(&normalized);
+    if trailer_stem.is_match(&stem)
+        || trailer_directory.is_match(&normalized)
+        || matches!(stem.trim(), "预告" | "预告片")
     {
+        "trailer".to_string()
+    } else if extra_directory.is_match(&normalized) || matches!(stem.trim(), "花絮" | "幕后") {
         "extra".to_string()
     } else {
         String::new()
@@ -2928,6 +2983,63 @@ mod cloud_sidecar_tests {
             vec!["loose-a", "loose-b", "movie-a", "movie-b", "show"]
         );
     }
+
+    #[test]
+    fn sample_detection_requires_token_boundaries() {
+        // 目录整段或分隔符界定的 sample 才是样片。
+        assert!(ignored_sample("Downloads/Sample/movie.mkv"));
+        assert!(ignored_sample("Downloads/samples/movie.mkv"));
+        assert!(ignored_sample("Downloads/Movie.2020.sample.mkv"));
+        assert!(ignored_sample("Downloads/Movie sample.mkv"));
+        // 标题里含 sample 子串的正片绝不能被丢弃。
+        assert!(!ignored_sample("Downloads/The.Sampler.2019.1080p.mkv"));
+        assert!(!ignored_sample("Downloads/Samples Collection/A.Movie.2020.mkv"));
+        assert!(!ignored_sample("Downloads/Free Samples (2012)/Free.Samples.2012.mkv"));
+    }
+
+    #[test]
+    fn extra_detection_requires_dedicated_directories_or_tokens() {
+        assert_eq!(extra_kind("Show/trailers/clip.mkv"), "trailer");
+        assert_eq!(extra_kind("Show/Movie.Trailer.mkv"), "trailer");
+        assert_eq!(extra_kind("Show/预告/片段.mkv"), "trailer");
+        assert_eq!(extra_kind("Show/extras/bonus.mkv"), "extra");
+        assert_eq!(extra_kind("Show/Featurettes/making.mkv"), "extra");
+        assert_eq!(extra_kind("Show/花絮/片段.mkv"), "extra");
+        // 剧名含 trailer/extras 子串不能把正片判成附加内容。
+        assert_eq!(extra_kind("Trailer Park Boys/Season 1/S01E01.mkv"), "");
+        assert_eq!(extra_kind("Extras.UK.S01E01.mkv"), "");
+    }
+
+    #[test]
+    fn subtitle_language_suffix_emits_bcp47_with_forced_and_sdh() {
+        assert_eq!(language_suffix("Show.S01E01.chs.srt"), ".zh-CN");
+        assert_eq!(language_suffix("Show.S01E01.cht.srt"), ".zh-TW");
+        assert_eq!(language_suffix("Show.S01E01.简体.srt"), ".zh-CN");
+        assert_eq!(language_suffix("Show.S01E01.eng.srt"), ".en");
+        assert_eq!(
+            language_suffix("Show.S01E01.chs.forced.srt"),
+            ".zh-CN.forced"
+        );
+        assert_eq!(language_suffix("Show.S01E01.en.sdh.srt"), ".en.sdh");
+        assert_eq!(language_suffix("Show.S01E01.srt"), "");
+    }
+
+    #[test]
+    fn path_template_renders_empty_values_without_zero_padding() {
+        let mut context = HashMap::new();
+        context.insert("title".to_string(), "剧名".to_string());
+        context.insert("season".to_string(), String::new());
+        context.insert("ext".to_string(), "mkv".to_string());
+        // 缺季时 {season:02} 渲染为空，而不是补零成 "00"。
+        let rendered =
+            render_path_template("剧目/Season {season:02}/{title}.{ext}", &context).unwrap();
+        assert_eq!(rendered, "剧目/Season/剧名.mkv");
+        // 空值残留的悬空 " - " 会被清理。
+        context.insert("episode_title".to_string(), String::new());
+        let rendered =
+            render_path_template("剧目/{title} - {episode_title} - .{ext}", &context).unwrap();
+        assert!(!rendered.contains("- -"), "{rendered}");
+    }
 }
 
 fn analyze_cloud_candidate(
@@ -2960,7 +3072,7 @@ fn analyze_cloud_candidate(
         path_stem(&loaded.candidate.name)
     };
     let group = parse_media_name_with_settings(&candidate_name, overrides, settings);
-    let mut preliminary = videos
+    let preliminary = videos
         .iter()
         .map(|entry| {
             let mut options = overrides.clone();
@@ -3004,19 +3116,33 @@ fn analyze_cloud_candidate(
         .year
         .or(group.year)
         .or_else(|| preliminary.iter().find_map(|item| item.year));
-    for (index, parsed) in preliminary.iter_mut().enumerate() {
-        parsed.media_type = media_type.clone();
-        if parsed.title.is_empty() {
-            parsed.title = title.clone();
-        }
-        parsed.year = year.or(parsed.year);
-        if videos.len() == 1 {
-            parsed.season = overrides.season.or(parsed.season);
-            parsed.episode = overrides.episode.or(parsed.episode);
-            parsed.episode_end = overrides.episode_end.or(parsed.episode_end);
-        }
-        let _ = index;
-    }
+    // 用最终确定的 media_type 对每个视频完整重新解析一遍（对齐 Node 端的
+    // 两遍解析）。季集提取强依赖 media_type 提示：只有 tv 提示才会启用
+    // "仅集号"（第5集 / EP05）和番剧 "- 05" 破折号集号分支。旧实现只事后
+    // 覆盖 media_type 字段、不重算季集，导致 "Show - 05.mkv" 这类文件
+    // 解析不出集号而报 episode_required。
+    let preliminary = videos
+        .iter()
+        .map(|entry| {
+            let mut options = overrides.clone();
+            options.media_type = Some(media_type.clone());
+            options.season = overrides.season.or_else(|| {
+                cloud_parent_season(&entry.logical_path, &loaded.candidate.logical_path)
+            });
+            if videos.len() != 1 {
+                options.episode = None;
+                options.episode_end = None;
+            }
+            let mut parsed =
+                parse_media_name_with_settings(&entry.logical_path, &options, settings);
+            parsed.media_type = media_type.clone();
+            if parsed.title.is_empty() {
+                parsed.title = title.clone();
+            }
+            parsed.year = year.or(parsed.year);
+            parsed
+        })
+        .collect::<Vec<_>>();
     let analyzed_videos = videos
         .iter()
         .zip(preliminary)
@@ -3134,6 +3260,11 @@ fn render_path_template(
                 .map(|value| value.as_str().to_lowercase())
                 .unwrap_or_default();
             let value = context.get(&key).cloned().unwrap_or_default();
+            // 空值渲染为空串（对齐 Node 端）：不允许 {season:02} 在缺季时
+            // 补零成 "00"，否则剧集附加内容会落进 "Season 00/" 目录。
+            if value.is_empty() {
+                return String::new();
+            }
             captures
                 .get(2)
                 .and_then(|value| value.as_str().parse::<usize>().ok())
@@ -3150,19 +3281,23 @@ fn render_path_template(
     if raw_parts.iter().any(|part| *part == "." || *part == "..") {
         return Err("整理路径模板不能包含相对目录跳转".to_string());
     }
+    // 对齐 Node cleanRenderedSegment：清理空值残留的悬空连接符，
+    // 避免剧集标题为空时产出 "剧名 - .mkv" 这类文件名。
+    let double_dash = Regex::new(r"\s+-\s+-\s+").expect("double dash regex");
+    let trailing_dash = Regex::new(r"(?:\s+-\s*)+$").expect("trailing dash regex");
     let parts = raw_parts
         .into_iter()
         .map(|part| {
-            sanitize_component(
-                &part
-                    .replace("()", "")
-                    .replace("[]", "")
-                    .replace("..", ".")
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                "Unknown",
-            )
+            let collapsed = part
+                .replace("()", "")
+                .replace("[]", "")
+                .replace("..", ".")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let collapsed = double_dash.replace_all(&collapsed, " - ").to_string();
+            let collapsed = trailing_dash.replace_all(&collapsed, "").to_string();
+            sanitize_component(&collapsed, "Unknown")
         })
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
@@ -3576,15 +3711,52 @@ fn season_directory_for_cloud_video(item: &CloudPreviewItem, media_root: &str) -
     }
 }
 
+/// 单次整理任务生命周期内的目标目录列表缓存（对齐 Node 端
+/// `createTargetResolver`）。`resolve_target` / `ensure_target_directory`
+/// 逐段解析路径，没有缓存时一个 24 集季的预览就要发数百次云端列目录请求，
+/// 极易触发限流并把任务长时间钉在 recognizing/running。
+struct TargetResolver {
+    cache: HashMap<String, Vec<CloudEntry>>,
+}
+
+impl TargetResolver {
+    fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+        }
+    }
+
+    async fn list(
+        &mut self,
+        app: &tauri::AppHandle,
+        parent_id: &str,
+        force: bool,
+    ) -> Result<Vec<CloudEntry>, String> {
+        if !force {
+            if let Some(children) = self.cache.get(parent_id) {
+                return Ok(children.clone());
+            }
+        }
+        let children = list_cloud_children(app, parent_id).await?;
+        self.cache.insert(parent_id.to_string(), children.clone());
+        Ok(children)
+    }
+
+    fn invalidate(&mut self, parent_id: &str) {
+        self.cache.remove(parent_id);
+    }
+}
+
 async fn resolve_target(
     app: &tauri::AppHandle,
     mapping: &OrganizerMapping,
     relative: &str,
+    resolver: &mut TargetResolver,
 ) -> Result<Option<CloudEntry>, String> {
     let mut parent_id = mapping.target_dir_id.clone();
     let mut current = None;
     for part in path_parts(relative) {
-        let children = list_cloud_children(app, &parent_id).await?;
+        let children = resolver.list(app, &parent_id, false).await?;
         let Some(entry) = children
             .into_iter()
             .find(|entry| entry.name == part || entry.name.eq_ignore_ascii_case(part))
@@ -3608,10 +3780,11 @@ async fn ensure_target_directory(
     app: &tauri::AppHandle,
     mapping: &OrganizerMapping,
     relative: &str,
+    resolver: &mut TargetResolver,
 ) -> Result<String, String> {
     let mut parent_id = mapping.target_dir_id.clone();
     for part in path_parts(relative) {
-        let children = list_cloud_children(app, &parent_id).await?;
+        let children = resolver.list(app, &parent_id, false).await?;
         if let Some(entry) = children
             .into_iter()
             .find(|entry| entry.name == part || entry.name.eq_ignore_ascii_case(part))
@@ -3622,7 +3795,8 @@ async fn ensure_target_directory(
             parent_id = entry.id;
         } else {
             let create_result = create_cloud_directory(app, &parent_id, part).await;
-            let refreshed = list_cloud_children(app, &parent_id).await?;
+            resolver.invalidate(&parent_id);
+            let refreshed = resolver.list(app, &parent_id, true).await?;
             if let Some(entry) = refreshed
                 .into_iter()
                 .find(|entry| entry.name == part || entry.name.eq_ignore_ascii_case(part))
@@ -3645,6 +3819,7 @@ async fn plan_target(
     relative: &str,
     source_identity: &str,
     claimed: &mut HashSet<String>,
+    resolver: &mut TargetResolver,
 ) -> Result<(String, String, bool, Option<String>, bool), String> {
     let normalized = relative.trim_matches('/').replace('\\', "/");
     let mut target_relative = normalized.clone();
@@ -3652,7 +3827,7 @@ async fn plan_target(
     let existing = if claimed.contains(&key) {
         None
     } else {
-        resolve_target(app, mapping, &target_relative).await?
+        resolve_target(app, mapping, &target_relative, resolver).await?
     };
     if !claimed.contains(&key) && existing.is_none() {
         claimed.insert(key);
@@ -3697,7 +3872,7 @@ async fn plan_target(
         };
         let key = target_key(&target_relative);
         if claimed.contains(&key)
-            || resolve_target(app, mapping, &target_relative)
+            || resolve_target(app, mapping, &target_relative, resolver)
                 .await?
                 .is_some()
         {
@@ -3840,6 +4015,8 @@ async fn build_preview(
     };
     let category = resolve_media_category(&metadata, secrets);
     let mut claimed = HashSet::new();
+    // 预览阶段共享一份目标目录缓存，避免每个条目都从 B 根重新逐级列目录。
+    let mut resolver = TargetResolver::new();
     let mut items = Vec::new();
     let mut video_targets = HashMap::new();
     for video in &analysis.videos {
@@ -3888,7 +4065,7 @@ async fn build_preview(
                 &sanitize_component(&source_entry.name, "extra"),
             ]);
         }
-        let planned = plan_target(app, mapping, &relative, &source_entry.id, &mut claimed).await?;
+        let planned = plan_target(app, mapping, &relative, &source_entry.id, &mut claimed, &mut resolver).await?;
         let target_relative = planned.0.clone();
         add_preview_item(
             &mut items,
@@ -3943,7 +4120,7 @@ async fn build_preview(
                 }
             );
             let planned =
-                plan_target(app, mapping, &relative, &source_entry.id, &mut claimed).await?;
+                plan_target(app, mapping, &relative, &source_entry.id, &mut claimed, &mut resolver).await?;
             add_preview_item(
                 &mut items,
                 mapping,
@@ -4068,11 +4245,19 @@ async fn build_preview(
                 if season.poster_url.is_empty() {
                     continue;
                 }
-                let season_root = main_videos
+                // 只为本次实际整理到的季生成季海报。TMDB 会返回剧集的全部季，
+                // 找不到对应季视频时旧逻辑回落到剧集根目录 poster.jpg，与主
+                // 海报撞名——冲突去重会产出 poster [hash].jpg 垃圾文件。
+                let Some(season_root) = main_videos
                     .iter()
                     .find(|item| item.season == Some(season.season_number))
                     .map(|item| season_directory_for_cloud_video(item, &media_root_relative))
-                    .unwrap_or_else(|| media_root_relative.clone());
+                else {
+                    continue;
+                };
+                if season_root == media_root_relative {
+                    continue;
+                }
                 generated.push((
                     format!("{season_root}/poster.jpg"),
                     "image",
@@ -4093,6 +4278,7 @@ async fn build_preview(
             &relative,
             source.as_deref().unwrap_or(&relative),
             &mut claimed,
+            &mut resolver,
         )
         .await?;
         add_preview_item(
@@ -4192,28 +4378,76 @@ fn source_id_for(loaded: &LoadedCandidate, source: &str) -> Option<String> {
     loaded_entry(loaded, source).map(|entry| entry.id.clone())
 }
 
+/// 字幕/音轨语言后缀（对齐 Node 端 `languageSuffix`）：输出 BCP-47 标记
+/// （Emby/Jellyfin 才能识别），并保留 forced/sdh 标记，避免
+/// `Show.chs.srt` 和 `Show.chs.forced.srt` 渲染成同名目标互相覆盖。
 fn language_suffix(value: &str) -> String {
-    let stem = path_stem(value);
-    let tokens = stem
-        .split(['.', ' ', '_', '-'])
-        .filter(|token| {
-            let lower = token.to_lowercase();
-            lower.len() >= 2
-                && lower.len() <= 8
-                && (lower == "chs"
-                    || lower == "cht"
-                    || lower == "eng"
-                    || lower == "jpn"
-                    || lower == "kor"
-                    || lower == "zh"
-                    || lower == "en"
-                    || lower == "cn"
-                    || lower == "tw")
+    static ZH_CN: OnceLock<Regex> = OnceLock::new();
+    static ZH_TW: OnceLock<Regex> = OnceLock::new();
+    static EN: OnceLock<Regex> = OnceLock::new();
+    static JA: OnceLock<Regex> = OnceLock::new();
+    static KO: OnceLock<Regex> = OnceLock::new();
+    static FORCED: OnceLock<Regex> = OnceLock::new();
+    static SDH: OnceLock<Regex> = OnceLock::new();
+    let name = path_stem(value).to_lowercase();
+    let language = if ZH_CN
+        .get_or_init(|| {
+            Regex::new(r"(?i)(?:zh[-_. ]?(?:cn|hans)|chs|(?:^|[._ -])sc(?:[._ -]|$)|简体|簡體|简中)")
+                .expect("zh-cn subtitle regex")
         })
-        .last()
-        .map(|token| format!(".{token}"))
-        .unwrap_or_default();
-    tokens
+        .is_match(&name)
+    {
+        "zh-CN"
+    } else if ZH_TW
+        .get_or_init(|| {
+            Regex::new(r"(?i)(?:zh[-_. ]?(?:tw|hant)|cht|(?:^|[._ -])tc(?:[._ -]|$)|繁体|繁體|繁中)")
+                .expect("zh-tw subtitle regex")
+        })
+        .is_match(&name)
+    {
+        "zh-TW"
+    } else if EN
+        .get_or_init(|| {
+            Regex::new(r"(?i)(?:^|[._ -])(?:eng|en)(?:[._ -]|$)|英文").expect("en subtitle regex")
+        })
+        .is_match(&name)
+    {
+        "en"
+    } else if JA
+        .get_or_init(|| {
+            Regex::new(r"(?i)(?:^|[._ -])(?:jpn|ja|jp)(?:[._ -]|$)|日文|日语|日語")
+                .expect("ja subtitle regex")
+        })
+        .is_match(&name)
+    {
+        "ja"
+    } else if KO
+        .get_or_init(|| {
+            Regex::new(r"(?i)(?:^|[._ -])(?:kor|ko|kr)(?:[._ -]|$)|韩文|韓文|韩语|韓語")
+                .expect("ko subtitle regex")
+        })
+        .is_match(&name)
+    {
+        "ko"
+    } else {
+        ""
+    };
+    let forced = FORCED
+        .get_or_init(|| Regex::new(r"(?i)(?:^|[._ -])forced(?:[._ -]|$)").expect("forced regex"))
+        .is_match(&name);
+    let sdh = SDH
+        .get_or_init(|| Regex::new(r"(?i)(?:^|[._ -])(?:sdh|hi)(?:[._ -]|$)").expect("sdh regex"))
+        .is_match(&name);
+    format!(
+        "{}{}{}",
+        if language.is_empty() {
+            String::new()
+        } else {
+            format!(".{language}")
+        },
+        if forced { ".forced" } else { "" },
+        if sdh { ".sdh" } else { "" }
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -4256,6 +4490,7 @@ async fn execute_transfers(
     app: &tauri::AppHandle,
     mapping: &OrganizerMapping,
     preview: &CloudPreview,
+    resolver: &mut TargetResolver,
 ) -> Result<(usize, usize, Vec<String>), String> {
     let mut transaction = Vec::new();
     let mut unattached_backups: Vec<(String, String)> = Vec::new();
@@ -4286,10 +4521,10 @@ async fn execute_transfers(
     let outcome = async {
         for (target_parent_relative, items) in groups {
             let target_parent_id =
-                ensure_target_directory(app, mapping, &target_parent_relative).await?;
+                ensure_target_directory(app, mapping, &target_parent_relative, resolver).await?;
             let mut prepared = Vec::new();
             for item in items {
-                let existing = resolve_target(app, mapping, &item.target_relative).await?;
+                let existing = resolve_target(app, mapping, &item.target_relative, resolver).await?;
                 if item.action == "skip" && existing.is_some() {
                     skipped += 1;
                     continue;
@@ -4300,6 +4535,7 @@ async fn execute_transfers(
                 let backup = if let Some(existing) = existing {
                     let backup_name = format!(".__gy_org_backup_{}", Uuid::new_v4().simple());
                     cloud_rename(app, &existing.id, &backup_name).await?;
+                    resolver.invalidate(&target_parent_id);
                     let backup = (existing.id, existing.name);
                     unattached_backups.push(backup.clone());
                     Some(backup)
@@ -4311,7 +4547,8 @@ async fn execute_transfers(
             if prepared.is_empty() {
                 continue;
             }
-            let before = list_cloud_children(app, &target_parent_id)
+            let before = resolver
+                .list(app, &target_parent_id, true)
                 .await?
                 .into_iter()
                 .map(|entry| entry.id)
@@ -4325,7 +4562,7 @@ async fn execute_transfers(
             } else {
                 cloud_copy_many(app, &source_ids, &target_parent_id).await?;
             }
-            let after = list_cloud_children(app, &target_parent_id).await?;
+            let after = resolver.list(app, &target_parent_id, true).await?;
             let mut available_copies = after
                 .iter()
                 .filter(|entry| !before.contains(&entry.id))
@@ -4372,6 +4609,8 @@ async fn execute_transfers(
                 });
             }
             cloud_rename_many(app, renames).await?;
+            // 移动/复制 + 批量改名都改变了目标目录内容，之后的组必须重新列取。
+            resolver.invalidate(&target_parent_id);
             transferred += source_ids.len();
         }
         Ok::<(), String>(())
@@ -4453,6 +4692,7 @@ async fn execute_scrape(
     mapping: &OrganizerMapping,
     preview: &CloudPreview,
     proxy: &str,
+    resolver: &mut TargetResolver,
 ) -> (usize, usize, Vec<String>) {
     let Some(metadata) = preview.metadata.as_ref() else {
         return (0, 0, vec!["没有可用的 TMDB 元数据，已跳过刮削".to_string()]);
@@ -4471,14 +4711,16 @@ async fn execute_scrape(
     let mut warnings = Vec::new();
     for item in generated {
         let parent_id =
-            match ensure_target_directory(app, mapping, &item.target_parent_relative).await {
+            match ensure_target_directory(app, mapping, &item.target_parent_relative, resolver)
+                .await
+            {
                 Ok(value) => value,
                 Err(error) => {
                     warnings.push(format!("{}：{error}", item.target));
                     continue;
                 }
             };
-        let existing = match resolve_target(app, mapping, &item.target_relative).await {
+        let existing = match resolve_target(app, mapping, &item.target_relative, resolver).await {
             Ok(value) => value,
             Err(error) => {
                 warnings.push(format!("{}：{error}", item.target));
@@ -4489,6 +4731,12 @@ async fn execute_scrape(
             skipped += 1;
             continue;
         }
+        // 预览后目标出现了同名文件：不静默覆盖别的进程刚写入的内容
+        // （对齐 Node 端行为）。
+        if item.action == "create" && existing.is_some() {
+            warnings.push(format!("{}：预览后目标已出现同名文件，已跳过", item.target));
+            continue;
+        }
         let mut backup = None;
         if let Some(existing) = existing {
             let backup_name = format!(".__gy_org_meta_{}", Uuid::new_v4().simple());
@@ -4496,6 +4744,7 @@ async fn execute_scrape(
                 warnings.push(format!("{}：覆盖前备份失败：{error}", item.target));
                 continue;
             }
+            resolver.invalidate(&parent_id);
             backup = Some((existing.id, existing.name));
         }
         let bytes = if item.kind == "nfo" {
@@ -4530,12 +4779,20 @@ async fn execute_scrape(
             if let Some((backup_id, original_name)) = backup {
                 let _ = cloud_rename(app, &backup_id, &original_name).await;
             }
+            resolver.invalidate(&parent_id);
             warnings.push(format!("{}：上传刮削元数据失败：{error}", item.target));
             continue;
         }
         if let Some((backup_id, _)) = backup {
-            let _ = cloud_delete(app, &backup_id).await;
+            // 备份清理失败要留痕：静默忽略会在 B 目录残留 .__gy_org_meta_* 孤儿文件。
+            if let Err(error) = cloud_delete(app, &backup_id).await {
+                warnings.push(format!(
+                    "{}：已写入新元数据，但清理覆盖备份失败：{error}",
+                    item.target
+                ));
+            }
         }
+        resolver.invalidate(&parent_id);
         scraped += 1;
     }
     (scraped, skipped, warnings)
@@ -5085,10 +5342,15 @@ fn save_mapping(path: &Path, mapping: &OrganizerMapping) -> Result<(), String> {
 }
 
 fn mapping_idle(path: &Path, id: &str) -> Result<(), String> {
+    // recognizing 状态加时间兜底：识别正常几分钟内就会结束，超过 10 分钟
+    // 未更新的 recognizing 视为历史残留（例如进程中断），不再永久锁住
+    // 监控配置的修改与删除。
+    let stale_before = now_seconds() - 600;
     let running = open_database(path)?
         .query_row(
-            "SELECT id FROM organizer_jobs WHERE mapping_id=?1 AND status IN ('recognizing','running') LIMIT 1",
-            params![id],
+            "SELECT id FROM organizer_jobs WHERE mapping_id=?1
+             AND (status='running' OR (status='recognizing' AND updated_at>=?2)) LIMIT 1",
+            params![id, stale_before],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -5192,9 +5454,46 @@ async fn recognize_job(
     let job = get_job(&path, id)?.ok_or_else(|| "整理任务不存在".to_string())?;
     let mapping =
         get_mapping(&path, &job.mapping_id)?.ok_or_else(|| "整理监控不存在".to_string())?;
-    let loaded = load_candidate(app, &mapping, &job.source_id)
-        .await?
-        .ok_or_else(|| "待整理云端项目已经不存在".to_string())?;
+    // 识别前置读取失败必须落库为 failed：任务初始状态就是 recognizing，
+    // 若此处直接返回错误，任务会永久停在 recognizing——既不会被轮询重试
+    // （去重查询包含 recognizing），还会让 mapping_idle 永久拒绝修改监控。
+    let loaded = match load_candidate(app, &mapping, &job.source_id).await {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => {
+            update_job_fields(
+                &path,
+                id,
+                &[
+                    ("status", json!("failed")),
+                    ("error_code", json!("source_missing")),
+                    ("message", json!("待整理云端项目已经不存在")),
+                ],
+            )?;
+            emit(
+                app,
+                "job-updated",
+                json!({ "job_id": id, "mapping_id": mapping.id, "status": "failed" }),
+            );
+            return get_job(&path, id)?.ok_or_else(|| "整理任务不存在".to_string());
+        }
+        Err(error) => {
+            update_job_fields(
+                &path,
+                id,
+                &[
+                    ("status", json!("failed")),
+                    ("error_code", json!("source_unavailable")),
+                    ("message", json!(format!("读取待整理云端内容失败：{error}"))),
+                ],
+            )?;
+            emit(
+                app,
+                "job-updated",
+                json!({ "job_id": id, "mapping_id": mapping.id, "status": "failed", "message": error }),
+            );
+            return Err(error);
+        }
+    };
     let overrides = resolved_overrides(&job, &mapping, &input);
     update_job_fields(
         &path,
@@ -5407,11 +5706,18 @@ fn schedule_candidate(
                 )
                 .optional()
                 .map_err(|error| format!("读取重复整理任务失败：{error}"))?;
-            let job_id = if let Some(job_id) = duplicate {
-                job_id
-            } else {
-                insert_job(&path, &mapping, &loaded.candidate, &loaded.fingerprint, share_after.unwrap_or(mapping.share_after_organize))?
-            };
+            if let Some(job_id) = duplicate {
+                // 命中同签名的已有任务：绝不重新识别或执行（对齐 Node 端）。
+                // 复制模式下 A 目录源文件长期存在，每轮轮询都会命中同一签名；
+                // 旧逻辑会把 completed 任务打回 recognizing 并重复执行——
+                // "保留两份"策略下每 15 秒生成一份重复文件，开启自动分享时
+                // 每轮创建一个新分享。
+                if let Some(true) = share_after {
+                    update_job_fields(&path, &job_id, &[("share_after_requested", json!(1))])?;
+                }
+                return Ok(());
+            }
+            let job_id = insert_job(&path, &mapping, &loaded.candidate, &loaded.fingerprint, share_after.unwrap_or(mapping.share_after_organize))?;
             if let Some(true) = share_after {
                 update_job_fields(&path, &job_id, &[("share_after_requested", json!(1))])?;
             }
@@ -5491,15 +5797,17 @@ async fn execute_job(
         json!({ "job_id": id, "mapping_id": mapping.id, "status": "running" }),
     );
     let outcome = async {
-        let (transferred, skipped, targets) = execute_transfers(app, &mapping, &preview).await?;
+        // 转移、刮削与分享共享同一份目标目录缓存，写操作后按父目录精确失效。
+        let mut resolver = TargetResolver::new();
+        let (transferred, skipped, targets) =
+            execute_transfers(app, &mapping, &preview, &mut resolver).await?;
         let (scraped, scrape_skipped, mut warnings) =
-            execute_scrape(app, &mapping, &preview, &secrets.tmdb_proxy).await;
-        if mapping.transfer_type == "move" {
-            warnings.push("云端移动会使来源资源的已有分享失效；光鸭没有复用来源分享".to_string());
-        }
+            execute_scrape(app, &mapping, &preview, &secrets.tmdb_proxy, &mut resolver).await;
         let mut share = None;
         if job.share_after_requested || mapping.share_after_organize {
-            match ensure_target_directory(app, &mapping, &preview.share_relative_path).await {
+            match ensure_target_directory(app, &mapping, &preview.share_relative_path, &mut resolver)
+                .await
+            {
                 Ok(target_id) => match create_fresh_organizer_share(
                     app.clone(),
                     &mapping.id,
@@ -5557,8 +5865,11 @@ async fn execute_job(
     } else {
         "completed_warning"
     };
+    // 移动模式的固定说明只进 message，不进 warnings：它不是异常，
+    // 不应把所有移动任务都渲染成 completed_warning，把真正的刮削失败
+    // 淹没在同一个提示堆里。
     let message = format!(
-        "云盘整理完成：转移 {} 项，刮削 {} 项{}{}",
+        "云盘整理完成：转移 {} 项，刮削 {} 项{}{}{}",
         result.transferred,
         result.scraped,
         if result.share.is_some() {
@@ -5570,6 +5881,11 @@ async fn execute_job(
             String::new()
         } else {
             format!("；{} 项提示", result.warnings.len())
+        },
+        if mapping.transfer_type == "move" {
+            "；提醒：云端移动会使来源资源的已有分享失效"
+        } else {
+            ""
         }
     );
     update_job_fields(
@@ -5690,7 +6006,28 @@ async fn polling_loop(app: tauri::AppHandle, state: OrganizerSharedState) {
             Err(_) => continue,
         };
         for mapping in mappings {
-            let _ = scan_mapping_inner(&app, &state, &mapping.id, false, None, None, None).await;
+            if let Err(error) =
+                scan_mapping_inner(&app, &state, &mapping.id, false, None, None, None).await
+            {
+                // 轮询失败要落库并通知前端，否则登录态失效/目录被删时监控
+                // 看起来一切正常，只是永远不产出任务。
+                if let Ok(path) = database_path(&state) {
+                    let _ = open_database(&path).and_then(|connection| {
+                        connection
+                            .execute(
+                                "UPDATE organizer_mappings SET watch_error=?1, updated_at=?2 WHERE id=?3",
+                                params![error, now_seconds(), mapping.id],
+                            )
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    });
+                }
+                emit(
+                    &app,
+                    "mapping-error",
+                    json!({ "mapping_id": mapping.id, "message": error }),
+                );
+            }
         }
     }
 }
@@ -6256,8 +6593,15 @@ pub async fn update_organizer_mapping(
     list_cloud_children(&app, &mapping.target_dir_id).await?;
     let mapping = OrganizerMapping { id, ..mapping };
     save_mapping(&path, &mapping)?;
+    // 只把旧预览打回待复核，不删除任务：needs_review 队列是用户的人工复核
+    // 工作区，调一次模板就整队清空的旧行为会丢掉所有待处理任务。
     open_database(&path)?
-        .execute("DELETE FROM organizer_jobs WHERE mapping_id=?1 AND status IN ('recognizing','ready','needs_review')", params![mapping.id])
+        .execute(
+            "UPDATE organizer_jobs SET status='needs_review', preview_json=NULL,
+             error_code='config_changed', message='整理配置已变更，请重新识别'
+             WHERE mapping_id=?1 AND status IN ('recognizing','ready')",
+            params![mapping.id],
+        )
         .map_err(|error| format!("清理旧整理预览失败：{error}"))?;
     emit(&app, "mapping-updated", json!({ "mapping_id": mapping.id }));
     get_mapping(&path, &mapping.id)?.ok_or_else(|| "整理监控保存后无法读取".to_string())
@@ -6388,7 +6732,8 @@ pub async fn share_organizer_job(
     if preview.share_relative_path.trim().is_empty() {
         return Err("整理预览缺少最终媒体目录，无法创建分享".to_string());
     }
-    let target = resolve_target(&app, &mapping, &preview.share_relative_path)
+    let mut resolver = TargetResolver::new();
+    let target = resolve_target(&app, &mapping, &preview.share_relative_path, &mut resolver)
         .await?
         .filter(|entry| entry.is_directory)
         .ok_or_else(|| "最终媒体目录已经不存在，无法创建分享".to_string())?;
@@ -6445,6 +6790,27 @@ pub async fn run_organizer_job(
         || input.clear_episode
         || input.clear_episode_end;
     if has_overrides || job.preview.is_none() || job.status == "needs_review" {
+        return recognize_job(&app, state.inner(), &id, input, true).await;
+    }
+    // 源内容或整理配置在预览后发生变化时自动重新识别再执行（对齐 Node 端），
+    // 而不是让 execute_job 抛"请先重新识别"逼用户手动再点一次。
+    let mapping =
+        get_mapping(&path, &job.mapping_id)?.ok_or_else(|| "整理监控不存在".to_string())?;
+    let secrets = load_secrets(&path)?;
+    let preview_stale = job.preview.as_ref().is_some_and(|preview| {
+        preview.mapping_signature != mapping_signature(&mapping, &secrets)
+    });
+    let source_changed = if preview_stale {
+        false
+    } else {
+        let loaded = load_candidate(&app, &mapping, &job.source_id)
+            .await?
+            .ok_or_else(|| "待整理云端项目已经不存在".to_string())?;
+        job.preview.as_ref().is_some_and(|preview| {
+            loaded.fingerprint.signature != preview.source_signature
+        })
+    };
+    if preview_stale || source_changed {
         recognize_job(&app, state.inner(), &id, input, true).await
     } else {
         execute_job(&app, state.inner(), &id).await
@@ -6458,6 +6824,19 @@ pub async fn retry_organizer_job(
     id: String,
     input: OrganizerJobInput,
 ) -> Result<OrganizerJob, String> {
+    // 整理进行中禁止重新识别：识别会清空 preview_json 并改写状态，
+    // 与正在执行的转移流程互相覆盖会导致回滚信息错乱。
+    let path = database_path(state.inner())?;
+    let job = get_job(&path, &id)?.ok_or_else(|| "整理任务不存在".to_string())?;
+    if job.status == "running" {
+        return Err("该任务正在整理，请等待完成".to_string());
+    }
+    {
+        let runtime = state.inner().lock().map_err(|error| error.to_string())?;
+        if runtime.running_jobs.contains(&id) {
+            return Err("该任务正在整理，请等待完成".to_string());
+        }
+    }
     recognize_job(&app, state.inner(), &id, input, false).await
 }
 

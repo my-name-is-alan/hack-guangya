@@ -47,17 +47,16 @@ onMounted(load)
 
 <style scoped>
 .network-panel { max-width: 980px; padding: 8px 18px 36px 24px; }
-.panel-lead { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 16px; }
-.panel-lead strong, .panel-lead span { display: block; }
-.panel-lead strong { font-size: 18px; }
-.panel-lead span { max-width: 680px; margin-top: 5px; color: var(--text-3, #98a2b3); font-size: 12px; line-height: 1.55; }
-.lead-icon { color: var(--primary, #1677ff); font-size: 24px; }
+/* 标题排版沿用全局 .panel-lead；此处仅保留本面板的双栏布局。 */
+.panel-lead { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.panel-lead span { max-width: 680px; line-height: 1.55; }
+.lead-icon { color: var(--primary, #262626); font-size: 24px; }
 .network-alert { margin-bottom: 16px; }
-.proxy-card { display: grid; grid-template-columns: 30px minmax(0, 1fr); align-items: start; gap: 12px; padding: 16px; border: 1px solid var(--line, #e5e7eb); border-radius: 10px; background: var(--surface, #fff); }
-.proxy-card-icon { display: grid; width: 28px; height: 28px; place-items: center; border-radius: 50%; color: var(--primary, #1677ff); background: var(--primary-soft, #f0f5ff); font-size: 18px; }
+.proxy-card { display: grid; grid-template-columns: 30px minmax(0, 1fr); align-items: start; gap: 12px; padding: 16px; border: 1px solid var(--line, #e5e5e5); border-radius: 10px; background: var(--surface, #fff); }
+.proxy-card-icon { display: grid; width: 28px; height: 28px; place-items: center; border-radius: 50%; color: var(--primary, #262626); background: var(--primary-soft, #f5f5f5); font-size: 18px; }
 .proxy-card-copy { min-width: 0; }
 .proxy-card strong, .proxy-card small { display: block; }
-.proxy-card small { margin: 3px 0 10px; color: var(--text-3, #98a2b3); font-size: 11px; line-height: 1.5; }
+.proxy-card small { margin: 3px 0 10px; color: var(--text-3, #737373); font-size: 11px; line-height: 1.5; }
 .panel-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 @media (max-width: 680px) { .network-panel { padding-inline: 14px; } .panel-actions { align-items: stretch; flex-direction: column; } .panel-actions .ant-btn { width: 100%; } }
 </style>

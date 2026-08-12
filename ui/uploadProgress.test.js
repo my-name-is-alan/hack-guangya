@@ -1,14 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import {
   formatUploadSpeed,
   nextUploadProgress,
   orderUploadProgress,
   uploadProgressStatus,
 } from './uploadProgress.js';
+import { readRustBackendSourceSync } from './rustBackendSource.js';
 
-const rustSource = readFileSync(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+const rustSource = readRustBackendSourceSync();
 
 test('a delayed progress event cannot regress a completed upload', () => {
   const done = { percent: 100, state: 'done', stage: '上传完成', updatedAt: 10 };

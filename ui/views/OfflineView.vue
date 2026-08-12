@@ -3,8 +3,10 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'v
 import { message, Modal } from 'antdv-next';
 import { DeleteOutlined, DownloadOutlined, FolderOpenOutlined, InboxOutlined, RedoOutlined, ReloadOutlined, StopOutlined } from '@antdv-next/icons';
 import CloudFolderPicker from '../components/cloud/CloudFolderPicker.vue';
+import PageHeader from '../components/layout/PageHeader.vue';
 import { appState } from '../store.js';
 import { bridge } from '../bridge.js';
+import { useFilesStore } from '../stores/files.ts';
 import { errorText, formatSize, offlineProgress, offlineStatus, pick, unwrapData } from '../formatters.js';
 
 const pageSize = 100;
@@ -92,6 +94,35 @@ function isTerminalTask(record) {
   const number = numericStatus(record);
   if (number !== null) return [2, 3, 4, 5].includes(number);
   return isPartialTask(record) || /success|done|complete|finish|fail|error|cancel|forbid|violation/.test(statusToken(record));
+}
+
+function isCompletedTask(record) {
+  if (!isTerminalTask(record)) return false;
+  const number = numericStatus(record);
+  if (number !== null) return number === 2 || number === 5;
+  const token = statusToken(record);
+  return isPartialTask(record) || (/success|done|complete|finish/.test(token) && !/fail|error|cancel/.test(token));
+}
+
+// 离线任务在云端异步落盘，整条链路没有目录失效回调；这里在轮询观察到任务
+// 从"进行中"转为"完成"时，主动失效其目标目录，让文件列表和缓存及时更新。
+const filesStore = useFilesStore();
+const observedTaskPhases = new Map();
+function reconcileCompletedOfflineTasks(tasks) {
+  const completedParents = new Set();
+  for (const record of tasks) {
+    const id = String(taskId(record) || '');
+    if (!id) continue;
+    const phase = isTerminalTask(record) ? 'terminal' : 'running';
+    const previous = observedTaskPhases.get(id);
+    observedTaskPhases.set(id, phase);
+    if (previous === 'running' && phase === 'terminal' && isCompletedTask(record)) {
+      completedParents.add(String(pick(record, ['parentId', 'parent_id', 'targetParentId'], '')));
+    }
+  }
+  if (completedParents.size) {
+    filesStore.handleDirectoryInvalidation({ parent_ids: [...completedParents] });
+  }
 }
 
 function displayStatus(record) {
@@ -207,6 +238,7 @@ async function loadOffline(cursor = currentCursor.value, { remember = false, pre
     const data = unwrapData(await bridge.invoke('list_offline_tasks', { cursor: normalizedCursor, page_size: pageSize }));
     const list = data.list || data.taskList || data.tasks || data.items || [];
     offlineTasks.value = Array.isArray(list) ? list : [];
+    reconcileCompletedOfflineTasks(offlineTasks.value);
     offlineTotal.value = Number(data.total ?? data.totalCount ?? offlineTasks.value.length) || 0;
     nextCursor.value = String(data.cursor ?? data.nextCursor ?? data.next_cursor ?? '');
     hasMore.value = data.hasMore === true || data.has_more === true;
@@ -411,6 +443,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="view-section">
+    <PageHeader title="云添加" description="解析磁力 / HTTP / ED2K 资源并直接离线下载到云盘目录。" />
     <div class="plain-toolbar">
       <div v-if="selectedKeys.length" class="offline-selection" role="status">
         已选 {{ selectedKeys.length }} 项
@@ -516,10 +549,10 @@ onBeforeUnmount(() => {
 .offline-alert { margin-bottom: 10px; }
 .offline-selection { color: var(--text-2, #525252); }
 .offline-summary strong, .offline-summary span { display: block; }
-.offline-summary span { margin-top: 2px; color: var(--text-3, #98a2b3); font-size: 12px; }
+.offline-summary span { margin-top: 2px; color: var(--text-3, #737373); font-size: 12px; }
 .offline-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.offline-error { display: block; overflow: hidden; color: var(--danger, #cf1322); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.offline-footer { display: flex; min-height: 42px; align-items: center; justify-content: space-between; color: var(--text-3, #98a2b3); font-size: 12px; }
-.resolve-line { display: flex; align-items: center; justify-content: space-between; color: var(--text-3, #98a2b3); font-size: 12px; }
+.offline-error { display: block; overflow: hidden; color: var(--danger, #ef4444); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.offline-footer { display: flex; min-height: 42px; align-items: center; justify-content: space-between; color: var(--text-3, #737373); font-size: 12px; }
+.resolve-line { display: flex; align-items: center; justify-content: space-between; color: var(--text-3, #737373); font-size: 12px; }
 .obfuscation-alert { margin-top: 12px; }
 </style>

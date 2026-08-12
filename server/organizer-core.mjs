@@ -1583,8 +1583,13 @@ export async function buildCloudNativePreview({ analysis, match, mapping, settin
     if (metadata.media_type === 'tv' && scrapeTypes.has('season_poster')) {
       for (const season of Object.values(metadata.seasons || {})) {
         if (!season.poster_url) continue;
+        // 只为本次实际整理到的季生成季海报：TMDB 返回剧集的全部季，找不到
+        // 对应季视频时回落到剧集根目录会与主海报 poster.jpg 撞名，冲突去重
+        // 产出 poster [hash].jpg 垃圾文件（与 Rust 端保持一致）。
         const seasonVideo = mainVideos.find((item) => Number(item.season) === Number(season.season_number));
-        const seasonRoot = seasonVideo ? seasonDirectoryForCloudVideo(seasonVideo, mediaRoot) : mediaRoot;
+        if (!seasonVideo) continue;
+        const seasonRoot = seasonDirectoryForCloudVideo(seasonVideo, mediaRoot);
+        if (seasonRoot === mediaRoot) continue;
         await addGenerated({ relative: path.posix.join(seasonRoot, 'poster.jpg'), kind: 'image', operation: 'download', source: season.poster_url, imageRole: 'season-poster', season: season.season_number, message: `下载第 ${season.season_number} 季海报` });
       }
     }

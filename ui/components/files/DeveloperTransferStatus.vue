@@ -53,7 +53,7 @@ const leadPercent = computed(() => developerTransferPercent(lead.value));
 </template>
 
 <style scoped>
-.transfer-task-trigger { display: grid; min-width: 202px; height: 32px; grid-template-columns: auto minmax(50px, 1fr) auto auto; align-items: center; gap: 8px; padding: 0 9px; border: 1px solid var(--primary-line, #d9d9d9); border-radius: 8px; color: var(--text-2, #525252); background: var(--surface, #fff); font: inherit; cursor: pointer; }
+.transfer-task-trigger { display: grid; min-width: 202px; height: var(--h-md, 28px); grid-template-columns: auto minmax(50px, 1fr) auto auto; align-items: center; gap: 8px; padding: 0 9px; border: 1px solid var(--primary-line, #e5e5e5); border-radius: 8px; color: var(--text-2, #525252); background: var(--surface, #fff); font: inherit; cursor: pointer; }
 .transfer-task-trigger:hover { border-color: var(--primary, #262626); background: var(--primary-soft, #f5f5f5); }
 .transfer-task-trigger:focus-visible { outline: 2px solid var(--primary, #262626); outline-offset: 2px; }
 .transfer-task-label { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
@@ -67,7 +67,7 @@ const leadPercent = computed(() => developerTransferPercent(lead.value));
 .transfer-job-heading strong, .transfer-job-heading span { display: block; }
 .transfer-job-heading strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .transfer-job-heading span { margin-top: 3px; color: var(--text-3, #737373); font-size: 12px; }
-.transfer-job-icon { display: grid; width: 36px; height: 36px; place-items: center; border-radius: 9px; color: var(--primary, #1677ff); background: var(--primary-soft, #f0f5ff); }
+.transfer-job-icon { display: grid; width: 36px; height: 36px; place-items: center; border-radius: 9px; color: var(--primary, #262626); background: var(--primary-soft, #f5f5f5); }
 .transfer-current, .transfer-message { margin: -3px 0 0; color: var(--text-3, #737373); font-size: 12px; line-height: 1.5; }
 .transfer-current { overflow: hidden; color: var(--text-2, #525252); text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 760px) { .transfer-task-trigger { min-width: 168px; } .transfer-task-label { font-size: 0; } .transfer-task-label :deep(.anticon) { font-size: 13px; } }

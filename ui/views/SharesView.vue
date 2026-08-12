@@ -11,6 +11,7 @@ import {
   SearchOutlined,
 } from '@antdv-next/icons';
 import { bridge } from '../bridge.js';
+import PageHeader from '../components/layout/PageHeader.vue';
 import FavoriteLinkDialog from '../components/shares/FavoriteLinkDialog.vue';
 import ReceiveShareDialog from '../components/shares/ReceiveShareDialog.vue';
 import { parseGuangyaShareLink } from '../shareLink.js';
@@ -302,6 +303,7 @@ onMounted(loadCloudShares);
 
 <template>
   <div class="view-section">
+    <PageHeader title="分享管理" description="管理分享链接的状态、有效期与流量，收藏常用分享。" />
     <a-tabs v-model:active-key="shareTab" class="page-tabs" :animated="false">
       <template #rightExtra>
         <a-space wrap>
@@ -413,10 +415,10 @@ onMounted(loadCloudShares);
 
 <style scoped>
 .share-search { width: 220px; }
-.share-toolbar { display: flex; min-height: 46px; align-items: center; justify-content: space-between; gap: 16px; }
+.share-toolbar { display: flex; min-height: var(--toolbar-h, 42px); align-items: center; justify-content: space-between; gap: 16px; }
 .selection-summary { color: var(--text-2, #525252); }
 .share-counts { color: var(--text-2, #525252); font-size: 12px; white-space: nowrap; }
-.form-help { display: block; margin-top: 6px; color: var(--text-3, #98a2b3); font-size: 12px; }
+.form-help { display: block; margin-top: 6px; color: var(--text-3, #737373); font-size: 12px; }
 @media (max-width: 900px) {
   .share-toolbar { align-items: flex-start; flex-direction: column; padding: 8px 0; }
   .share-search { width: 180px; }

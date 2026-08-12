@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import { readRustBackendSourceSync } from './rustBackendSource.js';
 
 const cloudViewSource = readFile(new URL('./views/CloudView.vue', import.meta.url), 'utf8');
-const appSource = readFile(new URL('./App.vue', import.meta.url), 'utf8');
 const fileSelectionBarSource = readFile(new URL('./components/files/FileSelectionBar.vue', import.meta.url), 'utf8');
 const gcidImportStatusSource = readFile(new URL('./components/files/GcidImportStatus.vue', import.meta.url), 'utf8');
 const renameRulesSource = readFile(new URL('./renameRules.js', import.meta.url), 'utf8');
@@ -108,7 +108,7 @@ test('desktop download progress exposes concurrent range mode', async () => {
 });
 
 test('active transfer management can pause resume and cancel downloads', async () => {
-  const [transferStoreSource, transferViewSource, desktopAppSource] = await Promise.all([transfersSource, transfersViewSource, appSource]);
+  const [transferStoreSource, transferViewSource] = await Promise.all([transfersSource, transfersViewSource]);
   assert.match(transferStoreSource, /bridge\.invoke\(['"]pause_download['"],\s*\{ task_id: id \}\)/);
   assert.match(transferStoreSource, /bridge\.invoke\(['"]resume_download['"],\s*\{ task_id: id \}\)/);
   assert.match(transferStoreSource, /bridge\.invoke\(['"]cancel_download['"],\s*\{ task_id: id \}\)/);
@@ -121,12 +121,6 @@ test('active transfer management can pause resume and cancel downloads', async (
   assert.match(transferViewSource, /继续下载/);
   assert.match(transferViewSource, /临时分片会被清理/);
   assert.match(transferViewSource, /item\.status === 'cancelled'/);
-  assert.match(desktopAppSource, /bridge\.invoke\(['"]pause_download['"],\s*\{ task_id: task\.id \}\)/);
-  assert.match(desktopAppSource, /bridge\.invoke\(['"]resume_download['"],\s*\{ task_id: task\.id \}\)/);
-  assert.match(desktopAppSource, /bridge\.invoke\(['"]cancel_download['"],\s*\{ task_id: task\.id \}\)/);
-  assert.match(desktopAppSource, /localDownloadQueue\.cancel\(task\.id\)/);
-  assert.match(desktopAppSource, /临时分片会被清理/);
-  assert.match(desktopAppSource, /task\.segmented && task\.connections > 1/);
 });
 
 test('active transfer management can cancel uploads without reviving cancelled rows', async () => {
@@ -141,14 +135,14 @@ test('active transfer management can cancel uploads without reviving cancelled r
 });
 
 test('active uploads expose pause and checkpoint resume across both runtimes', async () => {
-  const [transferStoreSource, transferViewSource, cloudSource, bridgeSource, serverSource, rustSource] = await Promise.all([
+  const [transferStoreSource, transferViewSource, cloudSource, bridgeSource, serverSource] = await Promise.all([
     transfersSource,
     transfersViewSource,
     cloudViewSource,
     readFile(new URL('./bridge.js', import.meta.url), 'utf8'),
     readFile(new URL('../server/server.mjs', import.meta.url), 'utf8'),
-    readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8'),
   ]);
+  const rustSource = readRustBackendSourceSync();
   assert.match(transferStoreSource, /async function pauseUpload\(filePath: string\)/);
   assert.match(transferStoreSource, /async function resumeUpload\(filePath: string\)/);
   assert.match(transferStoreSource, /bridge\.invoke\(['"]pause_upload['"],\s*\{ file_path: key, mapping_id: task\.mappingId \}\)/);

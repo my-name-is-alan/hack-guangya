@@ -2,14 +2,16 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-test('shadcn theme uses Vue-native static styles and compact controls', async () => {
+test('shadcn theme uses Vue-native static styles and readable default controls', async () => {
   const source = await readFile(new URL('./illustrationTheme.ts', import.meta.url), 'utf8');
 
   assert.match(source, /import \{ createStaticStyles \} from 'antdv-style'/);
   assert.doesNotMatch(source, /\bcreateStyles\b/);
   assert.doesNotMatch(source, /from 'react'/);
   assert.doesNotMatch(source, /\bclsx\b/);
-  assert.match(source, /componentSize: 'small'/);
+  // 默认控件尺寸必须是 middle（28px）：全局 small 会让整个桌面端过于局促，
+  // 高密度场景（表格等）按需显式 size="small"。
+  assert.match(source, /componentSize: 'middle'/);
   assert.match(source, /controlHeight: 28/);
   assert.match(source, /controlHeightSM: 22/);
   assert.match(source, /controlHeightLG: 34/);

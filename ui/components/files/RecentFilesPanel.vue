@@ -157,8 +157,8 @@ onMounted(() => loadRecent());
 <style scoped>
 .files-panel { min-height: 0; }
 .panel-summary strong, .panel-summary span { display: block; }
-.panel-summary span { margin-top: 2px; color: var(--text-3, #98a2b3); font-size: 12px; }
+.panel-summary span { margin-top: 2px; color: var(--text-3, #737373); font-size: 12px; }
 .panel-alert { margin-bottom: 10px; }
 .recent-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.panel-footer { display: flex; min-height: 42px; align-items: center; justify-content: space-between; color: var(--text-3, #98a2b3); font-size: 12px; }
+.panel-footer { display: flex; min-height: 42px; align-items: center; justify-content: space-between; color: var(--text-3, #737373); font-size: 12px; }
 </style>
