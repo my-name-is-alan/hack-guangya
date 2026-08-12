@@ -2,6 +2,11 @@
 
 历史版本的说明见 [GitHub Releases](https://github.com/my-name-is-alan/hack-guangya/releases)。
 
+## v0.1.38 - 2026-08-12
+
+- GCID/CID 导入遇到远程目录或文件“名称不可用”时，先使用 `gy_<随机值>` 临时名称完成创建/秒传，入库后再恢复原名。
+- 原名恢复失败时保留云端文件 ID 和临时名，后续仅重试改名，避免重复秒传；名称规则错误不再原样重试 5 次。
+
 ## v0.1.37 - 2026-08-12
 
 - GCID/CID 导入兼容 PikPak 的 `source: "pikpak"` 与 `containsCid: true` 导出格式。

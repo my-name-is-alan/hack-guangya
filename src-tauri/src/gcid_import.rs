@@ -11,14 +11,26 @@ pub(crate) struct GcidImportFile {
     pub(crate) gcid: String,
     pub(crate) cid: String,
     pub(crate) attempts: i64,
+    pub(crate) task_id: Option<String>,
+    pub(crate) file_id: Option<String>,
+    pub(crate) temporary_name: Option<String>,
 }
 
 #[derive(Debug)]
 pub(crate) enum GcidImportOutcome {
-    Imported { task_id: String, file_id: String },
+    Imported {
+        task_id: Option<String>,
+        file_id: String,
+    },
     Existing { file_id: String },
     Missed { task_id: String },
     Conflict(String),
+    RestoreFailed {
+        task_id: Option<String>,
+        file_id: String,
+        temporary_name: String,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -155,6 +167,9 @@ pub(crate) fn parse_gcid_export(raw: &[u8]) -> Result<(Vec<GcidImportFile>, u128
             gcid,
             cid,
             attempts: 0,
+            task_id: None,
+            file_id: None,
+            temporary_name: None,
         });
     }
     if let Some(declared) = export.total_size.as_ref() {
@@ -252,8 +267,8 @@ pub(crate) fn prepare_gcid_import_database(
             .prepare(
                 "INSERT INTO gcid_import_files
                    (job_id, path, folder_path, file_name, file_size, gcid, cid,
-                    status, attempts, task_id, file_id, error, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0, NULL, NULL, NULL, ?8)
+                    status, attempts, task_id, file_id, temporary_name, error, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0, NULL, NULL, NULL, NULL, ?8)
                  ON CONFLICT(job_id, path) DO UPDATE SET
                    folder_path = excluded.folder_path,
                    file_name = excluded.file_name,
@@ -262,8 +277,16 @@ pub(crate) fn prepare_gcid_import_database(
                    cid = excluded.cid,
                    status = 'pending',
                    attempts = 0,
-                   task_id = NULL,
-                   file_id = NULL,
+                   task_id = CASE
+                     WHEN gcid_import_files.temporary_name IS NOT NULL
+                       AND gcid_import_files.file_id IS NOT NULL
+                     THEN gcid_import_files.task_id ELSE NULL END,
+                   file_id = CASE
+                     WHEN gcid_import_files.temporary_name IS NOT NULL
+                     THEN gcid_import_files.file_id ELSE NULL END,
+                   temporary_name = CASE
+                     WHEN gcid_import_files.file_id IS NOT NULL
+                     THEN gcid_import_files.temporary_name ELSE NULL END,
                    error = NULL,
                    updated_at = excluded.updated_at",
             )
@@ -341,7 +364,7 @@ pub(crate) fn reset_all_gcid_import_files(database_path: &Path, job_id: &str) ->
         .execute(
             "UPDATE gcid_import_files
              SET status = 'pending', attempts = 0, task_id = NULL, file_id = NULL,
-                 error = NULL, updated_at = ?2
+                 temporary_name = NULL, error = NULL, updated_at = ?2
              WHERE job_id = ?1",
             params![job_id, unix_timestamp()],
         )
@@ -353,7 +376,10 @@ pub(crate) fn reset_retryable_gcid_import_files(database_path: &Path, job_id: &s
     open_database(database_path)?
         .execute(
             "UPDATE gcid_import_files
-             SET status = 'pending', attempts = 0, task_id = NULL, file_id = NULL,
+             SET status = 'pending', attempts = 0,
+                 task_id = CASE WHEN status = 'failed' AND temporary_name IS NOT NULL THEN task_id ELSE NULL END,
+                 file_id = CASE WHEN status = 'failed' AND temporary_name IS NOT NULL THEN file_id ELSE NULL END,
+                 temporary_name = CASE WHEN status = 'failed' THEN temporary_name ELSE NULL END,
                  error = NULL, updated_at = ?2
              WHERE job_id = ?1
                AND status IN ('processing', 'failed', 'missed', 'conflict')",
@@ -459,7 +485,8 @@ pub(crate) fn claim_gcid_import_file(
         .map_err(|error| format!("开始领取导入记录失败：{error}"))?;
     let record = transaction
         .query_row(
-            "SELECT path, folder_path, file_name, file_size, gcid, cid, attempts
+            "SELECT path, folder_path, file_name, file_size, gcid, cid, attempts,
+                    task_id, file_id, temporary_name
              FROM gcid_import_files
              WHERE job_id = ?1 AND status = 'pending'
              ORDER BY path
@@ -474,6 +501,9 @@ pub(crate) fn claim_gcid_import_file(
                     gcid: row.get(4)?,
                     cid: row.get(5)?,
                     attempts: row.get(6)?,
+                    task_id: row.get(7)?,
+                    file_id: row.get(8)?,
+                    temporary_name: row.get(9)?,
                 })
             },
         )
@@ -539,7 +569,8 @@ pub(crate) fn finish_gcid_import_file(
     open_database(database_path)?
         .execute(
             "UPDATE gcid_import_files
-             SET status = ?3, task_id = ?4, file_id = ?5, error = ?6, updated_at = ?7
+             SET status = ?3, task_id = ?4, file_id = ?5, temporary_name = NULL,
+                 error = ?6, updated_at = ?7
              WHERE job_id = ?1 AND path = ?2",
             params![
                 job_id,
@@ -552,6 +583,35 @@ pub(crate) fn finish_gcid_import_file(
             ],
         )
         .map_err(|error| format!("保存导入结果失败：{error}"))?;
+    Ok(())
+}
+
+pub(crate) fn finish_gcid_import_restore_failure(
+    database_path: &Path,
+    job_id: &str,
+    path: &str,
+    task_id: Option<&str>,
+    file_id: &str,
+    temporary_name: &str,
+    error: &str,
+) -> Result<(), String> {
+    open_database(database_path)?
+        .execute(
+            "UPDATE gcid_import_files
+             SET status = 'failed', task_id = ?3, file_id = ?4, temporary_name = ?5,
+                 error = ?6, updated_at = ?7
+             WHERE job_id = ?1 AND path = ?2",
+            params![
+                job_id,
+                path,
+                task_id,
+                file_id,
+                temporary_name,
+                error,
+                unix_timestamp()
+            ],
+        )
+        .map_err(|database_error| format!("保存导入原名恢复任务失败：{database_error}"))?;
     Ok(())
 }
 
@@ -607,12 +667,32 @@ pub(crate) async fn process_gcid_import_file(
             guard.device_id.clone(),
         )
     };
+    if let (Some(file_id), Some(temporary_name)) = (
+        record.file_id.as_deref(),
+        record.temporary_name.as_deref(),
+    ) {
+        return match rename_remote(&token, &device_id, file_id, &record.name).await {
+            Ok(()) => Ok(GcidImportOutcome::Imported {
+                task_id: record.task_id.clone(),
+                file_id: file_id.to_string(),
+            }),
+            Err(error) => Ok(GcidImportOutcome::RestoreFailed {
+                task_id: record.task_id.clone(),
+                file_id: file_id.to_string(),
+                temporary_name: temporary_name.to_string(),
+                error: format!(
+                    "文件已进入网盘，但恢复原名 {} 失败：{error}",
+                    record.name
+                ),
+            }),
+        };
+    }
     let remote_path = if record.folder_path.is_empty() {
         destination_name.to_string()
     } else {
         format!("{destination_name}/{}", record.folder_path)
     };
-    let parent_id = ensure_remote_path(
+    let parent_id = ensure_remote_path_obfuscated(
         app,
         state,
         &token,
@@ -621,7 +701,7 @@ pub(crate) async fn process_gcid_import_file(
         &remote_path,
     )
     .await?;
-    let response = api_post(
+    let original_response = api_post(
         &token,
         &device_id,
         "/userres/v1/get_res_center_token",
@@ -633,11 +713,53 @@ pub(crate) async fn process_gcid_import_file(
         }),
         &[156, 160],
     )
-    .await?;
+    .await;
+    let (response, submitted_name, restore_original_name) = match original_response {
+        Ok(response) => (response, record.name.clone(), false),
+        Err(error) if remote_name_unavailable(&error) => {
+            let temporary_name = temporary_remote_name(&record.name, true);
+            let response = api_post(
+                &token,
+                &device_id,
+                "/userres/v1/get_res_center_token",
+                json!({
+                    "capacity": 2,
+                    "name": temporary_name,
+                    "res": { "fileSize": record.size },
+                    "parentId": parent_id
+                }),
+                &[156, 160],
+            )
+            .await
+            .map_err(|temporary_error| {
+                format!(
+                    "文件名 {} 不可用，且使用临时名称创建秒传任务失败：{temporary_error}",
+                    record.name
+                )
+            })?;
+            (response, temporary_name, true)
+        }
+        Err(error) => return Err(error),
+    };
     if response.code == 160 {
-        return match find_remote_file(&token, &device_id, &parent_id, &record.name).await? {
+        return match find_remote_file(&token, &device_id, &parent_id, &submitted_name).await? {
             Some((file_id, file_size, 1)) if file_size == record.size => {
-                Ok(GcidImportOutcome::Existing { file_id })
+                if restore_original_name {
+                    match rename_remote(&token, &device_id, &file_id, &record.name).await {
+                        Ok(()) => Ok(GcidImportOutcome::Existing { file_id }),
+                        Err(error) => Ok(GcidImportOutcome::RestoreFailed {
+                            task_id: None,
+                            file_id,
+                            temporary_name: submitted_name,
+                            error: format!(
+                                "文件已进入网盘，但恢复原名 {} 失败：{error}",
+                                record.name
+                            ),
+                        }),
+                    }
+                } else {
+                    Ok(GcidImportOutcome::Existing { file_id })
+                }
             }
             Some((_, file_size, 1)) => Ok(GcidImportOutcome::Conflict(format!(
                 "同名文件大小不一致：云端 {file_size}，导入 {}",
@@ -685,7 +807,27 @@ pub(crate) async fn process_gcid_import_file(
         return Ok(GcidImportOutcome::Missed { task_id });
     }
     let file_id = wait_gcid_import_task(&token, &device_id, &task_id).await?;
-    Ok(GcidImportOutcome::Imported { task_id, file_id })
+    if restore_original_name {
+        return match rename_remote(&token, &device_id, &file_id, &record.name).await {
+            Ok(()) => Ok(GcidImportOutcome::Imported {
+                task_id: Some(task_id),
+                file_id,
+            }),
+            Err(error) => Ok(GcidImportOutcome::RestoreFailed {
+                task_id: Some(task_id),
+                file_id,
+                temporary_name: submitted_name,
+                error: format!(
+                    "文件已进入网盘，但恢复原名 {} 失败：{error}",
+                    record.name
+                ),
+            }),
+        };
+    }
+    Ok(GcidImportOutcome::Imported {
+        task_id: Some(task_id),
+        file_id,
+    })
 }
 
 pub(crate) async fn gcid_import_worker(
@@ -726,7 +868,7 @@ pub(crate) async fn gcid_import_worker(
                         &job_id,
                         &record.path,
                         "imported",
-                        Some(&task_id),
+                        task_id.as_deref(),
                         Some(&file_id),
                         None,
                     );
@@ -773,7 +915,33 @@ pub(crate) async fn gcid_import_worker(
                     terminal = true;
                     break;
                 }
-                Err(error) if attempt < MAX_GCID_IMPORT_ATTEMPTS => {
+                Ok(GcidImportOutcome::RestoreFailed {
+                    task_id,
+                    file_id,
+                    temporary_name,
+                    error,
+                }) => {
+                    let _ = finish_gcid_import_restore_failure(
+                        &database_path,
+                        &job_id,
+                        &record.path,
+                        task_id.as_deref(),
+                        &file_id,
+                        &temporary_name,
+                        &error,
+                    );
+                    status(
+                        &app,
+                        "error",
+                        format!("GCID 导入恢复原名失败：{}：{error}", record.path),
+                    );
+                    terminal = true;
+                    break;
+                }
+                Err(error)
+                    if attempt < MAX_GCID_IMPORT_ATTEMPTS
+                        && gcid_import_error_retryable(&error) =>
+                {
                     let _ = update_gcid_import_attempt(
                         &database_path,
                         &job_id,
@@ -819,6 +987,12 @@ pub(crate) async fn gcid_import_worker(
             emit_gcid_import_status(&app, &database_path, &job_id);
         }
     }
+}
+
+pub(crate) fn gcid_import_error_retryable(error: &str) -> bool {
+    !remote_name_unavailable(error)
+        && !error.contains("恢复原目录名")
+        && !error.contains("临时名称创建秒传任务失败")
 }
 
 pub(crate) async fn run_gcid_import(

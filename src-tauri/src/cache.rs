@@ -543,6 +543,47 @@ pub(crate) async fn ensure_remote_path(
     base_parent_id: &str,
     remote_path: &str,
 ) -> Result<String, String> {
+    ensure_remote_path_with_name_obfuscation(
+        app,
+        state,
+        token,
+        device_id,
+        base_parent_id,
+        remote_path,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn ensure_remote_path_obfuscated(
+    app: &tauri::AppHandle,
+    state: &SharedState,
+    token: &str,
+    device_id: &str,
+    base_parent_id: &str,
+    remote_path: &str,
+) -> Result<String, String> {
+    ensure_remote_path_with_name_obfuscation(
+        app,
+        state,
+        token,
+        device_id,
+        base_parent_id,
+        remote_path,
+        true,
+    )
+    .await
+}
+
+async fn ensure_remote_path_with_name_obfuscation(
+    app: &tauri::AppHandle,
+    state: &SharedState,
+    token: &str,
+    device_id: &str,
+    base_parent_id: &str,
+    remote_path: &str,
+    obfuscate_unavailable_names: bool,
+) -> Result<String, String> {
     let normalized = normalize_remote_path(remote_path);
     if normalized.is_empty() {
         return Ok(base_parent_id.to_string());
@@ -614,14 +655,41 @@ pub(crate) async fn ensure_remote_path(
                     }
                 }
             }
-            let result = api_post(
+            let original_result = api_post(
                 token,
                 device_id,
                 "/userres/v1/file/create_dir",
                 json!({ "parentId": parent, "dirName": part, "failIfNameExist": true }),
                 &[159],
             )
-            .await?;
+            .await;
+            let (result, submitted_name, restore_original_name) = match original_result {
+                Ok(result) => (result, part.to_string(), false),
+                Err(error)
+                    if obfuscate_unavailable_names && remote_name_unavailable(&error) =>
+                {
+                    let temporary_name = temporary_remote_name(part, false);
+                    let result = api_post(
+                        token,
+                        device_id,
+                        "/userres/v1/file/create_dir",
+                        json!({
+                            "parentId": parent,
+                            "dirName": temporary_name,
+                            "failIfNameExist": true
+                        }),
+                        &[159],
+                    )
+                    .await
+                    .map_err(|temporary_error| {
+                        format!(
+                            "远程目录名 {part} 不可用，且临时名称创建失败：{temporary_error}"
+                        )
+                    })?;
+                    (result, temporary_name, true)
+                }
+                Err(error) => return Err(error),
+            };
             let created = result.code != 159;
             let mut file_id = result
                 .data
@@ -630,7 +698,8 @@ pub(crate) async fn ensure_remote_path(
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             if file_id.is_none() && result.code == 159 {
-                file_id = find_remote_folder(token, device_id, &parent, part).await?;
+                file_id =
+                    find_remote_folder(token, device_id, &parent, &submitted_name).await?;
             }
             let file_id = file_id.ok_or_else(|| format!("无法创建或定位远程目录：{prefix}"))?;
             if created {
@@ -643,6 +712,22 @@ pub(crate) async fn ensure_remote_path(
                     [parent.clone()],
                     false,
                     "upload-create-directory",
+                );
+            }
+            if restore_original_name {
+                rename_remote(token, device_id, &file_id, part)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "远程目录已使用临时名称 {submitted_name} 创建，但恢复原目录名 {part} 失败：{error}"
+                        )
+                    })?;
+                webdav::invalidate_directory_cache(&parent);
+                webdav::publish_directory_invalidation(
+                    app,
+                    [parent.clone()],
+                    false,
+                    "upload-restore-directory-name",
                 );
             }
             {

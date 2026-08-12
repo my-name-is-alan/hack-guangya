@@ -2920,7 +2920,7 @@
     }
 
     #[test]
-    fn sqlite_adds_cid_to_legacy_flash_fingerprint_tables() {
+    fn sqlite_adds_flash_hash_and_name_restore_columns_to_legacy_tables() {
         let root =
             std::env::temp_dir().join(format!("guangya-cid-migration-test-{}", Uuid::new_v4()));
         let database = root.join("state.sqlite3");
@@ -2979,6 +2979,9 @@
                 .collect::<Result<Vec<_>, _>>()
                 .expect("columns");
             assert!(columns.iter().any(|column| column == "cid"));
+            if table == "gcid_import_files" {
+                assert!(columns.iter().any(|column| column == "temporary_name"));
+            }
         }
         drop(connection);
         let policy = CacheSettings {
@@ -3344,6 +3347,66 @@
         assert_eq!(first.len(), 32);
         assert!(validate_gcid_destination("Media Library").is_ok());
         assert!(validate_gcid_destination("../Media Library").is_err());
+    }
+
+    #[test]
+    fn gcid_import_name_obfuscation_preserves_file_extension_and_stops_permanent_retries() {
+        let file_name = temporary_remote_name("5_6059908845579280604.MP4", true);
+        let directory_name = temporary_remote_name("习呆呆", false);
+        assert!(file_name.starts_with("gy_"));
+        assert!(file_name.ends_with(".MP4"));
+        assert_eq!(file_name.len(), 27);
+        assert!(directory_name.starts_with("gy_"));
+        assert_eq!(directory_name.len(), 23);
+        assert!(remote_name_unavailable("名称不可用，请更换后重试"));
+        assert!(!gcid_import_error_retryable("名称不可用，请更换后重试"));
+        assert!(gcid_import_error_retryable("网络连接超时"));
+    }
+
+    #[test]
+    fn gcid_import_retry_preserves_pending_name_restore_ids() {
+        let root = std::env::temp_dir().join(format!(
+            "guangya-gcid-name-restore-test-{}",
+            Uuid::new_v4()
+        ));
+        let database = root.join("state.sqlite3");
+        init_database(&database).expect("database should initialize");
+        let connection = open_database(&database).expect("database should open");
+        connection
+            .execute(
+                "INSERT INTO gcid_import_jobs
+                   (job_id, source_path, source_name, destination_parent_id,
+                    destination_name, total_files, total_size, status, created_at, updated_at)
+                 VALUES ('restore-job', 'source.json', 'source.json', '', 'Media Library',
+                         1, '1', 'completed_with_errors', 1, 1)",
+                [],
+            )
+            .expect("job should be inserted");
+        connection
+            .execute(
+                "INSERT INTO gcid_import_files
+                   (job_id, path, folder_path, file_name, file_size, gcid, cid,
+                    status, attempts, task_id, file_id, temporary_name, error, updated_at)
+                 VALUES ('restore-job', 'blocked.mp4', '', 'blocked.mp4', 1, ?1, ?2,
+                         'failed', 1, 'task-1', 'file-1', 'gy_temporary.mp4',
+                         '恢复原名失败', 1)",
+                params![
+                    "0123456789ABCDEF0123456789ABCDEF01234567",
+                    "89ABCDEF0123456789ABCDEF0123456789ABCDEF"
+                ],
+            )
+            .expect("restore row should be inserted");
+        drop(connection);
+
+        reset_retryable_gcid_import_files(&database, "restore-job")
+            .expect("restore row should be requeued");
+        let record = claim_gcid_import_file(&database, "restore-job")
+            .expect("restore row should be claimable")
+            .expect("restore row should exist");
+        assert_eq!(record.task_id.as_deref(), Some("task-1"));
+        assert_eq!(record.file_id.as_deref(), Some("file-1"));
+        assert_eq!(record.temporary_name.as_deref(), Some("gy_temporary.mp4"));
+        fs::remove_dir_all(root).expect("GCID fixture cleanup");
     }
 
     #[test]

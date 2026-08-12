@@ -481,6 +481,32 @@ pub(crate) async fn rename_remote(
     Ok(())
 }
 
+pub(crate) fn remote_name_unavailable(error: &str) -> bool {
+    error.contains("名称不可用") || error.contains("请更换后重试")
+}
+
+pub(crate) fn temporary_remote_name(original_name: &str, preserve_extension: bool) -> String {
+    let extension = preserve_extension
+        .then(|| {
+            Path::new(original_name)
+                .extension()
+                .and_then(|value| value.to_str())
+                .filter(|value| {
+                    !value.is_empty()
+                        && value.len() <= 16
+                        && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+                .map(|value| format!(".{value}"))
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    format!(
+        "gy_{}{}",
+        &Uuid::new_v4().simple().to_string()[..20],
+        extension
+    )
+}
+
 
 pub(crate) fn normalize_api_id(value: &str, label: &str) -> Result<String, String> {
     let value = value.trim();

@@ -158,6 +158,7 @@ pub(crate) fn init_database(path: &Path) -> Result<(), String> {
                attempts INTEGER NOT NULL DEFAULT 0,
                task_id TEXT,
                file_id TEXT,
+               temporary_name TEXT,
                error TEXT,
                updated_at INTEGER NOT NULL,
                PRIMARY KEY (job_id, path)
@@ -263,6 +264,7 @@ pub(crate) fn init_database(path: &Path) -> Result<(), String> {
         "ALTER TABLE uploaded_files ADD COLUMN replacement_json TEXT",
         "ALTER TABLE file_fingerprints ADD COLUMN cid TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE gcid_import_files ADD COLUMN cid TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE gcid_import_files ADD COLUMN temporary_name TEXT",
         "ALTER TABLE developer_transfer_jobs ADD COLUMN work_total_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE developer_transfer_jobs ADD COLUMN processed_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE developer_transfer_jobs ADD COLUMN current_path TEXT NOT NULL DEFAULT ''",
