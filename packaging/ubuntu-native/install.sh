@@ -64,6 +64,7 @@ append_env_default GUANGYA_ADMIN_USERNAME admin
 append_env_default GUANGYA_WATCH_ROOT /var/lib/guangya-sync/watch
 append_env_default GUANGYA_ARCHIVE_ROOT /var/lib/guangya-sync/archive
 append_env_default GUANGYA_VIRTUAL_LIBRARY_ROOT /var/lib/guangya-sync/virtual-library
+append_env_default GUANGYA_EMBY_UPSTREAM http://127.0.0.1:8096
 append_env_default GUANGYA_WEBDAV_REDIRECT auto
 append_env_default GUANGYA_FILE_ROOTS /var/lib/guangya-sync/watch,/var/lib/guangya-sync/archive
 append_env_default GUANGYA_RCLONE_PATH /opt/guangya-sync/bin/rclone

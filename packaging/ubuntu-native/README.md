@@ -5,8 +5,8 @@
 ## 安装
 
 ```bash
-tar -xzf guangya-sync-native-ubuntu-x64-0.1.40.tar.gz
-cd guangya-sync-native-ubuntu-x64-0.1.40
+tar -xzf guangya-sync-native-ubuntu-x64-0.1.41.tar.gz
+cd guangya-sync-native-ubuntu-x64-0.1.41
 sudo ./install.sh
 ```
 
@@ -56,13 +56,19 @@ GUANGYA_NATIVE_MOUNT_TARGET=/var/lib/guangya-sync/mount
 
 ## Emby STRM 虚拟库
 
-网页“设置 → 挂载 → Emby 虚拟库”可把云端视频和音频映射为同名 `.strm`，并可按每个目录决定是否下载 NFO、海报和字幕。STRM 内容是带签名的播放直链 `http(s)://<STRM 直链地址>/strm/<fileId>?sign=…`：Emby 只需把虚拟库目录加入媒体库（仅此一个目录，不需要挂载盘、不需要任何代理），客户端照常连接 Emby 原始地址（如 8096）；播放时 Emby/客户端请求该直链并被 302 到云盘 CDN。
+网页“设置 → 挂载 → Emby 虚拟库”可把云端视频和音频映射为同名 `.strm`，并可按每个目录决定是否下载 NFO、海报和字幕。STRM 内容是带签名的播放直链 `http(s)://<STRM 直链地址>/strm/<fileId>?sign=…`：Emby 只需把虚拟库目录加入媒体库（仅此一个目录，不需要挂载盘）。
 
-先在“设置 → 挂载 → Emby 虚拟库”填写 STRM 直链地址——Emby 服务器和播放设备都能访问到本服务管理端口的地址（例如 `http://192.168.1.10:8080`），也可通过配置文件做首次初始化：
+播放推荐让客户端连接 **Emby 兼容网关**端口（默认 `18096`）：普通请求完整转发到 `GUANGYA_EMBY_UPSTREAM` 指向的 Emby，命中签名直链媒体源的原画播放请求直接 302 到云盘 CDN，播放数据不经过 Emby 和本服务。直连 Emby 原生端口（如 8096）也能播放，部分客户端的播放数据会经 Emby 服务器中转。
+
+先在“设置 → 挂载 → Emby 虚拟库”填写 STRM 直链地址——Emby 服务器和播放设备都能访问到本服务的地址（管理端口或网关端口均可），也可通过配置文件做首次初始化：
 
 ```bash
 GUANGYA_VIRTUAL_LIBRARY_ROOT=/var/lib/guangya-sync/virtual-library
-GUANGYA_STRM_BASE_URL=http://192.168.1.10:8080
+GUANGYA_STRM_BASE_URL=http://192.168.1.10:18096
+GUANGYA_EMBY_UPSTREAM=http://127.0.0.1:8096
+# 网关默认只监听 127.0.0.1；局域网设备直连时放开并用防火墙限制来源
+GUANGYA_EMBY_PROXY_HOST=0.0.0.0
+GUANGYA_EMBY_PROXY_ALLOW_NON_LOOPBACK=1
 ```
 
 管理账号和监听地址也保存在同一配置文件中：

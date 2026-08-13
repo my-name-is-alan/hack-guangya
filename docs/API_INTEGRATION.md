@@ -397,7 +397,8 @@ upload_by_fileid
 | 浏览器 `GET` 目录 | 生成本地 HTML directory index | 同上 | Local + L/R；不是把目录当文件下载。 |
 | `GET` 文件 | 默认 302 重定向到缓存的签名 CDN 直链（`GUANGYA_WEBDAV_REDIRECT=auto`，对 MiniRedir/WebDAVFS/davfs2/gvfs 等 UA 自动回退代理 Range，直链过期 403/410 强制刷新一次重试）；If-Match/If-None-Match/时间条件在 facade 用稳定 ETag 和 utime/ctime 本地判断 | `POST /userres/v1/get_res_download_url`（直链按文件缓存，TTL 从签名解析、上限 60 分钟）→ CDN | L/R；CDN 416 原样返回。 |
 | `HEAD` 文件 | 直接用目录条目元数据回应（大小、ETag、按扩展名的 Content-Type），不请求云端 | 无上游调用 | Local。 |
-| `GET|HEAD /strm/<fileId>?sign=` | Emby STRM 播放直链端点（管理端口，免管理登录）：恒时校验 per-instance HMAC 签名后 302 到缓存直链 | `POST /userres/v1/get_res_download_url`（共用直链缓存）→ CDN | L/R；签名无效 403、ID 非法 404。 |
+| `GET|HEAD /strm/<fileId>?sign=` | Emby STRM 播放直链端点（管理端口与网关端口，免管理登录）：恒时校验 per-instance HMAC 签名后 302 到缓存直链 | `POST /userres/v1/get_res_download_url`（共用直链缓存）→ CDN | L/R；签名无效 403、ID 非法 404。 |
+| Emby 兼容网关（18096） | 普通请求/WebSocket 转发到 `GUANGYA_EMBY_UPSTREAM`；stream/original/Items File 播放路由先调上游 PlaybackInfo，媒体源 Path 为本服务签名直链且验签通过时 302 到缓存 CDN 直链 | 上游 Emby + `get_res_download_url`（共用直链缓存） | L/R；未命中一律透传，HLS 转码不拦截。 |
 | `MKCOL` | 创建目录 | `POST /userres/v1/file/create_dir` | S/R。 |
 | `PUT` | 写本地临时文件后同步等待统一上传链确认 | token → OSS → task poll | L/S/R；覆盖时先上传临时名，再把旧对象改成备份名、把新对象改成目标名，成功后删除备份；失败时尽力回滚。它仍不是上游原子替换。 |
 | `DELETE` | 删除文件/目录并失效缓存 | `POST /userres/v1/file/delete_file` → task status | P/R；普通文件上下文会进入回收站。WebDAV 没有暴露回收站二次删除入口，因此不能把这里描述成无条件永久删除。 |

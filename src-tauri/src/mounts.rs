@@ -125,12 +125,16 @@ pub(crate) fn update_virtual_library_settings(
     state: tauri::State<'_, SharedState>,
     refresh_minutes: u64,
     strm_base_url: Option<String>,
+    emby_upstream: Option<String>,
 ) -> Result<VirtualLibraryInfo, String> {
     let mut guard = state.lock().map_err(|error| error.to_string())?;
     guard.virtual_library.set_refresh_minutes(refresh_minutes)?;
     guard
         .virtual_library
         .set_strm_base_url(strm_base_url.unwrap_or_default())?;
+    guard
+        .virtual_library
+        .set_emby_upstream(emby_upstream.unwrap_or_default())?;
     save_config(&guard);
     // 直链地址决定 STRM 服务监听范围（回环 / 所有网卡），通知其重新绑定。
     guard.strm_rebind.send_modify(|value| *value = value.wrapping_add(1));

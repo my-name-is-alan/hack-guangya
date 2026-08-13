@@ -110,6 +110,18 @@ const webdavHost = requestedWebDavHost;
 const webdavEndpoint = `http://127.0.0.1:${webdavPublicPort}/dav/`;
 const webdavRedirectMode = normalizeWebDavRedirectMode(process.env.GUANGYA_WEBDAV_REDIRECT);
 const strmBaseUrlSeed = String(process.env.GUANGYA_STRM_BASE_URL || '').trim();
+const defaultEmbyGatewayPort = process.env.NODE_TEST_CONTEXT ? 0 : 18096;
+const embyGatewayPort = Number(process.env.GUANGYA_EMBY_PROXY_PORT ?? defaultEmbyGatewayPort);
+if (!Number.isInteger(embyGatewayPort) || embyGatewayPort < 0 || embyGatewayPort > 65535) throw new Error('GUANGYA_EMBY_PROXY_PORT 必须是 0 到 65535 的整数');
+const embyGatewayPublicPort = Number(process.env.GUANGYA_EMBY_PROXY_PUBLIC_PORT || embyGatewayPort);
+if (!Number.isInteger(embyGatewayPublicPort) || embyGatewayPublicPort < 0 || embyGatewayPublicPort > 65535) throw new Error('GUANGYA_EMBY_PROXY_PUBLIC_PORT 必须是 0 到 65535 的整数');
+const requestedEmbyGatewayHost = String(process.env.GUANGYA_EMBY_PROXY_HOST || '127.0.0.1').trim();
+const allowEmbyGatewayNonLoopback = process.env.GUANGYA_EMBY_PROXY_ALLOW_NON_LOOPBACK === '1';
+if (!loopbackHosts.has(requestedEmbyGatewayHost.toLowerCase()) && !allowEmbyGatewayNonLoopback) {
+  throw new Error('Emby 网关端口默认只允许监听回环地址；容器内部监听需显式设置 GUANGYA_EMBY_PROXY_ALLOW_NON_LOOPBACK=1');
+}
+const embyGatewayHost = requestedEmbyGatewayHost;
+const embyUpstreamSeed = String(process.env.GUANGYA_EMBY_UPSTREAM || '').trim();
 const configuredDataDir = path.resolve(process.env.DATA_DIR || path.join(here, '..', '.web-data'));
 const configuredWatchRoot = path.resolve(process.env.GUANGYA_WATCH_ROOT || path.join(here, '..', 'watch'));
 const configuredArchiveRoot = path.resolve(process.env.GUANGYA_ARCHIVE_ROOT || path.join(here, '..', 'archive'));
@@ -2342,6 +2354,8 @@ const virtualLibrary = createVirtualLibraryService({
   publish,
   root: virtualLibraryRoot,
   strmBaseUrl: strmBaseUrlSeed,
+  embyUpstream: embyUpstreamSeed,
+  gatewayPort: embyGatewayPublicPort,
   fetchImpl: (...args) => createProxiedFetch(networkPreferences.proxy_url, undiciFetch)(...args),
   cloud: {
     listChildren: organizerListCloudChildren,
@@ -6403,6 +6417,34 @@ const webdavServer = http.createServer(async (request, response) => {
 webdavServer.requestTimeout = Math.max(requestTimeoutMs, ossTimeoutMs);
 webdavServer.headersTimeout = Math.min(requestTimeoutMs, 15_000);
 
+const embyGatewayServer = http.createServer(async (request, response) => {
+  const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+  try {
+    if (url.pathname === '/strm' || url.pathname.startsWith('/strm/')) {
+      await virtualLibrary.handleStrm(request, response, url);
+      return;
+    }
+    await virtualLibrary.handleGateway(request, response, url);
+  } catch (error) {
+    response.writeHead(502, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+    response.end(`Emby 网关请求失败：${error.message}`);
+  }
+});
+embyGatewayServer.requestTimeout = 0;
+embyGatewayServer.headersTimeout = Math.min(requestTimeoutMs, 15_000);
+embyGatewayServer.on('upgrade', (request, socket, head) => virtualLibrary.proxyUpgrade(request, socket, head));
+embyGatewayServer.once('error', (error) => {
+  virtualLibrary.setGatewayStatus({ running: false, error: error.message });
+  console.error(`Guangya Emby gateway failed: ${error.message}`);
+});
+embyGatewayServer.listen(embyGatewayPort, embyGatewayHost, () => {
+  const actualPort = Number(embyGatewayServer.address()?.port || embyGatewayPort);
+  const publicPort = embyGatewayPublicPort || actualPort;
+  virtualLibrary.setGatewayStatus({ running: true, error: null, port: publicPort });
+  const displayHost = embyGatewayHost.includes(':') ? `[${embyGatewayHost}]` : embyGatewayHost;
+  console.log(`Guangya Emby gateway listening on http://${displayHost}:${actualPort}/ -> ${virtualLibrary.info().emby_upstream}`);
+});
+
 webdavServer.listen(webdavPort, webdavHost, () => {
   const displayHost = webdavHost.includes(':') ? `[${webdavHost}]` : webdavHost;
   console.log(`Guangya WebDAV listening on http://${displayHost}:${webdavPort}/dav/, auth: ${webdavAccessControl.required() ? `enabled (${webdavUsername})` : 'not configured'}`);
@@ -6424,6 +6466,7 @@ server.listen(port, listenHost, async () => {
     virtualLibrary.close();
     await new Promise((resolve) => server.close(resolve));
     await new Promise((resolve) => webdavServer.close(resolve));
+    await new Promise((resolve) => embyGatewayServer.close(resolve));
     for (const watcher of watchers.values()) await watcher.close();
     await organizer.close();
     process.exit(0);

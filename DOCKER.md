@@ -1,6 +1,6 @@
 # Docker Web 部署配置
 
-本文档适用于 Docker Hub 镜像 `94xhzy/guangya-sync:0.1.40`。容器提供光鸭云盘 Web 管理界面、服务器目录监控、断点续传、媒体整理、自动分享与 HDHive 投稿。
+本文档适用于 Docker Hub 镜像 `94xhzy/guangya-sync:0.1.41`。容器提供光鸭云盘 Web 管理界面、服务器目录监控、断点续传、媒体整理、自动分享与 HDHive 投稿。
 
 ## 1. 准备目录和配置
 
@@ -23,7 +23,7 @@ openssl rand -hex 24
 把结果写入 `.env`：
 
 ```dotenv
-GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.40
+GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.41
 GUANGYA_HTTP_PORT=8080
 GUANGYA_ADMIN_USERNAME=admin
 GUANGYA_ADMIN_PASSWORD=替换为上面生成的强随机密码
@@ -167,12 +167,18 @@ docker compose \
 
 ### 3.3 Emby STRM 虚拟库（直链播放）
 
-“设置 → 挂载 → Emby 虚拟库”把云端视频和音频映射为同名 `.strm` 写入 `/virtual-library`，内容是带签名的播放直链 `http(s)://<STRM 直链地址>/strm/<fileId>?sign=…`。Emby 侧只需要一件事：把虚拟库目录挂载进 Emby 容器并加入媒体库——不需要挂载盘、不需要在 Emby 前面加代理，客户端照常连接 Emby 原始地址（如 8096）。播放时 Emby 或客户端请求 STRM 里的直链，管理端口的 `/strm/` 端点校验 HMAC 签名后 302 到云盘 CDN；直链按文件缓存复用，云端实测有效期约 6 小时。
+“设置 → 挂载 → Emby 虚拟库”把云端视频和音频映射为同名 `.strm` 写入 `/virtual-library`，内容是带签名的播放直链 `http(s)://<STRM 直链地址>/strm/<fileId>?sign=…`。Emby 侧只需要把虚拟库目录挂载进 Emby 容器并加入媒体库——不需要挂载盘。播放时 `/strm/` 端点校验 HMAC 签名后 302 到云盘 CDN；直链按文件缓存复用，云端实测有效期约 6 小时。
 
-使用前先在“设置 → 挂载 → Emby 虚拟库”填写 STRM 直链地址：必须是 **Emby 服务器和播放设备都能访问到本容器管理端口** 的地址，例如宿主机局域网地址 `http://192.168.1.10:8080`；Emby 与光鸭同步在同一 Compose 网络且客户端也能解析时，也可以用 `http://guangya-sync:8080`。也可以用环境变量做首次初始化：
+播放有两种方式：
+
+- **Emby 兼容网关（推荐）**：容器发布独立的网关端口（默认 `18096`，Compose 默认只发布到宿主机回环）。客户端把网关地址当作 Emby 服务器使用：普通请求（浏览、搜索、封面、WebSocket）完整转发到 `GUANGYA_EMBY_UPSTREAM` 指向的 Emby；命中签名直链媒体源的原画播放请求直接 302 到云盘 CDN，播放数据不经过 Emby 容器和本容器。需要局域网播放设备直连时设置 `GUANGYA_EMBY_GATEWAY_BIND=0.0.0.0` 并用防火墙限制来源。
+- **直连 Emby 原生端口**（如 8096）：同样可以播放；部分客户端的播放数据会经 Emby 服务器中转。
+
+使用前先在“设置 → 挂载 → Emby 虚拟库”填写 STRM 直链地址：必须是 **Emby 服务器和播放设备都能访问到本容器** 的地址，可以指向管理端口（如 `http://192.168.1.10:8080`）或网关端口（如 `http://192.168.1.10:18096`，`/strm/` 在两个端口都可用）。也可以用环境变量做首次初始化：
 
 ```dotenv
 GUANGYA_STRM_BASE_URL=http://192.168.1.10:8080
+GUANGYA_EMBY_UPSTREAM=http://host.docker.internal:8096
 ```
 
 修改直链地址后，下一次同步会自动重写全部 STRM 内容。`/strm/` 端点免管理登录，但必须携带按实例密钥计算的 HMAC 签名；签名密钥保存在 `/data/state.sqlite3`，不通过状态接口回显。
@@ -276,13 +282,13 @@ docker compose logs --tail=100 guangya-sync
 生产环境建议固定版本标签或不可变摘要：
 
 ```dotenv
-GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.40
+GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.41
 ```
 
-确认当前 `0.1.40` 与 `latest` 的远端摘要：
+确认当前 `0.1.41` 与 `latest` 的远端摘要：
 
 ```bash
-docker buildx imagetools inspect 94xhzy/guangya-sync:0.1.40
+docker buildx imagetools inspect 94xhzy/guangya-sync:0.1.41
 docker buildx imagetools inspect 94xhzy/guangya-sync:latest
 ```
 
@@ -340,5 +346,5 @@ docker compose logs -f guangya-sync
 docker compose restart guangya-sync
 docker compose down
 docker compose pull
-docker image inspect 94xhzy/guangya-sync:0.1.40
+docker image inspect 94xhzy/guangya-sync:0.1.41
 ```

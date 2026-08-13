@@ -1,19 +1,26 @@
 use super::*;
 use axum::{
     body::Body,
-    extract::{Path as AxumPath, Query, State},
-    http::{header::LOCATION, Response, StatusCode},
+    extract::{
+        ws::Message as AxumWsMessage, FromRequestParts, Path as AxumPath, Query, State,
+        WebSocketUpgrade,
+    },
+    http::{header::LOCATION, HeaderMap, Method, Request, Response, StatusCode},
+    response::IntoResponse,
     routing::get,
     Router,
 };
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as UpstreamWsMessage};
 
 const DEFAULT_STRM_PORT: u16 = 18_096;
+const DEFAULT_EMBY_UPSTREAM: &str = "http://127.0.0.1:8096";
 const LEGACY_REDIRECT_PORT: u16 = 19_091;
 const DEFAULT_REFRESH_MINUTES: u64 = 15;
 const MAX_REMOTE_ITEMS: usize = 100_000;
@@ -58,6 +65,8 @@ pub struct VirtualLibraryOptions {
     pub strm_port: u16,
     #[serde(default)]
     pub strm_base_url: String,
+    #[serde(default = "default_emby_upstream")]
+    pub emby_upstream: String,
     #[serde(default = "default_refresh_minutes")]
     pub refresh_minutes: u64,
     #[serde(default)]
@@ -69,6 +78,7 @@ impl Default for VirtualLibraryOptions {
         Self {
             strm_port: default_strm_port(),
             strm_base_url: String::new(),
+            emby_upstream: default_emby_upstream(),
             refresh_minutes: default_refresh_minutes(),
             mappings: Vec::new(),
         }
@@ -92,6 +102,8 @@ pub struct VirtualLibraryInfo {
     pub strm_port: u16,
     pub strm_running: bool,
     pub strm_error: Option<String>,
+    pub emby_upstream: String,
+    pub gateway_endpoint: String,
     pub refresh_minutes: u64,
     pub mappings: Vec<VirtualLibraryMapping>,
     pub statuses: HashMap<String, VirtualLibrarySyncStatus>,
@@ -136,6 +148,8 @@ impl VirtualLibraryManager {
             strm_port: self.options.strm_port,
             strm_running: self.strm_running,
             strm_error: self.strm_error.clone(),
+            emby_upstream: self.options.emby_upstream.clone(),
+            gateway_endpoint: format!("{}/", self.effective_strm_base()),
             refresh_minutes: self.options.refresh_minutes,
             mappings: self.options.mappings.clone(),
             statuses: self.statuses.clone(),
@@ -149,6 +163,11 @@ impl VirtualLibraryManager {
 
     pub fn set_strm_base_url(&mut self, value: String) -> Result<(), String> {
         self.options.strm_base_url = normalize_strm_base_url(&value)?;
+        Ok(())
+    }
+
+    pub fn set_emby_upstream(&mut self, value: String) -> Result<(), String> {
+        self.options.emby_upstream = normalize_emby_upstream(&value)?;
         Ok(())
     }
 
@@ -266,8 +285,31 @@ pub const fn default_strm_port() -> u16 {
     DEFAULT_STRM_PORT
 }
 
+pub fn default_emby_upstream() -> String {
+    DEFAULT_EMBY_UPSTREAM.to_string()
+}
+
 pub const fn default_refresh_minutes() -> u64 {
     DEFAULT_REFRESH_MINUTES
+}
+
+fn normalize_emby_upstream(value: &str) -> Result<String, String> {
+    let raw = if value.trim().is_empty() {
+        DEFAULT_EMBY_UPSTREAM
+    } else {
+        value.trim()
+    };
+    let parsed = reqwest::Url::parse(raw).map_err(|_| "Emby 原始服务地址无效".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+    {
+        return Err("Emby 原始服务地址必须是无账号、路径和查询参数的 HTTP(S) 地址".to_string());
+    }
+    Ok(parsed.origin().ascii_serialization())
 }
 
 fn normalize_refresh_minutes(value: u64) -> Result<u64, String> {
@@ -353,6 +395,7 @@ fn normalize_options(mut options: VirtualLibraryOptions) -> Result<VirtualLibrar
         return Err("STRM 直链端口不能与 WebDAV 端口相同".to_string());
     }
     options.strm_base_url = normalize_strm_base_url(&options.strm_base_url)?;
+    options.emby_upstream = normalize_emby_upstream(&options.emby_upstream)?;
     options.refresh_minutes = normalize_refresh_minutes(options.refresh_minutes)?;
     options.mappings = options
         .mappings
@@ -816,6 +859,471 @@ fn response(status: StatusCode, body: impl Into<Body>) -> Response<Body> {
 #[derive(Clone)]
 struct StrmContext {
     state: SharedState,
+    client: reqwest::Client,
+}
+
+/// 从 Emby MediaSources 的 Path 中解析本服务签发的 STRM 直链，
+/// 返回 (fileId, 签名)。非本服务直链返回 None。
+fn strm_url_credentials(value: &str) -> Option<(String, String)> {
+    let parsed = reqwest::Url::parse(value.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let mut segments = parsed.path_segments()?;
+    if segments.next()? != "strm" {
+        return None;
+    }
+    let file_id = segments.next()?.to_string();
+    if segments.next().is_some() {
+        return None;
+    }
+    let file_id = percent_encoding::percent_decode_str(&file_id)
+        .decode_utf8()
+        .ok()?
+        .to_string();
+    if !valid_strm_file_id(&file_id) {
+        return None;
+    }
+    let signature = parsed
+        .query_pairs()
+        .find(|(name, _)| name == "sign")
+        .map(|(_, value)| value.into_owned())?;
+    Some((file_id, signature))
+}
+
+/// 只匹配原画播放路由（stream/original/Items File）；HLS 转码等仍交给 Emby。
+fn playback_item_id(path: &str) -> Option<String> {
+    let mut segments = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if segments
+        .first()
+        .is_some_and(|value| value.eq_ignore_ascii_case("emby"))
+    {
+        segments.remove(0);
+    }
+    let raw_id = if segments.len() == 3
+        && (segments[0].eq_ignore_ascii_case("videos") || segments[0].eq_ignore_ascii_case("audio"))
+        && (segments[2].eq_ignore_ascii_case("stream")
+            || segments[2].to_ascii_lowercase().starts_with("stream.")
+            || segments[2].eq_ignore_ascii_case("original")
+            || segments[2].to_ascii_lowercase().starts_with("original."))
+    {
+        segments[1]
+    } else if segments.len() == 3
+        && segments[0].eq_ignore_ascii_case("items")
+        && segments[2].eq_ignore_ascii_case("file")
+    {
+        segments[1]
+    } else {
+        return None;
+    };
+    let decoded = percent_encoding::percent_decode_str(raw_id)
+        .decode_utf8()
+        .ok()?;
+    normalize_api_id(&decoded, "Emby 媒体 ID").ok()
+}
+
+fn emby_request_url(upstream: &str, uri: &axum::http::Uri) -> Result<reqwest::Url, String> {
+    let mut url = reqwest::Url::parse(upstream).map_err(|error| error.to_string())?;
+    url.set_path(uri.path());
+    url.set_query(uri.query());
+    Ok(url)
+}
+
+/// 对命中的播放路由调用上游 PlaybackInfo，找出 Path 为本服务签发
+/// STRM 直链的媒体源并校验签名，返回云端 fileId。
+async fn playback_file_id(
+    context: &StrmContext,
+    method: &Method,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+) -> Option<String> {
+    if !matches!(*method, Method::GET | Method::HEAD) {
+        return None;
+    }
+    let item_id = playback_item_id(uri.path())?;
+    let (upstream, secret) = {
+        let guard = context.state.lock().ok()?;
+        (
+            guard.virtual_library.options().emby_upstream,
+            guard.strm_sign_secret.clone(),
+        )
+    };
+    let prefix = if uri.path().to_ascii_lowercase().starts_with("/emby/") {
+        "/emby"
+    } else {
+        ""
+    };
+    let mut playback_url = reqwest::Url::parse(&upstream).ok()?;
+    playback_url.set_path(&format!("{prefix}/Items/{item_id}/PlaybackInfo"));
+    if let Some(query) = uri.query() {
+        let request_url = reqwest::Url::parse(&format!("http://localhost/?{query}")).ok()?;
+        for (name, value) in request_url.query_pairs() {
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "api_key" | "x-emby-token" | "userid"
+            ) {
+                playback_url.query_pairs_mut().append_pair(&name, &value);
+            }
+        }
+    }
+    let mut request = context.client.get(playback_url);
+    for name in [
+        "authorization",
+        "x-emby-authorization",
+        "x-emby-token",
+        "user-agent",
+    ] {
+        if let Some(value) = headers.get(name) {
+            request = request.header(name, value);
+        }
+    }
+    let payload = request
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json::<Value>()
+        .await
+        .ok()?;
+    let sources = payload
+        .get("MediaSources")
+        .or_else(|| payload.get("mediaSources"))
+        .and_then(Value::as_array)?;
+    let request_url = reqwest::Url::parse(&format!(
+        "http://localhost{}",
+        uri.path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/")
+    ))
+    .ok()?;
+    let requested_source_id = request_url
+        .query_pairs()
+        .find(|(name, _)| name.eq_ignore_ascii_case("MediaSourceId"))
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_default();
+    let mut ordered = sources.iter().collect::<Vec<_>>();
+    if !requested_source_id.is_empty() {
+        ordered.sort_by_key(|source| {
+            source
+                .get("Id")
+                .or_else(|| source.get("id"))
+                .and_then(Value::as_str)
+                .is_none_or(|value| value != requested_source_id)
+        });
+    }
+    for source in ordered {
+        let path = source
+            .get("Path")
+            .or_else(|| source.get("path"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if let Some((file_id, signature)) = strm_url_credentials(path) {
+            if verify_strm_signature(&secret, &file_id, &signature) {
+                return Some(file_id);
+            }
+        }
+    }
+    None
+}
+
+/// 浏览器（Emby Web）里的 JS fetch 读取跨域数据需要 CORS 头，而云盘 CDN
+/// 不返回；对浏览器 UA 的播放请求改为网关中转并注入 CORS 头，
+/// App 播放器仍然 302 直连 CDN。
+pub(crate) fn is_browser_user_agent(value: &str) -> bool {
+    let agent = value.to_ascii_lowercase();
+    agent.contains("mozilla/")
+        && (agent.contains("chrome/")
+            || agent.contains("safari/")
+            || agent.contains("firefox/")
+            || agent.contains("edg/"))
+}
+
+/// 浏览器播放中转：拉取 CDN 数据流式转发，透传 Range，补 CORS 头；
+/// 缓存直链过期（403/410）时强制刷新一次。
+async fn proxy_cdn_stream(
+    context: &StrmContext,
+    token: &str,
+    device_id: &str,
+    file_id: &str,
+    request_headers: &HeaderMap,
+) -> Response<Body> {
+    let send = |url: String| {
+        let mut outgoing = context.client.get(url);
+        for name in ["range", "if-range", "accept-encoding"] {
+            if let Some(value) = request_headers.get(name) {
+                outgoing = outgoing.header(name, value);
+            }
+        }
+        outgoing.send()
+    };
+    let url = match cached_res_download_url(token, device_id, file_id, false).await {
+        Ok(url) => url,
+        Err(error) => return response(StatusCode::BAD_GATEWAY, error),
+    };
+    let mut upstream = match send(url).await {
+        Ok(upstream) => upstream,
+        Err(error) => return response(StatusCode::BAD_GATEWAY, error.to_string()),
+    };
+    if matches!(upstream.status().as_u16(), 403 | 410) {
+        let refreshed = match cached_res_download_url(token, device_id, file_id, true).await {
+            Ok(url) => url,
+            Err(error) => return response(StatusCode::BAD_GATEWAY, error),
+        };
+        upstream = match send(refreshed).await {
+            Ok(upstream) => upstream,
+            Err(error) => return response(StatusCode::BAD_GATEWAY, error.to_string()),
+        };
+    }
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut builder = Response::builder().status(status);
+    for name in [
+        "content-type",
+        "content-length",
+        "content-range",
+        "accept-ranges",
+        "etag",
+        "last-modified",
+    ] {
+        if let Some(value) = upstream.headers().get(name) {
+            builder = builder.header(name, value.as_bytes());
+        }
+    }
+    builder = builder
+        .header("cache-control", "no-store")
+        .header("access-control-allow-origin", "*")
+        .header(
+            "access-control-expose-headers",
+            "Content-Range, Content-Length, Accept-Ranges, ETag, Last-Modified",
+        );
+    builder
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .unwrap_or_else(|_| response(StatusCode::BAD_GATEWAY, "构造播放中转响应失败"))
+}
+
+fn hop_by_hop_header(name: &axum::http::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+async fn proxy_http(context: &StrmContext, request: Request<Body>) -> Response<Body> {
+    let (parts, body) = request.into_parts();
+    let upstream = match context.state.lock() {
+        Ok(guard) => guard.virtual_library.options().emby_upstream,
+        Err(error) => return response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    };
+    let url = match emby_request_url(&upstream, &parts.uri) {
+        Ok(url) => url,
+        Err(error) => return response(StatusCode::BAD_GATEWAY, error),
+    };
+    let client_host = parts.headers.get("host").cloned();
+    let mut outgoing = context.client.request(parts.method, url);
+    for (name, value) in &parts.headers {
+        if name.as_str() != "host" && !hop_by_hop_header(name) {
+            outgoing = outgoing.header(name, value);
+        }
+    }
+    if let Some(host) = &client_host {
+        outgoing = outgoing.header("x-forwarded-host", host);
+    }
+    outgoing = outgoing
+        .header("x-forwarded-proto", "http")
+        .body(reqwest::Body::wrap_stream(body.into_data_stream()));
+    let upstream_response = match outgoing.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return response(
+                StatusCode::BAD_GATEWAY,
+                format!("Emby 原始服务连接失败：{error}"),
+            )
+        }
+    };
+    let status = upstream_response.status();
+    let mut headers = upstream_response.headers().clone();
+    for name in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        headers.remove(name);
+    }
+    if let (Some(location), Some(host)) = (headers.get(LOCATION).cloned(), client_host) {
+        if let (Ok(location), Ok(host)) = (location.to_str(), host.to_str()) {
+            if location.starts_with(&upstream) {
+                if let Ok(value) = format!("http://{host}{}", &location[upstream.len()..]).parse() {
+                    headers.insert(LOCATION, value);
+                }
+            }
+        }
+    }
+    let mut builder = Response::builder().status(status);
+    for (name, value) in &headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Body::from_stream(upstream_response.bytes_stream()))
+        .unwrap_or_else(|_| response(StatusCode::BAD_GATEWAY, "构造 Emby 网关响应失败"))
+}
+
+fn websocket_url(upstream: &str, uri: &axum::http::Uri) -> Result<String, String> {
+    let mut url = emby_request_url(upstream, uri)?;
+    let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
+    url.set_scheme(scheme)
+        .map_err(|_| "Emby WebSocket 地址无效".to_string())?;
+    Ok(url.to_string())
+}
+
+async fn relay_websocket(
+    downstream: axum::extract::ws::WebSocket,
+    upstream: String,
+    headers: HeaderMap,
+) {
+    let mut request = match upstream.into_client_request() {
+        Ok(request) => request,
+        Err(_) => return,
+    };
+    for name in [
+        "authorization",
+        "x-emby-authorization",
+        "x-emby-token",
+        "origin",
+        "user-agent",
+        "sec-websocket-protocol",
+    ] {
+        if let Some(value) = headers.get(name) {
+            request.headers_mut().insert(name, value.clone());
+        }
+    }
+    let upstream = match tokio_tungstenite::connect_async(request).await {
+        Ok((socket, _)) => socket,
+        Err(_) => return,
+    };
+    let (mut downstream_tx, mut downstream_rx) = downstream.split();
+    let (mut upstream_tx, mut upstream_rx) = upstream.split();
+    loop {
+        tokio::select! {
+            message = downstream_rx.next() => match message {
+                Some(Ok(AxumWsMessage::Text(value))) => {
+                    if upstream_tx.send(UpstreamWsMessage::Text(value.to_string().into())).await.is_err() { break; }
+                }
+                Some(Ok(AxumWsMessage::Binary(value))) => {
+                    if upstream_tx.send(UpstreamWsMessage::Binary(value)).await.is_err() { break; }
+                }
+                Some(Ok(AxumWsMessage::Ping(value))) => {
+                    if upstream_tx.send(UpstreamWsMessage::Ping(value)).await.is_err() { break; }
+                }
+                Some(Ok(AxumWsMessage::Pong(value))) => {
+                    if upstream_tx.send(UpstreamWsMessage::Pong(value)).await.is_err() { break; }
+                }
+                Some(Ok(AxumWsMessage::Close(_))) | Some(Err(_)) | None => break,
+            },
+            message = upstream_rx.next() => match message {
+                Some(Ok(UpstreamWsMessage::Text(value))) => {
+                    if downstream_tx.send(AxumWsMessage::Text(value.to_string().into())).await.is_err() { break; }
+                }
+                Some(Ok(UpstreamWsMessage::Binary(value))) => {
+                    if downstream_tx.send(AxumWsMessage::Binary(value)).await.is_err() { break; }
+                }
+                Some(Ok(UpstreamWsMessage::Ping(value))) => {
+                    if downstream_tx.send(AxumWsMessage::Ping(value)).await.is_err() { break; }
+                }
+                Some(Ok(UpstreamWsMessage::Pong(value))) => {
+                    if downstream_tx.send(AxumWsMessage::Pong(value)).await.is_err() { break; }
+                }
+                Some(Ok(UpstreamWsMessage::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(UpstreamWsMessage::Frame(_))) => {}
+            }
+        }
+    }
+}
+
+/// Emby 兼容网关：客户端把本服务地址当 Emby 用。普通请求（浏览、搜索、
+/// 图片、WebSocket）完整转发到 Emby 原始服务；命中 STRM 直链媒体源的原画
+/// 播放请求直接 302 到云盘 CDN，数据不经过 Emby 或本机。
+async fn gateway_request(
+    State(context): State<StrmContext>,
+    request: Request<Body>,
+) -> Response<Body> {
+    if request
+        .headers()
+        .get("upgrade")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+    {
+        let upstream = match context.state.lock() {
+            Ok(guard) => websocket_url(
+                &guard.virtual_library.options().emby_upstream,
+                request.uri(),
+            ),
+            Err(error) => Err(error.to_string()),
+        };
+        let upstream = match upstream {
+            Ok(value) => value,
+            Err(error) => return response(StatusCode::BAD_GATEWAY, error),
+        };
+        let headers = request.headers().clone();
+        let (mut parts, _) = request.into_parts();
+        return match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+            Ok(upgrade) => upgrade
+                .on_upgrade(move |socket| relay_websocket(socket, upstream, headers))
+                .into_response(),
+            Err(error) => response(StatusCode::BAD_REQUEST, error.to_string()),
+        };
+    }
+    let file_id =
+        playback_file_id(&context, request.method(), request.uri(), request.headers()).await;
+    if let Some(file_id) = file_id {
+        let (token, device_id) = match context.state.lock() {
+            Ok(guard) => match guard.token.clone() {
+                Some(token) => (token, guard.device_id.clone()),
+                None => return response(StatusCode::SERVICE_UNAVAILABLE, "请先登录光鸭云盘"),
+            },
+            Err(error) => return response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        };
+        let user_agent = request
+            .headers()
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if is_browser_user_agent(user_agent) {
+            return proxy_cdn_stream(&context, &token, &device_id, &file_id, request.headers())
+                .await;
+        }
+        return match cached_res_download_url(&token, &device_id, &file_id, false).await {
+            Ok(url) => Response::builder()
+                .status(StatusCode::FOUND)
+                .header(LOCATION, url)
+                .header("cache-control", "no-store")
+                .header("access-control-allow-origin", "*")
+                .body(Body::empty())
+                .unwrap_or_else(|_| {
+                    response(StatusCode::INTERNAL_SERVER_ERROR, "构造播放重定向失败")
+                }),
+            Err(error) => response(StatusCode::BAD_GATEWAY, error),
+        };
+    }
+    proxy_http(&context, request).await
 }
 
 /// `/strm/<fileId>?sign=<hmac>`：STRM 文件里的播放直链。
@@ -875,6 +1383,17 @@ pub async fn serve_strm(
     state: SharedState,
     mut rebind: watch::Receiver<u64>,
 ) {
+    let client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            status(&app, "error", format!("创建 Emby 网关客户端失败：{error}"));
+            return;
+        }
+    };
     loop {
         let (port, base) = match state.lock() {
             Ok(guard) => {
@@ -913,13 +1432,14 @@ pub async fn serve_strm(
         status(
             &app,
             "success",
-            format!("STRM 直链服务已启动（{scope}）：http://{address}/strm/"),
+            format!("STRM 直链与 Emby 兼容网关已启动（{scope}）：http://{address}/"),
         );
         let router = Router::new()
             .route("/strm/{file_id}", get(strm_request))
-            .fallback(|| async { response(StatusCode::NOT_FOUND, "not found") })
+            .fallback(gateway_request)
             .with_state(StrmContext {
                 state: state.clone(),
+                client: client.clone(),
             });
         let mut shutdown_signal = rebind.clone();
         let served = axum::serve(listener, router)
@@ -1009,6 +1529,70 @@ mod tests {
         let normalized = normalize_options(options).expect("legacy settings should normalize");
         assert_eq!(normalized.strm_port, DEFAULT_STRM_PORT);
         assert_eq!(normalized.strm_base_url, "");
+    }
+
+    #[test]
+    fn gateway_only_intercepts_original_stream_routes() {
+        assert_eq!(
+            playback_item_id("/emby/Videos/movie-id/stream.mkv").as_deref(),
+            Some("movie-id")
+        );
+        assert_eq!(
+            playback_item_id("/Audio/song-id/stream.mp3").as_deref(),
+            Some("song-id")
+        );
+        assert_eq!(
+            playback_item_id("/Videos/movie-id/original.mp4").as_deref(),
+            Some("movie-id")
+        );
+        assert_eq!(
+            playback_item_id("/Items/movie-id/File").as_deref(),
+            Some("movie-id")
+        );
+        assert!(playback_item_id("/Videos/movie-id/master.m3u8").is_none());
+        assert!(playback_item_id("/System/Info").is_none());
+    }
+
+    #[test]
+    fn gateway_matches_only_own_signed_strm_media_sources() {
+        let url = strm_url("http://192.168.2.223:18096", "secret", "1933793525808189509");
+        let (file_id, signature) = strm_url_credentials(&url).expect("own strm url should parse");
+        assert_eq!(file_id, "1933793525808189509");
+        assert!(verify_strm_signature("secret", &file_id, &signature));
+        assert!(!verify_strm_signature("other-secret", &file_id, &signature));
+
+        assert!(strm_url_credentials("/visual_media/movie.mkv").is_none());
+        assert!(strm_url_credentials("http://192.168.2.223:18096/strm/a/b?sign=x").is_none());
+        assert!(strm_url_credentials("http://192.168.2.223:18096/other/x?sign=x").is_none());
+        assert!(strm_url_credentials("http://192.168.2.223:18096/strm/id").is_none());
+    }
+
+    #[test]
+    fn browser_user_agents_are_proxied_instead_of_redirected() {
+        assert!(is_browser_user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+        ));
+        assert!(is_browser_user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+        ));
+        assert!(!is_browser_user_agent("Fileball/1.3.20"));
+        assert!(!is_browser_user_agent("ExoPlayerLib/2.19.1"));
+        assert!(!is_browser_user_agent("AppleCoreMedia/1.0.0.21F90"));
+        assert!(!is_browser_user_agent(""));
+    }
+
+    #[test]
+    fn emby_upstream_normalization_keeps_origin_only() {
+        assert_eq!(
+            normalize_emby_upstream("").unwrap(),
+            "http://127.0.0.1:8096"
+        );
+        assert_eq!(
+            normalize_emby_upstream("http://127.0.0.1:8096/").unwrap(),
+            "http://127.0.0.1:8096"
+        );
+        assert!(normalize_emby_upstream("http://127.0.0.1:8096/emby").is_err());
+        assert!(normalize_emby_upstream("ftp://127.0.0.1").is_err());
     }
 
     #[test]

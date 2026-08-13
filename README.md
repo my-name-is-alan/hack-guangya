@@ -53,7 +53,7 @@ pnpm tauri dev
 pnpm tauri build
 ```
 
-安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.40_x64-setup.exe`
+安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.41_x64-setup.exe`
 
 正式更新包必须使用长期保存的同一把 Tauri 私钥签名。构建机设置 `TAURI_SIGNING_PRIVATE_KEY`（可填私钥内容或私钥文件路径）和可选的 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 后执行构建，再生成 GitHub Release 所需文件：
 
@@ -125,22 +125,24 @@ WebDAV 是在线文件系统，不是离线镜像。打开大文件时由系统 
 
 “设置 → 挂载 → Emby 虚拟库”把云端媒体目录映射为本地 `.strm` 虚拟库：视频和音频生成同名 `.strm`，内容是带签名的播放直链 `http(s)://<STRM 直链地址>/strm/<fileId>?sign=…`；NFO、海报、字幕等元数据可按每个虚拟库选择下载或排除。
 
-Emby 侧只需要一件事：把虚拟库目录加入媒体库——仅此一个目录，不需要映射挂载盘，也不需要在 Emby 前面加任何代理。客户端照常连接 Emby 原生地址（如 `http://127.0.0.1:8096`）；扫描和播放时，Emby 或客户端请求 STRM 里的直链，`/strm/` 端点校验 HMAC 签名后 302 到云盘 CDN 直链，支持 DirectPlay 的客户端会直连 CDN 播放。
+Emby 侧只需要把虚拟库目录加入媒体库——仅此一个目录，不需要映射挂载盘。扫描时 Emby 请求 STRM 里的直链，`/strm/` 端点校验 HMAC 签名后 302 到云盘 CDN 直链。播放有两种方式：
 
-- 桌面端：STRM 直链服务监听 `http://127.0.0.1:18096/strm/`，直链地址留空时默认使用本机地址，适合 Emby 与桌面程序在同一台电脑；Emby 在其他机器时填写本机局域网地址。
-- Docker/Web：`/strm/` 挂在管理端口（默认 8080）上，免管理登录、仅校验签名；必须在设置中填写 Emby 服务器和播放设备都能访问到的地址（例如 `http://192.168.1.10:8080`），或用 `GUANGYA_STRM_BASE_URL` 首次初始化。
+- **Emby 兼容网关（推荐）**：客户端把网关地址当作 Emby 服务器使用。浏览、搜索、封面、WebSocket 全部转发给 Emby 原始服务；命中签名直链媒体源的原画播放请求（stream/original）直接 302 到云盘 CDN——播放数据不经过 Emby 服务器、也不经过本机，HLS 转码等请求仍由 Emby 处理。网关按 PlaybackInfo 返回的媒体源 Path 识别本服务签发的直链并本地校验签名，非虚拟库内容不受影响。
+- **直连 Emby 原生端口**（如 8096）：同样可以播放；支持 DirectPlay 远程源的客户端会自己请求直链并直连 CDN，其余客户端的播放数据会经 Emby 服务器中转。
+
+部署要点：
+
+- 桌面端：STRM 直链与 Emby 兼容网关共用 `18096` 端口。直链地址留空时只监听本机，适合 Emby 与桌面程序同机；Emby 在 Docker 容器或其他设备上时，把直链地址填成本机局域网地址（如 `http://192.168.x.x:18096`），服务会自动监听所有网卡。“Emby 原始地址”默认 `http://127.0.0.1:8096`。
+- Docker/Web：`/strm/` 同时挂在管理端口（默认 8080）和网关端口（默认 18096）上，免管理登录、仅校验签名；网关端口默认只发布到宿主机回环，需要局域网设备直连时设置 `GUANGYA_EMBY_GATEWAY_BIND=0.0.0.0`。直链地址用 `GUANGYA_STRM_BASE_URL` 首次初始化，Emby 原始地址用 `GUANGYA_EMBY_UPSTREAM` 配置。
 - 修改直链地址后，下一次同步会自动重写全部 STRM；同步只清理清单中由本软件生成、但云端已不存在的文件，不会删除目录里的其他文件。
 - 签名密钥按实例持久化到 SQLite，不通过状态接口回显；单条直链泄露只影响对应文件。
-
-> [!NOTE]
-> 从旧版本升级：Emby 兼容代理（18096 反向代理）和“云端纯路径”STRM 已移除。把 Emby 客户端地址改回 Emby 原生端口（如 8096），在设置中填写 STRM 直链地址后重新同步一次虚拟库即可，STRM 会自动重写为直链。
 
 ## Docker Web
 
 Docker Hub 镜像：[`94xhzy/guangya-sync`](https://hub.docker.com/r/94xhzy/guangya-sync)，推荐固定使用版本标签：
 
 ```bash
-docker pull 94xhzy/guangya-sync:0.1.40
+docker pull 94xhzy/guangya-sync:0.1.41
 ```
 
 先准备管理账号。用户名默认是 `admin`；请生成独立的强随机密码，复制 `.env.example` 为 `.env` 并填入 `GUANGYA_ADMIN_PASSWORD`：
@@ -225,7 +227,7 @@ pnpm web
 pnpm package:ubuntu
 ```
 
-输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.40.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
+输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.41.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
 
 ## 接口边界
 

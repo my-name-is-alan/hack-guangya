@@ -2,6 +2,12 @@
 
 历史版本的说明见 [GitHub Releases](https://github.com/my-name-is-alan/hack-guangya/releases)。
 
+## v0.1.41 - 2026-08-13
+
+- 新增 Emby 兼容网关：客户端把网关地址（桌面端与 STRM 直链服务共用 18096，Docker 独立发布 18096 端口）当作 Emby 服务器使用，浏览、搜索、图片、WebSocket 全部转发到 Emby 原始服务；命中本服务签名 STRM 直链媒体源的原画播放请求（stream/original/Items File）直接 302 到云盘 CDN，播放数据不经过 Emby 服务器和本机。HLS 转码等请求仍交给 Emby。
+- 网关按 PlaybackInfo 的媒体源 Path 识别签名直链并本地校验 HMAC，不再依赖清单扫描；直连 Emby 原生端口（8096）的播放方式继续可用。
+- 虚拟库设置恢复“Emby 原始地址”，Docker 恢复 `GUANGYA_EMBY_UPSTREAM` 与 18096 端口发布（默认仅宿主机回环，可用 `GUANGYA_EMBY_GATEWAY_BIND` 放开）。
+
 ## v0.1.40 - 2026-08-13
 
 - 桌面端 STRM 直链服务支持非本机访问：STRM 直链地址配置为非回环地址（Emby 在 Docker 容器或其他设备上）时自动监听所有网卡，保存设置后立即重新绑定，无需重启应用；留空或本机地址时保持仅监听 127.0.0.1。端点仍要求 HMAC 签名。

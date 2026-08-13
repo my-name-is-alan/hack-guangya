@@ -66,6 +66,10 @@ interface VirtualLibraryInfo {
   strm_running?: boolean
   strm_error?: string | null
   strm_configured?: boolean
+  emby_upstream: string
+  gateway_endpoint?: string
+  gateway_running?: boolean
+  gateway_error?: string | null
   refresh_minutes: number
   virtual_root?: string
   mappings: VirtualLibraryMapping[]
@@ -121,6 +125,10 @@ const virtual = reactive<VirtualLibraryInfo>({
   strm_running: false,
   strm_error: null,
   strm_configured: false,
+  emby_upstream: 'http://127.0.0.1:8096',
+  gateway_endpoint: '',
+  gateway_running: false,
+  gateway_error: null,
   refresh_minutes: 15,
   virtual_root: '',
   mappings: [],
@@ -163,14 +171,17 @@ const strmPlaceholder = computed(() => (isTauri
   ? `留空使用本机 http://127.0.0.1:${virtual.strm_port || 18096}`
   : `${typeof window === 'undefined' ? 'http://192.168.1.10:8080' : window.location.origin}`))
 
+const gatewayEndpoint = computed(() => virtual.gateway_endpoint || (virtual.strm_base_url ? `${virtual.strm_base_url}/` : ''))
+
 const strmStatus = computed(() => {
-  const playbackHint = `STRM 内容指向 ${strmEndpoint.value}<fileId>?sign=…；Emby 扫描和播放时请求该直链并被 302 到云盘 CDN，客户端照常连接 Emby 原始地址（如 8096），不需要任何代理。`
+  const playbackHint = `Emby 客户端连接网关 ${gatewayEndpoint.value} 可全程 302 直链播放（播放数据直连云盘 CDN，其余请求转发到 ${virtual.emby_upstream}）；STRM 内容指向 ${strmEndpoint.value}<fileId>?sign=…，直连 Emby 原生端口也能播放。`
   if (isTauri) {
-    if (virtual.strm_error) return { type: 'error' as const, title: 'STRM 直链服务未运行', detail: virtual.strm_error }
-    if (virtual.strm_running) return { type: 'success' as const, title: 'STRM 直链服务运行中', detail: playbackHint }
+    if (virtual.strm_error) return { type: 'error' as const, title: 'STRM 直链与 Emby 网关未运行', detail: virtual.strm_error }
+    if (virtual.strm_running) return { type: 'success' as const, title: 'STRM 直链与 Emby 网关运行中', detail: playbackHint }
     return { type: 'warning' as const, title: 'STRM 直链服务正在启动', detail: '' }
   }
-  if (virtual.strm_configured) return { type: 'success' as const, title: 'STRM 直链已配置', detail: playbackHint }
+  if (virtual.gateway_error) return { type: 'error' as const, title: 'Emby 网关未运行', detail: virtual.gateway_error }
+  if (virtual.strm_configured) return { type: 'success' as const, title: 'STRM 直链已配置，Emby 网关运行中', detail: playbackHint }
   return {
     type: 'warning' as const,
     title: '请先填写 STRM 直链地址',
@@ -372,6 +383,7 @@ async function saveVirtualSettings() {
     Object.assign(virtual, unwrapData(await bridge.invoke('update_virtual_library_settings', {
       refresh_minutes: virtual.refresh_minutes,
       strm_base_url: virtual.strm_base_url,
+      emby_upstream: virtual.emby_upstream,
     })) as VirtualLibraryInfo)
     message.success('虚拟库设置已保存，下次同步会按新直链地址重写 STRM')
   }
@@ -454,6 +466,9 @@ onBeforeUnmount(() => unsubscribe?.())
         <a-form-item label="STRM 直链地址">
           <a-input v-model:value="virtual.strm_base_url" :placeholder="strmPlaceholder" class="strm-base-input" />
         </a-form-item>
+        <a-form-item label="Emby 原始地址">
+          <a-input v-model:value="virtual.emby_upstream" placeholder="http://127.0.0.1:8096" class="strm-base-input" />
+        </a-form-item>
         <a-form-item label="自动刷新">
           <a-input-number v-model:value="virtual.refresh_minutes" :min="1" :max="1440" addon-after="分钟" />
         </a-form-item>
@@ -497,8 +512,8 @@ onBeforeUnmount(() => unsubscribe?.())
         show-icon
         message="Emby 使用方式"
         :description="isTauri
-          ? '把本地虚拟库目录作为媒体库加入 Emby——只需这一个目录，不需要映射挂载盘、也不需要任何代理。客户端照常连接 Emby 原始地址（如 http://127.0.0.1:8096）；Emby 在 Docker 容器或其他机器上时，把 STRM 直链地址改成本机局域网地址（如 http://192.168.x.x:18096），保存后直链服务会自动改为监听所有网卡并在下次同步重写 STRM。'
-          : `把 ${virtual.virtual_root || '/virtual-library'} 映射给 Emby 容器并作为媒体库加入——只需这一个目录，不需要映射挂载盘、也不需要任何代理。客户端照常连接 Emby 原始地址（如 8096）；STRM 直链地址必须是 Emby 和播放设备都能访问到的本服务地址。`"
+          ? `把本地虚拟库目录作为媒体库加入 Emby——只需这一个目录，不需要映射挂载盘。播放有两种方式：客户端连接 Emby 兼容网关 ${gatewayEndpoint || 'http://<本机>:18096/'}（推荐，播放全程 302 直链，数据不经过 Emby 和本机）；或直连 Emby 原生地址（如 8096），部分客户端的播放数据会经 Emby 服务器中转。Emby 在 Docker 容器或其他机器上时，把 STRM 直链地址改成本机局域网地址（如 http://192.168.x.x:18096），保存后服务会自动监听所有网卡并在下次同步重写 STRM。`
+          : `把 ${virtual.virtual_root || '/virtual-library'} 映射给 Emby 容器并作为媒体库加入——只需这一个目录，不需要映射挂载盘。播放推荐让客户端连接 Emby 兼容网关端口（默认 18096，播放全程 302 直链）；直连 Emby 原生端口（如 8096）也能播放，部分客户端的播放数据会经 Emby 服务器中转。STRM 直链地址必须是 Emby 和播放设备都能访问到的本服务地址。`"
         class="support-alert"
       />
     </template>
