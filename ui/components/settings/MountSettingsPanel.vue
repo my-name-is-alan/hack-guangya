@@ -497,7 +497,7 @@ onBeforeUnmount(() => unsubscribe?.())
         show-icon
         message="Emby 使用方式"
         :description="isTauri
-          ? '把本地虚拟库目录作为媒体库加入 Emby——只需这一个目录，不需要映射挂载盘、也不需要任何代理。客户端照常连接 Emby 原始地址（如 http://127.0.0.1:8096）；Emby 在其他机器时，把 STRM 直链地址改成它能访问到的本机地址。'
+          ? '把本地虚拟库目录作为媒体库加入 Emby——只需这一个目录，不需要映射挂载盘、也不需要任何代理。客户端照常连接 Emby 原始地址（如 http://127.0.0.1:8096）；Emby 在 Docker 容器或其他机器上时，把 STRM 直链地址改成本机局域网地址（如 http://192.168.x.x:18096），保存后直链服务会自动改为监听所有网卡并在下次同步重写 STRM。'
           : `把 ${virtual.virtual_root || '/virtual-library'} 映射给 Emby 容器并作为媒体库加入——只需这一个目录，不需要映射挂载盘、也不需要任何代理。客户端照常连接 Emby 原始地址（如 8096）；STRM 直链地址必须是 Emby 和播放设备都能访问到的本服务地址。`"
         class="support-alert"
       />

@@ -132,6 +132,8 @@ pub(crate) fn update_virtual_library_settings(
         .virtual_library
         .set_strm_base_url(strm_base_url.unwrap_or_default())?;
     save_config(&guard);
+    // 直链地址决定 STRM 服务监听范围（回环 / 所有网卡），通知其重新绑定。
+    guard.strm_rebind.send_modify(|value| *value = value.wrapping_add(1));
     Ok(virtual_library_info(&guard))
 }
 

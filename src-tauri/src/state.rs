@@ -150,6 +150,7 @@ pub(crate) struct RuntimeState {
     pub(crate) native_mount: NativeMountManager,
     pub(crate) virtual_library: VirtualLibraryManager,
     pub(crate) strm_sign_secret: String,
+    pub(crate) strm_rebind: Arc<watch::Sender<u64>>,
 }
 
 

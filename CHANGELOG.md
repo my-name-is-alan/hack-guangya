@@ -2,6 +2,11 @@
 
 历史版本的说明见 [GitHub Releases](https://github.com/my-name-is-alan/hack-guangya/releases)。
 
+## v0.1.40 - 2026-08-13
+
+- 桌面端 STRM 直链服务支持非本机访问：STRM 直链地址配置为非回环地址（Emby 在 Docker 容器或其他设备上）时自动监听所有网卡，保存设置后立即重新绑定，无需重启应用；留空或本机地址时保持仅监听 127.0.0.1。端点仍要求 HMAC 签名。
+- 设置页说明补充 Docker 容器内 Emby 的直链地址填写方式。
+
 ## v0.1.39 - 2026-08-13
 
 本次是挂载与 Emby 播放链路的整体重构：STRM 全面改为签名直链、移除 Emby 前置代理，WebDAV 读文件改为 302 直链直连 CDN。

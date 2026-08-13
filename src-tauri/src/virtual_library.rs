@@ -858,43 +858,87 @@ async fn strm_request(
     }
 }
 
-pub async fn serve_strm(app: tauri::AppHandle, state: SharedState, port: u16) {
-    let address = format!("127.0.0.1:{port}");
-    let listener = match tokio::net::TcpListener::bind(&address).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            let message = format!("STRM 直链端口监听 {address} 失败：{error}");
+/// 默认只监听本机；显式配置非回环直链地址（Emby 在 Docker 容器或其他
+/// 设备上）时监听所有网卡，端点本身仍要求 HMAC 签名。
+pub(crate) fn strm_bind_host(base_url: &str) -> &'static str {
+    let host = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+    match host.as_deref() {
+        None | Some("127.0.0.1") | Some("localhost") | Some("::1") | Some("[::1]") => "127.0.0.1",
+        Some(_) => "0.0.0.0",
+    }
+}
+
+pub async fn serve_strm(
+    app: tauri::AppHandle,
+    state: SharedState,
+    mut rebind: watch::Receiver<u64>,
+) {
+    loop {
+        let (port, base) = match state.lock() {
+            Ok(guard) => {
+                let options = guard.virtual_library.options();
+                (options.strm_port, options.strm_base_url)
+            }
+            Err(_) => return,
+        };
+        let bind_host = strm_bind_host(&base);
+        let address = format!("{bind_host}:{port}");
+        let listener = match tokio::net::TcpListener::bind(&address).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                let message = format!("STRM 直链端口监听 {address} 失败：{error}");
+                if let Ok(mut guard) = state.lock() {
+                    guard
+                        .virtual_library
+                        .set_strm_status(false, Some(message.clone()));
+                }
+                status(&app, "error", message);
+                // 等待设置变更后再重试，避免空转。
+                if rebind.changed().await.is_err() {
+                    return;
+                }
+                continue;
+            }
+        };
+        if let Ok(mut guard) = state.lock() {
+            guard.virtual_library.set_strm_status(true, None);
+        }
+        let scope = if bind_host == "0.0.0.0" {
+            "所有网卡"
+        } else {
+            "仅本机"
+        };
+        status(
+            &app,
+            "success",
+            format!("STRM 直链服务已启动（{scope}）：http://{address}/strm/"),
+        );
+        let router = Router::new()
+            .route("/strm/{file_id}", get(strm_request))
+            .fallback(|| async { response(StatusCode::NOT_FOUND, "not found") })
+            .with_state(StrmContext {
+                state: state.clone(),
+            });
+        let mut shutdown_signal = rebind.clone();
+        let served = axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_signal.changed().await;
+            })
+            .await;
+        // 消费本轮变更标记，下一轮循环按最新设置重新决定监听范围。
+        let _ = rebind.borrow_and_update();
+        if let Err(error) = served {
+            let message = format!("STRM 直链服务异常退出：{error}");
             if let Ok(mut guard) = state.lock() {
                 guard
                     .virtual_library
                     .set_strm_status(false, Some(message.clone()));
             }
             status(&app, "error", message);
-            return;
+            sleep(Duration::from_secs(3)).await;
         }
-    };
-    if let Ok(mut guard) = state.lock() {
-        guard.virtual_library.set_strm_status(true, None);
-    }
-    status(
-        &app,
-        "success",
-        format!("STRM 直链服务已启动：http://{address}/strm/"),
-    );
-    let router = Router::new()
-        .route("/strm/{file_id}", get(strm_request))
-        .fallback(|| async { response(StatusCode::NOT_FOUND, "not found") })
-        .with_state(StrmContext {
-            state: state.clone(),
-        });
-    if let Err(error) = axum::serve(listener, router).await {
-        let message = format!("STRM 直链服务异常退出：{error}");
-        if let Ok(mut guard) = state.lock() {
-            guard
-                .virtual_library
-                .set_strm_status(false, Some(message.clone()));
-        }
-        status(&app, "error", message);
     }
 }
 
@@ -965,6 +1009,17 @@ mod tests {
         let normalized = normalize_options(options).expect("legacy settings should normalize");
         assert_eq!(normalized.strm_port, DEFAULT_STRM_PORT);
         assert_eq!(normalized.strm_base_url, "");
+    }
+
+    #[test]
+    fn strm_bind_host_widens_only_for_non_loopback_bases() {
+        assert_eq!(strm_bind_host(""), "127.0.0.1");
+        assert_eq!(strm_bind_host("http://127.0.0.1:18096"), "127.0.0.1");
+        assert_eq!(strm_bind_host("http://localhost:18096"), "127.0.0.1");
+        assert_eq!(strm_bind_host("http://[::1]:18096"), "127.0.0.1");
+        assert_eq!(strm_bind_host("http://192.168.2.223:18096"), "0.0.0.0");
+        assert_eq!(strm_bind_host("http://host.docker.internal:18096"), "0.0.0.0");
+        assert_eq!(strm_bind_host("https://nas.example.com/guangya"), "0.0.0.0");
     }
 
     #[test]

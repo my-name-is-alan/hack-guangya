@@ -92,7 +92,6 @@ pub(crate) fn run() {
             let webdav_password = config.webdav_password.clone();
             let native_mount_options = config.native_mount.clone();
             let virtual_library = VirtualLibraryManager::new(config.virtual_library.clone());
-            let virtual_library_strm_port = virtual_library.options().strm_port;
             let strm_sign_secret = load_app_state(&db_path, "strm_sign_secret")?
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| {
@@ -103,6 +102,8 @@ pub(crate) fn run() {
                     )
                 });
             save_app_state(&db_path, "strm_sign_secret", &strm_sign_secret)?;
+            let (strm_rebind_tx, strm_rebind_rx) = watch::channel(0_u64);
+            let strm_rebind = Arc::new(strm_rebind_tx);
             let upload_concurrency = normalize_transfer_concurrency(
                 config.upload_concurrency,
                 DEFAULT_UPLOAD_CONCURRENCY,
@@ -186,6 +187,7 @@ pub(crate) fn run() {
                 ),
                 virtual_library,
                 strm_sign_secret,
+                strm_rebind,
             }));
             app.manage(DownloadRegistry::default());
             app.manage(PendingAppUpdate::default());
@@ -214,7 +216,7 @@ pub(crate) fn run() {
             tauri::async_runtime::spawn(virtual_library::serve_strm(
                 app_handle.clone(),
                 state.clone(),
-                virtual_library_strm_port,
+                strm_rebind_rx,
             ));
             if let Ok(guard) = state.lock() {
                 save_config(&guard);
