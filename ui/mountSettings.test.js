@@ -60,15 +60,18 @@ test('桌面 ACL 放行全部 WebDAV 与原生挂载命令', () => {
   }
 })
 
-test('虚拟库生成纯路径 STRM，并由独立 Emby 代理端口按路径决定 302', () => {
+test('虚拟库生成签名直链 STRM，Emby 原生端口播放且只映射一个目录', () => {
   assert.match(mountPanel, /Emby 虚拟库（STRM）/)
   assert.match(mountPanel, /视频和音频生成同名/)
   assert.match(mountPanel, /保留元数据/)
   assert.match(mountPanel, /排除所有元数据，只生成 STRM/)
-  assert.match(mountPanel, /内容是云端纯路径/)
-  assert.match(mountPanel, /继续使用原始 8096 不会触发光鸭/)
-  assert.match(mountPanel, /普通请求和未命中的播放请求转发/)
-  assert.match(mountPanel, /http:\/\/127\.0\.0\.1:18096/)
+  assert.match(mountPanel, /内容是带签名的播放直链/)
+  assert.match(mountPanel, /STRM 直链地址/)
+  assert.match(mountPanel, /strm_base_url/)
+  assert.match(mountPanel, /302 到云盘 CDN/)
+  assert.match(mountPanel, /客户端照常连接 Emby 原始地址/)
+  assert.match(mountPanel, /不需要映射挂载盘、也不需要任何代理/)
+  assert.doesNotMatch(mountPanel, /emby_upstream|proxy_endpoint|Emby 兼容代理/)
   for (const command of [
     'get_virtual_library_info',
     'update_virtual_library_settings',
@@ -81,5 +84,8 @@ test('虚拟库生成纯路径 STRM，并由独立 Emby 代理端口按路径决
     assert.match(desktopPermissions, new RegExp(`"${command}"`))
   }
   assert.match(server, /\/api\/virtual-library/)
-  assert.match(server, /embyProxyServer/)
+  // 公开签名播放端点在管理登录校验之前放行，Emby 反向代理已移除。
+  assert.match(server, /url\.pathname === '\/strm' \|\| url\.pathname\.startsWith\('\/strm\/'\)/)
+  assert.match(server, /handleStrm/)
+  assert.doesNotMatch(server, /embyProxyServer|GUANGYA_EMBY/)
 })

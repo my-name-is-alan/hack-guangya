@@ -11,7 +11,8 @@
 - 桌面端自动更新：启动时默认检查 GitHub 最新正式版，也可在“设置 → 更新”手动检查；发现新版本后展示版本说明和下载进度，经确认后校验签名并安装。
 - 云盘文件管理：浏览根目录和子目录，拖入文件或文件夹上传，并支持新建文件夹、详情、云端最近、批量复制、剪切、移动、重命名、移入回收站和创建分享；回收站支持批量恢复、彻底删除和清空，异步文件操作完成后才刷新。
 - 当前账号开发者模式与小号秒传：在“多号秒传”面板填写当前登录账号自己的官方开发者 `client_id` / `client_secret`；所有权验证通过后，文件列表/详情可在主接口失败时使用开发者接口兜底，并可保存多个小号接收 TOKEN 进行秒传。
-- 本地目录挂载：通过 WebDAV 将整个云盘映射为 Windows 盘符、macOS Finder 目录或 Linux/FUSE 目录；支持列目录、读取、新建、覆盖、重命名、移动、复制和删除，Docker Web 同样提供 `/dav/`。
+- 本地目录挂载：通过 WebDAV 将整个云盘映射为 Windows 盘符、macOS Finder 目录或 Linux/FUSE 目录；支持列目录、读取、新建、覆盖、重命名、移动、复制和删除，Docker Web 同样提供 `/dav/`。读文件默认 302 重定向到云盘签名直链，rclone 等客户端直连 CDN，数据不经过本进程中转。
+- Emby STRM 虚拟库：把云端媒体目录映射为本地 `.strm` 虚拟库，STRM 内容是带签名的播放直链；Emby 只需把这一个目录加入媒体库，客户端照常连接 Emby 原生地址（如 8096），播放时 302 到云盘 CDN，不需要挂载盘或任何 Emby 前置代理。
 - 批量重命名：规则按顺序链式执行，支持普通替换、正则替换、前后缀、序号模板及大小写转换，执行前实时预览并检查重名。
 - 桌面操作习惯：支持右键菜单，以及 `Ctrl+A`、`Ctrl+C`、`Ctrl+X`、`Ctrl+V`、`F2`、`Delete` 快捷键。
 - 云添加：先解析磁力、HTTP、HTTPS、ED2K 资源，再选择云端目录并创建任务；展示进度、错误和当日次数，支持取消、重试和清理记录，磁力资源会按解析结果提交可用子文件序号。
@@ -36,7 +37,7 @@
 
 可用字段包括 `{category}`、兼容拼写 `{catgroy}`、`{country}`、`{year}`、`{title}`、`{original_title}`、`{tmdb_id}`（兼容 `{tmdbid}`）、`{season}`、`{episode}`、`{episode_end}`、`{Season x}`、`{Expose n}`、`{edition}`、`{quality}`、`{part}` 和 `{ext}`；字段可以自由组合，系统会清理非法文件名字符并拒绝 `.`/`..` 路径跳转。页面提供三个预设，也可直接编辑完整相对路径。
 
-整理监控是云端轮询，不是本机文件事件监听。两个 WebDAV/原生挂载共用同一云端目录时，写操作会立即失效本进程缓存；服务端目录缓存最长保留 15 秒，rclone 默认目录缓存为 2 秒、VFS 变化轮询为 5 秒，通常几秒内即可看到另一挂载创建的新文件夹。客户端自身的离线缓存仍可能需要手动刷新。
+整理监控是云端轮询，不是本机文件事件监听。两个 WebDAV/原生挂载共用同一云端目录时，写操作会立即失效本进程缓存；服务端目录缓存最长保留 15 秒，rclone 默认目录缓存为 10 秒、VFS 变化轮询为 5 秒，通常十几秒内即可看到另一挂载创建的新文件夹。客户端自身的离线缓存仍可能需要手动刷新。
 
 刮削开关默认关闭。打开后先选择要执行的类型（默认预选电影 NFO、剧集 NFO、海报、背景图），不会把所有可用元数据全部下载；刮削失败会记录为警告并保留已完成的主体整理。上传任务可在“上传后自动整理”中关联 A 目录：关闭时沿用原上传后自动分享流程，开启时先等待 A → B 完成，再从 B 创建新分享，避免把即将移动的 A 目录提交给 HDHive。
 
@@ -52,7 +53,7 @@ pnpm tauri dev
 pnpm tauri build
 ```
 
-安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.38_x64-setup.exe`
+安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.39_x64-setup.exe`
 
 正式更新包必须使用长期保存的同一把 Tauri 私钥签名。构建机设置 `TAURI_SIGNING_PRIVATE_KEY`（可填私钥内容或私钥文件路径）和可选的 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 后执行构建，再生成 GitHub Release 所需文件：
 
@@ -105,6 +106,8 @@ sudo mount -t davfs "http://127.0.0.1:19090/" /mnt/guangya
 
 WebDAV 是在线文件系统，不是离线镜像。打开大文件时由系统 WebDAV 客户端或 rclone 的 VFS 缓存负责按需读取；写入会继续走现有的 OSS 分片上传与云端入库确认。Windows 内置 WebClient 被策略禁用或需要更稳定的大文件缓存时，建议改用 `rclone mount --vfs-cache-mode full`。
 
+读文件默认按 302 直链重定向工作（`GUANGYA_WEBDAV_REDIRECT=auto`）：GET 被重定向到云盘签名 CDN 直链，rclone、Infuse 等客户端直连 CDN，数据不再经过本进程双跳中转；直链按文件缓存复用（实测有效期约 6 小时，缓存预留安全余量），HEAD 请求直接用目录元数据回应、不再触发云端接口。对 Windows WebClient、macOS Finder、davfs2 等已知不能正确处理重定向的客户端会自动回退为中转；设置 `GUANGYA_WEBDAV_REDIRECT=off` 可强制全部中转。
+
 ## 原生挂载（rclone / FUSE）
 
 “设置 → 挂载”默认提供软件托管的原生挂载模式。桌面安装包内置经过 SHA256 校验的官方 rclone `v1.74.4`，无需单独配置 remote：
@@ -118,12 +121,26 @@ WebDAV 是在线文件系统，不是离线镜像。打开大文件时由系统 
 
 原生挂载仍通过只监听本机的 WebDAV 服务访问光鸭接口，不会新增公网端口。rclone 密码通过标准输入转换并仅注入子进程环境，不写入 rclone 配置文件。
 
+## Emby STRM 虚拟库（直链播放）
+
+“设置 → 挂载 → Emby 虚拟库”把云端媒体目录映射为本地 `.strm` 虚拟库：视频和音频生成同名 `.strm`，内容是带签名的播放直链 `http(s)://<STRM 直链地址>/strm/<fileId>?sign=…`；NFO、海报、字幕等元数据可按每个虚拟库选择下载或排除。
+
+Emby 侧只需要一件事：把虚拟库目录加入媒体库——仅此一个目录，不需要映射挂载盘，也不需要在 Emby 前面加任何代理。客户端照常连接 Emby 原生地址（如 `http://127.0.0.1:8096`）；扫描和播放时，Emby 或客户端请求 STRM 里的直链，`/strm/` 端点校验 HMAC 签名后 302 到云盘 CDN 直链，支持 DirectPlay 的客户端会直连 CDN 播放。
+
+- 桌面端：STRM 直链服务监听 `http://127.0.0.1:18096/strm/`，直链地址留空时默认使用本机地址，适合 Emby 与桌面程序在同一台电脑；Emby 在其他机器时填写本机局域网地址。
+- Docker/Web：`/strm/` 挂在管理端口（默认 8080）上，免管理登录、仅校验签名；必须在设置中填写 Emby 服务器和播放设备都能访问到的地址（例如 `http://192.168.1.10:8080`），或用 `GUANGYA_STRM_BASE_URL` 首次初始化。
+- 修改直链地址后，下一次同步会自动重写全部 STRM；同步只清理清单中由本软件生成、但云端已不存在的文件，不会删除目录里的其他文件。
+- 签名密钥按实例持久化到 SQLite，不通过状态接口回显；单条直链泄露只影响对应文件。
+
+> [!NOTE]
+> 从旧版本升级：Emby 兼容代理（18096 反向代理）和“云端纯路径”STRM 已移除。把 Emby 客户端地址改回 Emby 原生端口（如 8096），在设置中填写 STRM 直链地址后重新同步一次虚拟库即可，STRM 会自动重写为直链。
+
 ## Docker Web
 
 Docker Hub 镜像：[`94xhzy/guangya-sync`](https://hub.docker.com/r/94xhzy/guangya-sync)，推荐固定使用版本标签：
 
 ```bash
-docker pull 94xhzy/guangya-sync:0.1.38
+docker pull 94xhzy/guangya-sync:0.1.39
 ```
 
 先准备管理账号。用户名默认是 `admin`；请生成独立的强随机密码，复制 `.env.example` 为 `.env` 并填入 `GUANGYA_ADMIN_PASSWORD`：
@@ -166,6 +183,7 @@ docker compose -f docker-compose.yml -f docker-compose.fuse.yml up -d
 - `./watch` → `/watch`：本地备份任务的源目录；
 - `./archive` → `/archive`：Docker 版“上传后移动到归档”策略的目录；
 - `./media` → `/media`：可选的本地备份允许根目录，不是云盘内原生整理的目标；
+- `./virtual-library` → `/virtual-library`：Emby STRM 虚拟库输出目录，把它再挂载给 Emby 容器；
 - `./docker-data` → `/data`：任务和分享收藏配置。
 
 Docker Web 不能直接读取浏览器所在电脑的任意本地目录。默认 `GUANGYA_FILE_ROOTS=/watch,/archive,/media`，只能浏览和操作明确挂载到这些容器目录中的文件。网页支持扫码和短信验证码登录；也可以在启动前通过 `GUANGYA_TOKEN` 环境变量注入令牌。登录会话和上传历史保存在 `/data/state.sqlite3`。
@@ -207,7 +225,7 @@ pnpm web
 pnpm package:ubuntu
 ```
 
-输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.38.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
+输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.39.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
 
 ## 接口边界
 

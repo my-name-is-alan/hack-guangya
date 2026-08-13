@@ -2,6 +2,24 @@
 
 历史版本的说明见 [GitHub Releases](https://github.com/my-name-is-alan/hack-guangya/releases)。
 
+## v0.1.39 - 2026-08-13
+
+本次是挂载与 Emby 播放链路的整体重构：STRM 全面改为签名直链、移除 Emby 前置代理，WebDAV 读文件改为 302 直链直连 CDN。
+
+### Emby STRM 虚拟库（直链播放）
+
+- STRM 内容从“云端纯路径”改为带 HMAC 签名的播放直链 `http(s)://<直链地址>/strm/<fileId>?sign=…`；新增免管理登录、恒时签名校验的 `/strm/` 播放端点（Docker/Web 在管理端口，桌面端在 18096 直链服务），校验通过后 302 到云盘 CDN。
+- Emby 只需把虚拟库这一个目录加入媒体库：不再需要把挂载盘映射给 Emby，客户端照常连接 Emby 原生地址（如 8096），支持 DirectPlay 的客户端直连 CDN 播放。
+- 移除 Emby 兼容反向代理（18096 反代与 WebSocket 转发）与 `GUANGYA_EMBY_*` 环境变量；桌面端 18096 端口位改为轻量 STRM 直链服务，旧配置的 `proxy_port` 自动迁移。虚拟库设置以 `strm_base_url`（STRM 直链地址）取代“Emby 原始地址”，Docker 可用 `GUANGYA_STRM_BASE_URL` 首次初始化；修改地址后下次同步自动重写全部 STRM。
+- 签名密钥按实例持久化到 SQLite，不通过状态接口回显。
+
+### 挂载性能
+
+- WebDAV 读文件默认 302 重定向到云盘签名直链（`GUANGYA_WEBDAV_REDIRECT=auto`）：rclone、Infuse 等客户端直连 CDN，数据不再经过本进程双跳中转；对 Windows WebClient、macOS Finder、davfs2 等已知不支持重定向的客户端自动回退中转，`off` 可强制全部中转。
+- 新增单文件直链缓存（有效期从 URL 签名解析并预留安全余量，回退 30 分钟、上限 60 分钟，并发请求同一文件只调用一次云端接口）：此前每个 Range/HEAD 请求都会调用一次 `get_res_download_url`，rclone 按 4MB 分块顺序读时每 4MB 触发一次云端接口是挂载卡顿的主因。WebDAV 读取、STRM 端点与虚拟库元数据下载共用该缓存，中转路径直链过期（403/410）自动刷新一次重试。
+- HEAD 请求直接用目录条目元数据回应，不再触发云端接口与 CDN 请求；桌面端 WebDAV 读取改用全局共享连接池（此前每次读取新建 reqwest 客户端）。
+- rclone 托管挂载默认参数调优：读取分块 4M→8M、缓冲 4M→16M、预读 16M→32M、目录缓存 2s→10s。
+
 ## v0.1.38 - 2026-08-12
 
 - GCID/CID 导入遇到远程目录或文件“名称不可用”时，先使用 `gy_<随机值>` 临时名称完成创建/秒传，入库后再恢复原名。

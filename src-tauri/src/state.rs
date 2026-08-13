@@ -149,6 +149,7 @@ pub(crate) struct RuntimeState {
     pub(crate) webdav_error: Option<String>,
     pub(crate) native_mount: NativeMountManager,
     pub(crate) virtual_library: VirtualLibraryManager,
+    pub(crate) strm_sign_secret: String,
 }
 
 

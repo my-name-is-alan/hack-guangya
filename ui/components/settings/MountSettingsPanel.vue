@@ -60,11 +60,12 @@ interface VirtualLibraryStatus {
 }
 
 interface VirtualLibraryInfo {
-  proxy_endpoint: string
-  proxy_port: number
-  proxy_running: boolean
-  proxy_error?: string | null
-  emby_upstream: string
+  strm_endpoint?: string
+  strm_base_url: string
+  strm_port?: number
+  strm_running?: boolean
+  strm_error?: string | null
+  strm_configured?: boolean
   refresh_minutes: number
   virtual_root?: string
   mappings: VirtualLibraryMapping[]
@@ -114,11 +115,12 @@ const native = reactive<NativeMountInfo>({
   error: null,
 })
 const virtual = reactive<VirtualLibraryInfo>({
-  proxy_endpoint: 'http://127.0.0.1:18096/',
-  proxy_port: 18096,
-  proxy_running: false,
-  proxy_error: null,
-  emby_upstream: 'http://127.0.0.1:8096',
+  strm_endpoint: '',
+  strm_base_url: '',
+  strm_port: 18096,
+  strm_running: false,
+  strm_error: null,
+  strm_configured: false,
   refresh_minutes: 15,
   virtual_root: '',
   mappings: [],
@@ -150,6 +152,30 @@ const nativeStatus = computed(() => {
   if (native.running) return { type: 'success', title: `已挂载到 ${native.target}`, detail: `${native.engine} ${native.version}` }
   if (!native.available) return { type: 'warning', title: '原生挂载环境未就绪', detail: native.error || native.prerequisite }
   return { type: 'info', title: '原生挂载可以启动', detail: `${native.version} · ${native.prerequisite}` }
+})
+
+const strmEndpoint = computed(() => {
+  if (virtual.strm_endpoint) return virtual.strm_endpoint
+  return virtual.strm_base_url ? `${virtual.strm_base_url}/strm/` : ''
+})
+
+const strmPlaceholder = computed(() => (isTauri
+  ? `留空使用本机 http://127.0.0.1:${virtual.strm_port || 18096}`
+  : `${typeof window === 'undefined' ? 'http://192.168.1.10:8080' : window.location.origin}`))
+
+const strmStatus = computed(() => {
+  const playbackHint = `STRM 内容指向 ${strmEndpoint.value}<fileId>?sign=…；Emby 扫描和播放时请求该直链并被 302 到云盘 CDN，客户端照常连接 Emby 原始地址（如 8096），不需要任何代理。`
+  if (isTauri) {
+    if (virtual.strm_error) return { type: 'error' as const, title: 'STRM 直链服务未运行', detail: virtual.strm_error }
+    if (virtual.strm_running) return { type: 'success' as const, title: 'STRM 直链服务运行中', detail: playbackHint }
+    return { type: 'warning' as const, title: 'STRM 直链服务正在启动', detail: '' }
+  }
+  if (virtual.strm_configured) return { type: 'success' as const, title: 'STRM 直链已配置', detail: playbackHint }
+  return {
+    type: 'warning' as const,
+    title: '请先填写 STRM 直链地址',
+    detail: '填写 Emby 服务器和播放客户端都能访问到本服务的地址（例如 http://192.168.1.10:8080），保存后再同步虚拟库。',
+  }
 })
 
 async function loadInfo() {
@@ -345,9 +371,9 @@ async function saveVirtualSettings() {
   try {
     Object.assign(virtual, unwrapData(await bridge.invoke('update_virtual_library_settings', {
       refresh_minutes: virtual.refresh_minutes,
-      emby_upstream: virtual.emby_upstream,
+      strm_base_url: virtual.strm_base_url,
     })) as VirtualLibraryInfo)
-    message.success('虚拟库刷新设置已保存')
+    message.success('虚拟库设置已保存，下次同步会按新直链地址重写 STRM')
   }
   catch (reason) { message.error(errorText(reason)) }
   finally { virtualBusy.settings = false }
@@ -409,29 +435,29 @@ onBeforeUnmount(() => unsubscribe?.())
 
     <template v-if="mountMode === 'virtual'">
       <a-alert
-        :type="virtual.proxy_running ? 'success' : 'error'"
+        :type="strmStatus.type"
         show-icon
-        :message="virtual.proxy_running ? 'Emby 兼容代理运行中' : 'Emby 兼容代理未运行'"
-        :description="virtual.proxy_error || `客户端连接 ${virtual.proxy_endpoint}；普通请求和未命中的播放请求转发到 ${virtual.emby_upstream}，只有命中虚拟库纯路径的播放请求返回 302。`"
+        :message="strmStatus.title"
+        :description="strmStatus.detail"
         class="mount-alert"
       />
 
       <div class="virtual-toolbar">
         <div>
           <strong>云端目录 → 本地 STRM 虚拟库</strong>
-          <span>视频和音频生成同名 <code>.strm</code>，内容是云端纯路径；元数据可按每个虚拟库选择下载或排除。</span>
+          <span>视频和音频生成同名 <code>.strm</code>，内容是带签名的播放直链；元数据可按每个虚拟库选择下载或排除。</span>
         </div>
         <a-button type="primary" @click="resetVirtualForm"><PlusOutlined />添加虚拟库</a-button>
       </div>
 
       <a-form class="virtual-settings" layout="inline">
-        <a-form-item label="Emby 原始地址">
-          <a-input v-model:value="virtual.emby_upstream" placeholder="http://127.0.0.1:8096" />
+        <a-form-item label="STRM 直链地址">
+          <a-input v-model:value="virtual.strm_base_url" :placeholder="strmPlaceholder" class="strm-base-input" />
         </a-form-item>
         <a-form-item label="自动刷新">
           <a-input-number v-model:value="virtual.refresh_minutes" :min="1" :max="1440" addon-after="分钟" />
         </a-form-item>
-        <a-button :loading="virtualBusy.settings" @click="saveVirtualSettings">保存刷新设置</a-button>
+        <a-button :loading="virtualBusy.settings" @click="saveVirtualSettings">保存设置</a-button>
       </a-form>
 
       <a-empty v-if="!virtual.mappings.length" description="尚未配置虚拟库" class="virtual-empty" />
@@ -471,8 +497,8 @@ onBeforeUnmount(() => unsubscribe?.())
         show-icon
         message="Emby 使用方式"
         :description="isTauri
-          ? `先把本地虚拟库目录加入 ${virtual.emby_upstream} 的媒体库。继续使用原始 8096 不会触发光鸭；需要直链播放的客户端把 Emby 地址改为 ${virtual.proxy_endpoint}。`
-          : `把 ${virtual.virtual_root || '/virtual-library'} 映射给 Emby，并把客户端 Emby 地址改为 ${virtual.proxy_endpoint}。Emby 原始地址 ${virtual.emby_upstream} 仍可直接使用且不会触发 302。`"
+          ? '把本地虚拟库目录作为媒体库加入 Emby——只需这一个目录，不需要映射挂载盘、也不需要任何代理。客户端照常连接 Emby 原始地址（如 http://127.0.0.1:8096）；Emby 在其他机器时，把 STRM 直链地址改成它能访问到的本机地址。'
+          : `把 ${virtual.virtual_root || '/virtual-library'} 映射给 Emby 容器并作为媒体库加入——只需这一个目录，不需要映射挂载盘、也不需要任何代理。客户端照常连接 Emby 原始地址（如 8096）；STRM 直链地址必须是 Emby 和播放设备都能访问到的本服务地址。`"
         class="support-alert"
       />
     </template>
@@ -689,7 +715,7 @@ onBeforeUnmount(() => unsubscribe?.())
           <a-input v-model:value="virtualForm.local_path" :placeholder="isTauri ? '选择 Emby 扫描的本地目录' : `${virtual.virtual_root || '/virtual-library'}/movies`">
             <template v-if="isTauri" #suffix><FolderOpenOutlined class="copy-icon" @click="selectVirtualTarget" /></template>
           </a-input>
-          <div class="field-help">STRM 只写云端纯路径，不含 HTTP。同步只会清理清单中由光鸭生成、但云端已不存在的文件；不会删除目录里的其他文件。</div>
+          <div class="field-help">STRM 写入带签名的播放直链（<code>…/strm/&lt;fileId&gt;?sign=…</code>），修改直链地址后下次同步会自动重写。同步只会清理清单中由光鸭生成、但云端已不存在的文件；不会删除目录里的其他文件。</div>
         </a-form-item>
         <div class="virtual-option-row">
           <span><strong>保留元数据</strong><small>开启后下载 NFO、海报、字幕等小文件；关闭后只生成视频/音频 STRM。</small></span>
@@ -737,6 +763,7 @@ onBeforeUnmount(() => unsubscribe?.())
 .virtual-toolbar span { color: var(--text-3, #737373); font-size: 12px; }
 .virtual-settings { display: flex; max-width: 780px; align-items: flex-end; margin-bottom: 16px; padding: 12px; border: 1px solid var(--line, #e5e5e5); border-radius: 10px; background: var(--surface-muted, #fafafa); }
 .virtual-settings :deep(.ant-form-item) { margin-bottom: 0; }
+.strm-base-input { min-width: 250px; }
 .virtual-empty { max-width: 780px; padding: 32px 0; }
 .virtual-list { display: grid; max-width: 780px; gap: 12px; }
 .virtual-card { display: grid; gap: 12px; padding: 15px; border: 1px solid var(--line, #e5e5e5); border-radius: 12px; background: var(--surface, #fff); }

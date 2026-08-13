@@ -3656,3 +3656,48 @@
         assert_eq!(after.counts.existing, 0);
         fs::remove_dir_all(root).expect("GCID fixture cleanup");
     }
+
+    #[test]
+    fn webdav_redirect_gates_by_mode_and_user_agent() {
+        assert!(webdav::webdav_redirect_allowed("auto", "rclone/v1.74.4"));
+        assert!(!webdav::webdav_redirect_allowed(
+            "auto",
+            "Microsoft-WebDAV-MiniRedir/10.0.22631"
+        ));
+        assert!(!webdav::webdav_redirect_allowed(
+            "auto",
+            "WebDAVFS/3.0.0 (03008000) Darwin/23.0.0"
+        ));
+        assert!(!webdav::webdav_redirect_allowed(
+            "auto",
+            "davfs2/1.6.1 neon/0.32.5"
+        ));
+        assert!(webdav::webdav_redirect_allowed(
+            "always",
+            "Microsoft-WebDAV-MiniRedir/10.0.22631"
+        ));
+        assert!(!webdav::webdav_redirect_allowed("off", "rclone/v1.74.4"));
+    }
+
+    #[test]
+    fn signed_download_url_expiry_is_parsed_from_common_cdn_parameters() {
+        assert_eq!(
+            parse_signed_url_expiry_unix("https://cdn.example.com/f?Expires=1770000000&Signature=x"),
+            Some(1_770_000_000)
+        );
+        assert_eq!(
+            parse_signed_url_expiry_unix("https://cdn.example.com/f?Expires=1770000000000"),
+            Some(1_770_000_000)
+        );
+        assert_eq!(
+            parse_signed_url_expiry_unix(
+                "https://cdn.example.com/f?x-oss-date=20260813T000000Z&x-oss-expires=21600"
+            ),
+            Some(1_786_579_200 + 21_600)
+        );
+        assert_eq!(
+            parse_signed_url_expiry_unix("https://cdn.example.com/f?token=abc"),
+            None
+        );
+        assert_eq!(parse_signed_url_expiry_unix("not a url"), None);
+    }

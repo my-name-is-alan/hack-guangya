@@ -348,15 +348,15 @@ fn build_mount_arguments(
         "--vfs-write-back".to_string(),
         "5s".to_string(),
         "--dir-cache-time".to_string(),
-        "2s".to_string(),
+        "10s".to_string(),
         "--poll-interval".to_string(),
         "0".to_string(),
         "--buffer-size".to_string(),
-        "4M".to_string(),
-        "--vfs-read-ahead".to_string(),
         "16M".to_string(),
+        "--vfs-read-ahead".to_string(),
+        "32M".to_string(),
         "--vfs-read-chunk-size".to_string(),
-        "4M".to_string(),
+        "8M".to_string(),
         "--log-file".to_string(),
         log_path.to_string_lossy().to_string(),
         "--log-level".to_string(),
@@ -689,13 +689,19 @@ mod tests {
             .any(|pair| pair == ["--vfs-cache-max-size", "32G"]));
         assert!(arguments
             .windows(2)
-            .any(|pair| pair == ["--dir-cache-time", "2s"]));
+            .any(|pair| pair == ["--dir-cache-time", "10s"]));
         assert!(arguments
             .windows(2)
             .any(|pair| pair == ["--vfs-cache-max-age", "24h"]));
         assert!(arguments
             .windows(2)
-            .any(|pair| pair == ["--vfs-read-chunk-size", "4M"]));
+            .any(|pair| pair == ["--vfs-read-chunk-size", "8M"]));
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["--buffer-size", "16M"]));
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["--vfs-read-ahead", "32M"]));
     }
 
     #[cfg(windows)]

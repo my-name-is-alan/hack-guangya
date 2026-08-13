@@ -1,22 +1,17 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
-import http from 'node:http';
-import https from 'node:https';
-import net from 'node:net';
 import path from 'node:path';
-import tls from 'node:tls';
 import { fetch as undiciFetch } from 'undici';
 
 const VIDEO_EXTENSIONS = new Set(['3gp', 'asf', 'avi', 'flv', 'm2ts', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 'mts', 'rm', 'rmvb', 'ts', 'vob', 'webm', 'wmv']);
 const AUDIO_EXTENSIONS = new Set(['aac', 'ac3', 'aiff', 'alac', 'ape', 'dff', 'dsf', 'dts', 'flac', 'm4a', 'mp3', 'ogg', 'opus', 'wav', 'wma']);
 const METADATA_EXTENSIONS = new Set(['ass', 'cue', 'gif', 'jpeg', 'jpg', 'lrc', 'nfo', 'png', 'srt', 'ssa', 'sub', 'sup', 'vtt', 'webp', 'xml']);
 const MANIFEST_NAME = '.guangya-virtual-library.json';
-const DEFAULT_EMBY_UPSTREAM = 'http://127.0.0.1:8096';
 const MAX_ITEMS = 100_000;
 const MAX_DEPTH = 64;
 const MAX_METADATA_BYTES = 64 * 1024 * 1024;
-const HOP_BY_HOP_HEADERS = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
+const FILE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,256}$/;
 
 function cleanText(value) { return String(value ?? '').trim(); }
 function extension(name) { return path.extname(cleanText(name)).slice(1).toLowerCase(); }
@@ -34,19 +29,45 @@ function safeComponent(value) {
   if (/^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/.test(stem)) output = `_${output}`;
   return output;
 }
-function virtualComponent(value) { return cleanText(value).replace(/[\\/\u0000-\u001f\u007f]/g, '_') || '未命名'; }
 export function strmFileName(name) {
   const safe = safeComponent(name);
   const suffix = path.extname(safe);
   return `${suffix ? safe.slice(0, -suffix.length) : safe}.strm`;
 }
-export function virtualMediaPath(sourcePath, segments, name) {
-  const prefix = cleanText(sourcePath).replaceAll('\\', '/').replace(/\/+$/, '');
-  const suffix = [...segments, name].map(virtualComponent).join('/');
-  return `${prefix.startsWith('/') ? prefix : `/${prefix}`}/${suffix}`.replace(/\/{2,}/g, '/');
+export function strmContent(url) { return `${cleanText(url)}\n`; }
+export function normalizeStrmBaseUrl(value) {
+  const raw = cleanText(value);
+  if (!raw) return '';
+  let parsed;
+  try { parsed = new URL(raw); } catch { throw new Error('STRM 直链地址无效'); }
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error('STRM 直链地址必须是不带账号和查询参数的 HTTP(S) 地址，例如 http://192.168.1.10:8080');
+  }
+  const pathname = parsed.pathname.replace(/\/+$/, '');
+  return `${parsed.origin}${pathname}`;
 }
-export function strmContent(virtualPath) { return `${cleanText(virtualPath)}\n`; }
-function normalizedVirtualPath(value) { return cleanText(value).replaceAll('\\', '/').replace(/\/{2,}/g, '/').replace(/\/$/, '').toLowerCase(); }
+export function strmSignature(secret, fileId) {
+  return crypto.createHmac('sha256', String(secret || '')).update(String(fileId || '')).digest('hex');
+}
+export function verifyStrmSignature(secret, fileId, signature) {
+  if (!cleanText(secret) || !cleanText(fileId)) return false;
+  const expected = Buffer.from(strmSignature(secret, fileId), 'utf8');
+  const provided = Buffer.from(cleanText(signature).toLowerCase(), 'utf8');
+  return provided.length === expected.length && crypto.timingSafeEqual(expected, provided);
+}
+export function strmRequestFileId(pathname) {
+  const match = String(pathname || '').match(/^\/strm\/([^/]+)$/);
+  if (!match) return '';
+  let decoded;
+  try { decoded = decodeURIComponent(match[1]); } catch { return ''; }
+  if (decoded === '.' || decoded === '..' || !FILE_ID_PATTERN.test(decoded)) return '';
+  return decoded;
+}
+export function strmUrlFor(baseUrl, secret, fileId) {
+  const base = normalizeStrmBaseUrl(baseUrl);
+  if (!base) throw new Error('请先在虚拟库设置中填写 STRM 直链地址（Emby 及其客户端能访问到本服务的地址）');
+  return `${base}/strm/${encodeURIComponent(cleanText(fileId))}?sign=${strmSignature(secret, fileId)}`;
+}
 function normalizeRemoteEntry(value) {
   const id = cleanText(value?.fileId || value?.id);
   const name = cleanText(value?.fileName || value?.name);
@@ -64,14 +85,6 @@ function normalizeRefreshMinutes(value) {
   if (!Number.isInteger(number) || number < 1 || number > 1440) throw new Error('虚拟库刷新间隔必须为 1 到 1440 分钟');
   return number;
 }
-export function normalizeEmbyUpstream(value) {
-  const raw = cleanText(value) || DEFAULT_EMBY_UPSTREAM;
-  let parsed;
-  try { parsed = new URL(raw); } catch { throw new Error('Emby 原始服务地址无效'); }
-  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error('Emby 原始服务地址必须是无账号和查询参数的 HTTP(S) 地址');
-  if (parsed.pathname !== '/' && parsed.pathname !== '') throw new Error('Emby 原始服务地址不要包含路径，例如 http://127.0.0.1:8096');
-  return parsed.origin;
-}
 function normalizedTarget(root, value) {
   const target = path.resolve(cleanText(value) || root);
   if (!isWithin(root, target)) throw new Error(`Docker/Web 虚拟库目录必须位于 ${root}`);
@@ -79,7 +92,7 @@ function normalizedTarget(root, value) {
 }
 function normalizeMapping(root, input = {}) {
   const sourceDirId = cleanText(input.source_dir_id || input.sourceDirId);
-  if (!/^[A-Za-z0-9._:-]{1,256}$/.test(sourceDirId)) throw new Error('虚拟库云端目录 ID 无效');
+  if (!FILE_ID_PATTERN.test(sourceDirId)) throw new Error('虚拟库云端目录 ID 无效');
   const sourcePath = cleanText(input.source_path || input.sourcePath);
   if (!sourcePath) throw new Error('虚拟库云端目录路径不能为空');
   const localPath = normalizedTarget(root, input.local_path || input.localPath);
@@ -97,42 +110,26 @@ function normalizeMapping(root, input = {}) {
 }
 async function readManifest(root) {
   try { return JSON.parse(await fsp.readFile(path.join(root, MANIFEST_NAME), 'utf8')); }
-  catch { return { version: 2, source_dir_id: '', entries: {} }; }
+  catch { return { version: 3, source_dir_id: '', entries: {} }; }
 }
 async function writeManifest(root, manifest) { await fsp.writeFile(path.join(root, MANIFEST_NAME), JSON.stringify(manifest, null, 2)); }
-function playbackItemId(pathname) {
-  const match = pathname.match(/^\/(?:emby\/)?(?:videos|audio)\/([^/]+)\/(?:stream(?:\.[^/]+)?|original(?:\.[^/]+)?)$/i)
-    || pathname.match(/^\/(?:emby\/)?items\/([^/]+)\/file$/i);
-  if (!match) return '';
-  try { return decodeURIComponent(match[1]); } catch { return ''; }
-}
-function copyAuthHeaders(headers) {
-  const copied = {};
-  for (const name of ['authorization', 'x-emby-authorization', 'x-emby-token', 'user-agent']) {
-    if (headers[name]) copied[name] = headers[name];
-  }
-  return copied;
-}
 
 export function createVirtualLibraryService({
   database,
   cloud,
   root,
-  proxyPort = 18096,
-  embyUpstream = DEFAULT_EMBY_UPSTREAM,
+  strmBaseUrl = '',
   fetchImpl = undiciFetch,
   publish = () => {},
 }) {
   const virtualRoot = path.resolve(root);
-  let currentProxyPort = Number(proxyPort) || 0;
-  let proxyRunning = false;
-  let proxyError = null;
   fs.mkdirSync(virtualRoot, { recursive: true });
   database.exec(`
     CREATE TABLE IF NOT EXISTS virtual_library_settings (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       refresh_minutes INTEGER NOT NULL DEFAULT 15,
-      emby_upstream TEXT NOT NULL DEFAULT '${DEFAULT_EMBY_UPSTREAM}',
+      strm_base_url TEXT NOT NULL DEFAULT '',
+      sign_secret TEXT NOT NULL DEFAULT '',
       updated_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS virtual_library_mappings (
@@ -147,11 +144,16 @@ export function createVirtualLibraryService({
     );
   `);
   const settingsColumns = database.prepare('PRAGMA table_info(virtual_library_settings)').all().map((column) => column.name);
-  const addedEmbyUpstream = !settingsColumns.includes('emby_upstream');
-  if (addedEmbyUpstream) database.exec(`ALTER TABLE virtual_library_settings ADD COLUMN emby_upstream TEXT NOT NULL DEFAULT '${DEFAULT_EMBY_UPSTREAM}'`);
-  database.prepare('INSERT OR IGNORE INTO virtual_library_settings (id, refresh_minutes, emby_upstream, updated_at) VALUES (1, 15, ?, ?)').run(normalizeEmbyUpstream(embyUpstream), Math.floor(Date.now() / 1000));
-  if (addedEmbyUpstream || !cleanText(database.prepare('SELECT emby_upstream FROM virtual_library_settings WHERE id = 1').get()?.emby_upstream)) {
-    database.prepare('UPDATE virtual_library_settings SET emby_upstream = ? WHERE id = 1').run(normalizeEmbyUpstream(embyUpstream));
+  if (!settingsColumns.includes('strm_base_url')) database.exec("ALTER TABLE virtual_library_settings ADD COLUMN strm_base_url TEXT NOT NULL DEFAULT ''");
+  if (!settingsColumns.includes('sign_secret')) database.exec("ALTER TABLE virtual_library_settings ADD COLUMN sign_secret TEXT NOT NULL DEFAULT ''");
+  database.prepare('INSERT OR IGNORE INTO virtual_library_settings (id, refresh_minutes, strm_base_url, sign_secret, updated_at) VALUES (1, 15, ?, ?, ?)')
+    .run(normalizeStrmBaseUrl(strmBaseUrl), crypto.randomBytes(32).toString('hex'), Math.floor(Date.now() / 1000));
+  const initialRow = database.prepare('SELECT strm_base_url, sign_secret FROM virtual_library_settings WHERE id = 1').get();
+  if (!cleanText(initialRow?.sign_secret)) {
+    database.prepare('UPDATE virtual_library_settings SET sign_secret = ? WHERE id = 1').run(crypto.randomBytes(32).toString('hex'));
+  }
+  if (!cleanText(initialRow?.strm_base_url) && cleanText(strmBaseUrl)) {
+    database.prepare('UPDATE virtual_library_settings SET strm_base_url = ? WHERE id = 1').run(normalizeStrmBaseUrl(strmBaseUrl));
   }
   const statuses = new Map();
 
@@ -163,17 +165,20 @@ export function createVirtualLibraryService({
     }));
   }
   function settings() {
-    const row = database.prepare('SELECT refresh_minutes, emby_upstream FROM virtual_library_settings WHERE id = 1').get();
-    return { refreshMinutes: Number(row?.refresh_minutes || 15), embyUpstream: normalizeEmbyUpstream(row?.emby_upstream || embyUpstream) };
+    const row = database.prepare('SELECT refresh_minutes, strm_base_url, sign_secret FROM virtual_library_settings WHERE id = 1').get();
+    return {
+      refreshMinutes: Number(row?.refresh_minutes || 15),
+      strmBaseUrl: (() => { try { return normalizeStrmBaseUrl(row?.strm_base_url); } catch { return ''; } })(),
+      signSecret: cleanText(row?.sign_secret),
+    };
   }
   function info() {
     const current = settings();
     return {
-      proxy_endpoint: `http://127.0.0.1:${currentProxyPort}/`,
-      proxy_port: currentProxyPort,
-      proxy_running: proxyRunning,
-      proxy_error: proxyError,
-      emby_upstream: current.embyUpstream,
+      strm_base_url: current.strmBaseUrl,
+      strm_configured: Boolean(current.strmBaseUrl),
+      strm_path: '/strm',
+      strm_endpoint: current.strmBaseUrl ? `${current.strmBaseUrl}/strm/` : '',
       refresh_minutes: current.refreshMinutes,
       virtual_root: virtualRoot,
       mappings: mappings(),
@@ -181,18 +186,11 @@ export function createVirtualLibraryService({
     };
   }
   function emitInfo() { publish({ type: 'virtual-library', data: info() }); }
-  function setProxyStatus({ running, error = null, port } = {}) {
-    if (typeof running === 'boolean') proxyRunning = running;
-    if (Number.isInteger(Number(port)) && Number(port) >= 0 && Number(port) <= 65535) currentProxyPort = Number(port);
-    proxyError = error ? cleanText(error) : null;
-    emitInfo();
-    return info();
-  }
   function updateSettings(input = {}) {
     const current = settings();
     const refreshMinutes = normalizeRefreshMinutes(input.refresh_minutes ?? input.refreshMinutes ?? current.refreshMinutes);
-    const upstream = normalizeEmbyUpstream(input.emby_upstream ?? input.embyUpstream ?? current.embyUpstream);
-    database.prepare('UPDATE virtual_library_settings SET refresh_minutes = ?, emby_upstream = ?, updated_at = ? WHERE id = 1').run(refreshMinutes, upstream, Math.floor(Date.now() / 1000));
+    const base = normalizeStrmBaseUrl(input.strm_base_url ?? input.strmBaseUrl ?? current.strmBaseUrl);
+    database.prepare('UPDATE virtual_library_settings SET refresh_minutes = ?, strm_base_url = ?, updated_at = ? WHERE id = 1').run(refreshMinutes, base, Math.floor(Date.now() / 1000));
     emitInfo();
     return info();
   }
@@ -231,11 +229,13 @@ export function createVirtualLibraryService({
     await fsp.writeFile(target, bytes);
   }
   async function syncInner(mapping) {
+    const { strmBaseUrl: base, signSecret } = settings();
+    if (!base) throw new Error('请先在虚拟库设置中填写 STRM 直链地址（Emby 及其客户端能访问到本服务的地址）');
     const targetRoot = normalizedTarget(virtualRoot, mapping.local_path);
     await fsp.mkdir(targetRoot, { recursive: true });
     const previous = await readManifest(targetRoot);
-    const next = { version: 2, source_dir_id: mapping.source_dir_id, entries: {} };
-    const queue = [{ parentId: mapping.source_dir_id, relative: '', virtualSegments: [], depth: 0 }];
+    const next = { version: 3, source_dir_id: mapping.source_dir_id, entries: {} };
+    const queue = [{ parentId: mapping.source_dir_id, relative: '', depth: 0 }];
     const outputs = new Set();
     const summary = { strm_files: 0, metadata_files: 0, skipped_files: 0 };
     let scanned = 0;
@@ -249,7 +249,7 @@ export function createVirtualLibraryService({
         if (entry.isDirectory) {
           const relative = path.join(current.relative, safeComponent(entry.name));
           await fsp.mkdir(path.join(targetRoot, relative), { recursive: true });
-          queue.push({ parentId: entry.id, relative, virtualSegments: [...current.virtualSegments, entry.name], depth: current.depth + 1 });
+          queue.push({ parentId: entry.id, relative, depth: current.depth + 1 });
           continue;
         }
         const kind = virtualFileKind(entry.name);
@@ -260,13 +260,12 @@ export function createVirtualLibraryService({
         if (outputs.has(collision)) throw new Error(`多个云端文件会生成同一本地文件：${key}`);
         outputs.add(collision);
         const target = path.join(targetRoot, relative);
-        const virtualPath = kind === 'strm' ? virtualMediaPath(mapping.source_path, current.virtualSegments, entry.name) : '';
-        const manifestEntry = { source_id: entry.id, size: entry.size, modified_ms: entry.modifiedMs, kind, virtual_path: virtualPath };
+        const manifestEntry = { source_id: entry.id, size: entry.size, modified_ms: entry.modifiedMs, kind };
         const old = previous.entries?.[key];
         const unchanged = old && old.source_id === manifestEntry.source_id && Number(old.size) === manifestEntry.size
-          && Number(old.modified_ms) === manifestEntry.modified_ms && old.kind === kind && old.virtual_path === virtualPath && fs.existsSync(target);
+          && Number(old.modified_ms) === manifestEntry.modified_ms && old.kind === kind && fs.existsSync(target);
         if (kind === 'strm') {
-          const content = strmContent(virtualPath);
+          const content = strmContent(strmUrlFor(base, signSecret, entry.id));
           const sameContent = unchanged && await fsp.readFile(target, 'utf8').then((value) => value === content).catch(() => false);
           if (!sameContent) { await fsp.mkdir(path.dirname(target), { recursive: true }); await fsp.writeFile(target, content); }
           summary.strm_files += 1;
@@ -289,6 +288,7 @@ export function createVirtualLibraryService({
     const mapping = mappings().find((item) => item.id === cleanText(id));
     if (!mapping) throw new Error('虚拟库配置不存在');
     if (!mapping.enabled) throw new Error('该虚拟库已停用');
+    if (!settings().strmBaseUrl) throw new Error('请先在虚拟库设置中填写 STRM 直链地址（Emby 及其客户端能访问到本服务的地址）');
     if (statuses.get(mapping.id)?.running) throw new Error('该虚拟库正在同步');
     statuses.set(mapping.id, { ...(statuses.get(mapping.id) || {}), running: true, error: null });
     emitInfo();
@@ -301,126 +301,44 @@ export function createVirtualLibraryService({
     });
     return info();
   }
-  async function sourceIdForVirtualPath(value) {
-    const expected = normalizedVirtualPath(value);
-    if (!expected) return '';
-    for (const mapping of mappings().filter((item) => item.enabled)) {
-      const manifest = await readManifest(mapping.local_path);
-      for (const entry of Object.values(manifest.entries || {})) {
-        if (entry.kind === 'strm' && normalizedVirtualPath(entry.virtual_path) === expected) return cleanText(entry.source_id);
-      }
-    }
-    return '';
-  }
-  async function playbackSourceId(request, url) {
-    if (!['GET', 'HEAD'].includes(request.method)) return '';
-    const itemId = playbackItemId(url.pathname);
-    if (!itemId) return '';
-    const upstream = settings().embyUpstream;
-    const prefix = /^\/emby\//i.test(url.pathname) ? '/emby' : '';
-    const playbackUrl = new URL(`${prefix}/Items/${encodeURIComponent(itemId)}/PlaybackInfo`, upstream);
-    for (const [name, value] of url.searchParams) {
-      if (['api_key', 'x-emby-token', 'userid'].includes(name.toLowerCase())) playbackUrl.searchParams.set(name, value);
-    }
-    const response = await fetchImpl(playbackUrl, { headers: copyAuthHeaders(request.headers), redirect: 'manual' });
-    if (!response.ok) return '';
-    const payload = await response.json();
-    const sources = Array.isArray(payload?.MediaSources) ? payload.MediaSources : Array.isArray(payload?.mediaSources) ? payload.mediaSources : [];
-    const requestedId = cleanText(url.searchParams.get('MediaSourceId') || url.searchParams.get('mediaSourceId'));
-    const ordered = requestedId
-      ? [...sources.filter((source) => cleanText(source?.Id || source?.id) === requestedId), ...sources.filter((source) => cleanText(source?.Id || source?.id) !== requestedId)]
-      : sources;
-    for (const source of ordered) {
-      const sourceId = await sourceIdForVirtualPath(source?.Path || source?.path);
-      if (sourceId) return sourceId;
-    }
-    return '';
-  }
-  function proxyHttp(request, response, url) {
-    return new Promise((resolve, reject) => {
-      const upstream = new URL(settings().embyUpstream);
-      const headers = { ...request.headers, host: upstream.host };
-      for (const name of HOP_BY_HOP_HEADERS) delete headers[name];
-      if (request.headers.host) headers['x-forwarded-host'] = request.headers.host;
-      headers['x-forwarded-proto'] = 'http';
-      const transport = upstream.protocol === 'https:' ? https : http;
-      const outgoing = transport.request({
-        protocol: upstream.protocol,
-        hostname: upstream.hostname,
-        port: upstream.port || (upstream.protocol === 'https:' ? 443 : 80),
-        method: request.method,
-        path: `${url.pathname}${url.search}`,
-        headers,
-      }, (upstreamResponse) => {
-        const responseHeaders = { ...upstreamResponse.headers };
-        for (const name of HOP_BY_HOP_HEADERS) delete responseHeaders[name];
-        const location = cleanText(responseHeaders.location);
-        if (location.startsWith(upstream.origin) && request.headers.host) responseHeaders.location = `http://${request.headers.host}${location.slice(upstream.origin.length)}`;
-        response.writeHead(upstreamResponse.statusCode || 502, responseHeaders);
-        upstreamResponse.pipe(response);
-        upstreamResponse.once('end', resolve);
-        upstreamResponse.once('error', reject);
-      });
-      outgoing.once('error', reject);
-      request.once('aborted', () => outgoing.destroy());
-      request.pipe(outgoing);
-    });
-  }
-  async function handleProxy(request, response, url) {
-    let sourceId = '';
-    try { sourceId = await playbackSourceId(request, url); } catch {}
-    if (sourceId) {
-      const location = await cloud.getDownloadUrl(sourceId);
-      response.writeHead(302, { location, 'cache-control': 'no-store', 'access-control-allow-origin': '*' });
+  async function handleStrm(request, response, url) {
+    const method = String(request.method || 'GET').toUpperCase();
+    if (!['GET', 'HEAD'].includes(method)) {
+      response.writeHead(405, { allow: 'GET, HEAD', 'cache-control': 'no-store' });
       response.end();
       return;
     }
-    await proxyHttp(request, response, url);
-  }
-  const upgradeSockets = new Set();
-  function proxyUpgrade(request, socket, head) {
-    const upstream = new URL(settings().embyUpstream);
-    const connect = upstream.protocol === 'https:' ? tls.connect : net.connect;
-    const upstreamSocket = connect({
-      host: upstream.hostname,
-      port: Number(upstream.port || (upstream.protocol === 'https:' ? 443 : 80)),
-      ...(upstream.protocol === 'https:' ? { servername: upstream.hostname } : {}),
-    });
-    upgradeSockets.add(socket);
-    upgradeSockets.add(upstreamSocket);
-    upstreamSocket.once('connect', () => {
-      const headers = [];
-      for (let index = 0; index < request.rawHeaders.length; index += 2) {
-        const name = request.rawHeaders[index];
-        const value = request.rawHeaders[index + 1];
-        headers.push(`${name}: ${name.toLowerCase() === 'host' ? upstream.host : value}`);
-      }
-      upstreamSocket.write(`${request.method} ${request.url} HTTP/${request.httpVersion}\r\n${headers.join('\r\n')}\r\n\r\n`);
-      if (head?.length) upstreamSocket.write(head);
-      socket.pipe(upstreamSocket).pipe(socket);
-    });
-    const fail = () => {
-      if (!socket.destroyed) socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
-      upstreamSocket.destroy();
-    };
-    upstreamSocket.once('error', fail);
-    socket.once('error', () => upstreamSocket.destroy());
-    socket.once('close', () => {
-      upgradeSockets.delete(socket);
-      upstreamSocket.destroy();
-    });
-    upstreamSocket.once('close', () => {
-      upgradeSockets.delete(upstreamSocket);
-      socket.destroy();
-    });
+    const fileId = strmRequestFileId(url.pathname);
+    if (!fileId) {
+      response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+      response.end('not found');
+      return;
+    }
+    if (!verifyStrmSignature(settings().signSecret, fileId, url.searchParams.get('sign'))) {
+      response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+      response.end('STRM 签名无效');
+      return;
+    }
+    let location;
+    try {
+      location = await cloud.getDownloadUrl(fileId);
+    } catch (error) {
+      response.writeHead(502, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+      response.end(`获取云盘直链失败：${error.message}`);
+      return;
+    }
+    response.writeHead(302, { location, 'cache-control': 'no-store', 'access-control-allow-origin': '*' });
+    response.end();
   }
   let refreshTimer = null;
   function start() {
     const schedule = () => {
       clearTimeout(refreshTimer);
       refreshTimer = setTimeout(() => {
-        for (const mapping of mappings().filter((item) => item.enabled)) {
-          try { sync(mapping.id); } catch {}
+        if (settings().strmBaseUrl) {
+          for (const mapping of mappings().filter((item) => item.enabled)) {
+            try { sync(mapping.id); } catch {}
+          }
         }
         schedule();
       }, settings().refreshMinutes * 60_000);
@@ -430,8 +348,6 @@ export function createVirtualLibraryService({
   }
   function close() {
     clearTimeout(refreshTimer);
-    for (const socket of upgradeSockets) socket.destroy();
-    upgradeSockets.clear();
   }
-  return { info, updateSettings, upsert, remove, sync, handleProxy, proxyUpgrade, setProxyStatus, start, close };
+  return { info, updateSettings, upsert, remove, sync, handleStrm, start, close };
 }

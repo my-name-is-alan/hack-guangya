@@ -1,28 +1,26 @@
 use super::*;
 use axum::{
     body::Body,
-    extract::{ws::Message as AxumWsMessage, FromRequestParts, State, WebSocketUpgrade},
-    http::{header::LOCATION, HeaderMap, Method, Request, Response, StatusCode},
-    response::IntoResponse,
+    extract::{Path as AxumPath, Query, State},
+    http::{header::LOCATION, Response, StatusCode},
+    routing::get,
     Router,
 };
-use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as UpstreamWsMessage};
 
-const DEFAULT_PROXY_PORT: u16 = 18_096;
+const DEFAULT_STRM_PORT: u16 = 18_096;
 const LEGACY_REDIRECT_PORT: u16 = 19_091;
-const DEFAULT_EMBY_UPSTREAM: &str = "http://127.0.0.1:8096";
 const DEFAULT_REFRESH_MINUTES: u64 = 15;
 const MAX_REMOTE_ITEMS: usize = 100_000;
 const MAX_REMOTE_DEPTH: usize = 64;
 const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
 const MANIFEST_NAME: &str = ".guangya-virtual-library.json";
+const MAX_FILE_ID_CHARS: usize = 256;
 
 const VIDEO_EXTENSIONS: &[&str] = &[
     "3gp", "asf", "avi", "flv", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "mts", "rm",
@@ -52,10 +50,14 @@ pub struct VirtualLibraryMapping {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VirtualLibraryOptions {
-    #[serde(default = "default_proxy_port", alias = "redirect_port")]
-    pub proxy_port: u16,
-    #[serde(default = "default_emby_upstream")]
-    pub emby_upstream: String,
+    #[serde(
+        default = "default_strm_port",
+        alias = "proxy_port",
+        alias = "redirect_port"
+    )]
+    pub strm_port: u16,
+    #[serde(default)]
+    pub strm_base_url: String,
     #[serde(default = "default_refresh_minutes")]
     pub refresh_minutes: u64,
     #[serde(default)]
@@ -65,8 +67,8 @@ pub struct VirtualLibraryOptions {
 impl Default for VirtualLibraryOptions {
     fn default() -> Self {
         Self {
-            proxy_port: default_proxy_port(),
-            emby_upstream: default_emby_upstream(),
+            strm_port: default_strm_port(),
+            strm_base_url: String::new(),
             refresh_minutes: default_refresh_minutes(),
             mappings: Vec::new(),
         }
@@ -85,11 +87,11 @@ pub struct VirtualLibrarySyncStatus {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VirtualLibraryInfo {
-    pub proxy_endpoint: String,
-    pub proxy_port: u16,
-    pub proxy_running: bool,
-    pub proxy_error: Option<String>,
-    pub emby_upstream: String,
+    pub strm_endpoint: String,
+    pub strm_base_url: String,
+    pub strm_port: u16,
+    pub strm_running: bool,
+    pub strm_error: Option<String>,
     pub refresh_minutes: u64,
     pub mappings: Vec<VirtualLibraryMapping>,
     pub statuses: HashMap<String, VirtualLibrarySyncStatus>,
@@ -98,8 +100,8 @@ pub struct VirtualLibraryInfo {
 pub struct VirtualLibraryManager {
     options: VirtualLibraryOptions,
     statuses: HashMap<String, VirtualLibrarySyncStatus>,
-    proxy_running: bool,
-    proxy_error: Option<String>,
+    strm_running: bool,
+    strm_error: Option<String>,
 }
 
 impl VirtualLibraryManager {
@@ -108,8 +110,8 @@ impl VirtualLibraryManager {
         Self {
             options,
             statuses: HashMap::new(),
-            proxy_running: false,
-            proxy_error: None,
+            strm_running: false,
+            strm_error: None,
         }
     }
 
@@ -117,13 +119,23 @@ impl VirtualLibraryManager {
         self.options.clone()
     }
 
+    /// STRM 内容使用的直链前缀：未显式配置时回落到本机 STRM 服务地址，
+    /// 适合 Emby 与本软件在同一台机器的默认场景。
+    pub fn effective_strm_base(&self) -> String {
+        if self.options.strm_base_url.is_empty() {
+            format!("http://127.0.0.1:{}", self.options.strm_port)
+        } else {
+            self.options.strm_base_url.clone()
+        }
+    }
+
     pub fn info(&self) -> VirtualLibraryInfo {
         VirtualLibraryInfo {
-            proxy_endpoint: format!("http://127.0.0.1:{}/", self.options.proxy_port),
-            proxy_port: self.options.proxy_port,
-            proxy_running: self.proxy_running,
-            proxy_error: self.proxy_error.clone(),
-            emby_upstream: self.options.emby_upstream.clone(),
+            strm_endpoint: format!("{}/strm/", self.effective_strm_base()),
+            strm_base_url: self.options.strm_base_url.clone(),
+            strm_port: self.options.strm_port,
+            strm_running: self.strm_running,
+            strm_error: self.strm_error.clone(),
             refresh_minutes: self.options.refresh_minutes,
             mappings: self.options.mappings.clone(),
             statuses: self.statuses.clone(),
@@ -135,8 +147,8 @@ impl VirtualLibraryManager {
         Ok(())
     }
 
-    pub fn set_emby_upstream(&mut self, value: String) -> Result<(), String> {
-        self.options.emby_upstream = normalize_emby_upstream(&value)?;
+    pub fn set_strm_base_url(&mut self, value: String) -> Result<(), String> {
+        self.options.strm_base_url = normalize_strm_base_url(&value)?;
         Ok(())
     }
 
@@ -213,9 +225,9 @@ impl VirtualLibraryManager {
         }
     }
 
-    pub fn set_proxy_status(&mut self, running: bool, error: Option<String>) {
-        self.proxy_running = running;
-        self.proxy_error = error;
+    pub fn set_strm_status(&mut self, running: bool, error: Option<String>) {
+        self.strm_running = running;
+        self.strm_error = error;
     }
 }
 
@@ -241,8 +253,6 @@ struct ManifestEntry {
     size: u64,
     modified_ms: u64,
     kind: String,
-    #[serde(default)]
-    virtual_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -252,18 +262,8 @@ struct VirtualLibraryManifest {
     entries: BTreeMap<String, ManifestEntry>,
 }
 
-#[derive(Clone)]
-struct ProxyContext {
-    state: SharedState,
-    client: reqwest::Client,
-}
-
-pub const fn default_proxy_port() -> u16 {
-    DEFAULT_PROXY_PORT
-}
-
-pub fn default_emby_upstream() -> String {
-    DEFAULT_EMBY_UPSTREAM.to_string()
+pub const fn default_strm_port() -> u16 {
+    DEFAULT_STRM_PORT
 }
 
 pub const fn default_refresh_minutes() -> u64 {
@@ -277,33 +277,82 @@ fn normalize_refresh_minutes(value: u64) -> Result<u64, String> {
     Ok(value)
 }
 
-fn normalize_emby_upstream(value: &str) -> Result<String, String> {
-    let raw = if value.trim().is_empty() {
-        DEFAULT_EMBY_UPSTREAM
-    } else {
-        value.trim()
-    };
-    let parsed = reqwest::Url::parse(raw).map_err(|_| "Emby 原始服务地址无效".to_string())?;
+pub fn normalize_strm_base_url(value: &str) -> Result<String, String> {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return Ok(String::new());
+    }
+    let parsed = reqwest::Url::parse(raw).map_err(|_| "STRM 直链地址无效".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https")
         || !parsed.username().is_empty()
         || parsed.password().is_some()
         || parsed.query().is_some()
         || parsed.fragment().is_some()
-        || parsed.path() != "/"
     {
-        return Err("Emby 原始服务地址必须是无账号、路径和查询参数的 HTTP(S) 地址".to_string());
+        return Err(
+            "STRM 直链地址必须是不带账号和查询参数的 HTTP(S) 地址，例如 http://192.168.1.10:18096"
+                .to_string(),
+        );
     }
-    Ok(parsed.origin().ascii_serialization())
+    let origin = parsed.origin().ascii_serialization();
+    let path = parsed.path().trim_end_matches('/');
+    Ok(format!("{origin}{path}"))
+}
+
+pub(crate) fn strm_signature(secret: &str, file_id: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .unwrap_or_else(|_| Hmac::<Sha256>::new_from_slice(b"guangya").expect("hmac"));
+    mac.update(file_id.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |acc, (l, r)| acc | (l ^ r))
+        == 0
+}
+
+pub(crate) fn verify_strm_signature(secret: &str, file_id: &str, signature: &str) -> bool {
+    if secret.trim().is_empty() || file_id.trim().is_empty() {
+        return false;
+    }
+    let expected = strm_signature(secret, file_id);
+    constant_time_eq(
+        expected.as_bytes(),
+        signature.trim().to_ascii_lowercase().as_bytes(),
+    )
+}
+
+pub(crate) fn strm_url(base: &str, secret: &str, file_id: &str) -> String {
+    format!(
+        "{}/strm/{}?sign={}",
+        base.trim_end_matches('/'),
+        utf8_percent_encode(file_id, NON_ALPHANUMERIC),
+        strm_signature(secret, file_id)
+    )
+}
+
+fn valid_strm_file_id(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value.chars().count() <= MAX_FILE_ID_CHARS
+        && !value.chars().any(char::is_control)
+        && !value.contains(['/', '\\'])
 }
 
 fn normalize_options(mut options: VirtualLibraryOptions) -> Result<VirtualLibraryOptions, String> {
-    if options.proxy_port == 0 || options.proxy_port == LEGACY_REDIRECT_PORT {
-        options.proxy_port = default_proxy_port();
+    if options.strm_port == 0 || options.strm_port == LEGACY_REDIRECT_PORT {
+        options.strm_port = default_strm_port();
     }
-    if options.proxy_port == DEFAULT_WEBDAV_PORT {
-        return Err("Emby 代理端口不能与 WebDAV 端口相同".to_string());
+    if options.strm_port == DEFAULT_WEBDAV_PORT {
+        return Err("STRM 直链端口不能与 WebDAV 端口相同".to_string());
     }
-    options.emby_upstream = normalize_emby_upstream(&options.emby_upstream)?;
+    options.strm_base_url = normalize_strm_base_url(&options.strm_base_url)?;
     options.refresh_minutes = normalize_refresh_minutes(options.refresh_minutes)?;
     options.mappings = options
         .mappings
@@ -435,57 +484,8 @@ fn media_output_name(name: &str) -> String {
     format!("{stem}.strm")
 }
 
-fn virtual_component(value: &str) -> String {
-    let value = value
-        .chars()
-        .map(|character| {
-            if character.is_control() || matches!(character, '/' | '\\') {
-                '_'
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
-    let value = value.trim();
-    if value.is_empty() {
-        "未命名".to_string()
-    } else {
-        value.to_string()
-    }
-}
-
-fn virtual_media_path(source_path: &str, segments: &[String], name: &str) -> String {
-    let mut parts = source_path
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_string();
-    if !parts.starts_with('/') {
-        parts.insert(0, '/');
-    }
-    for segment in segments
-        .iter()
-        .map(|value| virtual_component(value))
-        .chain(std::iter::once(virtual_component(name)))
-    {
-        parts.push('/');
-        parts.push_str(&segment);
-    }
-    while parts.contains("//") {
-        parts = parts.replace("//", "/");
-    }
-    parts
-}
-
-fn strm_content(virtual_path: &str) -> String {
-    format!("{}\n", virtual_path.trim())
-}
-
-fn normalized_virtual_path(value: &str) -> String {
-    let mut normalized = value.trim().replace('\\', "/");
-    while normalized.contains("//") {
-        normalized = normalized.replace("//", "/");
-    }
-    normalized.trim_end_matches('/').to_lowercase()
+fn strm_content(url: &str) -> String {
+    format!("{}\n", url.trim())
 }
 
 fn safe_relative(path: &Path) -> bool {
@@ -595,31 +595,6 @@ async fn fetch_children(
     Ok(entries)
 }
 
-async fn download_url(token: &str, device_id: &str, file_id: &str) -> Result<String, String> {
-    let response = api_post(
-        token,
-        device_id,
-        "/userres/v1/get_res_download_url",
-        json!({ "fileId": file_id }),
-        &[],
-    )
-    .await?;
-    response
-        .data
-        .as_ref()
-        .and_then(|data| {
-            data.get("downloadUrl")
-                .or_else(|| data.get("downloadURL"))
-                .or_else(|| data.get("signedURL"))
-                .or_else(|| data.get("signedUrl"))
-                .or_else(|| data.get("url"))
-        })
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| "光鸭没有返回文件下载地址".to_string())
-}
-
 async fn download_metadata(
     client: &reqwest::Client,
     token: &str,
@@ -630,13 +605,14 @@ async fn download_metadata(
     if entry.size > MAX_METADATA_BYTES {
         return Err(format!("元数据文件超过 64 MB：{}", entry.name));
     }
-    let url = download_url(token, device_id, &entry.id).await?;
+    let url = cached_res_download_url(token, device_id, &entry.id, false).await?;
     let response = client
         .get(url)
         .send()
         .await
         .map_err(|error| format!("下载元数据失败（{}）：{error}", entry.name))?;
     if !response.status().is_success() {
+        download_url_cache().invalidate(&entry.id);
         return Err(format!(
             "下载元数据失败（{}）：HTTP {}",
             entry.name,
@@ -709,7 +685,7 @@ pub async fn sync_mapping(
     state: &SharedState,
     mapping: &VirtualLibraryMapping,
 ) -> Result<SyncSummary, String> {
-    let (token, device_id) = {
+    let (token, device_id, strm_base, sign_secret) = {
         let guard = state.lock().map_err(|error| error.to_string())?;
         (
             guard
@@ -717,8 +693,13 @@ pub async fn sync_mapping(
                 .clone()
                 .ok_or_else(|| "请先登录光鸭云盘".to_string())?,
             guard.device_id.clone(),
+            guard.virtual_library.effective_strm_base(),
+            guard.strm_sign_secret.clone(),
         )
     };
+    if sign_secret.trim().is_empty() {
+        return Err("STRM 签名密钥未初始化，请重启应用".to_string());
+    }
     let root = normalize_local_root(&mapping.local_path)?;
     tokio::fs::create_dir_all(&root)
         .await
@@ -730,16 +711,11 @@ pub async fn sync_mapping(
         .build()
         .map_err(|error| format!("创建元数据下载客户端失败：{error}"))?;
     let mut next = VirtualLibraryManifest {
-        version: 2,
+        version: 3,
         source_dir_id: mapping.source_dir_id.clone(),
         entries: BTreeMap::new(),
     };
-    let mut pending = VecDeque::from([(
-        mapping.source_dir_id.clone(),
-        PathBuf::new(),
-        Vec::<String>::new(),
-        0_usize,
-    )]);
+    let mut pending = VecDeque::from([(mapping.source_dir_id.clone(), PathBuf::new(), 0_usize)]);
     let mut seen_outputs = HashSet::new();
     let mut scanned = 0_usize;
     let mut summary = SyncSummary {
@@ -748,7 +724,7 @@ pub async fn sync_mapping(
         skipped_files: 0,
     };
 
-    while let Some((parent_id, relative_dir, virtual_segments, depth)) = pending.pop_front() {
+    while let Some((parent_id, relative_dir, depth)) = pending.pop_front() {
         if depth > MAX_REMOTE_DEPTH {
             return Err(format!("云端目录超过 {MAX_REMOTE_DEPTH} 层，已停止同步"));
         }
@@ -762,9 +738,7 @@ pub async fn sync_mapping(
                 tokio::fs::create_dir_all(root.join(&child_relative))
                     .await
                     .map_err(|error| format!("创建虚拟库目录失败：{error}"))?;
-                let mut child_virtual_segments = virtual_segments.clone();
-                child_virtual_segments.push(entry.name);
-                pending.push_back((entry.id, child_relative, child_virtual_segments, depth + 1));
+                pending.push_back((entry.id, child_relative, depth + 1));
                 continue;
             }
 
@@ -786,28 +760,21 @@ pub async fn sync_mapping(
                 return Err(format!("多个云端文件会生成同一本地文件：{key}"));
             }
             let target = root.join(&relative_file);
-            let virtual_path = if kind == "strm" {
-                virtual_media_path(&mapping.source_path, &virtual_segments, &entry.name)
-            } else {
-                String::new()
-            };
             let manifest_entry = ManifestEntry {
                 source_id: entry.id.clone(),
                 size: entry.size,
                 modified_ms: entry.modified_ms,
                 kind: kind.to_string(),
-                virtual_path: virtual_path.clone(),
             };
             let unchanged = previous.entries.get(&key).is_some_and(|previous| {
                 previous.source_id == manifest_entry.source_id
                     && previous.size == manifest_entry.size
                     && previous.modified_ms == manifest_entry.modified_ms
                     && previous.kind == manifest_entry.kind
-                    && previous.virtual_path == manifest_entry.virtual_path
                     && target.is_file()
             });
             if kind == "strm" {
-                let content = strm_content(&virtual_path);
+                let content = strm_content(&strm_url(&strm_base, &sign_secret, &entry.id));
                 if !unchanged
                     || tokio::fs::read_to_string(&target).await.ok().as_deref()
                         != Some(content.as_str())
@@ -846,414 +813,86 @@ fn response(status: StatusCode, body: impl Into<Body>) -> Response<Body> {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-fn playback_item_id(path: &str) -> Option<String> {
-    let mut segments = path
-        .trim_matches('/')
-        .split('/')
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    if segments
-        .first()
-        .is_some_and(|value| value.eq_ignore_ascii_case("emby"))
-    {
-        segments.remove(0);
-    }
-    let raw_id = if segments.len() == 3
-        && (segments[0].eq_ignore_ascii_case("videos") || segments[0].eq_ignore_ascii_case("audio"))
-        && (segments[2].eq_ignore_ascii_case("stream")
-            || segments[2].to_ascii_lowercase().starts_with("stream.")
-            || segments[2].eq_ignore_ascii_case("original")
-            || segments[2].to_ascii_lowercase().starts_with("original."))
-    {
-        segments[1]
-    } else if segments.len() == 3
-        && segments[0].eq_ignore_ascii_case("items")
-        && segments[2].eq_ignore_ascii_case("file")
-    {
-        segments[1]
-    } else {
-        return None;
-    };
-    let decoded = percent_encoding::percent_decode_str(raw_id)
-        .decode_utf8()
-        .ok()?;
-    normalize_api_id(&decoded, "Emby 媒体 ID").ok()
+#[derive(Clone)]
+struct StrmContext {
+    state: SharedState,
 }
 
-async fn source_id_for_virtual_path(
-    mappings: &[VirtualLibraryMapping],
-    value: &str,
-) -> Option<String> {
-    let expected = normalized_virtual_path(value);
-    if expected.is_empty() {
-        return None;
+/// `/strm/<fileId>?sign=<hmac>`：STRM 文件里的播放直链。
+/// 免登录，仅校验 per-instance HMAC 签名，校验通过后 302 到云盘 CDN 直链。
+async fn strm_request(
+    State(context): State<StrmContext>,
+    AxumPath(file_id): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    let file_id = file_id.trim().to_string();
+    if !valid_strm_file_id(&file_id) {
+        return response(StatusCode::NOT_FOUND, "not found");
     }
-    for mapping in mappings.iter().filter(|mapping| mapping.enabled) {
-        let manifest = load_manifest(Path::new(&mapping.local_path)).await;
-        if let Some(entry) = manifest.entries.values().find(|entry| {
-            entry.kind == "strm" && normalized_virtual_path(&entry.virtual_path) == expected
-        }) {
-            return Some(entry.source_id.clone());
-        }
-    }
-    None
-}
-
-fn emby_request_url(upstream: &str, uri: &axum::http::Uri) -> Result<reqwest::Url, String> {
-    let mut url = reqwest::Url::parse(upstream).map_err(|error| error.to_string())?;
-    url.set_path(uri.path());
-    url.set_query(uri.query());
-    Ok(url)
-}
-
-async fn playback_source_id(
-    context: &ProxyContext,
-    method: &Method,
-    uri: &axum::http::Uri,
-    headers: &HeaderMap,
-) -> Option<String> {
-    if !matches!(*method, Method::GET | Method::HEAD) {
-        return None;
-    }
-    let item_id = playback_item_id(uri.path())?;
-    let (upstream, mappings) = {
-        let guard = context.state.lock().ok()?;
+    let signature = query.get("sign").map(String::as_str).unwrap_or_default();
+    let (secret, token, device_id) = {
+        let Ok(guard) = context.state.lock() else {
+            return response(StatusCode::INTERNAL_SERVER_ERROR, "内部状态不可用");
+        };
         (
-            guard.virtual_library.options().emby_upstream,
-            guard.virtual_library.options().mappings,
+            guard.strm_sign_secret.clone(),
+            guard.token.clone(),
+            guard.device_id.clone(),
         )
     };
-    let prefix = if uri.path().to_ascii_lowercase().starts_with("/emby/") {
-        "/emby"
-    } else {
-        ""
+    if !verify_strm_signature(&secret, &file_id, signature) {
+        return response(StatusCode::FORBIDDEN, "STRM 签名无效");
+    }
+    let Some(token) = token else {
+        return response(StatusCode::SERVICE_UNAVAILABLE, "请先登录光鸭云盘");
     };
-    let mut playback_url = reqwest::Url::parse(&upstream).ok()?;
-    playback_url.set_path(&format!("{prefix}/Items/{item_id}/PlaybackInfo"));
-    if let Some(query) = uri.query() {
-        let request_url = reqwest::Url::parse(&format!("http://localhost/?{query}")).ok()?;
-        for (name, value) in request_url.query_pairs() {
-            if matches!(
-                name.to_ascii_lowercase().as_str(),
-                "api_key" | "x-emby-token" | "userid"
-            ) {
-                playback_url.query_pairs_mut().append_pair(&name, &value);
-            }
-        }
-    }
-    let mut request = context.client.get(playback_url);
-    for name in [
-        "authorization",
-        "x-emby-authorization",
-        "x-emby-token",
-        "user-agent",
-    ] {
-        if let Some(value) = headers.get(name) {
-            request = request.header(name, value);
-        }
-    }
-    let payload = request
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json::<Value>()
-        .await
-        .ok()?;
-    let sources = payload
-        .get("MediaSources")
-        .or_else(|| payload.get("mediaSources"))
-        .and_then(Value::as_array)?;
-    let request_url = reqwest::Url::parse(&format!(
-        "http://localhost{}",
-        uri.path_and_query()
-            .map(|value| value.as_str())
-            .unwrap_or("/")
-    ))
-    .ok()?;
-    let requested_source_id = request_url
-        .query_pairs()
-        .find(|(name, _)| name.eq_ignore_ascii_case("MediaSourceId"))
-        .map(|(_, value)| value.into_owned())
-        .unwrap_or_default();
-    let mut ordered = sources.iter().collect::<Vec<_>>();
-    if !requested_source_id.is_empty() {
-        ordered.sort_by_key(|source| {
-            source
-                .get("Id")
-                .or_else(|| source.get("id"))
-                .and_then(Value::as_str)
-                .is_none_or(|value| value != requested_source_id)
-        });
-    }
-    for source in ordered {
-        let path = source
-            .get("Path")
-            .or_else(|| source.get("path"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if let Some(source_id) = source_id_for_virtual_path(&mappings, path).await {
-            return Some(source_id);
-        }
-    }
-    None
-}
-
-fn hop_by_hop_header(name: &axum::http::HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-    )
-}
-
-async fn proxy_http(context: &ProxyContext, request: Request<Body>) -> Response<Body> {
-    let (parts, body) = request.into_parts();
-    let upstream = match context.state.lock() {
-        Ok(guard) => guard.virtual_library.options().emby_upstream,
-        Err(error) => return response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-    };
-    let url = match emby_request_url(&upstream, &parts.uri) {
-        Ok(url) => url,
-        Err(error) => return response(StatusCode::BAD_GATEWAY, error),
-    };
-    let client_host = parts.headers.get("host").cloned();
-    let mut outgoing = context.client.request(parts.method, url);
-    for (name, value) in &parts.headers {
-        if name.as_str() != "host" && !hop_by_hop_header(name) {
-            outgoing = outgoing.header(name, value);
-        }
-    }
-    if let Some(host) = &client_host {
-        outgoing = outgoing.header("x-forwarded-host", host);
-    }
-    outgoing = outgoing
-        .header("x-forwarded-proto", "http")
-        .body(reqwest::Body::wrap_stream(body.into_data_stream()));
-    let upstream_response = match outgoing.send().await {
-        Ok(response) => response,
-        Err(error) => {
-            return response(
-                StatusCode::BAD_GATEWAY,
-                format!("Emby 原始服务连接失败：{error}"),
-            )
-        }
-    };
-    let status = upstream_response.status();
-    let mut headers = upstream_response.headers().clone();
-    for name in [
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "proxy-connection",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-    ] {
-        headers.remove(name);
-    }
-    if let (Some(location), Some(host)) = (headers.get(LOCATION).cloned(), client_host) {
-        if let (Ok(location), Ok(host)) = (location.to_str(), host.to_str()) {
-            if location.starts_with(&upstream) {
-                if let Ok(value) = format!("http://{host}{}", &location[upstream.len()..]).parse() {
-                    headers.insert(LOCATION, value);
-                }
-            }
-        }
-    }
-    let mut builder = Response::builder().status(status);
-    for (name, value) in &headers {
-        builder = builder.header(name, value);
-    }
-    builder
-        .body(Body::from_stream(upstream_response.bytes_stream()))
-        .unwrap_or_else(|_| response(StatusCode::BAD_GATEWAY, "构造 Emby 代理响应失败"))
-}
-
-fn websocket_url(upstream: &str, uri: &axum::http::Uri) -> Result<String, String> {
-    let mut url = emby_request_url(upstream, uri)?;
-    let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
-    url.set_scheme(scheme)
-        .map_err(|_| "Emby WebSocket 地址无效".to_string())?;
-    Ok(url.to_string())
-}
-
-async fn relay_websocket(
-    downstream: axum::extract::ws::WebSocket,
-    upstream: String,
-    headers: HeaderMap,
-) {
-    let mut request = match upstream.into_client_request() {
-        Ok(request) => request,
-        Err(_) => return,
-    };
-    for name in [
-        "authorization",
-        "x-emby-authorization",
-        "x-emby-token",
-        "origin",
-        "user-agent",
-        "sec-websocket-protocol",
-    ] {
-        if let Some(value) = headers.get(name) {
-            request.headers_mut().insert(name, value.clone());
-        }
-    }
-    let upstream = match tokio_tungstenite::connect_async(request).await {
-        Ok((socket, _)) => socket,
-        Err(_) => return,
-    };
-    let (mut downstream_tx, mut downstream_rx) = downstream.split();
-    let (mut upstream_tx, mut upstream_rx) = upstream.split();
-    loop {
-        tokio::select! {
-            message = downstream_rx.next() => match message {
-                Some(Ok(AxumWsMessage::Text(value))) => {
-                    if upstream_tx.send(UpstreamWsMessage::Text(value.to_string().into())).await.is_err() { break; }
-                }
-                Some(Ok(AxumWsMessage::Binary(value))) => {
-                    if upstream_tx.send(UpstreamWsMessage::Binary(value)).await.is_err() { break; }
-                }
-                Some(Ok(AxumWsMessage::Ping(value))) => {
-                    if upstream_tx.send(UpstreamWsMessage::Ping(value)).await.is_err() { break; }
-                }
-                Some(Ok(AxumWsMessage::Pong(value))) => {
-                    if upstream_tx.send(UpstreamWsMessage::Pong(value)).await.is_err() { break; }
-                }
-                Some(Ok(AxumWsMessage::Close(_))) | Some(Err(_)) | None => break,
-            },
-            message = upstream_rx.next() => match message {
-                Some(Ok(UpstreamWsMessage::Text(value))) => {
-                    if downstream_tx.send(AxumWsMessage::Text(value.to_string().into())).await.is_err() { break; }
-                }
-                Some(Ok(UpstreamWsMessage::Binary(value))) => {
-                    if downstream_tx.send(AxumWsMessage::Binary(value)).await.is_err() { break; }
-                }
-                Some(Ok(UpstreamWsMessage::Ping(value))) => {
-                    if downstream_tx.send(AxumWsMessage::Ping(value)).await.is_err() { break; }
-                }
-                Some(Ok(UpstreamWsMessage::Pong(value))) => {
-                    if downstream_tx.send(AxumWsMessage::Pong(value)).await.is_err() { break; }
-                }
-                Some(Ok(UpstreamWsMessage::Close(_))) | Some(Err(_)) | None => break,
-                Some(Ok(UpstreamWsMessage::Frame(_))) => {}
-            }
-        }
+    match cached_res_download_url(&token, &device_id, &file_id, false).await {
+        Ok(url) => Response::builder()
+            .status(StatusCode::FOUND)
+            .header(LOCATION, url)
+            .header("cache-control", "no-store")
+            .header("access-control-allow-origin", "*")
+            .body(Body::empty())
+            .unwrap_or_else(|_| response(StatusCode::INTERNAL_SERVER_ERROR, "构造播放重定向失败")),
+        Err(error) => response(StatusCode::BAD_GATEWAY, format!("获取云盘直链失败：{error}")),
     }
 }
 
-async fn proxy_request(
-    State(context): State<ProxyContext>,
-    request: Request<Body>,
-) -> Response<Body> {
-    if request
-        .headers()
-        .get("upgrade")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
-    {
-        let upstream = match context.state.lock() {
-            Ok(guard) => websocket_url(
-                &guard.virtual_library.options().emby_upstream,
-                request.uri(),
-            ),
-            Err(error) => Err(error.to_string()),
-        };
-        let upstream = match upstream {
-            Ok(value) => value,
-            Err(error) => return response(StatusCode::BAD_GATEWAY, error),
-        };
-        let headers = request.headers().clone();
-        let (mut parts, _) = request.into_parts();
-        return match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
-            Ok(upgrade) => upgrade
-                .on_upgrade(move |socket| relay_websocket(socket, upstream, headers))
-                .into_response(),
-            Err(error) => response(StatusCode::BAD_REQUEST, error.to_string()),
-        };
-    }
-    let source_id =
-        playback_source_id(&context, request.method(), request.uri(), request.headers()).await;
-    if let Some(source_id) = source_id {
-        let (token, device_id) = match context.state.lock() {
-            Ok(guard) => match guard.token.clone() {
-                Some(token) => (token, guard.device_id.clone()),
-                None => return response(StatusCode::SERVICE_UNAVAILABLE, "请先登录光鸭云盘"),
-            },
-            Err(error) => return response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-        };
-        return match download_url(&token, &device_id, &source_id).await {
-            Ok(url) => Response::builder()
-                .status(StatusCode::FOUND)
-                .header(LOCATION, url)
-                .header("cache-control", "no-store")
-                .header("access-control-allow-origin", "*")
-                .body(Body::empty())
-                .unwrap_or_else(|_| {
-                    response(StatusCode::INTERNAL_SERVER_ERROR, "构造播放重定向失败")
-                }),
-            Err(error) => response(StatusCode::BAD_GATEWAY, error),
-        };
-    }
-    proxy_http(&context, request).await
-}
-
-pub async fn serve_proxy(app: tauri::AppHandle, state: SharedState, port: u16) {
+pub async fn serve_strm(app: tauri::AppHandle, state: SharedState, port: u16) {
     let address = format!("127.0.0.1:{port}");
     let listener = match tokio::net::TcpListener::bind(&address).await {
         Ok(listener) => listener,
         Err(error) => {
-            let message = format!("Emby 代理端口监听 {address} 失败：{error}");
+            let message = format!("STRM 直链端口监听 {address} 失败：{error}");
             if let Ok(mut guard) = state.lock() {
                 guard
                     .virtual_library
-                    .set_proxy_status(false, Some(message.clone()));
+                    .set_strm_status(false, Some(message.clone()));
             }
             status(&app, "error", message);
             return;
         }
     };
-    let client = match reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(15))
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => {
-            status(&app, "error", format!("创建 Emby 代理客户端失败：{error}"));
-            return;
-        }
-    };
     if let Ok(mut guard) = state.lock() {
-        guard.virtual_library.set_proxy_status(true, None);
+        guard.virtual_library.set_strm_status(true, None);
     }
     status(
         &app,
         "success",
-        format!("虚拟库 Emby 代理已启动：http://{address}/"),
+        format!("STRM 直链服务已启动：http://{address}/strm/"),
     );
     let router = Router::new()
-        .fallback(proxy_request)
-        .with_state(ProxyContext {
+        .route("/strm/{file_id}", get(strm_request))
+        .fallback(|| async { response(StatusCode::NOT_FOUND, "not found") })
+        .with_state(StrmContext {
             state: state.clone(),
-            client,
         });
     if let Err(error) = axum::serve(listener, router).await {
-        let message = format!("虚拟库播放重定向服务异常退出：{error}");
+        let message = format!("STRM 直链服务异常退出：{error}");
         if let Ok(mut guard) = state.lock() {
             guard
                 .virtual_library
-                .set_proxy_status(false, Some(message.clone()));
+                .set_strm_status(false, Some(message.clone()));
         }
         status(&app, "error", message);
     }
@@ -1275,41 +914,67 @@ mod tests {
     }
 
     #[test]
-    fn strm_contains_only_the_cloud_virtual_path() {
-        let path = virtual_media_path("/电影", &["子目录".to_string()], "示例 电影.mkv");
-        assert_eq!(strm_content(&path), "/电影/子目录/示例 电影.mkv\n");
-        assert!(!strm_content(&path).contains("http"));
+    fn strm_contains_a_signed_direct_link() {
+        let url = strm_url("http://127.0.0.1:18096", "secret", "file-1");
+        assert_eq!(
+            url,
+            format!(
+                "http://127.0.0.1:18096/strm/file%2D1?sign={}",
+                strm_signature("secret", "file-1")
+            )
+        );
+        assert_eq!(strm_content(&url), format!("{url}\n"));
+        assert!(verify_strm_signature(
+            "secret",
+            "file-1",
+            &strm_signature("secret", "file-1")
+        ));
+        assert!(!verify_strm_signature(
+            "secret",
+            "file-1",
+            &strm_signature("secret", "file-2")
+        ));
+        assert!(!verify_strm_signature("", "file-1", ""));
     }
 
     #[test]
-    fn legacy_redirect_settings_migrate_to_the_emby_proxy_defaults() {
+    fn strm_base_url_normalization_accepts_prefix_paths_and_rejects_credentials() {
+        assert_eq!(normalize_strm_base_url("").unwrap(), "");
+        assert_eq!(
+            normalize_strm_base_url("http://192.168.1.10:18096/").unwrap(),
+            "http://192.168.1.10:18096"
+        );
+        assert_eq!(
+            normalize_strm_base_url("https://nas.example.com/guangya/").unwrap(),
+            "https://nas.example.com/guangya"
+        );
+        assert!(normalize_strm_base_url("ftp://192.168.1.10").is_err());
+        assert!(normalize_strm_base_url("http://user:pass@192.168.1.10").is_err());
+        assert!(normalize_strm_base_url("http://192.168.1.10?x=1").is_err());
+    }
+
+    #[test]
+    fn legacy_proxy_settings_migrate_to_the_strm_service_defaults() {
         let options: VirtualLibraryOptions = serde_json::from_value(serde_json::json!({
-            "redirect_port": LEGACY_REDIRECT_PORT,
+            "proxy_port": LEGACY_REDIRECT_PORT,
+            "emby_upstream": "http://127.0.0.1:8096",
             "refresh_minutes": 15,
             "mappings": []
         }))
         .expect("legacy virtual-library settings should deserialize");
         let normalized = normalize_options(options).expect("legacy settings should normalize");
-        assert_eq!(normalized.proxy_port, DEFAULT_PROXY_PORT);
-        assert_eq!(normalized.emby_upstream, DEFAULT_EMBY_UPSTREAM);
+        assert_eq!(normalized.strm_port, DEFAULT_STRM_PORT);
+        assert_eq!(normalized.strm_base_url, "");
     }
 
     #[test]
-    fn emby_proxy_only_classifies_original_stream_routes() {
-        assert_eq!(
-            playback_item_id("/emby/Videos/movie-id/stream.mkv").as_deref(),
-            Some("movie-id")
-        );
-        assert_eq!(
-            playback_item_id("/Audio/song-id/stream.mp3").as_deref(),
-            Some("song-id")
-        );
-        assert_eq!(
-            playback_item_id("/Items/movie-id/File").as_deref(),
-            Some("movie-id")
-        );
-        assert!(playback_item_id("/Videos/movie-id/master.m3u8").is_none());
-        assert!(playback_item_id("/System/Info").is_none());
+    fn strm_file_id_validation_rejects_traversal_and_separators() {
+        assert!(valid_strm_file_id("file-1"));
+        assert!(valid_strm_file_id("file:1"));
+        assert!(!valid_strm_file_id(""));
+        assert!(!valid_strm_file_id(".."));
+        assert!(!valid_strm_file_id("a/b"));
+        assert!(!valid_strm_file_id("a\\b"));
     }
 
     #[test]

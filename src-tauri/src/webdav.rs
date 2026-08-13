@@ -6,7 +6,8 @@ use axum::{
         header::{
             ACCEPT_RANGES, ALLOW, AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION,
             CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_MATCH, IF_MODIFIED_SINCE,
-            IF_NONE_MATCH, IF_UNMODIFIED_SINCE, LAST_MODIFIED, PRAGMA, RANGE, WWW_AUTHENTICATE,
+            IF_NONE_MATCH, IF_UNMODIFIED_SINCE, LAST_MODIFIED, LOCATION, PRAGMA, RANGE,
+            USER_AGENT, WWW_AUTHENTICATE,
         },
         HeaderMap, Method, Request, Response, StatusCode,
     },
@@ -1317,6 +1318,53 @@ fn request_http_date(headers: &HeaderMap, name: &axum::http::HeaderName) -> Opti
         .map(|duration| duration.as_millis() as u64)
 }
 
+pub(crate) fn webdav_redirect_mode() -> &'static str {
+    static MODE: OnceLock<&'static str> = OnceLock::new();
+    MODE.get_or_init(|| {
+        match std::env::var("GUANGYA_WEBDAV_REDIRECT")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "off" | "0" | "false" => "off",
+            "always" => "always",
+            _ => "auto",
+        }
+    })
+}
+
+/// 已知不能正确处理 GET 302 的 WebDAV 客户端继续走中转；
+/// rclone、Infuse 等客户端直接 302 到 CDN 直链。
+pub(crate) fn webdav_redirect_allowed(mode: &str, user_agent: &str) -> bool {
+    match mode {
+        "always" => true,
+        "off" => false,
+        _ => {
+            let agent = user_agent.to_ascii_lowercase();
+            !(agent.contains("microsoft-webdav-miniredir")
+                || agent.contains("webdavfs")
+                || agent.contains("davfs")
+                || agent.contains("gvfs"))
+        }
+    }
+}
+
+async fn fetch_download(
+    client: &reqwest::Client,
+    request_headers: &HeaderMap,
+    url: String,
+) -> DavResult<reqwest::Response> {
+    let mut upstream_request = client.get(url);
+    if let Some(value) = request_headers.get(RANGE) {
+        upstream_request = upstream_request.header(RANGE.as_str(), value.as_bytes());
+    }
+    upstream_request
+        .send()
+        .await
+        .map_err(|error| DavError::new(StatusCode::BAD_GATEWAY, error.to_string()))
+}
+
 async fn read_file(
     context: &WebDavContext,
     request_headers: &HeaderMap,
@@ -1348,38 +1396,54 @@ async fn read_file(
     {
         return webdav_condition_response(StatusCode::NOT_MODIFIED, entry);
     }
-    let (token, device_id) = auth_context(&context.state)?;
-    let response = api_post(
-        &token,
-        &device_id,
-        "/userres/v1/get_res_download_url",
-        json!({ "fileId": entry.id }),
-        &[],
-    )
-    .await
-    .map_err(DavError::from)?;
-    let data = response.data.unwrap_or_default();
-    let download_url = data
-        .get("signedURL")
-        .or_else(|| data.get("signedUrl"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| DavError::new(StatusCode::BAD_GATEWAY, "光鸭没有返回文件下载地址"))?;
-    let client = reqwest::Client::new();
-    let mut upstream_request = client.get(download_url);
-    if let Some(value) = request_headers.get(RANGE) {
-        upstream_request = upstream_request.header(RANGE.as_str(), value.as_bytes());
+    if head_only {
+        // 目录条目自带大小和修改时间，HEAD 不再请求云端。
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(ACCEPT_RANGES, "bytes")
+            .header(CONTENT_TYPE, content_type(entry))
+            .header(CONTENT_LENGTH, entry.size.to_string())
+            .header(ETAG, etag)
+            .header(LAST_MODIFIED, http_date(entry.modified_ms))
+            .body(Body::empty())
+            .map_err(|error| DavError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
     }
-    let upstream = upstream_request
-        .send()
+    let (token, device_id) = auth_context(&context.state)?;
+    let download_url = cached_res_download_url(&token, &device_id, &entry.id, false)
         .await
-        .map_err(|error| DavError::new(StatusCode::BAD_GATEWAY, error.to_string()))?;
+        .map_err(DavError::from)?;
+    let user_agent = request_headers
+        .get(USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if webdav_redirect_allowed(webdav_redirect_mode(), user_agent) {
+        return Response::builder()
+            .status(StatusCode::FOUND)
+            .header(LOCATION, download_url)
+            .header(CACHE_CONTROL, "no-store")
+            .header(ACCEPT_RANGES, "bytes")
+            .header(ETAG, etag)
+            .header(LAST_MODIFIED, http_date(entry.modified_ms))
+            .body(Body::empty())
+            .map_err(|error| DavError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
+    }
+    let client =
+        http_client().map_err(|error| DavError::new(StatusCode::BAD_GATEWAY, error))?;
+    let mut upstream = fetch_download(&client, request_headers, download_url).await?;
+    if matches!(upstream.status().as_u16(), 403 | 410) {
+        // 缓存的签名直链可能已在云端过期，强制刷新一次再重试。
+        let refreshed = cached_res_download_url(&token, &device_id, &entry.id, true)
+            .await
+            .map_err(DavError::from)?;
+        upstream = fetch_download(&client, request_headers, refreshed).await?;
+    }
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     if !upstream.status().is_success()
         && upstream.status().as_u16() != 304
         && upstream.status().as_u16() != 416
     {
+        download_url_cache().invalidate(&entry.id);
         return Err(DavError::new(
             if upstream.status().as_u16() == 404 {
                 StatusCode::NOT_FOUND
@@ -1406,13 +1470,8 @@ async fn read_file(
     }
     builder = builder.header(ETAG, etag);
     builder = builder.header(LAST_MODIFIED, http_date(entry.modified_ms));
-    let body = if head_only {
-        Body::empty()
-    } else {
-        Body::from_stream(upstream.bytes_stream())
-    };
     builder
-        .body(body)
+        .body(Body::from_stream(upstream.bytes_stream()))
         .map_err(|error| DavError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 

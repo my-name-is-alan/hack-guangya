@@ -1,6 +1,6 @@
 # Docker Web 部署配置
 
-本文档适用于 Docker Hub 镜像 `94xhzy/guangya-sync:0.1.38`。容器提供光鸭云盘 Web 管理界面、服务器目录监控、断点续传、媒体整理、自动分享与 HDHive 投稿。
+本文档适用于 Docker Hub 镜像 `94xhzy/guangya-sync:0.1.39`。容器提供光鸭云盘 Web 管理界面、服务器目录监控、断点续传、媒体整理、自动分享与 HDHive 投稿。
 
 ## 1. 准备目录和配置
 
@@ -23,7 +23,7 @@ openssl rand -hex 24
 把结果写入 `.env`：
 
 ```dotenv
-GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.38
+GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.39
 GUANGYA_HTTP_PORT=8080
 GUANGYA_ADMIN_USERNAME=admin
 GUANGYA_ADMIN_PASSWORD=替换为上面生成的强随机密码
@@ -70,6 +70,7 @@ GUANGYA_HTTP_PORT=18080
 | `./watch` | `/watch` | 本地备份任务的源目录 |
 | `./archive` | `/archive` | “上传后移动到归档”策略的目标目录 |
 | `./media` | `/media` | 可选的本地备份允许根目录；云盘内原生整理不写入这里 |
+| `./virtual-library` | `/virtual-library` | Emby STRM 虚拟库输出目录，把它再挂载给 Emby 容器 |
 
 必须持久化 `/data`。升级或重建容器不会丢数据，但删除 `docker-data` 会清除登录会话、上传指纹和任务配置。
 
@@ -124,12 +125,14 @@ rclone config create guangya webdav \
 
 rclone mount guangya: /mnt/guangya \
   --vfs-cache-mode full \
-  --dir-cache-time 2s \
+  --dir-cache-time 10s \
   --vfs-cache-poll-interval 5s \
   --poll-interval 0
 ```
 
-两个挂载点通过同一个 WebDAV 服务访问云端时，WebDAV 写操作会主动失效服务端目录缓存；来自另一个进程或实例的变化则按短 TTL 重新读取。服务端新鲜缓存为 2 秒、过期后台刷新窗口为 15 秒，rclone 目录缓存建议保持 2 秒，通常几秒内可看到另一挂载创建的新文件夹。若客户端仍显示旧目录，先执行挂载客户端自己的刷新或重新进入目录。
+读文件默认走 302 直链重定向（`GUANGYA_WEBDAV_REDIRECT=auto`）：GET 请求被重定向到云盘签名 CDN 直链，rclone 直连 CDN，数据不再经过容器中转，顺序吞吐与起播延迟显著改善；直链按文件缓存复用，不再每个分块请求都调用一次云端接口。对 Windows WebClient、macOS Finder、davfs2 等已知不能正确处理重定向的客户端会自动回退为服务器中转；设置 `GUANGYA_WEBDAV_REDIRECT=off` 可强制全部中转。
+
+两个挂载点通过同一个 WebDAV 服务访问云端时，WebDAV 写操作会主动失效服务端目录缓存；来自另一个进程或实例的变化则按短 TTL 重新读取。服务端新鲜缓存为 2 秒、过期后台刷新窗口为 15 秒，rclone 目录缓存默认 10 秒，通常十几秒内可看到另一挂载创建的新文件夹。若客户端仍显示旧目录，先执行挂载客户端自己的刷新或重新进入目录。
 
 在同一个 Compose 网络中的其他容器可直接访问私有地址 `http://guangya-sync:19090/dav/`。如果要在容器内执行 FUSE 挂载，需要显式提供 `/dev/fuse` 和相应权限；普通业务容器优先直接使用 WebDAV，不要无条件开启 `privileged`。
 
@@ -161,6 +164,18 @@ docker compose \
 
 > [!WARNING]
 > `docker-compose.fuse.yml` 包含 `SYS_ADMIN`、`/dev/fuse` 和 `apparmor:unconfined`。不要把它作为默认生产配置，也不要用于不可信镜像。Docker Desktop for Windows/macOS 无法用这种方式把 Linux VM 内挂载可靠地传播成宿主机盘符，请改用对应桌面客户端。
+
+### 3.3 Emby STRM 虚拟库（直链播放）
+
+“设置 → 挂载 → Emby 虚拟库”把云端视频和音频映射为同名 `.strm` 写入 `/virtual-library`，内容是带签名的播放直链 `http(s)://<STRM 直链地址>/strm/<fileId>?sign=…`。Emby 侧只需要一件事：把虚拟库目录挂载进 Emby 容器并加入媒体库——不需要挂载盘、不需要在 Emby 前面加代理，客户端照常连接 Emby 原始地址（如 8096）。播放时 Emby 或客户端请求 STRM 里的直链，管理端口的 `/strm/` 端点校验 HMAC 签名后 302 到云盘 CDN；直链按文件缓存复用，云端实测有效期约 6 小时。
+
+使用前先在“设置 → 挂载 → Emby 虚拟库”填写 STRM 直链地址：必须是 **Emby 服务器和播放设备都能访问到本容器管理端口** 的地址，例如宿主机局域网地址 `http://192.168.1.10:8080`；Emby 与光鸭同步在同一 Compose 网络且客户端也能解析时，也可以用 `http://guangya-sync:8080`。也可以用环境变量做首次初始化：
+
+```dotenv
+GUANGYA_STRM_BASE_URL=http://192.168.1.10:8080
+```
+
+修改直链地址后，下一次同步会自动重写全部 STRM 内容。`/strm/` 端点免管理登录，但必须携带按实例密钥计算的 HMAC 签名；签名密钥保存在 `/data/state.sqlite3`，不通过状态接口回显。
 
 ## 4. 光鸭登录
 
@@ -261,13 +276,13 @@ docker compose logs --tail=100 guangya-sync
 生产环境建议固定版本标签或不可变摘要：
 
 ```dotenv
-GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.38
+GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.39
 ```
 
-确认当前 `0.1.38` 与 `latest` 的远端摘要：
+确认当前 `0.1.39` 与 `latest` 的远端摘要：
 
 ```bash
-docker buildx imagetools inspect 94xhzy/guangya-sync:0.1.38
+docker buildx imagetools inspect 94xhzy/guangya-sync:0.1.39
 docker buildx imagetools inspect 94xhzy/guangya-sync:latest
 ```
 
@@ -325,5 +340,5 @@ docker compose logs -f guangya-sync
 docker compose restart guangya-sync
 docker compose down
 docker compose pull
-docker image inspect 94xhzy/guangya-sync:0.1.38
+docker image inspect 94xhzy/guangya-sync:0.1.39
 ```

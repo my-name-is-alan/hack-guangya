@@ -92,7 +92,17 @@ pub(crate) fn run() {
             let webdav_password = config.webdav_password.clone();
             let native_mount_options = config.native_mount.clone();
             let virtual_library = VirtualLibraryManager::new(config.virtual_library.clone());
-            let virtual_library_proxy_port = virtual_library.options().proxy_port;
+            let virtual_library_strm_port = virtual_library.options().strm_port;
+            let strm_sign_secret = load_app_state(&db_path, "strm_sign_secret")?
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}{}",
+                        Uuid::new_v4().simple(),
+                        Uuid::new_v4().simple()
+                    )
+                });
+            save_app_state(&db_path, "strm_sign_secret", &strm_sign_secret)?;
             let upload_concurrency = normalize_transfer_concurrency(
                 config.upload_concurrency,
                 DEFAULT_UPLOAD_CONCURRENCY,
@@ -175,6 +185,7 @@ pub(crate) fn run() {
                     resource_dir,
                 ),
                 virtual_library,
+                strm_sign_secret,
             }));
             app.manage(DownloadRegistry::default());
             app.manage(PendingAppUpdate::default());
@@ -200,10 +211,10 @@ pub(crate) fn run() {
                     webdav_port,
                 ));
             }
-            tauri::async_runtime::spawn(virtual_library::serve_proxy(
+            tauri::async_runtime::spawn(virtual_library::serve_strm(
                 app_handle.clone(),
                 state.clone(),
-                virtual_library_proxy_port,
+                virtual_library_strm_port,
             ));
             if let Ok(guard) = state.lock() {
                 save_config(&guard);

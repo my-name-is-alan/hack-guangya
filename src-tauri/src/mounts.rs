@@ -124,11 +124,13 @@ pub(crate) fn get_virtual_library_info(
 pub(crate) fn update_virtual_library_settings(
     state: tauri::State<'_, SharedState>,
     refresh_minutes: u64,
-    emby_upstream: String,
+    strm_base_url: Option<String>,
 ) -> Result<VirtualLibraryInfo, String> {
     let mut guard = state.lock().map_err(|error| error.to_string())?;
     guard.virtual_library.set_refresh_minutes(refresh_minutes)?;
-    guard.virtual_library.set_emby_upstream(emby_upstream)?;
+    guard
+        .virtual_library
+        .set_strm_base_url(strm_base_url.unwrap_or_default())?;
     save_config(&guard);
     Ok(virtual_library_info(&guard))
 }

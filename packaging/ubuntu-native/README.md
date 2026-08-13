@@ -5,8 +5,8 @@
 ## 安装
 
 ```bash
-tar -xzf guangya-sync-native-ubuntu-x64-0.1.38.tar.gz
-cd guangya-sync-native-ubuntu-x64-0.1.38
+tar -xzf guangya-sync-native-ubuntu-x64-0.1.39.tar.gz
+cd guangya-sync-native-ubuntu-x64-0.1.39
 sudo ./install.sh
 ```
 
@@ -52,15 +52,17 @@ sudo guangya-sync restart
 GUANGYA_NATIVE_MOUNT_TARGET=/var/lib/guangya-sync/mount
 ```
 
+读文件默认按 `GUANGYA_WEBDAV_REDIRECT=auto` 把 GET 302 重定向到云盘直链（rclone 直连 CDN，数据不再经过本服务中转）；对 Windows WebClient、macOS Finder、davfs2 等已知不支持重定向的客户端自动回退为服务器中转。设置为 `off` 可强制全部中转。
+
 ## Emby STRM 虚拟库
 
-网页“设置 → 挂载 → Emby 虚拟库”可把云端视频和音频映射为同名 `.strm`，STRM 内容是云端纯路径，并可按每个目录决定是否下载 NFO、海报和字幕。Emby 原始地址（默认 `127.0.0.1:8096`）不受影响；客户端改连光鸭代理端口 `127.0.0.1:18096` 后，普通请求完整转发给 Emby，只有播放路径命中虚拟库清单时才返回 302 云盘直链。
+网页“设置 → 挂载 → Emby 虚拟库”可把云端视频和音频映射为同名 `.strm`，并可按每个目录决定是否下载 NFO、海报和字幕。STRM 内容是带签名的播放直链 `http(s)://<STRM 直链地址>/strm/<fileId>?sign=…`：Emby 只需把虚拟库目录加入媒体库（仅此一个目录，不需要挂载盘、不需要任何代理），客户端照常连接 Emby 原始地址（如 8096）；播放时 Emby/客户端请求该直链并被 302 到云盘 CDN。
+
+先在“设置 → 挂载 → Emby 虚拟库”填写 STRM 直链地址——Emby 服务器和播放设备都能访问到本服务管理端口的地址（例如 `http://192.168.1.10:8080`），也可通过配置文件做首次初始化：
 
 ```bash
 GUANGYA_VIRTUAL_LIBRARY_ROOT=/var/lib/guangya-sync/virtual-library
-GUANGYA_EMBY_UPSTREAM=http://127.0.0.1:8096
-GUANGYA_EMBY_PROXY_HOST=0.0.0.0
-GUANGYA_EMBY_PROXY_ALLOW_NON_LOOPBACK=1
+GUANGYA_STRM_BASE_URL=http://192.168.1.10:8080
 ```
 
 管理账号和监听地址也保存在同一配置文件中：

@@ -17,6 +17,7 @@ import {
   jwtAccountIdentity,
 } from './auth-session-scope.mjs';
 import { createDirectoryCache } from './directory-cache.mjs';
+import { createDownloadUrlCache } from './download-url-cache.mjs';
 import {
   createGcidExportDiagnostics,
   gcidDiagnosticLogPath,
@@ -76,6 +77,7 @@ import {
 } from './upload-replacement.mjs';
 import { createVirtualLibraryService } from './virtual-library.mjs';
 import { createWebDavHandler, normalizeWebDavEntry, WebDavError } from './webdav.mjs';
+import { createWebDavFileReader, normalizeWebDavRedirectMode } from './webdav-read.mjs';
 import { parseGuangyaShareLink } from '../ui/shareLink.js';
 import {
   chunkDeveloperPreAuditFileIds,
@@ -106,18 +108,8 @@ if (!loopbackHosts.has(requestedWebDavHost.toLowerCase()) && !allowWebDavNonLoop
 }
 const webdavHost = requestedWebDavHost;
 const webdavEndpoint = `http://127.0.0.1:${webdavPublicPort}/dav/`;
-const defaultEmbyProxyPort = process.env.NODE_TEST_CONTEXT ? 0 : 18096;
-const embyProxyPort = Number(process.env.GUANGYA_EMBY_PROXY_PORT ?? defaultEmbyProxyPort);
-if (!Number.isInteger(embyProxyPort) || embyProxyPort < 0 || embyProxyPort > 65535) throw new Error('GUANGYA_EMBY_PROXY_PORT 必须是 0 到 65535 的整数');
-const embyProxyPublicPort = Number(process.env.GUANGYA_EMBY_PROXY_PUBLIC_PORT || embyProxyPort);
-if (!Number.isInteger(embyProxyPublicPort) || embyProxyPublicPort < 0 || embyProxyPublicPort > 65535) throw new Error('GUANGYA_EMBY_PROXY_PUBLIC_PORT 必须是 0 到 65535 的整数');
-const requestedEmbyProxyHost = String(process.env.GUANGYA_EMBY_PROXY_HOST || '127.0.0.1').trim();
-const allowEmbyProxyNonLoopback = process.env.GUANGYA_EMBY_PROXY_ALLOW_NON_LOOPBACK === '1';
-if (!loopbackHosts.has(requestedEmbyProxyHost.toLowerCase()) && !allowEmbyProxyNonLoopback) {
-  throw new Error('Emby 代理端口默认只允许监听回环地址；容器内部监听需显式设置 GUANGYA_EMBY_PROXY_ALLOW_NON_LOOPBACK=1');
-}
-const embyProxyHost = requestedEmbyProxyHost;
-const embyUpstream = String(process.env.GUANGYA_EMBY_UPSTREAM || 'http://127.0.0.1:8096').trim();
+const webdavRedirectMode = normalizeWebDavRedirectMode(process.env.GUANGYA_WEBDAV_REDIRECT);
+const strmBaseUrlSeed = String(process.env.GUANGYA_STRM_BASE_URL || '').trim();
 const configuredDataDir = path.resolve(process.env.DATA_DIR || path.join(here, '..', '.web-data'));
 const configuredWatchRoot = path.resolve(process.env.GUANGYA_WATCH_ROOT || path.join(here, '..', 'watch'));
 const configuredArchiveRoot = path.resolve(process.env.GUANGYA_ARCHIVE_ROOT || path.join(here, '..', 'archive'));
@@ -2342,16 +2334,18 @@ const organizer = createOrganizerService({
     shareAfterOrganize: createOrganizerShare,
   },
 });
+const downloadUrlCache = createDownloadUrlCache({
+  fetchUrl: async (fileId) => (await getCloudDownload({ file_ids: [String(fileId)], packaged: false })).download_url,
+});
 const virtualLibrary = createVirtualLibraryService({
   database,
   publish,
   root: virtualLibraryRoot,
-  proxyPort: embyProxyPublicPort,
-  embyUpstream,
+  strmBaseUrl: strmBaseUrlSeed,
   fetchImpl: (...args) => createProxiedFetch(networkPreferences.proxy_url, undiciFetch)(...args),
   cloud: {
     listChildren: organizerListCloudChildren,
-    getDownloadUrl: async (fileId) => (await getCloudDownload({ file_ids: [String(fileId)], packaged: false })).download_url,
+    getDownloadUrl: (fileId, options) => downloadUrlCache.get(String(fileId), options),
   },
 });
 async function resolveMappingPath(mapping, value, expectedType = null) {
@@ -5674,67 +5668,12 @@ async function putWebDavFile({ request, parentId, name, existing }) {
     await fsp.rm(temporaryRoot, { recursive: true, force: true });
   }
 }
-function webDavEtagMatches(value, etag) {
-  const expected = String(etag || '').replace(/^W\//i, '');
-  return String(value || '').split(',').map((item) => item.trim()).some((item) => item === '*' || item.replace(/^W\//i, '') === expected);
-}
-function finishWebDavConditional(response, statusCode, entry) {
-  response.writeHead(statusCode, {
-    etag: entry.etag,
-    'last-modified': new Date(entry.modifiedAt).toUTCString(),
-  });
-  response.end();
-}
-async function readWebDavFile({ request, response, entry, headOnly }) {
-  const ifMatch = request.headers['if-match'];
-  if (ifMatch && !webDavEtagMatches(ifMatch, entry.etag)) {
-    finishWebDavConditional(response, 412, entry);
-    return;
-  }
-  const ifUnmodifiedSince = Date.parse(String(request.headers['if-unmodified-since'] || ''));
-  if (!ifMatch && Number.isFinite(ifUnmodifiedSince) && entry.modifiedAt > ifUnmodifiedSince + 999) {
-    finishWebDavConditional(response, 412, entry);
-    return;
-  }
-  const ifNoneMatch = request.headers['if-none-match'];
-  if (ifNoneMatch && webDavEtagMatches(ifNoneMatch, entry.etag)) {
-    finishWebDavConditional(response, 304, entry);
-    return;
-  }
-  const ifModifiedSince = Date.parse(String(request.headers['if-modified-since'] || ''));
-  if (!ifNoneMatch && Number.isFinite(ifModifiedSince) && entry.modifiedAt <= ifModifiedSince + 999) {
-    finishWebDavConditional(response, 304, entry);
-    return;
-  }
-  const download = await getCloudDownload({ file_ids: [entry.id], packaged: false });
-  const headers = {};
-  if (request.headers.range) headers.range = request.headers.range;
-  const upstream = await fetch(download.download_url, {
-    method: 'GET',
-    headers,
-    signal: AbortSignal.timeout(ossTimeoutMs),
-  });
-  if (!upstream.ok && upstream.status !== 206 && upstream.status !== 304 && upstream.status !== 416) {
-    throw new WebDavError(upstream.status === 404 ? 404 : 502, `云端文件读取失败（HTTP ${upstream.status}）`);
-  }
-  const responseHeaders = {
-    'accept-ranges': upstream.headers.get('accept-ranges') || 'bytes',
-    'content-type': upstream.headers.get('content-type') || 'application/octet-stream',
-    etag: entry.etag,
-    'last-modified': new Date(entry.modifiedAt).toUTCString(),
-  };
-  for (const name of ['content-length', 'content-range', 'content-disposition']) {
-    const value = upstream.headers.get(name);
-    if (value) responseHeaders[name] = value;
-  }
-  response.writeHead(upstream.status, responseHeaders);
-  if (headOnly || !upstream.body) {
-    await upstream.body?.cancel();
-    response.end();
-    return;
-  }
-  await pipeline(upstream.body, response);
-}
+const readWebDavFile = createWebDavFileReader({
+  downloadUrls: downloadUrlCache,
+  fetchImpl: fetch,
+  redirectMode: webdavRedirectMode,
+  timeoutMs: ossTimeoutMs,
+});
 const handleWebDav = createWebDavHandler({
   prefix: '/dav',
   listChildren: listWebDavChildren,
@@ -6410,6 +6349,10 @@ const server = http.createServer(async (request, response) => {
       response.end(JSON.stringify(result.payload));
       return;
     }
+    if (url.pathname === '/strm' || url.pathname.startsWith('/strm/')) {
+      // Playback links inside generated STRM files: no admin session, HMAC signature only.
+      return virtualLibrary.handleStrm(request, response, url);
+    }
     const authorization = await accessControl.authenticate(request);
     if (!authorization.ok) {
       const acceptsHtml = String(request.headers.accept || '').includes('text/html');
@@ -6460,30 +6403,6 @@ const webdavServer = http.createServer(async (request, response) => {
 webdavServer.requestTimeout = Math.max(requestTimeoutMs, ossTimeoutMs);
 webdavServer.headersTimeout = Math.min(requestTimeoutMs, 15_000);
 
-const embyProxyServer = http.createServer(async (request, response) => {
-  const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
-  try {
-    await virtualLibrary.handleProxy(request, response, url);
-  } catch (error) {
-    response.writeHead(502, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
-    response.end(`Emby 代理请求失败：${error.message}`);
-  }
-});
-embyProxyServer.requestTimeout = 0;
-embyProxyServer.headersTimeout = Math.min(requestTimeoutMs, 15_000);
-embyProxyServer.on('upgrade', (request, socket, head) => virtualLibrary.proxyUpgrade(request, socket, head));
-embyProxyServer.once('error', (error) => {
-  virtualLibrary.setProxyStatus({ running: false, error: error.message });
-  console.error(`Guangya Emby proxy failed: ${error.message}`);
-});
-embyProxyServer.listen(embyProxyPort, embyProxyHost, () => {
-  const actualPort = Number(embyProxyServer.address()?.port || embyProxyPort);
-  const publicPort = embyProxyPublicPort || actualPort;
-  virtualLibrary.setProxyStatus({ running: true, error: null, port: publicPort });
-  const displayHost = embyProxyHost.includes(':') ? `[${embyProxyHost}]` : embyProxyHost;
-  console.log(`Guangya Emby proxy listening on http://${displayHost}:${actualPort}/ -> ${virtualLibrary.info().emby_upstream}`);
-});
-
 webdavServer.listen(webdavPort, webdavHost, () => {
   const displayHost = webdavHost.includes(':') ? `[${webdavHost}]` : webdavHost;
   console.log(`Guangya WebDAV listening on http://${displayHost}:${webdavPort}/dav/, auth: ${webdavAccessControl.required() ? `enabled (${webdavUsername})` : 'not configured'}`);
@@ -6505,7 +6424,6 @@ server.listen(port, listenHost, async () => {
     virtualLibrary.close();
     await new Promise((resolve) => server.close(resolve));
     await new Promise((resolve) => webdavServer.close(resolve));
-    await new Promise((resolve) => embyProxyServer.close(resolve));
     for (const watcher of watchers.values()) await watcher.close();
     await organizer.close();
     process.exit(0);

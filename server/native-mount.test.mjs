@@ -40,10 +40,12 @@ test('原生挂载命令映射只读、上传并行、读取并行和 VFS 缓存
   assert.deepEqual(args.slice(args.indexOf('--transfers'), args.indexOf('--transfers') + 2), ['--transfers', '7']);
   assert.deepEqual(args.slice(args.indexOf('--vfs-read-chunk-streams'), args.indexOf('--vfs-read-chunk-streams') + 2), ['--vfs-read-chunk-streams', '5']);
   assert.deepEqual(args.slice(args.indexOf('--vfs-cache-max-size'), args.indexOf('--vfs-cache-max-size') + 2), ['--vfs-cache-max-size', '48G']);
-  assert.deepEqual(args.slice(args.indexOf('--dir-cache-time'), args.indexOf('--dir-cache-time') + 2), ['--dir-cache-time', '2s']);
+  assert.deepEqual(args.slice(args.indexOf('--dir-cache-time'), args.indexOf('--dir-cache-time') + 2), ['--dir-cache-time', '10s']);
   assert.deepEqual(args.slice(args.indexOf('--vfs-cache-poll-interval'), args.indexOf('--vfs-cache-poll-interval') + 2), ['--vfs-cache-poll-interval', '5s']);
   assert.deepEqual(args.slice(args.indexOf('--vfs-cache-max-age'), args.indexOf('--vfs-cache-max-age') + 2), ['--vfs-cache-max-age', '24h']);
-  assert.deepEqual(args.slice(args.indexOf('--vfs-read-chunk-size'), args.indexOf('--vfs-read-chunk-size') + 2), ['--vfs-read-chunk-size', '4M']);
+  assert.deepEqual(args.slice(args.indexOf('--vfs-read-chunk-size'), args.indexOf('--vfs-read-chunk-size') + 2), ['--vfs-read-chunk-size', '8M']);
+  assert.deepEqual(args.slice(args.indexOf('--buffer-size'), args.indexOf('--buffer-size') + 2), ['--buffer-size', '16M']);
+  assert.deepEqual(args.slice(args.indexOf('--vfs-read-ahead'), args.indexOf('--vfs-read-ahead') + 2), ['--vfs-read-ahead', '32M']);
   assert.deepEqual(args.slice(args.indexOf('--config'), args.indexOf('--config') + 2), ['--config', '/dev/null']);
 });
 

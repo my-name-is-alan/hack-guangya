@@ -14,6 +14,7 @@ mod cache;
 mod constants;
 mod db;
 mod developer;
+mod download_url_cache;
 mod downloads;
 mod files;
 mod gcid_export;

@@ -65,6 +65,7 @@ pub(crate) use crate::cache::*;
 pub(crate) use crate::constants::*;
 pub(crate) use crate::db::*;
 pub(crate) use crate::developer::*;
+pub(crate) use crate::download_url_cache::*;
 pub(crate) use crate::downloads::*;
 pub(crate) use crate::files::*;
 pub(crate) use crate::gcid_export::*;

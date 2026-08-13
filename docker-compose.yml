@@ -1,13 +1,12 @@
 services:
   guangya-sync:
-    image: ${GUANGYA_IMAGE:-94xhzy/guangya-sync:0.1.38}
+    image: ${GUANGYA_IMAGE:-94xhzy/guangya-sync:0.1.39}
     pull_policy: always
     container_name: guangya-sync
     restart: unless-stopped
     ports:
       - "${GUANGYA_HTTP_PORT:-8080}:8080"
       - "127.0.0.1:${GUANGYA_WEBDAV_PORT:-19090}:19090"
-      - "${GUANGYA_EMBY_PROXY_BIND:-127.0.0.1}:${GUANGYA_EMBY_PROXY_PORT:-18096}:18096"
     environment:
       HOST: "0.0.0.0"
       PORT: "8080"
@@ -17,12 +16,9 @@ services:
       GUANGYA_WEBDAV_ALLOW_NON_LOOPBACK: "1"
       GUANGYA_WEBDAV_USERNAME: ${GUANGYA_WEBDAV_USERNAME:-guangya}
       GUANGYA_WEBDAV_PASSWORD: ${GUANGYA_WEBDAV_PASSWORD:-}
+      GUANGYA_WEBDAV_REDIRECT: ${GUANGYA_WEBDAV_REDIRECT:-auto}
       GUANGYA_VIRTUAL_LIBRARY_ROOT: /virtual-library
-      GUANGYA_EMBY_PROXY_HOST: "0.0.0.0"
-      GUANGYA_EMBY_PROXY_PORT: "18096"
-      GUANGYA_EMBY_PROXY_PUBLIC_PORT: ${GUANGYA_EMBY_PROXY_PORT:-18096}
-      GUANGYA_EMBY_PROXY_ALLOW_NON_LOOPBACK: "1"
-      GUANGYA_EMBY_UPSTREAM: ${GUANGYA_EMBY_UPSTREAM:-http://host.docker.internal:8096}
+      GUANGYA_STRM_BASE_URL: ${GUANGYA_STRM_BASE_URL:-}
       DATA_DIR: /data
       GUANGYA_ADMIN_USERNAME: ${GUANGYA_ADMIN_USERNAME:-admin}
       GUANGYA_ADMIN_PASSWORD: ${GUANGYA_ADMIN_PASSWORD:?请先在 .env 中设置强随机管理密码}
