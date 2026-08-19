@@ -11,6 +11,7 @@ test('shadcn theme uses Vue-native static styles and readable default controls',
   assert.doesNotMatch(source, /\bclsx\b/);
   // 默认控件尺寸必须是 middle（28px）：全局 small 会让整个桌面端过于局促，
   // 高密度场景（表格等）按需显式 size="small"。
+  assert.match(source, /getPopupContainer: \(\) => document\.body/);
   assert.match(source, /componentSize: 'middle'/);
   assert.match(source, /controlHeight: 28/);
   assert.match(source, /controlHeightSM: 22/);

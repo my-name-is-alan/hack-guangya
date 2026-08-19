@@ -49,6 +49,9 @@ pub struct VirtualLibraryMapping {
     pub source_dir_id: String,
     pub source_path: String,
     pub local_path: String,
+    /// 该目录在 Emby 看到的路径，用于同步后的增量刷新通知；留空不通知。
+    #[serde(default)]
+    pub emby_path: String,
     #[serde(default)]
     pub include_metadata: bool,
     #[serde(default = "default_true")]
@@ -67,6 +70,8 @@ pub struct VirtualLibraryOptions {
     pub strm_base_url: String,
     #[serde(default = "default_emby_upstream")]
     pub emby_upstream: String,
+    #[serde(default)]
+    pub emby_api_key: String,
     #[serde(default = "default_refresh_minutes")]
     pub refresh_minutes: u64,
     #[serde(default)]
@@ -79,6 +84,7 @@ impl Default for VirtualLibraryOptions {
             strm_port: default_strm_port(),
             strm_base_url: String::new(),
             emby_upstream: default_emby_upstream(),
+            emby_api_key: String::new(),
             refresh_minutes: default_refresh_minutes(),
             mappings: Vec::new(),
         }
@@ -92,6 +98,9 @@ pub struct VirtualLibrarySyncStatus {
     pub strm_files: usize,
     pub metadata_files: usize,
     pub skipped_files: usize,
+    pub changed_files: usize,
+    pub emby_notified: Option<usize>,
+    pub emby_notify_error: Option<String>,
     pub error: Option<String>,
 }
 
@@ -103,6 +112,7 @@ pub struct VirtualLibraryInfo {
     pub strm_running: bool,
     pub strm_error: Option<String>,
     pub emby_upstream: String,
+    pub emby_api_key_configured: bool,
     pub gateway_endpoint: String,
     pub refresh_minutes: u64,
     pub mappings: Vec<VirtualLibraryMapping>,
@@ -149,6 +159,7 @@ impl VirtualLibraryManager {
             strm_running: self.strm_running,
             strm_error: self.strm_error.clone(),
             emby_upstream: self.options.emby_upstream.clone(),
+            emby_api_key_configured: !self.options.emby_api_key.trim().is_empty(),
             gateway_endpoint: format!("{}/", self.effective_strm_base()),
             refresh_minutes: self.options.refresh_minutes,
             mappings: self.options.mappings.clone(),
@@ -169,6 +180,11 @@ impl VirtualLibraryManager {
     pub fn set_emby_upstream(&mut self, value: String) -> Result<(), String> {
         self.options.emby_upstream = normalize_emby_upstream(&value)?;
         Ok(())
+    }
+
+    /// 空字符串保持不变的语义由调用方处理；这里直接落值（传 "" 即清除）。
+    pub fn set_emby_api_key(&mut self, value: String) {
+        self.options.emby_api_key = value.trim().to_string();
     }
 
     pub fn upsert_mapping(
@@ -238,10 +254,17 @@ impl VirtualLibraryManager {
                 status.strm_files = summary.strm_files;
                 status.metadata_files = summary.metadata_files;
                 status.skipped_files = summary.skipped_files;
+                status.changed_files = summary.changes.total;
                 status.error = None;
             }
             Err(error) => status.error = Some(error),
         }
+    }
+
+    pub fn set_emby_notify_result(&mut self, id: &str, notified: Option<usize>, error: Option<String>) {
+        let status = self.statuses.entry(id.to_string()).or_default();
+        status.emby_notified = notified;
+        status.emby_notify_error = error;
     }
 
     pub fn set_strm_status(&mut self, running: bool, error: Option<String>) {
@@ -250,11 +273,45 @@ impl VirtualLibraryManager {
     }
 }
 
+pub const MAX_CHANGE_PATHS: usize = 200;
+
+#[derive(Debug, Clone, Default)]
+pub struct SyncChanges {
+    pub created: Vec<String>,
+    pub modified: Vec<String>,
+    pub removed: Vec<String>,
+    pub total: usize,
+    pub truncated: bool,
+}
+
+impl SyncChanges {
+    fn record(&mut self, bucket: ChangeKind, key: &str) {
+        self.total += 1;
+        if self.created.len() + self.modified.len() + self.removed.len() >= MAX_CHANGE_PATHS {
+            self.truncated = true;
+            return;
+        }
+        match bucket {
+            ChangeKind::Created => self.created.push(key.to_string()),
+            ChangeKind::Modified => self.modified.push(key.to_string()),
+            ChangeKind::Removed => self.removed.push(key.to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ChangeKind {
+    Created,
+    Modified,
+    Removed,
+}
+
 #[derive(Debug, Clone)]
 pub struct SyncSummary {
     pub strm_files: usize,
     pub metadata_files: usize,
     pub skipped_files: usize,
+    pub changes: SyncChanges,
 }
 
 #[derive(Debug, Clone)]
@@ -405,12 +462,50 @@ fn normalize_options(mut options: VirtualLibraryOptions) -> Result<VirtualLibrar
     Ok(options)
 }
 
+/// Emby 内路径：支持 Windows 与 POSIX 形式，去除尾部分隔符；留空表示不通知。
+pub fn normalize_emby_path(value: &str) -> String {
+    value.trim().trim_end_matches(['/', '\\']).to_string()
+}
+
+/// 云端路径子树是否重叠（相同或互为前缀）；'/' 视为整个云盘。
+pub fn cloud_paths_overlap(left: &str, right: &str) -> bool {
+    let normalize = |value: &str| -> String {
+        let collapsed = value.trim().replace('\\', "/");
+        let mut collapsed = collapsed;
+        while collapsed.contains("//") {
+            collapsed = collapsed.replace("//", "/");
+        }
+        if collapsed.is_empty() {
+            return String::new();
+        }
+        if collapsed == "/" {
+            return "/".to_string();
+        }
+        let stripped = collapsed.trim_end_matches('/');
+        if stripped.starts_with('/') {
+            stripped.to_string()
+        } else {
+            format!("/{stripped}")
+        }
+    };
+    let a = normalize(left);
+    let b = normalize(right);
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == "/" || b == "/" {
+        return true;
+    }
+    a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+}
+
 fn normalize_mapping(mut mapping: VirtualLibraryMapping) -> Result<VirtualLibraryMapping, String> {
     mapping.id = mapping.id.trim().to_string();
     if mapping.id.is_empty() {
         mapping.id = Uuid::new_v4().to_string();
     }
     mapping.name = mapping.name.trim().to_string();
+    mapping.emby_path = normalize_emby_path(&mapping.emby_path);
     mapping.source_dir_id = normalize_api_id(&mapping.source_dir_id, "虚拟库云端目录 ID")?;
     mapping.source_path = mapping.source_path.trim().to_string();
     if mapping.source_path.is_empty() {
@@ -700,7 +795,8 @@ async fn remove_stale_files(
     root: &Path,
     previous: &VirtualLibraryManifest,
     next: &VirtualLibraryManifest,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
+    let mut removed = Vec::new();
     for key in previous.entries.keys() {
         if next.entries.contains_key(key) {
             continue;
@@ -711,8 +807,8 @@ async fn remove_stale_files(
         }
         let target = root.join(relative);
         match tokio::fs::remove_file(&target).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(()) => removed.push(key.clone()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => removed.push(key.clone()),
             Err(error) => {
                 return Err(format!(
                     "清理过期虚拟文件失败（{}）：{error}",
@@ -721,7 +817,81 @@ async fn remove_stale_files(
             }
         }
     }
-    Ok(())
+    Ok(removed)
+}
+
+/// 自底向上删除 `root` 下的空目录，保留虚拟库根目录本身。
+async fn prune_empty_directories(root: &Path) -> Result<Vec<String>, String> {
+    let mut removed = Vec::new();
+    prune_empty_directories_inner(root, root, &mut removed).await?;
+    Ok(removed)
+}
+
+fn prune_empty_directories_inner<'a>(
+    root: &'a Path,
+    dir: &'a Path,
+    removed: &'a mut Vec<String>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut entries = match tokio::fs::read_dir(dir).await {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(format!("读取虚拟库目录失败（{}）：{error}", dir.display()))
+            }
+        };
+        let mut children = Vec::new();
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|error| format!("读取虚拟库目录失败（{}）：{error}", dir.display()))?
+        {
+            children.push(entry);
+        }
+        for entry in children {
+            let file_type = entry
+                .file_type()
+                .await
+                .map_err(|error| format!("读取虚拟库目录失败（{}）：{error}", dir.display()))?;
+            if file_type.is_dir() {
+                prune_empty_directories_inner(root, &entry.path(), removed).await?;
+            }
+        }
+        if dir == root {
+            return Ok(());
+        }
+        let mut remaining = match tokio::fs::read_dir(dir).await {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(format!("读取虚拟库目录失败（{}）：{error}", dir.display()))
+            }
+        };
+        let mut empty = true;
+        while let Some(entry) = remaining
+            .next_entry()
+            .await
+            .map_err(|error| format!("读取虚拟库目录失败（{}）：{error}", dir.display()))?
+        {
+            if entry.file_name() != MANIFEST_NAME {
+                empty = false;
+                break;
+            }
+        }
+        if empty {
+            tokio::fs::remove_dir(dir).await.map_err(|error| {
+                format!("清理空虚拟库目录失败（{}）：{error}", dir.display())
+            })?;
+            let key = dir
+                .strip_prefix(root)
+                .map(relative_key)
+                .unwrap_or_else(|_| relative_key(dir));
+            if !key.is_empty() {
+                removed.push(key);
+            }
+        }
+        Ok(())
+    })
 }
 
 pub async fn sync_mapping(
@@ -765,6 +935,7 @@ pub async fn sync_mapping(
         strm_files: 0,
         metadata_files: 0,
         skipped_files: 0,
+        changes: SyncChanges::default(),
     };
 
     while let Some((parent_id, relative_dir, depth)) = pending.pop_front() {
@@ -816,6 +987,7 @@ pub async fn sync_mapping(
                     && previous.kind == manifest_entry.kind
                     && target.is_file()
             });
+            let existed_before = previous.entries.contains_key(&key);
             if kind == "strm" {
                 let content = strm_content(&strm_url(&strm_base, &sign_secret, &entry.id));
                 if !unchanged
@@ -830,11 +1002,27 @@ pub async fn sync_mapping(
                     tokio::fs::write(&target, content).await.map_err(|error| {
                         format!("写入 STRM 失败（{}）：{error}", target.display())
                     })?;
+                    summary.changes.record(
+                        if existed_before {
+                            ChangeKind::Modified
+                        } else {
+                            ChangeKind::Created
+                        },
+                        &key,
+                    );
                 }
                 summary.strm_files += 1;
             } else {
                 if !unchanged {
                     download_metadata(&client, &token, &device_id, &entry, &target).await?;
+                    summary.changes.record(
+                        if existed_before {
+                            ChangeKind::Modified
+                        } else {
+                            ChangeKind::Created
+                        },
+                        &key,
+                    );
                 }
                 summary.metadata_files += 1;
             }
@@ -842,9 +1030,79 @@ pub async fn sync_mapping(
         }
     }
 
-    remove_stale_files(&root, &previous, &next).await?;
+    let removed_keys = remove_stale_files(&root, &previous, &next).await?;
+    for key in &removed_keys {
+        summary.changes.record(ChangeKind::Removed, key);
+    }
+    // 过期 STRM/元数据删掉后，自底向上收回变空的电影/剧集文件夹。
+    for key in prune_empty_directories(&root).await? {
+        summary.changes.record(ChangeKind::Removed, &key);
+    }
     save_manifest(&root, &next).await?;
     Ok(summary)
+}
+
+/// 同步完成后按变更清单调用 Emby 的增量扫描接口；未配置 API Key 或
+/// Emby 内路径时返回 None（不通知）。
+pub async fn notify_emby(
+    upstream: &str,
+    api_key: &str,
+    emby_path: &str,
+    changes: &SyncChanges,
+) -> Result<Option<usize>, String> {
+    let emby_path = normalize_emby_path(emby_path);
+    if api_key.trim().is_empty() || emby_path.is_empty() || changes.total == 0 {
+        return Ok(None);
+    }
+    let windows_style = emby_path.contains('\\');
+    let to_emby_path = |key: &str| -> String {
+        if windows_style {
+            format!("{emby_path}\\{}", key.replace('/', "\\"))
+        } else {
+            format!("{emby_path}/{key}")
+        }
+    };
+    let updates: Vec<Value> = if changes.truncated {
+        vec![json!({ "Path": emby_path, "UpdateType": "Modified" })]
+    } else {
+        changes
+            .created
+            .iter()
+            .map(|key| json!({ "Path": to_emby_path(key), "UpdateType": "Created" }))
+            .chain(
+                changes
+                    .modified
+                    .iter()
+                    .map(|key| json!({ "Path": to_emby_path(key), "UpdateType": "Modified" })),
+            )
+            .chain(
+                changes
+                    .removed
+                    .iter()
+                    .map(|key| json!({ "Path": to_emby_path(key), "UpdateType": "Deleted" })),
+            )
+            .collect()
+    };
+    if updates.is_empty() {
+        return Ok(None);
+    }
+    let count = updates.len();
+    let target = format!(
+        "{}/emby/Library/Media/Updated",
+        upstream.trim_end_matches('/')
+    );
+    let client = http_client()?;
+    let response = client
+        .post(target)
+        .header("x-emby-token", api_key.trim())
+        .json(&json!({ "Updates": updates }))
+        .send()
+        .await
+        .map_err(|error| format!("Emby 刷新通知失败：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("Emby 刷新通知失败：HTTP {}", response.status()));
+    }
+    Ok(Some(count))
 }
 
 fn response(status: StatusCode, body: impl Into<Body>) -> Response<Body> {
@@ -1366,6 +1624,36 @@ async fn strm_request(
     }
 }
 
+/// `/guangya/webhooks/emby?token=<secret>`：Emby webhook 推送入口，转交
+/// Telegram 渠道解析并通知；免管理登录，仅校验 webhook secret。
+async fn emby_webhook_request(
+    State(context): State<StrmContext>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response<Body> {
+    let Ok(db_path) = context.state.lock().map(|guard| guard.db_path.clone()) else {
+        return response(StatusCode::INTERNAL_SERVER_ERROR, "内部状态不可用");
+    };
+    let content_type = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let token = query
+        .get("token")
+        .or_else(|| query.get("secret"))
+        .map(String::as_str);
+    let (status_code, payload) =
+        crate::telegram::handle_emby_webhook(&db_path, token, &content_type, &body);
+    Response::builder()
+        .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_REQUEST))
+        .header("content-type", "application/json; charset=utf-8")
+        .header("cache-control", "no-store")
+        .body(Body::from(payload.to_string()))
+        .unwrap_or_else(|_| response(StatusCode::INTERNAL_SERVER_ERROR, "构造响应失败"))
+}
+
 /// 默认只监听本机；显式配置非回环直链地址（Emby 在 Docker 容器或其他
 /// 设备上）时监听所有网卡，端点本身仍要求 HMAC 签名。
 pub(crate) fn strm_bind_host(base_url: &str) -> &'static str {
@@ -1436,6 +1724,11 @@ pub async fn serve_strm(
         );
         let router = Router::new()
             .route("/strm/{file_id}", get(strm_request))
+            .route(
+                "/guangya/webhooks/emby",
+                axum::routing::post(emby_webhook_request)
+                    .route_layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
+            )
             .fallback(gateway_request)
             .with_state(StrmContext {
                 state: state.clone(),
@@ -1641,6 +1934,7 @@ mod tests {
                 local_path: root.to_string(),
                 include_metadata: false,
                 enabled: true,
+                emby_path: String::new(),
             })
             .expect("first mapping should be accepted");
         let error = manager
@@ -1652,8 +1946,32 @@ mod tests {
                 local_path: Path::new(root).join("nested").to_string_lossy().to_string(),
                 include_metadata: false,
                 enabled: true,
+                emby_path: String::new(),
             })
             .expect_err("overlapping targets must be rejected");
         assert!(error.contains("互相包含"));
+    }
+
+    #[tokio::test]
+    async fn prune_empty_directories_removes_nested_empty_movie_folders() {
+        let root = std::env::temp_dir().join(format!(
+            "guangya-vl-prune-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let movie_dir = root.join("电影").join("阿凡达");
+        tokio::fs::create_dir_all(&movie_dir)
+            .await
+            .expect("create nested dirs");
+        tokio::fs::write(root.join("kept.strm"), "keep\n")
+            .await
+            .expect("write kept file");
+        let removed = prune_empty_directories(&root)
+            .await
+            .expect("prune should succeed");
+        assert!(removed.iter().any(|key| key == "电影/阿凡达" || key == "电影"));
+        assert!(!movie_dir.exists());
+        assert!(!root.join("电影").exists());
+        assert!(root.join("kept.strm").exists());
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 }

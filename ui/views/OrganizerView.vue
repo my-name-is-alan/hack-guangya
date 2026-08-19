@@ -33,6 +33,7 @@ import {
   organizerPreviewItems,
   organizerPreviewTarget,
   organizerStatus,
+  organizerStatusMeta,
   organizerTemplateExamples,
   organizerTransferLabel,
   ORGANIZER_MOVIE_TEMPLATE_TOKENS,
@@ -55,6 +56,9 @@ const DEFAULT_SETTINGS = Object.freeze({
   release_groups: '',
   render_words: '',
   capture_groups: '',
+  upgrade_criteria: ['resolution', 'dynamic_range', 'release_group', 'size'],
+  upgrade_release_groups: '',
+  upgrade_criteria_options: [],
   include_media_info: true,
   movie_path_template: '{category}/{country}/{year}/{title} ({year}) [tmdb-{tmdb_id}]/{title} ({year}){edition}{quality}{part}.{ext}',
   tv_path_template: '{category}/{country}/{year}/{title} ({year}) [tmdb-{tmdb_id}]/Season {season:02}/{title}.S{season:02}E{episode:02}{episode_end}.{ext}',
@@ -157,7 +161,12 @@ const review = reactive({
   season: '',
   episode: '',
   episode_end: '',
+  episode_offset: '',
+  recognition_words: '',
 });
+const selectedJobIds = ref([]);
+const batchBusy = ref(false);
+const batchProgress = reactive({ done: 0, total: 0 });
 const preview = reactive({ open: false, job: null });
 let settingsHydrated = false;
 let refreshTimer = null;
@@ -216,6 +225,8 @@ function organizerSettingsInput({ validate = false } = {}) {
     release_groups: String(settingsForm.release_groups || ''),
     render_words: String(settingsForm.render_words || ''),
     capture_groups: String(settingsForm.capture_groups || ''),
+    upgrade_criteria: cloneSerializable(settingsForm.upgrade_criteria || []),
+    upgrade_release_groups: String(settingsForm.upgrade_release_groups || ''),
     include_media_info: Boolean(settingsForm.include_media_info),
     movie_path_template: String(settingsForm.movie_path_template || ''),
     tv_path_template: String(settingsForm.tv_path_template || ''),
@@ -241,8 +252,23 @@ const jobColumns = [
   { title: '识别与目标', key: 'result', width: 300 },
   { title: '状态', key: 'status', width: 108 },
   { title: '更新时间', key: 'time', width: 142 },
-  { title: '操作', key: 'actions', width: 330 },
+  { title: '操作', key: 'actions', width: 330, fixed: 'right' },
 ];
+
+const jobFilters = reactive({ status: 'all', keyword: '' });
+const jobStatusOptions = [
+  { value: 'all', label: '全部状态' },
+  ...Object.entries(organizerStatusMeta).map(([value, meta]) => ({ value, label: meta.label })),
+];
+const filteredJobs = computed(() => {
+  const keyword = jobFilters.keyword.trim().toLowerCase();
+  return (organizer.jobs || []).filter((job) => {
+    if (jobFilters.status !== 'all' && job.status !== jobFilters.status) return false;
+    if (!keyword) return true;
+    return [job.source_path, job.query_title, job.message, organizerMatchedTitle(job)]
+      .some((value) => String(value || '').toLowerCase().includes(keyword));
+  });
+});
 
 const JOB_DELETE_ACTIONS = Object.freeze([
   { key: 'history', label: '仅删除历史记录', delete_source: false, delete_target: false },
@@ -275,6 +301,18 @@ function hydrateSettings(settings, force = false) {
     release_groups: String(settings.release_groups || ''),
     render_words: String(settings.render_words || ''),
     capture_groups: String(settings.capture_groups || ''),
+    upgrade_criteria: Array.isArray(settings.upgrade_criteria) && settings.upgrade_criteria.length
+      ? [...settings.upgrade_criteria]
+      : [...DEFAULT_SETTINGS.upgrade_criteria],
+    upgrade_release_groups: String(settings.upgrade_release_groups || ''),
+    upgrade_criteria_options: Array.isArray(settings.upgrade_criteria_options) && settings.upgrade_criteria_options.length
+      ? cloneSerializable(settings.upgrade_criteria_options)
+      : [
+        { value: 'resolution', label: '分辨率' },
+        { value: 'dynamic_range', label: '动态范围' },
+        { value: 'release_group', label: '制作组' },
+        { value: 'size', label: '文件大小' },
+      ],
     include_media_info: settings.include_media_info !== false,
     movie_path_template: settings.movie_path_template || DEFAULT_SETTINGS.movie_path_template,
     tv_path_template: settings.tv_path_template || DEFAULT_SETTINGS.tv_path_template,
@@ -619,8 +657,8 @@ async function submitMapping() {
     message.warning('开启刮削后请至少选择一种元数据类型');
     return;
   }
-  if ((mappingForm.transfer_type === 'move' || mappingForm.conflict_policy === 'overwrite') && !mappingForm.share_risk_acknowledged) {
-    message.warning('请先确认移动/覆盖导致旧分享失效的风险');
+  if ((mappingForm.transfer_type === 'move' || mappingForm.conflict_policy === 'overwrite' || mappingForm.conflict_policy === 'upgrade') && !mappingForm.share_risk_acknowledged) {
+    message.warning('请先确认移动/覆盖/洗版导致旧分享失效的风险');
     return;
   }
   mappingSubmitting.value = true;
@@ -799,6 +837,8 @@ function openReview(job, mode = 'review') {
   review.season = job.season ?? '';
   review.episode = job.episode ?? '';
   review.episode_end = job.episode_end ?? '';
+  review.episode_offset = job.episode_offset ?? '';
+  review.recognition_words = job.recognition_words || '';
   review.open = true;
 }
 
@@ -830,12 +870,16 @@ async function submitReview(execute) {
       season: optionalNumber(review.season),
       episode: optionalNumber(review.episode),
       episode_end: optionalNumber(review.episode_end),
+      episode_offset: optionalNumber(review.episode_offset),
+      recognition_words: String(review.recognition_words || '').trim() || undefined,
       clear_tmdb_id: optionalNumber(review.tmdb_id) === undefined,
       clear_title: !String(review.title || '').trim(),
       clear_year: optionalNumber(review.year) === undefined,
       clear_season: optionalNumber(review.season) === undefined,
       clear_episode: optionalNumber(review.episode) === undefined,
       clear_episode_end: optionalNumber(review.episode_end) === undefined,
+      clear_episode_offset: optionalNumber(review.episode_offset) === undefined,
+      clear_recognition_words: !String(review.recognition_words || '').trim(),
     };
     const command = execute
       ? (review.mode === 'rearchive' ? 'rearchive_organizer_job' : 'run_organizer_job')
@@ -857,6 +901,39 @@ async function submitReview(execute) {
 function openPreview(job) {
   preview.job = job;
   preview.open = true;
+}
+
+const jobRowSelection = computed(() => ({
+  selectedRowKeys: selectedJobIds.value,
+  onChange: (keys) => { selectedJobIds.value = keys; },
+  getCheckboxProps: (record) => ({ disabled: ['recognizing', 'running'].includes(record.status) }),
+}));
+
+/**
+ * 批量重新识别并整理：走“重新归档”链路（后台识别 → 自动执行；
+ * 已落位过的任务先清理旧产物），沿用每个任务已保存的人工修正。
+ * 归档提交立即返回，整体进度看顶栏“整理中”指示。
+ */
+async function batchRetryJobs() {
+  const ids = selectedJobIds.value.filter((id) => {
+    const job = organizer.jobs.find((item) => item.id === id);
+    return job && !['recognizing', 'running'].includes(job.status);
+  });
+  if (!ids.length) return;
+  batchBusy.value = true;
+  batchProgress.total = ids.length;
+  batchProgress.done = 0;
+  const failures = [];
+  for (const id of ids) {
+    try { await bridge.invoke('rearchive_organizer_job', { id, input: {} }); }
+    catch (error) { failures.push(errorText(error)); }
+    batchProgress.done += 1;
+  }
+  batchBusy.value = false;
+  selectedJobIds.value = [];
+  await loadState({ silent: true });
+  if (failures.length) message.warning(`已提交 ${ids.length - failures.length} 个任务重新归档，${failures.length} 个提交失败：${failures[0]}`);
+  else message.success(`已提交 ${ids.length} 个任务重新归档，正在后台识别并整理`);
 }
 
 function candidateScore(candidate) {
@@ -1008,6 +1085,22 @@ onBeforeUnmount(() => {
               <a-textarea v-model:value="settingsForm.capture_groups" aria-label="自定义制作组捕获正则" :auto-size="{ minRows: 14, maxRows: 28 }" :spellcheck="false" placeholder="# 每行一个含捕获组的正则，例如&#10;-([A-Za-z0-9@._-]+)$" />
               <p class="field-help">第一个非空捕获组会作为制作组；未命中时仍会尝试文件名末尾的 <code>-Group</code>。</p>
             </a-tab-pane>
+            <a-tab-pane key="upgrade_policy" tab="洗版策略">
+              <a-form-item label="比较维度与优先级">
+                <a-select
+                  v-model:value="settingsForm.upgrade_criteria"
+                  mode="multiple"
+                  :options="settingsForm.upgrade_criteria_options"
+                  placeholder="按点选顺序决定优先级"
+                  aria-label="洗版比较维度与优先级"
+                />
+                <p class="field-help">目标冲突选择“洗版”的监控生效：按选中顺序逐项比较（先分出胜负的维度定结果），全部持平视为同一版本并跳过。动态范围排序为 DV &gt; HDR10+ &gt; HDR10 &gt; HLG &gt; SDR。</p>
+              </a-form-item>
+              <a-form-item label="制作组优先级（从高到低）">
+                <a-textarea v-model:value="settingsForm.upgrade_release_groups" aria-label="洗版制作组优先级" :auto-size="{ minRows: 6, maxRows: 16 }" :spellcheck="false" placeholder="# 每行一个制作组，靠前优先，例如&#10;FRDS&#10;WiKi&#10;CHD" />
+                <p class="field-help">仅“制作组”维度使用；留空时跳过该维度。名单外的制作组视为最低且彼此持平。</p>
+              </a-form-item>
+            </a-tab-pane>
           </a-tabs>
         </a-card>
       </section>
@@ -1127,7 +1220,23 @@ onBeforeUnmount(() => {
         <div class="section-heading">
           <div><h2>整理任务</h2><p>每次执行前都会校验源文件是否变化；有多个 TMDB 候选时会停下来等待选择。</p></div>
         </div>
-        <a-table :columns="jobColumns" :data-source="organizer.jobs" row-key="id" :pagination="{ pageSize: 12, showSizeChanger: false }" :scroll="{ x: 990 }" size="middle">
+        <div class="table-filter-bar">
+          <a-select v-model:value="jobFilters.status" :options="jobStatusOptions" class="filter-status" aria-label="按状态筛选整理任务" />
+          <a-input v-model:value="jobFilters.keyword" allow-clear placeholder="搜索来源 / 识别结果 / 消息" class="filter-keyword" aria-label="搜索整理任务">
+            <template #prefix><SearchOutlined /></template>
+          </a-input>
+          <span v-if="jobFilters.status !== 'all' || jobFilters.keyword" class="filter-count">{{ filteredJobs.length }} / {{ organizer.jobs.length }} 条</span>
+          <template v-if="selectedJobIds.length">
+            <span class="filter-count">已选 {{ selectedJobIds.length }} 条</span>
+            <a-tooltip title="后台重新识别并自动整理；已落位过的任务会先清理上次的文件与元数据">
+              <a-button size="small" type="primary" :loading="batchBusy" @click="batchRetryJobs">
+                <ReloadOutlined />批量重新识别并整理{{ batchBusy ? `（${batchProgress.done}/${batchProgress.total}）` : '' }}
+              </a-button>
+            </a-tooltip>
+            <a-button size="small" :disabled="batchBusy" @click="selectedJobIds = []">取消选择</a-button>
+          </template>
+        </div>
+        <a-table :columns="jobColumns" :data-source="filteredJobs" row-key="id" :row-selection="jobRowSelection" :pagination="{ pageSize: 12, showSizeChanger: false }" :scroll="{ x: 990 }" size="middle">
           <template #emptyText><a-empty description="等待目录中出现媒体文件" /></template>
           <template #bodyCell="{ column, record }">
             <template v-if="column.key === 'source'">
@@ -1148,7 +1257,7 @@ onBeforeUnmount(() => {
               <a-space :size="2">
                 <a-button v-if="record.preview" type="text" size="small" @click="openPreview(record)"><EyeOutlined />预览</a-button>
                 <a-button v-if="record.status === 'ready'" type="primary" size="small" :loading="jobBusy[record.id]" @click="runJob(record)"><PlayCircleOutlined />执行</a-button>
-                <a-button v-else-if="record.status === 'needs_review'" type="link" size="small" :loading="jobBusy[record.id]" @click="openReview(record)"><SearchOutlined />人工确认</a-button>
+                <a-button v-else-if="['needs_review', 'failed'].includes(record.status)" type="link" size="small" :loading="jobBusy[record.id]" @click="openReview(record)"><SearchOutlined />人工确认</a-button>
                 <a-button v-if="['failed', 'completed', 'completed_warning'].includes(record.status)" type="link" size="small" :loading="jobBusy[record.id]" @click="openReorganize(record)"><ReloadOutlined />重新归档</a-button>
                 <a-button v-if="['completed', 'completed_warning'].includes(record.status) && record.preview?.share_relative_path" type="link" size="small" :loading="jobBusy[`share:${record.id}`]" @click="createJobShare(record)"><ShareAltOutlined />{{ jobShareUrl(record) ? '重新分享' : '创建分享' }}</a-button>
                 <a-button v-if="jobShareUrl(record)" type="text" size="small" aria-label="复制整理分享链接" @click="copyJobShare(record)"><CopyOutlined /></a-button>
@@ -1202,17 +1311,30 @@ onBeforeUnmount(() => {
           <a-input-number v-model:value="mappingForm.settle_seconds" :min="5" :max="3600" :step="5" style="width: 100%" addon-after="秒" />
         </a-form-item>
         <a-form-item label="媒体类型">
-          <a-select v-model:value="mappingForm.media_type" :options="[{ label: '自动识别', value: '' }, { label: '电影', value: 'movie' }, { label: '电视剧', value: 'tv' }]" />
+          <a-radio-group v-model:value="mappingForm.media_type" class="mapping-choice" aria-label="媒体类型">
+            <a-radio-button value="">自动识别</a-radio-button>
+            <a-radio-button value="movie">电影</a-radio-button>
+            <a-radio-button value="tv">电视剧</a-radio-button>
+          </a-radio-group>
         </a-form-item>
         <a-form-item label="整理方式">
-          <a-select v-model:value="mappingForm.transfer_type" :options="[{ label: '云盘内复制（推荐）', value: 'copy' }, { label: '云盘内移动', value: 'move' }]" />
+          <a-radio-group v-model:value="mappingForm.transfer_type" class="mapping-choice" aria-label="整理方式">
+            <a-radio-button value="copy">云盘内复制（推荐）</a-radio-button>
+            <a-radio-button value="move">云盘内移动</a-radio-button>
+          </a-radio-group>
         </a-form-item>
         <a-form-item label="目标冲突">
-          <a-select v-model:value="mappingForm.conflict_policy" :options="[{ label: '跳过已有文件', value: 'skip' }, { label: '覆盖已有文件', value: 'overwrite' }, { label: '追加短标识保留两份', value: 'rename' }]" />
+          <a-radio-group v-model:value="mappingForm.conflict_policy" class="mapping-choice" aria-label="目标冲突">
+            <a-radio-button value="skip">跳过已有文件</a-radio-button>
+            <a-radio-button value="overwrite">覆盖已有文件</a-radio-button>
+            <a-radio-button value="rename">追加短标识保留两份</a-radio-button>
+            <a-radio-button value="upgrade">洗版（按优先级替换旧版本）</a-radio-button>
+          </a-radio-group>
         </a-form-item>
       </div>
-      <a-alert v-if="mappingForm.transfer_type === 'move' || mappingForm.conflict_policy === 'overwrite'" type="warning" show-icon message="光鸭分享不是稳定快照：移动、删除或覆盖云端资源可能让 A 目录或旧目标的已有分享失效。整理后分享会从 B 目录重新创建新链接，不复用旧链接。" class="transfer-alert" />
-      <a-checkbox v-if="mappingForm.transfer_type === 'move' || mappingForm.conflict_policy === 'overwrite'" v-model:checked="mappingForm.share_risk_acknowledged" class="risk-check">我已了解移动/覆盖会使旧分享失效</a-checkbox>
+      <a-alert v-if="mappingForm.conflict_policy === 'upgrade'" type="info" show-icon message="洗版：目标目录中同一部电影/同一集的旧版本会按“设置 → 整理与刮削 → 识别规则 → 洗版策略”的优先级比较；新版本更优时旧文件移入回收站再落位，否则跳过新文件。" class="transfer-alert" />
+      <a-alert v-if="mappingForm.transfer_type === 'move' || mappingForm.conflict_policy === 'overwrite' || mappingForm.conflict_policy === 'upgrade'" type="warning" show-icon message="光鸭分享不是稳定快照：移动、删除或覆盖云端资源可能让 A 目录或旧目标的已有分享失效。整理后分享会从 B 目录重新创建新链接，不复用旧链接。" class="transfer-alert" />
+      <a-checkbox v-if="mappingForm.transfer_type === 'move' || mappingForm.conflict_policy === 'overwrite' || mappingForm.conflict_policy === 'upgrade'" v-model:checked="mappingForm.share_risk_acknowledged" class="risk-check">我已了解移动/覆盖/洗版会使旧分享失效</a-checkbox>
       <div class="switch-list">
         <label><span><strong>扫描已有内容</strong><small>创建任务后立即检查云盘 A 目录中的一级项目</small></span><a-switch v-model:checked="mappingForm.scan_existing" /></label>
         <label><span><strong>刮削元数据（默认关闭）</strong><small>开启后仅执行下方选中的类型，不会全量刮削</small></span><a-switch :checked="mappingForm.scrape" @change="toggleScrape" /></label>
@@ -1291,6 +1413,20 @@ onBeforeUnmount(() => {
         <a-form-item label="集号"><a-input-number v-model:value="review.episode" :min="0" :precision="0" placeholder="单文件可填写" style="width: 100%" /></a-form-item>
         <a-form-item label="结束集号"><a-input-number v-model:value="review.episode_end" :min="0" :precision="0" placeholder="多集文件可填写" style="width: 100%" /></a-form-item>
       </div>
+      <a-collapse ghost class="review-advanced">
+        <a-collapse-panel key="advanced" :header="`高级选项${review.episode_offset !== '' || review.recognition_words ? '（已设置）' : ''}`">
+          <div class="review-advanced-grid">
+            <a-form-item label="集偏移">
+              <a-input-number v-model:value="review.episode_offset" :precision="0" placeholder="例如 -12 或 24" style="width: 100%" />
+              <div class="field-help">识别出的每集集号统一加此偏移（可为负），用于源命名与 TMDB 集数错位的剧集。</div>
+            </a-form-item>
+            <a-form-item label="临时识别词" class="review-words">
+              <a-textarea v-model:value="review.recognition_words" :auto-size="{ minRows: 3, maxRows: 8 }" :spellcheck="false" placeholder="仅对本任务生效，优先于全局识别词：&#10;屏蔽词&#10;被替换词 => 替换词&#10;(?i)^Alias\.(\d+) => Show.S01E\1" />
+              <div class="field-help">格式与“识别设置 → 自定义识别词”一致；可先在顶部“识别测试工具”里调试。</div>
+            </a-form-item>
+          </div>
+        </a-collapse-panel>
+      </a-collapse>
     </a-form>
     <template #footer>
       <a-button @click="review.open = false">取消</a-button>
@@ -1449,7 +1585,10 @@ onBeforeUnmount(() => {
 .job-source, .job-result { display: grid; min-width: 0; gap: 2px; }
 .job-source strong, .job-result strong, .job-source span, .job-result span, .job-result small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .job-source span, .job-result span, .job-source small, .job-result small { color: var(--text-3, #737373); font-size: 10px; }
-.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; overflow: visible; }
+.form-grid > :nth-child(n + 3) { grid-column: 1 / -1; }
+.mapping-choice { display: flex; flex-wrap: wrap; width: 100%; }
+.mapping-choice :deep(.ant-radio-button-wrapper) { flex: 1 1 auto; text-align: center; }
 .transfer-alert { margin: 0 0 10px; }
 .risk-check { margin: 0 0 12px; color: var(--text-2, #525252); }
 .switch-list { display: grid; border-top: 1px solid var(--line, #e5e5e5); }
@@ -1476,6 +1615,10 @@ onBeforeUnmount(() => {
 .candidate-card > :deep(.anticon) { color: var(--primary); }
 .review-grid { display: grid; grid-template-columns: 1.4fr repeat(3, minmax(110px, .7fr)); gap: 12px; }
 .review-title { grid-column: span 2; }
+.review-advanced :deep(.ant-collapse-header) { padding-inline-start: 0 !important; color: var(--text-2, #525252); font-size: 13px; }
+.review-advanced-grid { display: grid; grid-template-columns: minmax(140px, .6fr) 1.4fr; gap: 12px; }
+.review-advanced-grid :deep(textarea) { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+@media (max-width: 900px) { .review-advanced-grid { grid-template-columns: 1fr; } }
 .matched-media { display: grid; grid-template-columns: 74px minmax(0, 1fr); gap: 12px; margin-bottom: 14px; padding: 10px; border: 1px solid var(--line-soft, #f5f5f5); border-radius: 10px; background: var(--surface-muted, #fafafa); }
 .matched-media img { width: 74px; height: 106px; border-radius: 7px; object-fit: cover; }
 .matched-media div { display: grid; min-width: 0; align-content: center; gap: 3px; }

@@ -9,8 +9,10 @@ import path from 'node:path';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import {
+  cloudPathsOverlap,
   createVirtualLibraryService,
   isBrowserUserAgent,
+  normalizeEmbyPath,
   normalizeEmbyUpstream,
   normalizeStrmBaseUrl,
   strmContent,
@@ -21,6 +23,7 @@ import {
   strmUrlFor,
   verifyStrmSignature,
   virtualFileKind,
+  pruneEmptyDirectories,
 } from './virtual-library.mjs';
 import { startTestServer, stopTestServer, waitUntil } from './test-helpers.mjs';
 
@@ -303,6 +306,98 @@ test('Emby 兼容网关：命中签名直链的播放请求 302 到 CDN，其余
   assert.throws(() => normalizeEmbyUpstream('http://127.0.0.1:8096/emby'), /不要包含路径/);
 });
 
+test('云端路径重叠判定与 Emby 内路径规范化', () => {
+  assert.equal(cloudPathsOverlap('/媒体', '/媒体/电影'), true);
+  assert.equal(cloudPathsOverlap('/媒体/电影', '/媒体'), true);
+  assert.equal(cloudPathsOverlap('/媒体', '/媒体'), true);
+  assert.equal(cloudPathsOverlap('/媒体', '/媒体库'), false);
+  assert.equal(cloudPathsOverlap('/', '/任意/路径'), true);
+  assert.equal(cloudPathsOverlap('', '/媒体'), false);
+  assert.equal(normalizeEmbyPath('/visual_media/'), '/visual_media');
+  assert.equal(normalizeEmbyPath('G:\\visual_media\\'), 'G:\\visual_media');
+  assert.equal(normalizeEmbyPath('  '), '');
+});
+
+test('同步收集变更清单并通知 Emby，整理联动匹配触发同步', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-virtual-notify-'));
+  const database = new DatabaseSync(':memory:');
+  const embyRequests = [];
+  let children = [
+    { fileId: 'movie-1', fileName: 'Movie.2026.mkv', resType: 1, fileSize: 10_000, utime: 11 },
+  ];
+  let listCalls = 0;
+  const service = createVirtualLibraryService({
+    database,
+    root,
+    strmBaseUrl: 'http://192.168.1.10:18096',
+    embyUpstream: 'http://127.0.0.1:8096',
+    cloud: {
+      listChildren: async () => { listCalls += 1; return children; },
+      getDownloadUrl: async (id) => `https://download.invalid/${id}`,
+    },
+    fetchImpl: async (target, options = {}) => {
+      if (String(target).includes('/emby/Library/Media/Updated')) {
+        embyRequests.push({ headers: options.headers, body: JSON.parse(options.body) });
+        return new Response(null, { status: 204 });
+      }
+      return new Response(Buffer.from('metadata'));
+    },
+  });
+  t.after(async () => {
+    service.close();
+    database.close();
+    await fsp.rm(root, { recursive: true, force: true });
+  });
+  service.updateSettings({ emby_api_key: 'emby-key' });
+  service.upsert({
+    id: 'movies',
+    name: '电影',
+    source_dir_id: 'cloud-movies',
+    source_path: '/媒体/电影',
+    local_path: path.join(root, 'movies'),
+    emby_path: '/visual_media',
+    include_metadata: false,
+    enabled: true,
+  });
+
+  service.sync('movies');
+  let status = await waitForSync(service, 'movies');
+  assert.equal(status.changed_files, 1);
+  await waitUntil(() => service.info().statuses.movies.emby_notified === 1 ? true : null, 3_000);
+  assert.equal(embyRequests.length, 1);
+  assert.equal(embyRequests[0].headers['x-emby-token'], 'emby-key');
+  assert.deepEqual(embyRequests[0].body.Updates, [
+    { Path: '/visual_media/Movie.2026.strm', UpdateType: 'Created' },
+  ]);
+
+  // 无变更的同步不再通知
+  service.sync('movies');
+  await waitForSync(service, 'movies');
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(embyRequests.length, 1);
+
+  // 云端换内容：新增 + 删除
+  children = [{ fileId: 'movie-2', fileName: 'Other.2026.mkv', resType: 1, fileSize: 9_000, utime: 12 }];
+  service.sync('movies');
+  await waitForSync(service, 'movies');
+  await waitUntil(() => embyRequests.length === 2 ? true : null, 3_000);
+  assert.deepEqual(embyRequests[1].body.Updates.map((update) => update.UpdateType).sort(), ['Created', 'Deleted']);
+
+  // 整理联动匹配：dirId 相等或路径重叠才触发
+  assert.deepEqual(service.syncForCloudTarget({ dirId: 'cloud-movies', path: '/别处' }), ['movies']);
+  await waitForSync(service, 'movies');
+  assert.deepEqual(service.syncForCloudTarget({ dirId: 'other', path: '/媒体/电影/2026' }), ['movies']);
+  await waitForSync(service, 'movies');
+  assert.deepEqual(service.syncForCloudTarget({ dirId: 'other', path: '/无关目录' }), []);
+
+  // 正在同步时 queueSync 合并为待重跑
+  const before = listCalls;
+  service.sync('movies');
+  assert.equal(service.queueSync('movies'), true);
+  await waitUntil(() => (listCalls >= before + 2 && !service.info().statuses.movies.running) ? true : null, 5_000);
+  assert.ok(listCalls >= before + 2);
+});
+
 test('未配置 STRM 直链地址时同步立即报错', async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-virtual-nobase-'));
   const database = new DatabaseSync(':memory:');
@@ -452,4 +547,59 @@ test('Web API 持久化虚拟库配置与 STRM 直链设置，/strm 免管理登
     body: JSON.stringify({ mapping: { id: 'outside', source_dir_id: 'cloud-outside', source_path: '/外部', local_path: path.join(root, 'outside') } }),
   });
   assert.equal(outsideResponse.status, 400);
+});
+
+test('pruneEmptyDirectories 自底向上删除空目录并保留仍有文件的目录', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-vl-prune-'));
+  await fsp.mkdir(path.join(root, '电影', '阿凡达'), { recursive: true });
+  await fsp.mkdir(path.join(root, '电影', '保留'), { recursive: true });
+  await fsp.writeFile(path.join(root, '电影', '保留', 'Movie.strm'), 'keep\n');
+  const removed = await pruneEmptyDirectories(root);
+  assert.ok(removed.includes('电影/阿凡达'));
+  await assert.rejects(fsp.access(path.join(root, '电影', '阿凡达')));
+  assert.equal(await fsp.readFile(path.join(root, '电影', '保留', 'Movie.strm'), 'utf8'), 'keep\n');
+  await fsp.rm(root, { recursive: true, force: true });
+});
+
+test('同步删除过期 STRM 后会收回变空的电影文件夹', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'guangya-virtual-empty-dir-'));
+  const database = new DatabaseSync(':memory:');
+  let tree = {
+    'cloud-movies': [{ fileId: 'avatar-dir', fileName: '阿凡达', resType: 2 }],
+    'avatar-dir': [{ fileId: 'avatar-1', fileName: '阿凡达.mkv', resType: 1, fileSize: 10_000, utime: 11 }],
+  };
+  const service = createVirtualLibraryService({
+    database,
+    root,
+    strmBaseUrl: 'http://192.168.1.10:18096',
+    cloud: {
+      listChildren: async (parentId) => tree[parentId] || [],
+      getDownloadUrl: async (id) => `https://download.invalid/${id}`,
+    },
+  });
+  t.after(async () => {
+    service.close();
+    database.close();
+    await fsp.rm(root, { recursive: true, force: true });
+  });
+  const target = path.join(root, 'movies');
+  service.upsert({
+    id: 'movies',
+    name: '电影',
+    source_dir_id: 'cloud-movies',
+    source_path: '/电影',
+    local_path: target,
+    include_metadata: false,
+    enabled: true,
+  });
+  service.sync('movies');
+  await waitForSync(service, 'movies');
+  assert.equal(await fsp.readFile(path.join(target, '阿凡达', '阿凡达.strm'), 'utf8').then((value) => value.includes('/strm/avatar-1')), true);
+
+  tree = { 'cloud-movies': [] };
+  service.sync('movies');
+  await waitForSync(service, 'movies');
+  await assert.rejects(fsp.access(path.join(target, '阿凡达', '阿凡达.strm')));
+  await assert.rejects(fsp.access(path.join(target, '阿凡达')));
+  assert.equal((await fsp.readdir(target)).includes('.guangya-virtual-library.json'), true);
 });

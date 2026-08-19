@@ -17,6 +17,7 @@ const DEFAULT_EMBY_UPSTREAM = 'http://127.0.0.1:8096';
 const MAX_ITEMS = 100_000;
 const MAX_DEPTH = 64;
 const MAX_METADATA_BYTES = 64 * 1024 * 1024;
+const MAX_CHANGE_PATHS = 200;
 const FILE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,256}$/;
 const HOP_BY_HOP_HEADERS = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
 
@@ -109,6 +110,25 @@ function copyAuthHeaders(headers) {
   }
   return copied;
 }
+/** 该虚拟库目录在 Emby 里看到的路径；支持 Windows 与 POSIX 形式，留空表示不通知 Emby。 */
+export function normalizeEmbyPath(value) {
+  return cleanText(value).replace(/[\\/]+$/, '');
+}
+function normalizedCloudPath(value) {
+  const collapsed = cleanText(value).replaceAll('\\', '/').replace(/\/{2,}/g, '/');
+  if (!collapsed) return '';
+  if (collapsed === '/') return '/';
+  const stripped = collapsed.replace(/\/+$/, '');
+  return stripped.startsWith('/') ? stripped : `/${stripped}`;
+}
+/** 云端路径子树是否重叠（相同或互为前缀）；'/' 视为整个云盘，与任何路径重叠。 */
+export function cloudPathsOverlap(left, right) {
+  const a = normalizedCloudPath(left);
+  const b = normalizedCloudPath(right);
+  if (!a || !b) return false;
+  if (a === '/' || b === '/') return true;
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
 /**
  * 浏览器（Emby Web）里的 JS fetch 读取跨域数据需要 CORS 头，而云盘 CDN 不返回；
  * 浏览器 UA 的播放请求由网关中转并注入 CORS 头，App 播放器仍然 302 直连 CDN。
@@ -154,6 +174,7 @@ function normalizeMapping(root, input = {}) {
     source_dir_id: sourceDirId,
     source_path: sourcePath,
     local_path: localPath,
+    emby_path: normalizeEmbyPath(input.emby_path ?? input.embyPath),
     include_metadata: input.include_metadata === true || input.includeMetadata === true,
     enabled: input.enabled !== false,
   };
@@ -163,6 +184,29 @@ async function readManifest(root) {
   catch { return { version: 3, source_dir_id: '', entries: {} }; }
 }
 async function writeManifest(root, manifest) { await fsp.writeFile(path.join(root, MANIFEST_NAME), JSON.stringify(manifest, null, 2)); }
+/** 自底向上删除 root 下的空目录；保留 root 本身。返回被删除目录的相对路径（/ 分隔）。 */
+export async function pruneEmptyDirectories(root) {
+  const removed = [];
+  const rootResolved = path.resolve(root);
+  async function walk(dir) {
+    let entries = [];
+    try { entries = await fsp.readdir(dir, { withFileTypes: true }); }
+    catch (error) { if (error?.code !== 'ENOENT') throw error; return; }
+    for (const entry of entries) {
+      if (entry.isDirectory()) await walk(path.join(dir, entry.name));
+    }
+    if (path.resolve(dir) === rootResolved) return;
+    const remaining = await fsp.readdir(dir).catch((error) => {
+      if (error?.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (!remaining || remaining.some((name) => name !== MANIFEST_NAME)) return;
+    await fsp.rmdir(dir);
+    removed.push(path.relative(rootResolved, dir).split(path.sep).filter(Boolean).join('/'));
+  }
+  await walk(rootResolved);
+  return removed;
+}
 
 export function createVirtualLibraryService({
   database,
@@ -193,6 +237,7 @@ export function createVirtualLibraryService({
       source_dir_id TEXT NOT NULL,
       source_path TEXT NOT NULL,
       local_path TEXT NOT NULL,
+      emby_path TEXT NOT NULL DEFAULT '',
       include_metadata INTEGER NOT NULL DEFAULT 0,
       enabled INTEGER NOT NULL DEFAULT 1,
       updated_at INTEGER NOT NULL
@@ -202,6 +247,9 @@ export function createVirtualLibraryService({
   if (!settingsColumns.includes('strm_base_url')) database.exec("ALTER TABLE virtual_library_settings ADD COLUMN strm_base_url TEXT NOT NULL DEFAULT ''");
   if (!settingsColumns.includes('sign_secret')) database.exec("ALTER TABLE virtual_library_settings ADD COLUMN sign_secret TEXT NOT NULL DEFAULT ''");
   if (!settingsColumns.includes('emby_upstream')) database.exec(`ALTER TABLE virtual_library_settings ADD COLUMN emby_upstream TEXT NOT NULL DEFAULT '${DEFAULT_EMBY_UPSTREAM}'`);
+  if (!settingsColumns.includes('emby_api_key')) database.exec("ALTER TABLE virtual_library_settings ADD COLUMN emby_api_key TEXT NOT NULL DEFAULT ''");
+  const mappingColumns = database.prepare('PRAGMA table_info(virtual_library_mappings)').all().map((column) => column.name);
+  if (!mappingColumns.includes('emby_path')) database.exec("ALTER TABLE virtual_library_mappings ADD COLUMN emby_path TEXT NOT NULL DEFAULT ''");
   database.prepare('INSERT OR IGNORE INTO virtual_library_settings (id, refresh_minutes, strm_base_url, sign_secret, emby_upstream, updated_at) VALUES (1, 15, ?, ?, ?, ?)')
     .run(normalizeStrmBaseUrl(strmBaseUrl), crypto.randomBytes(32).toString('hex'), normalizeEmbyUpstream(embyUpstream), Math.floor(Date.now() / 1000));
   const initialRow = database.prepare('SELECT strm_base_url, sign_secret, emby_upstream FROM virtual_library_settings WHERE id = 1').get();
@@ -217,20 +265,27 @@ export function createVirtualLibraryService({
   const statuses = new Map();
 
   function mappings() {
-    return database.prepare('SELECT id, name, source_dir_id, source_path, local_path, include_metadata, enabled FROM virtual_library_mappings ORDER BY updated_at DESC').all().map((row) => ({
+    return database.prepare('SELECT id, name, source_dir_id, source_path, local_path, emby_path, include_metadata, enabled FROM virtual_library_mappings ORDER BY updated_at DESC').all().map((row) => ({
       ...row,
       include_metadata: Boolean(row.include_metadata),
       enabled: Boolean(row.enabled),
     }));
   }
   function settings() {
-    const row = database.prepare('SELECT refresh_minutes, strm_base_url, sign_secret, emby_upstream FROM virtual_library_settings WHERE id = 1').get();
+    const row = database.prepare('SELECT refresh_minutes, strm_base_url, sign_secret, emby_upstream, emby_api_key FROM virtual_library_settings WHERE id = 1').get();
     return {
       refreshMinutes: Number(row?.refresh_minutes || 15),
       strmBaseUrl: (() => { try { return normalizeStrmBaseUrl(row?.strm_base_url); } catch { return ''; } })(),
       signSecret: cleanText(row?.sign_secret),
       embyUpstream: (() => { try { return normalizeEmbyUpstream(row?.emby_upstream); } catch { return DEFAULT_EMBY_UPSTREAM; } })(),
+      embyApiKey: cleanText(row?.emby_api_key),
     };
+  }
+  /** 相对播放直链 `/strm/{fileId}?sign=…`：同源访问，内嵌播放与外部播放器共用。 */
+  function strmPathFor(fileId) {
+    const id = cleanText(fileId);
+    if (!id) throw new Error('文件 ID 为空');
+    return `/strm/${encodeURIComponent(id)}?sign=${strmSignature(settings().signSecret, id)}`;
   }
   function info() {
     const current = settings();
@@ -240,6 +295,7 @@ export function createVirtualLibraryService({
       strm_path: '/strm',
       strm_endpoint: current.strmBaseUrl ? `${current.strmBaseUrl}/strm/` : '',
       emby_upstream: current.embyUpstream,
+      emby_api_key_configured: Boolean(current.embyApiKey),
       gateway_endpoint: `http://127.0.0.1:${currentGatewayPort}/`,
       gateway_port: currentGatewayPort,
       gateway_running: gatewayRunning,
@@ -263,7 +319,11 @@ export function createVirtualLibraryService({
     const refreshMinutes = normalizeRefreshMinutes(input.refresh_minutes ?? input.refreshMinutes ?? current.refreshMinutes);
     const base = normalizeStrmBaseUrl(input.strm_base_url ?? input.strmBaseUrl ?? current.strmBaseUrl);
     const upstream = normalizeEmbyUpstream(input.emby_upstream ?? input.embyUpstream ?? current.embyUpstream);
-    database.prepare('UPDATE virtual_library_settings SET refresh_minutes = ?, strm_base_url = ?, emby_upstream = ?, updated_at = ? WHERE id = 1').run(refreshMinutes, base, upstream, Math.floor(Date.now() / 1000));
+    // API Key 留空表示保持不变（不回显）；提交 "off" 清除。
+    const rawApiKey = input.emby_api_key ?? input.embyApiKey;
+    let apiKey = current.embyApiKey;
+    if (cleanText(rawApiKey)) apiKey = cleanText(rawApiKey) === 'off' ? '' : cleanText(rawApiKey);
+    database.prepare('UPDATE virtual_library_settings SET refresh_minutes = ?, strm_base_url = ?, emby_upstream = ?, emby_api_key = ?, updated_at = ? WHERE id = 1').run(refreshMinutes, base, upstream, apiKey, Math.floor(Date.now() / 1000));
     emitInfo();
     return info();
   }
@@ -276,12 +336,12 @@ export function createVirtualLibraryService({
       throw new Error('虚拟库本地目录不能与其他配置相同或互相包含');
     }
     database.prepare(`INSERT INTO virtual_library_mappings
-      (id, name, source_dir_id, source_path, local_path, include_metadata, enabled, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      (id, name, source_dir_id, source_path, local_path, emby_path, include_metadata, enabled, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET name=excluded.name, source_dir_id=excluded.source_dir_id,
-      source_path=excluded.source_path, local_path=excluded.local_path,
+      source_path=excluded.source_path, local_path=excluded.local_path, emby_path=excluded.emby_path,
       include_metadata=excluded.include_metadata, enabled=excluded.enabled, updated_at=excluded.updated_at`)
-      .run(mapping.id, mapping.name, mapping.source_dir_id, mapping.source_path, mapping.local_path, Number(mapping.include_metadata), Number(mapping.enabled), Math.floor(Date.now() / 1000));
+      .run(mapping.id, mapping.name, mapping.source_dir_id, mapping.source_path, mapping.local_path, mapping.emby_path, Number(mapping.include_metadata), Number(mapping.enabled), Math.floor(Date.now() / 1000));
     emitInfo();
     return info();
   }
@@ -311,6 +371,15 @@ export function createVirtualLibraryService({
     const queue = [{ parentId: mapping.source_dir_id, relative: '', depth: 0 }];
     const outputs = new Set();
     const summary = { strm_files: 0, metadata_files: 0, skipped_files: 0 };
+    const changes = { created: [], modified: [], removed: [], total: 0, truncated: false };
+    const recordChange = (bucket, key) => {
+      changes.total += 1;
+      if (changes.created.length + changes.modified.length + changes.removed.length >= MAX_CHANGE_PATHS) {
+        changes.truncated = true;
+        return;
+      }
+      bucket.push(key);
+    };
     let scanned = 0;
     while (queue.length) {
       const current = queue.shift();
@@ -340,10 +409,17 @@ export function createVirtualLibraryService({
         if (kind === 'strm') {
           const content = strmContent(strmUrlFor(base, signSecret, entry.id));
           const sameContent = unchanged && await fsp.readFile(target, 'utf8').then((value) => value === content).catch(() => false);
-          if (!sameContent) { await fsp.mkdir(path.dirname(target), { recursive: true }); await fsp.writeFile(target, content); }
+          if (!sameContent) {
+            await fsp.mkdir(path.dirname(target), { recursive: true });
+            await fsp.writeFile(target, content);
+            recordChange(old ? changes.modified : changes.created, key);
+          }
           summary.strm_files += 1;
         } else {
-          if (!unchanged) await writeMetadata(entry, target);
+          if (!unchanged) {
+            await writeMetadata(entry, target);
+            recordChange(old ? changes.modified : changes.created, key);
+          }
           summary.metadata_files += 1;
         }
         next.entries[key] = manifestEntry;
@@ -352,10 +428,45 @@ export function createVirtualLibraryService({
     for (const key of Object.keys(previous.entries || {})) {
       if (next.entries[key]) continue;
       const candidate = path.resolve(targetRoot, key);
-      if (isWithin(targetRoot, candidate)) await fsp.rm(candidate, { force: true });
+      if (isWithin(targetRoot, candidate)) {
+        await fsp.rm(candidate, { force: true });
+        recordChange(changes.removed, key);
+      }
+    }
+    // 过期 STRM/元数据删掉后，自底向上收回变空的电影/剧集文件夹，避免
+    // “阿凡达.strm 没了但 阿凡达/ 还在”。不删虚拟库根目录，也不动仍有文件的目录。
+    for (const key of await pruneEmptyDirectories(targetRoot)) {
+      recordChange(changes.removed, key);
     }
     await writeManifest(targetRoot, next);
-    return summary;
+    return { ...summary, changes };
+  }
+  /** 同步完成后按变更清单通知 Emby 增量扫描；未配置 API Key 或 Emby 内路径时跳过。 */
+  async function notifyEmby(mapping, changes) {
+    const { embyUpstream: upstream, embyApiKey } = settings();
+    const embyPath = normalizeEmbyPath(mapping.emby_path);
+    if (!embyApiKey || !embyPath || !changes?.total) return null;
+    const windowsStyle = embyPath.includes('\\');
+    const toEmbyPath = (key) => (windowsStyle ? `${embyPath}\\${key.replaceAll('/', '\\')}` : `${embyPath}/${key}`);
+    const updates = changes.truncated
+      ? [{ Path: embyPath, UpdateType: 'Modified' }]
+      : [
+        ...changes.created.map((key) => ({ Path: toEmbyPath(key), UpdateType: 'Created' })),
+        ...changes.modified.map((key) => ({ Path: toEmbyPath(key), UpdateType: 'Modified' })),
+        ...changes.removed.map((key) => ({ Path: toEmbyPath(key), UpdateType: 'Deleted' })),
+      ];
+    if (!updates.length) return null;
+    const response = await fetchImpl(new URL('/emby/Library/Media/Updated', upstream), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-emby-token': embyApiKey },
+      body: JSON.stringify({ Updates: updates }),
+    });
+    if (!response.ok) throw new Error(`Emby 刷新通知失败：HTTP ${response.status}`);
+    return { count: updates.length };
+  }
+  const pendingResync = new Set();
+  function finishSync(mappingId) {
+    if (pendingResync.delete(mappingId)) queueSync(mappingId);
   }
   function sync(id) {
     const mapping = mappings().find((item) => item.id === cleanText(id));
@@ -365,14 +476,49 @@ export function createVirtualLibraryService({
     if (statuses.get(mapping.id)?.running) throw new Error('该虚拟库正在同步');
     statuses.set(mapping.id, { ...(statuses.get(mapping.id) || {}), running: true, error: null });
     emitInfo();
-    void syncInner(mapping).then((summary) => {
-      statuses.set(mapping.id, { running: false, last_sync_at: Math.floor(Date.now() / 1000), ...summary, error: null });
+    void syncInner(mapping).then(async (result) => {
+      const { changes, ...counters } = result;
+      statuses.set(mapping.id, { running: false, last_sync_at: Math.floor(Date.now() / 1000), ...counters, changed_files: changes.total, error: null });
       emitInfo();
+      try {
+        const notified = await notifyEmby(mapping, changes);
+        if (notified) {
+          statuses.set(mapping.id, { ...(statuses.get(mapping.id) || {}), emby_notified: notified.count, emby_notify_error: null });
+          emitInfo();
+        }
+      } catch (error) {
+        statuses.set(mapping.id, { ...(statuses.get(mapping.id) || {}), emby_notify_error: error.message });
+        emitInfo();
+      }
+      finishSync(mapping.id);
     }).catch((error) => {
       statuses.set(mapping.id, { ...(statuses.get(mapping.id) || {}), running: false, error: error.message });
       emitInfo();
+      finishSync(mapping.id);
     });
     return info();
+  }
+  /** 触发同步；若该虚拟库正在同步则记为待重跑，当前轮结束后自动再同步一次。 */
+  function queueSync(id) {
+    const key = cleanText(id);
+    try {
+      sync(key);
+      return true;
+    } catch (error) {
+      if (statuses.get(key)?.running) {
+        pendingResync.add(key);
+        return true;
+      }
+      return false;
+    }
+  }
+  /** 整理器等云端写入方完成后调用：找出覆盖该云端目录的虚拟库并触发同步。 */
+  function syncForCloudTarget({ dirId, path: cloudPath } = {}) {
+    const id = cleanText(dirId);
+    const matched = mappings().filter((mapping) => mapping.enabled
+      && ((id && mapping.source_dir_id === id) || cloudPathsOverlap(mapping.source_path, cloudPath)));
+    for (const mapping of matched) queueSync(mapping.id);
+    return matched.map((mapping) => mapping.id);
   }
   async function handleStrm(request, response, url) {
     const method = String(request.method || 'GET').toUpperCase();
@@ -575,5 +721,5 @@ export function createVirtualLibraryService({
     for (const socket of upgradeSockets) socket.destroy();
     upgradeSockets.clear();
   }
-  return { info, updateSettings, upsert, remove, sync, handleStrm, handleGateway, proxyUpgrade, setGatewayStatus, start, close };
+  return { info, updateSettings, upsert, remove, sync, queueSync, syncForCloudTarget, strmPathFor, handleStrm, handleGateway, proxyUpgrade, setGatewayStatus, start, close };
 }

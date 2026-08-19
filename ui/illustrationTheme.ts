@@ -66,6 +66,10 @@ function useIllustrationTheme() {
   const { styles } = useStyles()
 
   return computed<ConfigProviderProps>(() => ({
+    // 下拉挂到 body：抽屉/对话框有 overflow 与 transform，Blink/Gecko 会把
+    // 挂在触发器上的 Select 弹层裁掉或立刻判定为点击外部。WebKit（iOS Safari）
+    // 往往仍能显示，表现为“只有手机 Safari 能选整理方式”。
+    getPopupContainer: () => document.body,
     // 桌面端默认控件高度使用 middle（28px）：全局 small（22px）在 Windows
     // 上过于局促，是"界面太挤"的主要来源；表格等高密度场景仍可显式
     // size="small"。
