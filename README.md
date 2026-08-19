@@ -41,7 +41,9 @@
 
 刮削开关默认关闭。打开后先选择要执行的类型（默认预选电影 NFO、剧集 NFO、海报、背景图），不会把所有可用元数据全部下载；刮削失败会记录为警告并保留已完成的主体整理。上传任务可在“上传后自动整理”中关联 A 目录：关闭时沿用原上传后自动分享流程，开启时先等待 A → B 完成，再从 B 创建新分享，避免把即将移动的 A 目录提交给 HDHive。
 
-光鸭分享不是不可变快照。移动、删除或覆盖云端文件可能使旧分享失效或内容不再完整，因此整理器对 `move`/`overwrite` 强制风险确认，整理后的分享始终是 B 目录的新链接；A 目录或历史分享不会被复用。
+目标冲突支持跳过、覆盖、保留两份和洗版四种策略。洗版会在目标目录内识别同一内容的旧版本（电影按同 part、剧集按同季同集），按“识别设置 → 洗版策略”配置的优先级（默认分辨率 → 动态范围 → 制作组 → 文件大小）比较：新版本更优时把旧视频连同其字幕/NFO 等伴随文件移入回收站再落位，现有版本更优或持平则跳过转移；预览会列出替换清单与胜出维度。制作组优先级名单每行一个、靠前优先，`#` 开头为注释。
+
+光鸭分享不是不可变快照。移动、删除或覆盖云端文件可能使旧分享失效或内容不再完整，因此整理器对 `move`/`overwrite`/洗版强制风险确认，整理后的分享始终是 B 目录的新链接；A 目录或历史分享不会被复用。
 
 ## 开发和打包
 
@@ -53,7 +55,7 @@ pnpm tauri dev
 pnpm tauri build
 ```
 
-安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.43_x64-setup.exe`
+安装包：`target/release/bundle/nsis/光鸭文件夹同步_0.1.44_x64-setup.exe`
 
 正式更新包必须使用长期保存的同一把 Tauri 私钥签名。构建机设置 `TAURI_SIGNING_PRIVATE_KEY`（可填私钥内容或私钥文件路径）和可选的 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 后执行构建，再生成 GitHub Release 所需文件：
 
@@ -136,13 +138,36 @@ Emby 侧只需要把虚拟库目录加入媒体库——仅此一个目录，不
 - Docker/Web：`/strm/` 同时挂在管理端口（默认 8080）和网关端口（默认 18096）上，免管理登录、仅校验签名；网关端口默认只发布到宿主机回环，需要局域网设备直连时设置 `GUANGYA_EMBY_GATEWAY_BIND=0.0.0.0`。直链地址用 `GUANGYA_STRM_BASE_URL` 首次初始化，Emby 原始地址用 `GUANGYA_EMBY_UPSTREAM` 配置。
 - 修改直链地址后，下一次同步会自动重写全部 STRM；同步只清理清单中由本软件生成、但云端已不存在的文件，不会删除目录里的其他文件。
 - 签名密钥按实例持久化到 SQLite，不通过状态接口回显；单条直链泄露只影响对应文件。
+- 整理任务完成后会自动匹配输出目录所在的虚拟库并触发同步；填写 Emby API Key 后，同步完成自动调用 Emby `/Library/Media/Updated` 按路径刷新变更（新增/修改/删除）。Emby 看到的虚拟库路径与本服务不一致时（常见于容器路径映射），在虚拟库映射中填写“Emby 内部路径”用于换算。
+
+## Telegram Bot 通知与交互
+
+“设置 → Telegram”接入 Telegram Bot 作为通知与交互渠道，桌面端与 Docker/Web 端功能一致。支持两种接入模式（都以 bot 身份运行）：
+
+- **Bot API（直接 Bot Token）**：HTTPS 调用官方 `api.telegram.org` 或自建反代地址，getUpdates 长轮询，走“网络偏好”里的全局代理（HTTP/SOCKS5 均可）。
+- **MTProto（TG API）**：填 `api_id` + `api_hash`（[my.telegram.org](https://my.telegram.org) 获取）+ Bot Token，以 MTProto 协议直连 Telegram 数据中心，不依赖 Bot API 域名；仅支持 SOCKS5 代理，会话在本地持久化。
+
+出站通知（每类可单独开关）：
+
+- **入库通知**：云盘整理完成（转移 + 刮削摘要、目标路径，带 TMDB 海报）。
+- **识别失败通知**：识别待处理 / 整理失败，附「重新识别 / 重新整理 / 填写 TMDB ID」按钮；点“填写 TMDB ID”后直接回复 `94605 tv s=1` 即可带覆盖参数重新整理。
+- **登录失效通知**：光鸭登录态失效时推送，附「获取扫码登录二维码」按钮，扫码即可在 Telegram 里完成重登。
+- **Emby webhook 通知**：在 Emby 后台把 Webhook 地址指向本服务（设置页可复制带密钥的地址），推送入库（library.new）、播放开始/停止和用户登录事件。Docker/Web 端点为管理端口 `/webhooks/emby` 与网关端口 `/guangya/webhooks/emby`；桌面端使用网关端口（默认 18096）。
+
+交互命令：`/status` 系统状态、`/jobs` 最近整理任务（失败项带操作按钮）、`/logs [数量]` 最新运行日志（默认 50 条）、`/update` 检查更新（桌面端支持一键安装）、`/login` 获取光鸭扫码登录二维码、`re <任务ID> tmdbid=12345 [tv|movie] [s=1] [e=2]` 手动指定 TMDB 重新整理。
+
+安全与注意事项：
+
+- 只响应 Chat ID 白名单内的会话；未配置时先给机器人发送 `/start`，把回显的 Chat ID 填入设置。
+- 同一个 Bot Token 不要同时在桌面端与 Docker 端启用（Bot API getUpdates 会 409 冲突）；两端各建一个 bot 即可。
+- Docker/Web 支持 `TELEGRAM_*` 环境变量托管配置（见 `.env.example`），环境变量优先于设置页。
 
 ## Docker Web
 
 Docker Hub 镜像：[`94xhzy/guangya-sync`](https://hub.docker.com/r/94xhzy/guangya-sync)，推荐固定使用版本标签：
 
 ```bash
-docker pull 94xhzy/guangya-sync:0.1.43
+docker pull 94xhzy/guangya-sync:0.1.44
 ```
 
 先准备管理账号。用户名默认是 `admin`；请生成独立的强随机密码，复制 `.env.example` 为 `.env` 并填入 `GUANGYA_ADMIN_PASSWORD`：
@@ -227,7 +252,7 @@ pnpm web
 pnpm package:ubuntu
 ```
 
-输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.43.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
+输出位于 `release/guangya-sync-native-ubuntu-x64-0.1.44.tar.gz`，解压后执行 `sudo ./install.sh`。安装包自带 Node.js 24 Linux 运行时和全部生产依赖。安装器会生成强随机管理密码、以 `0600` 权限写入 `/etc/guangya-sync.env`，并且只在首次生成时显示一次。Ubuntu 原生版默认只允许网页浏览 `/var/lib/guangya-sync/watch` 和 `/var/lib/guangya-sync/archive`；需要增加其他目录时使用 `GUANGYA_FILE_ROOTS` 设置白名单。应用自己的 `DATA_DIR` 始终隐藏，避免误选并上传包含登录会话的状态库。详细说明见包内 `README.md`。
 
 ## 接口边界
 

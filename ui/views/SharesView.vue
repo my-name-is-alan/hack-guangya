@@ -44,6 +44,12 @@ const cloudShares = ref([]);
 const cloudSharesLoading = ref(false);
 const cloudShareActionBusy = ref(false);
 const cloudShareQuery = ref('');
+const cloudShareStatusFilter = ref('all');
+const shareStatusFilterOptions = [
+  { value: 'all', label: '全部状态' },
+  { value: 'valid', label: '有效' },
+  { value: 'invalid', label: '已失效' },
+];
 const cloudSharePage = ref(1);
 const cloudSharePageSize = ref(20);
 const selectedKeys = ref([]);
@@ -101,15 +107,19 @@ function trafficLabel(record) {
 
 const filteredCloudShares = computed(() => {
   const query = cloudShareQuery.value.trim().toLowerCase();
-  if (!query) return cloudShares.value;
-  return cloudShares.value.filter((record) => [
-    shareDisplayName(record),
-    record.shareUrl,
-    record.share_url,
-    record.code,
-    record.id,
-    record.shareId,
-  ].some((value) => String(value ?? '').toLowerCase().includes(query)));
+  return cloudShares.value.filter((record) => {
+    if (cloudShareStatusFilter.value === 'valid' && shareStatusValue(record) !== 1) return false;
+    if (cloudShareStatusFilter.value === 'invalid' && !isInvalidShare(record)) return false;
+    if (!query) return true;
+    return [
+      shareDisplayName(record),
+      record.shareUrl,
+      record.share_url,
+      record.code,
+      record.id,
+      record.shareId,
+    ].some((value) => String(value ?? '').toLowerCase().includes(query));
+  });
 });
 const selectedRecords = computed(() => {
   const ids = new Set(selectedKeys.value.map(String));
@@ -307,6 +317,7 @@ onMounted(loadCloudShares);
     <a-tabs v-model:active-key="shareTab" class="page-tabs" :animated="false">
       <template #rightExtra>
         <a-space wrap>
+          <a-select v-if="shareTab === 'cloud'" v-model:value="cloudShareStatusFilter" :options="shareStatusFilterOptions" aria-label="按状态筛选分享" class="share-status-filter" @change="cloudSharePage = 1" />
           <a-input v-if="shareTab === 'cloud'" v-model:value="cloudShareQuery" allow-clear aria-label="搜索分享" placeholder="搜索分享" class="share-search" @change="cloudSharePage = 1">
             <template #prefix><SearchOutlined /></template>
           </a-input>
@@ -415,6 +426,7 @@ onMounted(loadCloudShares);
 
 <style scoped>
 .share-search { width: 220px; }
+.share-status-filter { width: 110px; }
 .share-toolbar { display: flex; min-height: var(--toolbar-h, 42px); align-items: center; justify-content: space-between; gap: 16px; }
 .selection-summary { color: var(--text-2, #525252); }
 .share-counts { color: var(--text-2, #525252); font-size: 12px; white-space: nowrap; }

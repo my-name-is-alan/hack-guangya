@@ -13,8 +13,8 @@ pub(crate) fn should_sync(path: &Path, sync_types: &[String]) -> bool {
 pub(crate) fn ignored(path: &Path) -> bool {
     let name = path
         .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or("")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default()
         .to_lowercase();
     name.starts_with("~$")
         || [
@@ -74,42 +74,73 @@ pub(crate) fn install_watcher(state: &SharedState, mapping: &Mapping) -> Result<
 }
 
 pub(crate) fn collect_existing_files(root: &Path, sync_types: &[String], files: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(root) else {
+    collect_existing_files_with_skips(root, sync_types, files, &mut Vec::new());
+}
+
+pub(crate) fn collect_existing_files_with_skips(
+    root: &Path,
+    sync_types: &[String],
+    files: &mut Vec<PathBuf>,
+    skips: &mut Vec<UploadScanSkip>,
+) {
+    let mut visited = HashSet::new();
+    collect_existing_files_inner(root, sync_types, files, skips, &mut visited);
+}
+
+fn collect_existing_files_inner(
+    root: &Path,
+    sync_types: &[String],
+    files: &mut Vec<PathBuf>,
+    skips: &mut Vec<UploadScanSkip>,
+    visited: &mut HashSet<PathIdentity>,
+) {
+    let Some((kind, readable)) = inspect_local_entry(root, skips) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if metadata.file_type().is_symlink() {
-            continue;
+    match kind {
+        LocalEntryKind::File => {
+            if !ignored(root) && should_sync(root, sync_types) {
+                files.push(user_visible_path(root));
+            }
         }
-        if metadata.is_dir() {
-            collect_existing_files(&path, sync_types, files);
-        } else if metadata.is_file() && !ignored(&path) && should_sync(&path, sync_types) {
-            files.push(path);
+        LocalEntryKind::Directory => {
+            if !visited.insert(path_identity(&readable)) {
+                skips.push(UploadScanSkip::new(root, "检测到循环链接，已跳过"));
+                return;
+            }
+            let entries = match fs::read_dir(&readable) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    skips.push(UploadScanSkip::new(
+                        root,
+                        format!("读取目录失败：{error}"),
+                    ));
+                    return;
+                }
+            };
+            for entry in entries {
+                match entry {
+                    Ok(entry) => collect_existing_files_inner(
+                        &entry.path(),
+                        sync_types,
+                        files,
+                        skips,
+                        visited,
+                    ),
+                    Err(error) => skips.push(UploadScanSkip::new(
+                        root,
+                        format!("读取目录项失败：{error}"),
+                    )),
+                }
+            }
         }
     }
 }
 
 pub(crate) fn collect_watch_event_files(path: &Path, sync_types: &[String]) -> Vec<PathBuf> {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return Vec::new();
-    };
-    if metadata.file_type().is_symlink() {
-        return Vec::new();
-    }
-    if metadata.is_dir() {
-        let mut files = Vec::new();
-        collect_existing_files(path, sync_types, &mut files);
-        return files;
-    }
-    if metadata.is_file() && !ignored(path) && should_sync(path, sync_types) {
-        vec![path.to_path_buf()]
-    } else {
-        Vec::new()
-    }
+    let mut files = Vec::new();
+    collect_existing_files(path, sync_types, &mut files);
+    files
 }
 
 pub(crate) fn enqueue_existing_files(app: &tauri::AppHandle, state: &SharedState, mapping: &Mapping) {
@@ -117,15 +148,33 @@ pub(crate) fn enqueue_existing_files(app: &tauri::AppHandle, state: &SharedState
         return;
     }
     let mut files = Vec::new();
-    collect_existing_files(
+    let mut skips = Vec::new();
+    collect_existing_files_with_skips(
         Path::new(&mapping.local_path),
         &mapping.sync_types,
         &mut files,
+        &mut skips,
     );
     emit(
         app,
         json!({ "type": "status", "level": "info", "message": format!("正在扫描已有文件：{} 个", files.len()) }),
     );
+    if !skips.is_empty() {
+        let preview = skips
+            .iter()
+            .take(3)
+            .map(|skip| format!("{}：{}", skip.path, skip.reason))
+            .collect::<Vec<_>>()
+            .join("；");
+        emit(
+            app,
+            json!({
+                "type": "status",
+                "level": "warning",
+                "message": format!("扫描已有文件时跳过 {} 个路径。{preview}", skips.len())
+            }),
+        );
+    }
     if let Ok(guard) = state.lock() {
         for path in files {
             let _ = guard.event_tx.send(FsEvent {

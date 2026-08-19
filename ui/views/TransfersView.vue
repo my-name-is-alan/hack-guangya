@@ -38,6 +38,24 @@ const downloadCounts = computed(() => ({
   finished: downloads.value.filter(item => ['completed', 'failed', 'cancelled'].includes(item.status)).length,
 }))
 
+const transferFilterOptions = [
+  { label: '全部', value: 'all' },
+  { label: '进行中', value: 'active' },
+  { label: '已结束', value: 'finished' },
+]
+const uploadFilter = shallowRef<'all' | 'active' | 'finished'>('all')
+const downloadFilter = shallowRef<'all' | 'active' | 'finished'>('all')
+const visibleUploads = computed(() => {
+  if (uploadFilter.value === 'all') return orderedUploads.value
+  const finished = uploadFilter.value === 'finished'
+  return orderedUploads.value.filter(item => ['done', 'error', 'cancelled'].includes(item.state) === finished)
+})
+const visibleDownloads = computed(() => {
+  if (downloadFilter.value === 'all') return downloads.value
+  const finished = downloadFilter.value === 'finished'
+  return downloads.value.filter(item => ['completed', 'failed', 'cancelled'].includes(item.status) === finished)
+})
+
 async function pauseDownload(id: string) {
   try { await transfers.pauseDownload(id) }
   catch (error) { message.error(errorText(error)) }
@@ -107,9 +125,13 @@ watch(tab, value => void router.replace({ query: { ...route.query, tab: value } 
       </template>
 
       <a-tab-pane key="upload" :tab="`上传 ${uploadCounts.active ? `(${uploadCounts.active})` : ''}`">
-        <a-empty v-if="!orderedUploads.length" class="section-empty" description="暂无上传任务" />
+        <div v-if="orderedUploads.length" class="table-filter-bar">
+          <a-segmented v-model:value="uploadFilter" :options="transferFilterOptions" aria-label="筛选上传任务" />
+          <span v-if="uploadFilter !== 'all'" class="filter-count">{{ visibleUploads.length }} / {{ orderedUploads.length }} 条</span>
+        </div>
+        <a-empty v-if="!visibleUploads.length" class="section-empty" :description="orderedUploads.length ? '没有符合筛选的上传任务' : '暂无上传任务'" />
         <div v-else class="transfer-list">
-          <div v-for="item in orderedUploads" :key="item.filePath" class="transfer-row">
+          <div v-for="item in visibleUploads" :key="item.filePath" class="transfer-row">
             <span class="transfer-icon upload"><CloudUploadOutlined /></span>
             <div class="transfer-main">
               <div class="transfer-name"><strong :title="item.filePath">{{ item.fileName }}</strong><span>{{ item.stage }}</span></div>
@@ -137,9 +159,13 @@ watch(tab, value => void router.replace({ query: { ...route.query, tab: value } 
       </a-tab-pane>
 
       <a-tab-pane key="download" :tab="`下载 ${downloadCounts.active ? `(${downloadCounts.active})` : ''}`">
-        <a-empty v-if="!downloads.length" class="section-empty" description="暂无下载任务" />
+        <div v-if="downloads.length" class="table-filter-bar">
+          <a-segmented v-model:value="downloadFilter" :options="transferFilterOptions" aria-label="筛选下载任务" />
+          <span v-if="downloadFilter !== 'all'" class="filter-count">{{ visibleDownloads.length }} / {{ downloads.length }} 条</span>
+        </div>
+        <a-empty v-if="!visibleDownloads.length" class="section-empty" :description="downloads.length ? '没有符合筛选的下载任务' : '暂无下载任务'" />
         <div v-else class="transfer-list">
-          <div v-for="item in downloads" :key="item.id" class="transfer-row">
+          <div v-for="item in visibleDownloads" :key="item.id" class="transfer-row">
             <span class="transfer-icon download"><CloudDownloadOutlined /></span>
             <div class="transfer-main">
               <div class="transfer-name"><strong :title="item.fileName">{{ item.fileName }}</strong><span>{{ item.filePath || item.destination }}</span></div>

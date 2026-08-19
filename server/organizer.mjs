@@ -9,6 +9,7 @@ import {
   DEFAULT_SCRAPE_TYPES,
   NATIVE_ENGINE_VERSION,
   ORGANIZER_PATH_PRESETS,
+  UPGRADE_CRITERIA,
   VIDEO_EXTENSIONS,
   analyzeCloudMediaCandidate,
   buildCloudNativePreview,
@@ -17,19 +18,21 @@ import {
   cloudCandidateFingerprint,
   createTmdbClient,
   normalizeOrganizerCloudEntry,
+  normalizeUpgradeCriteria,
   parseMediaName,
   planCloudScrapeCandidates,
   renderNfo,
   renderOrganizerPathTemplate,
   normalizeCategoryRules,
   resolveTmdbMatch,
+  upgradeCriterionLabel,
   validateAuxiliaryRuleBlock,
 } from './organizer-core.mjs';
 import { createProxiedFetch, normalizeProxyUrl } from './network-preferences.mjs';
 
 const TRANSFER_TYPES = new Set(['copy', 'move']);
 const MEDIA_TYPES = new Set(['', 'movie', 'tv']);
-const CONFLICT_POLICIES = new Set(['skip', 'overwrite', 'rename']);
+const CONFLICT_POLICIES = new Set(['skip', 'overwrite', 'rename', 'upgrade']);
 const SCRAPE_TYPES = new Set(['movie_nfo', 'tvshow_nfo', 'episode_nfo', 'poster', 'fanart', 'season_poster']);
 const ACTIVE_STATUSES = new Set(['recognizing', 'ready', 'running', 'needs_review']);
 const POLL_INTERVAL_MS = 15_000;
@@ -39,7 +42,9 @@ const MAX_SCRAPE_CANDIDATES = 1_000;
 const SCRAPE_SCAN_CONCURRENCY = 3;
 const SCRAPE_RECOGNITION_CONCURRENCY = 4;
 const SCRAPE_EXECUTION_CONCURRENCY = 3;
-const ORGANIZER_RENAME_CONCURRENCY = 4;
+// 云端 rename 接口对并发敏感（并发过高会触发业务码 120 限流），串行执行，
+// 底层 renameEntry 另有限流退避重试兜底。
+const ORGANIZER_RENAME_CONCURRENCY = 1;
 
 function nowSeconds() {
   return Math.floor(Date.now() / 1000);
@@ -82,7 +87,7 @@ function normalizeMediaType(value) {
 
 function normalizeConflictPolicy(value) {
   const normalized = cleanText(value).toLowerCase() || 'skip';
-  if (!CONFLICT_POLICIES.has(normalized)) throw new Error('冲突策略必须是跳过、覆盖或保留两份');
+  if (!CONFLICT_POLICIES.has(normalized)) throw new Error('冲突策略必须是跳过、覆盖、保留两份或洗版');
   return normalized;
 }
 
@@ -213,8 +218,8 @@ export function normalizeOrganizerMappingInput(input = {}, current = {}) {
     input.share_risk_acknowledged ?? input.acknowledge_share_risk,
     Boolean(current.share_risk_acknowledged),
   );
-  if ((transferType === 'move' || conflictPolicy === 'overwrite') && !riskAcknowledged) {
-    throw new Error('移动或覆盖可能使已有分享失效，请先确认分享失效风险');
+  if ((transferType === 'move' || conflictPolicy === 'overwrite' || conflictPolicy === 'upgrade') && !riskAcknowledged) {
+    throw new Error('移动、覆盖或洗版可能使已有分享失效，请先确认分享失效风险');
   }
   const scrape = booleanValue(input.scrape, Boolean(current.scrape));
   return {
@@ -339,6 +344,8 @@ function initializeSchema(database) {
     category_rules: "TEXT NOT NULL DEFAULT '[]'",
     scrape_targets: "TEXT NOT NULL DEFAULT '[]'",
     default_scrape_types: "TEXT NOT NULL DEFAULT '[\"movie_nfo\",\"tvshow_nfo\",\"poster\",\"fanart\"]'",
+    upgrade_criteria: "TEXT NOT NULL DEFAULT '[\"resolution\",\"dynamic_range\",\"release_group\",\"size\"]'",
+    upgrade_release_groups: "TEXT NOT NULL DEFAULT ''",
   })) ensureColumn(database, 'organizer_settings', column, definition);
   for (const [column, definition] of Object.entries({
     source_dir_id: "TEXT NOT NULL DEFAULT ''",
@@ -358,6 +365,8 @@ function initializeSchema(database) {
     query_year: 'INTEGER',
     result_json: 'TEXT',
     error_code: 'TEXT',
+    episode_offset: 'INTEGER',
+    recognition_words: 'TEXT',
   })) ensureColumn(database, 'organizer_jobs', column, definition);
   database.prepare("UPDATE organizer_jobs SET status = 'failed', error_code = 'service_restarted', message = '服务上次退出，任务可重新识别', updated_at = ? WHERE status IN ('recognizing', 'running')").run(nowSeconds());
   database.prepare("UPDATE organizer_mappings SET enabled = 0, scrape = 0, watch_error = '旧版本地整理配置已停用，请重新选择光鸭云盘 A/B 目录', updated_at = ? WHERE source_dir_id = '' OR target_dir_id = ''").run(nowSeconds());
@@ -400,6 +409,8 @@ function jobFromRow(row) {
     season: row.season == null ? null : Number(row.season),
     episode: row.episode == null ? null : Number(row.episode),
     episode_end: row.episode_end == null ? null : Number(row.episode_end),
+    episode_offset: row.episode_offset == null ? null : Number(row.episode_offset),
+    recognition_words: String(row.recognition_words || '').trim() || null,
     query_year: row.query_year == null ? null : Number(row.query_year),
     preview: parseJson(row.preview_json),
     result: parseJson(row.result_json),
@@ -589,7 +600,7 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     return database.prepare(`SELECT tmdb_api_key, language, image_language, include_adult, minimum_match_score,
       word_segment_search, similarity_match, recognition_words, release_groups, render_words, capture_groups, include_media_info,
       movie_path_template, tv_path_template, movie_category, tv_category, tmdb_api_base, tmdb_image_base,
-      category_rules, scrape_targets, default_scrape_types, updated_at FROM organizer_settings WHERE id = 1`).get()
+      category_rules, scrape_targets, default_scrape_types, upgrade_criteria, upgrade_release_groups, updated_at FROM organizer_settings WHERE id = 1`).get()
       || { tmdb_api_key: '', ...DEFAULT_ORGANIZER_SETTINGS, updated_at: 0 };
   }
 
@@ -623,6 +634,8 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
       category_rules: categoryRules,
       scrape_targets: scrapeTargets,
       default_scrape_types: defaultScrapeTypes,
+      upgrade_criteria: normalizeUpgradeCriteria(parseJson(stored.upgrade_criteria, DEFAULT_ORGANIZER_SETTINGS.upgrade_criteria)),
+      upgrade_release_groups: normalizeRuleText(stored.upgrade_release_groups, '洗版制作组优先级'),
       // TMDB and all other external integrations share one proxy setting.
       tmdb_proxy: cleanText(configuredNetwork.proxy_url || configuredNetwork.tmdb_proxy),
       api_key_managed_by_environment: Boolean(envApiKey),
@@ -659,6 +672,9 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
         { value: 'episode_nfo', label: '单集 NFO' }, { value: 'poster', label: '海报' },
         { value: 'fanart', label: '背景图' }, { value: 'season_poster', label: '季海报' },
       ],
+      upgrade_criteria: settings.upgrade_criteria,
+      upgrade_release_groups: settings.upgrade_release_groups,
+      upgrade_criteria_options: UPGRADE_CRITERIA.map((value) => ({ value, label: upgradeCriterionLabel(value) })),
     };
   }
 
@@ -744,11 +760,13 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     const removedTargetIds = new Set(previousScrapeTargets.map((target) => target.dir_id).filter((id) => !nextTargetIds.has(id)));
     const usedRemovedTarget = listMappings().find((mapping) => removedTargetIds.has(mapping.target_dir_id));
     if (usedRemovedTarget) throw new Error(`刮削输出“${usedRemovedTarget.target_path}”仍被整理监控使用，请先修改对应监控的输出目标`);
+    const upgradeCriteria = normalizeUpgradeCriteria(input.upgrade_criteria ?? parseJson(stored.upgrade_criteria, DEFAULT_ORGANIZER_SETTINGS.upgrade_criteria));
+    const upgradeReleaseGroups = normalizeRuleText(input.upgrade_release_groups ?? stored.upgrade_release_groups, '洗版制作组优先级');
     database.prepare(`INSERT INTO organizer_settings
       (id, tmdb_api_key, language, image_language, include_adult, minimum_match_score, word_segment_search, similarity_match,
        recognition_words, release_groups, render_words, capture_groups, include_media_info, movie_path_template, tv_path_template, movie_category, tv_category,
-       tmdb_api_base, tmdb_image_base, category_rules, scrape_targets, default_scrape_types, updated_at)
-      VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       tmdb_api_base, tmdb_image_base, category_rules, scrape_targets, default_scrape_types, upgrade_criteria, upgrade_release_groups, updated_at)
+      VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET tmdb_api_key=excluded.tmdb_api_key, language=excluded.language,
         image_language=excluded.image_language, include_adult=excluded.include_adult,
         minimum_match_score=excluded.minimum_match_score, word_segment_search=excluded.word_segment_search,
@@ -758,10 +776,12 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
         movie_path_template=excluded.movie_path_template,
         tv_path_template=excluded.tv_path_template, movie_category=excluded.movie_category,
         tv_category=excluded.tv_category, tmdb_api_base=excluded.tmdb_api_base, tmdb_image_base=excluded.tmdb_image_base,
-        category_rules=excluded.category_rules, scrape_targets=excluded.scrape_targets, default_scrape_types=excluded.default_scrape_types, updated_at=excluded.updated_at`)
+        category_rules=excluded.category_rules, scrape_targets=excluded.scrape_targets, default_scrape_types=excluded.default_scrape_types,
+        upgrade_criteria=excluded.upgrade_criteria, upgrade_release_groups=excluded.upgrade_release_groups, updated_at=excluded.updated_at`)
       .run(apiKey, language, imageLanguage, Number(includeAdult), minimumMatchScore, Number(wordSegmentSearch), Number(similarityMatch),
         recognitionWords, releaseGroups, renderWords, captureGroups, Number(includeMediaInfo), moviePathTemplate, tvPathTemplate, movieCategory, tvCategory,
-        apiBase, imageBase, JSON.stringify(categoryRules), JSON.stringify(scrapeTargets), JSON.stringify(defaultScrapeTypes), nowSeconds());
+        apiBase, imageBase, JSON.stringify(categoryRules), JSON.stringify(scrapeTargets), JSON.stringify(defaultScrapeTypes),
+        JSON.stringify(upgradeCriteria), upgradeReleaseGroups, nowSeconds());
     const updateMappingTargetPath = database.prepare('UPDATE organizer_mappings SET target_path = ?, updated_at = ? WHERE target_dir_id = ?');
     for (const target of scrapeTargets) updateMappingTargetPath.run(target.path, nowSeconds(), target.dir_id);
     emit('settings-updated');
@@ -1156,10 +1176,15 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
       settings.release_groups, settings.render_words, settings.capture_groups,
       settings.include_media_info,
       settings.category_rules, settings.scrape_targets, settings.default_scrape_types,
+      settings.upgrade_criteria, settings.upgrade_release_groups,
     ])).digest('hex');
   }
 
   function resolvedJobOverrides(job, mapping, input = {}) {
+    const recognitionWords = input.clear_recognition_words === true
+      ? ''
+      : String(input.recognition_words ?? job.recognition_words ?? '').trim();
+    if (recognitionWords) validateOrganizerRuleBlockText(recognitionWords);
     return {
       media_type: normalizeMediaType(input.media_type ?? job.media_type ?? mapping.media_type),
       tmdb_id: input.clear_tmdb_id === true ? null : normalizeOptionalInteger(input.tmdb_id ?? job.tmdb_id, 'TMDB ID', 1),
@@ -1168,7 +1193,21 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
       season: input.clear_season === true ? null : normalizeOptionalInteger(input.season ?? job.season, '季号', 0),
       episode: input.clear_episode === true ? null : normalizeOptionalInteger(input.episode ?? job.episode, '集号', 0),
       episode_end: input.clear_episode_end === true ? null : normalizeOptionalInteger(input.episode_end ?? job.episode_end, '结束集号', 0),
+      episode_offset: input.clear_episode_offset === true ? null : normalizeOptionalInteger(input.episode_offset ?? job.episode_offset, '集偏移', -9999),
+      recognition_words: recognitionWords || null,
     };
+  }
+
+  function validateOrganizerRuleBlockText(value) {
+    validateAuxiliaryRuleBlock(value, '临时识别词', { replacement: true });
+  }
+
+  /** 临时识别词叠加在全局识别词之前，仅对当前识别流程生效。 */
+  function settingsWithTemporaryWords(settings, overrides) {
+    const words = String(overrides?.recognition_words || '').trim();
+    if (!words) return settings;
+    const global = String(settings.recognition_words || '').trim();
+    return { ...settings, recognition_words: global ? `${words}\n${global}` : words };
   }
 
   function createTargetResolver(mapping) {
@@ -1239,12 +1278,13 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
       source_file_count: loaded.fingerprint.file_count, source_signature: loaded.fingerprint.signature,
       media_type: overrides.media_type || null, tmdb_id: overrides.tmdb_id == null ? null : String(overrides.tmdb_id),
       season: overrides.season, episode: overrides.episode, episode_end: overrides.episode_end,
+      episode_offset: overrides.episode_offset, recognition_words: overrides.recognition_words,
       query_title: overrides.title || null, query_year: overrides.year, error_code: null, result_json: null,
       message: '光鸭正在解析云盘文件名并匹配 TMDB',
     });
     emit('job-updated', { job_id: id, mapping_id: job.mapping_id, status: 'recognizing' });
     try {
-      const settings = effectiveSettings();
+      const settings = settingsWithTemporaryWords(effectiveSettings(), overrides);
       const analysis = analyzeCloudMediaCandidate(loaded, overrides, settings);
       if (settings.include_media_info) await enrichAnalysisWithMediaInfo(analysis, cloud, env);
       if (!overrides.title) overrides.title = analysis.title;
@@ -1255,6 +1295,11 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
       const preview = await buildCloudNativePreview({
         analysis, match, mapping, settings, mappingSignature: mappingSignature(mapping, settings),
         sourceSignature: loaded.fingerprint.signature, targetExists: (relative) => resolver.resolve(relative),
+        listTargetChildren: async (relativeDir) => {
+          if (!relativeDir) return resolver.list(mapping.target_dir_id);
+          const directory = await resolver.resolve(relativeDir);
+          return directory?.is_directory ? resolver.list(directory.id) : [];
+        },
       });
       const classification = classifyNativePreview(preview);
       updateJob(id, {
@@ -1305,6 +1350,19 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     return warnings;
   }
 
+  /** 洗版：转移前把被替换的旧版本及其伴随文件移入回收站。 */
+  async function deleteReplacedVersions(item, resolver, parentId) {
+    if (item.action !== 'upgrade' || !Array.isArray(item.replaces) || !item.replaces.length) return;
+    for (const replaced of item.replaces) {
+      try {
+        await cloud.deleteEntry(replaced.id);
+      } catch (error) {
+        throw new Error(`洗版删除旧版本失败（${replaced.name}）：${error.message}`);
+      }
+    }
+    resolver.invalidate(parentId);
+  }
+
   async function executeTransfers(preview, mapping, resolver) {
     const transferItems = preview.data.items.filter((item) => item.success && item.source_id && ['video', 'subtitle', 'audio', 'trailer', 'extra'].includes(item.kind));
     const transaction = [];
@@ -1325,6 +1383,8 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
         if (items.length > 1 && typeof batchOperation === 'function') {
           const prepared = [];
           for (const item of items) {
+            if (item.action === 'skip' && item.suppressed) { skipped += 1; continue; }
+            await deleteReplacedVersions(item, resolver, parentId);
             const existing = await resolver.resolve(item.target_relative, true);
             if (item.action === 'skip' && existing) { skipped += 1; continue; }
             if (item.action === 'create' && existing) throw new Error(`预览后目标已出现同名项目：${item.target}`);
@@ -1352,7 +1412,7 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
               ? after.find((entry) => entry.id === item.source_id)
               : (copyIndex >= 0 ? availableCopies.splice(copyIndex, 1)[0] : null);
             if (!created?.id) throw new Error(`云端${mapping.transfer_type === 'move' ? '移动' : '复制'}已完成，但无法定位目标资源：${item.source_name}`);
-            transaction.push({ operation: mapping.transfer_type, created_id: created.id, source_parent_id: item.source_parent_id, source_name: item.source_name, target_parent_id: parentId, target_name: item.target_name, backup });
+            transaction.push({ operation: mapping.transfer_type, created_id: created.id, source_parent_id: item.source_parent_id, source_name: item.source_name, target_parent_id: parentId, target_name: item.target_name, kind: item.kind, target_relative: item.target_relative, backup });
             if (backup) unattachedBackups.delete(backup.id);
           }
           await mapWithConcurrency(transaction.slice(-prepared.length).filter((step) => step.source_name !== step.target_name), ORGANIZER_RENAME_CONCURRENCY,
@@ -1362,6 +1422,8 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
           continue;
         }
         for (const item of items) {
+        if (item.action === 'skip' && item.suppressed) { skipped += 1; continue; }
+        await deleteReplacedVersions(item, resolver, parentId);
         let existing = await resolver.resolve(item.target_relative, true);
         if (item.action === 'skip' && existing) { skipped += 1; continue; }
         if (item.action === 'create' && existing) throw new Error(`预览后目标已出现同名项目：${item.target}`);
@@ -1379,7 +1441,7 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
         const created = await locateOperationResult(resolver, parentId, item.source_id, item.source_name, before, mapping.transfer_type);
         if (created.name !== item.target_name) await cloud.renameEntry(created.id, item.target_name);
         resolver.invalidate(parentId);
-        transaction.push({ operation: mapping.transfer_type, created_id: created.id, source_parent_id: item.source_parent_id, source_name: item.source_name, target_parent_id: parentId, target_name: item.target_name, backup });
+        transaction.push({ operation: mapping.transfer_type, created_id: created.id, source_parent_id: item.source_parent_id, source_name: item.source_name, target_parent_id: parentId, target_name: item.target_name, kind: item.kind, target_relative: item.target_relative, backup });
         if (backup) unattachedBackups.delete(backup.id);
         transferred += 1;
       }
@@ -1397,7 +1459,17 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
       try { await cloud.deleteEntry(step.backup.id); }
       catch (error) { throw new Error(`新文件已落库，但清理覆盖备份失败：${error.message}`); }
     }
-    return { transferred, skipped, targets: transaction.map((item) => item.created_id) };
+    return {
+      transferred,
+      skipped,
+      targets: transaction.map((item) => item.created_id),
+      created_items: transaction.map((item) => ({
+        id: item.created_id,
+        name: item.target_name,
+        kind: item.kind || '',
+        target_relative: item.target_relative || '',
+      })),
+    };
   }
 
   async function generatedBytes(item, preview) {
@@ -1417,6 +1489,7 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     let scraped = 0;
     let skipped = 0;
     const warnings = [];
+    const created = [];
     for (const item of generated) {
       let backup = null;
       let parentId = '';
@@ -1436,6 +1509,7 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
         resolver.invalidate(parentId);
         if (backup) await cloud.deleteEntry(backup.id);
         scraped += 1;
+        created.push({ id: '', name: item.target_name, kind: item.kind, target_relative: item.target_relative || '' });
       } catch (error) {
         if (backup) {
           try { await cloud.renameEntry(backup.id, backup.original_name); resolver.invalidate(parentId); }
@@ -1444,7 +1518,7 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
         warnings.push(`${item.target}：${error.message}`);
       }
     }
-    return { scraped, skipped, warnings };
+    return { scraped, skipped, warnings, created };
   }
 
   async function executeJobInner(id) {
@@ -1459,7 +1533,12 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     if (job.preview.mapping_signature !== mappingSignature(mapping, settings)) throw new Error('整理配置在预览后发生变化，请先重新识别');
     const loaded = await loadCloudCandidate(mapping, job.source_id);
     if (!loaded) throw new Error('待整理云端项目已经不存在');
-    if (loaded.fingerprint.signature !== job.preview.source_signature || loaded.fingerprint.signature !== job.source_signature) throw new Error('待整理云端内容在预览后发生变化，请先重新识别');
+    if (loaded.fingerprint.signature !== job.preview.source_signature || loaded.fingerprint.signature !== job.source_signature) {
+      // 源内容在预览后发生变化（常见于上传仍在进行）：交给 executeJob 自动重新识别
+      const error = new Error('待整理云端内容在预览后发生变化');
+      error.code = 'source_changed';
+      throw error;
+    }
     updateJob(id, { status: 'running', error_code: null, message: '光鸭正在执行云盘 A → B 原生整理' });
     emit('job-updated', { job_id: id, mapping_id: job.mapping_id, status: 'running' });
     try {
@@ -1478,12 +1557,16 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
           share = await cloud.shareAfterOrganize({ mappingId: mapping.id, remoteTargetId: targetId, title: job.preview.share_title, targetType: 'folder' });
         } catch (error) { warnings.push(`整理已完成，但创建 B 目录新分享失败：${error.message}`); }
       }
-      const result = { success: true, transferred: transfer.transferred, skipped: transfer.skipped + scrape.skipped, scraped: scrape.scraped, warnings, targets: transfer.targets, share };
+      const result = { success: true, transferred: transfer.transferred, skipped: transfer.skipped + scrape.skipped, scraped: scrape.scraped, warnings, targets: transfer.targets, share, created_items: [...(transfer.created_items || []), ...(scrape.created || [])] };
       const status = warnings.length ? 'completed_warning' : 'completed';
       const moveNotice = mapping.transfer_type === 'move' ? '；提醒：云端移动会使来源资源的已有分享失效' : '';
       const message = `云盘整理完成：转移 ${result.transferred} 项，刮削 ${result.scraped} 项${share ? '，已从 B 目录重新分享' : ''}${warnings.length ? `；${warnings.length} 项提示` : ''}${moveNotice}`;
       updateJob(id, { status, error_code: warnings.length ? 'completed_warning' : null, result_json: JSON.stringify(result), message });
       emit('job-updated', { job_id: id, mapping_id: job.mapping_id, status });
+      // 通知虚拟库同步覆盖 B 目录的 STRM 并刷新 Emby；失败不影响整理结果。
+      if (result.transferred > 0) {
+        try { cloud.onOrganizeCompleted?.({ targetDirId: mapping.target_dir_id, targetPath: mapping.target_path }); } catch {}
+      }
       return getJob(id);
     } catch (error) {
       updateJob(id, { status: 'failed', error_code: 'transfer_failed', message: error.message });
@@ -1498,7 +1581,16 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     if (!job) throw new Error('整理任务不存在');
     if (mutatingMappings.has(job.mapping_id)) throw new Error('云盘目录配置正在变更，请稍后执行整理');
     executingJobs.add(id);
-    try { return await executeJobInner(id); } finally { executingJobs.delete(id); }
+    try {
+      return await executeJobInner(id);
+    } catch (error) {
+      // 源内容在预览后变化：自动按最新内容重新识别并执行，而不是报错卡在待执行
+      if (error?.code === 'source_changed') {
+        executingJobs.delete(id);
+        return previewJob(id, {}, true);
+      }
+      throw error;
+    } finally { executingJobs.delete(id); }
   }
 
   async function shareJob(id) {
@@ -1548,6 +1640,102 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     return previewJob(id, input, false);
   }
 
+  /** 目录（含一层子目录）内是否还有视频文件：决定共享刮削元数据是否可以随重新归档清理。 */
+  async function directoryStillHasVideo(resolver, relative) {
+    try {
+      const entry = await resolver.resolve(relative, true);
+      if (!entry?.id || !entry.is_directory) return false;
+      const children = await resolver.list(entry.id, true);
+      if (children.some((child) => !child.is_directory && VIDEO_EXTENSIONS.has(path.posix.extname(child.name).toLowerCase()))) return true;
+      for (const child of children.filter((item) => item.is_directory)) {
+        const grand = await resolver.list(child.id);
+        if (grand.some((item) => !item.is_directory && VIDEO_EXTENSIONS.has(path.posix.extname(item.name).toLowerCase()))) return true;
+      }
+      return false;
+    } catch { return true; }
+  }
+
+  /**
+   * 重新归档前清理上一次执行创建的产物：
+   * 1. 删除转移落位的视频/字幕等文件（按 ID，容忍已不存在）；
+   * 2. 与被删视频同名前缀的单集元数据一并删除；共享元数据（tvshow.nfo、海报）
+   *    只在所在目录已无其他视频时删除——单集纠错不会破坏剧集的其余内容；
+   * 3. 自底向上删除因此变空的目录，到整理目标根为止。
+   */
+  async function cleanupPreviousOutputs(mapping, job) {
+    const warnings = [];
+    const result = job.result || {};
+    const items = Array.isArray(result.created_items) && result.created_items.length
+      ? result.created_items
+      : (Array.isArray(result.targets) ? result.targets.filter(Boolean).map((id) => ({ id, name: '', kind: 'video', target_relative: '' })) : []);
+    if (!items.length) return warnings;
+    const mediaKinds = new Set(['video', 'subtitle', 'audio', 'trailer', 'extra', '']);
+    const resolver = createTargetResolver(mapping);
+    const deletedStems = new Set();
+    const affectedDirs = new Set();
+    const stemOfRelative = (relative) => {
+      const name = String(relative || '').split('/').filter(Boolean).at(-1) || '';
+      const extension = path.posix.extname(name);
+      return (extension ? name.slice(0, -extension.length) : name).toLocaleLowerCase();
+    };
+    const parentOf = (relative) => String(relative || '').split('/').filter(Boolean).slice(0, -1).join('/');
+    for (const item of items.filter((entry) => mediaKinds.has(String(entry.kind || '')))) {
+      if (!item.id) continue;
+      try {
+        await cloud.deleteEntry(item.id);
+        if (item.target_relative) {
+          deletedStems.add(stemOfRelative(item.target_relative));
+          affectedDirs.add(parentOf(item.target_relative));
+        }
+      } catch (error) {
+        if (!String(error.message || '').includes('不存在')) warnings.push(`清理旧文件 ${item.name || item.id} 失败：${error.message}`);
+      }
+    }
+    for (const item of items.filter((entry) => ['nfo', 'image'].includes(String(entry.kind || '')))) {
+      if (!item.target_relative) continue;
+      const stem = stemOfRelative(item.target_relative);
+      const parentRelative = parentOf(item.target_relative);
+      const tiedToDeletedVideo = [...deletedStems].some((deleted) => stem.startsWith(deleted));
+      const removable = tiedToDeletedVideo || !(await directoryStillHasVideo(resolver, parentRelative));
+      if (!removable) continue;
+      try {
+        const entry = await resolver.resolve(item.target_relative, true);
+        if (entry?.id && !entry.is_directory) {
+          await cloud.deleteEntry(entry.id);
+          resolver.invalidate(entry.parent_id);
+          affectedDirs.add(parentRelative);
+        }
+      } catch (error) {
+        if (!String(error.message || '').includes('不存在')) warnings.push(`清理旧元数据 ${item.name} 失败：${error.message}`);
+      }
+    }
+    // 空目录自底向上收敛：只删除确实变空的目录，有其他内容（其他版本、
+    // 其他集、非本任务文件）的目录原样保留。
+    const chains = new Set();
+    for (const dir of affectedDirs) {
+      let current = dir;
+      while (current) {
+        chains.add(current);
+        current = parentOf(current);
+      }
+    }
+    const ordered = [...chains].sort((left, right) => right.split('/').length - left.split('/').length);
+    for (const dir of ordered) {
+      try {
+        const entry = await resolver.resolve(dir, true);
+        if (!entry?.id || !entry.is_directory) continue;
+        const children = await resolver.list(entry.id, true);
+        if (!children.length) {
+          await cloud.deleteEntry(entry.id);
+          resolver.invalidate(entry.parent_id);
+        }
+      } catch (error) {
+        warnings.push(`清理空目录 ${dir} 失败：${error.message}`);
+      }
+    }
+    return warnings;
+  }
+
   async function rearchiveJob(id, input = {}) {
     const job = getJob(id);
     if (!job) throw new Error('整理任务不存在');
@@ -1567,6 +1755,14 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     });
     void (async () => {
       try {
+        // 上次已经落位过的任务：先清理旧产物（含变空的目录），再重新识别，
+        // 避免错误版本的文件夹和元数据残留在媒体库。
+        if (job.result && (job.result.targets?.length || job.result.created_items?.length)) {
+          const cleanupWarnings = await cleanupPreviousOutputs(mapping, job);
+          if (cleanupWarnings.length) {
+            updateJob(id, { message: `旧产物清理有 ${cleanupWarnings.length} 项提示：${cleanupWarnings.join('；')}；继续重新识别` });
+          }
+        }
         const recognized = await previewJob(id, input, false);
         if (recognized?.status === 'ready') await executeJob(id);
       } catch (error) {
@@ -1647,7 +1843,70 @@ export function createOrganizerService({ database, cloud, publish = () => {}, en
     pendingTimers.clear();
   }
 
-  return { state, updateSettings, testConnection, addMapping, updateMapping, removeMapping, removeJob, scanMapping, runJob, retryJob, rearchiveJob, shareJob, notifyUpload, scrapeSelected, initialize, close };
+  /**
+   * 识别测试工具：用当前设置（可叠加临时识别词）解析文件名，
+   * 可选走完整 TMDB 匹配链做识别预览。不落库、不影响任务。
+   */
+  async function testRecognition(input = {}) {
+    const names = (Array.isArray(input.names) ? input.names : String(input.names || '').split(/\r?\n/))
+      .map((name) => String(name || '').trim()).filter(Boolean).slice(0, 50);
+    const temporaryWords = String(input.recognition_words || '').trim();
+    if (temporaryWords) validateAuxiliaryRuleBlock(temporaryWords, '临时识别词', { replacement: true });
+    const hint = ['movie', 'tv'].includes(cleanText(input.media_type).toLowerCase()) ? cleanText(input.media_type).toLowerCase() : '';
+    const settings = settingsWithTemporaryWords(effectiveSettings(), { recognition_words: temporaryWords });
+    const withMatch = input.with_match === true;
+    const items = [];
+    for (const name of names) {
+      const parsed = parseMediaName(name, {
+        media_type: hint,
+        recognition_words: settings.recognition_words,
+        release_groups: settings.release_groups,
+        render_words: settings.render_words,
+        capture_groups: settings.capture_groups,
+      });
+      const row = { name, parsed };
+      if (withMatch) {
+        if (!settings.api_key) {
+          row.match = { ready: false, message: '请先配置 TMDB API Key' };
+        } else {
+          const analysis = {
+            candidate_path: name,
+            candidate_type: 'file',
+            media_type: parsed.media_type,
+            title: parsed.title,
+            title_candidates: [parsed.cn_name, parsed.en_name].filter(Boolean),
+            year: parsed.year,
+            tmdb_id: parsed.tmdb_id,
+            videos: [],
+            sidecars: [],
+            ignored_samples: [],
+            query: { title: parsed.title, year: parsed.year, media_type: parsed.media_type, tmdb_id: parsed.tmdb_id },
+          };
+          try {
+            const resolution = await resolveTmdbMatch({ analysis, client: tmdbClient(settings), settings, overrides: { media_type: hint || undefined } });
+            row.match = {
+              ready: resolution.ready,
+              message: resolution.message,
+              title: resolution.metadata?.title,
+              original_title: resolution.metadata?.original_title,
+              year: resolution.metadata?.year,
+              tmdb_id: resolution.selected?.tmdb_id,
+              media_type: resolution.query?.media_type,
+              candidates: (resolution.candidates || []).slice(0, 5).map((candidate) => ({
+                tmdb_id: candidate.tmdb_id, title: candidate.title, year: candidate.year, media_type: candidate.media_type,
+              })),
+            };
+          } catch (error) {
+            row.match = { ready: false, message: error.message };
+          }
+        }
+      }
+      items.push(row);
+    }
+    return { items };
+  }
+
+  return { state, updateSettings, testConnection, addMapping, updateMapping, removeMapping, removeJob, scanMapping, runJob, retryJob, rearchiveJob, shareJob, notifyUpload, scrapeSelected, testRecognition, initialize, close };
 }
 
 export const organizerInternals = {

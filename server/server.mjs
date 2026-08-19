@@ -56,6 +56,7 @@ import {
   uploadCredentialsExpired,
 } from './guangya-protocol.mjs';
 import { createGuangyaDeveloperClient, DeveloperApiError } from './guangya-developer.mjs';
+import { createLogBuffer } from './log-buffer.mjs';
 import { createNativeMountManager, normalizeNativeMountOptions } from './native-mount.mjs';
 import {
   createProxiedFetch,
@@ -68,6 +69,7 @@ import {
   invalidateRemoteDirectoryIds as invalidateRemoteDirectoryIdsFromCache,
   reconcileRemoteDirectoryCache as reconcileRemoteDirectoryCacheEntries,
 } from './remote-directory-cache.mjs';
+import { createTelegramService } from './telegram.mjs';
 import { uploadPartSize } from './upload-parts.mjs';
 import {
   createUploadReplacementContext,
@@ -89,6 +91,9 @@ import {
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const uiRoot = path.resolve(here, '..', 'dist');
+let appVersion = '0.0.0';
+try { appVersion = JSON.parse(fs.readFileSync(path.join(here, '..', 'package.json'), 'utf8')).version || appVersion; } catch {}
+const logBuffer = createLogBuffer(500);
 const port = Number(process.env.PORT || 8080);
 const adminUsername = String(process.env.GUANGYA_ADMIN_USERNAME || 'admin');
 const adminPassword = String(process.env.GUANGYA_ADMIN_PASSWORD || '');
@@ -1856,7 +1861,23 @@ async function testDeveloperCredentials(probeFileId = '') {
 }
 
 function state() { return { logged_in: Boolean(token), paused, pending: queue.size + waitingFiles.size + pendingUploads.size, active_uploads: active, upload_concurrency: uploadConcurrency, download_concurrency: downloadConcurrency, multipart: multipartMode, multipart_part_size: multipartMode, mappings, saved_shares: savedShares, hdhive: { enabled: hdhiveEnabled, configured: Boolean(hdhiveBaseUrl && hdhiveSecret), base_url: hdhiveBaseUrl, instance_id: hdhiveInstanceId }, auto_share_receipts: autoShareReceipts() }; }
-function publish(payload) { const line = `data: ${JSON.stringify(payload)}\n\n`; for (const response of clients) response.write(line); }
+const eventObservers = new Set();
+function recordPublishedEvent(payload) {
+  if (!payload || typeof payload !== 'object') return;
+  if (payload.type === 'status') { logBuffer.push(payload.level || 'info', payload.message || ''); return; }
+  if (payload.type === 'organizer') {
+    if (payload.event === 'mapping-error') logBuffer.push('warning', `[整理] 监控异常：${payload.message || ''}`);
+    else if (payload.event === 'job-updated' && payload.message) logBuffer.push('info', `[整理] ${payload.status || ''}：${payload.message}`);
+  }
+}
+function publish(payload) {
+  const line = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const response of clients) response.write(line);
+  recordPublishedEvent(payload);
+  for (const observer of eventObservers) {
+    try { observer(payload); } catch {}
+  }
+}
 function publishState() { publish({ type: 'state', state: state() }); }
 function status(level, message) { publish({ type: 'status', level, message }); }
 function publishCloudDirectoryInvalidated(parentIds = [], {
@@ -1931,6 +1952,8 @@ function invalidateAuthSession() {
   synchronizeWebDavCacheScope();
   replaceAuthSession(null, null);
   publishState();
+  // telegram 在下方创建；该函数只在运行期的鉴权失败路径被调用，此时已初始化。
+  try { telegram.notifyAuthExpired('登录态已失效，请重新扫码登录'); } catch {}
 }
 function uploadHistoryPath(item) { return item.history_path || item.file_path; }
 function uploadEventPath(item) { return item.event_path || item.file_path; }
@@ -2344,6 +2367,8 @@ const organizer = createOrganizerService({
     uploadBuffer: organizerUploadBuffer,
     getDownloadUrl: async (fileId) => (await getCloudDownload({ file_ids: [String(fileId)], packaged: false })).download_url,
     shareAfterOrganize: createOrganizerShare,
+    // virtualLibrary 在下方创建；调用发生在整理任务完成时，届时已初始化。
+    onOrganizeCompleted: ({ targetDirId, targetPath }) => virtualLibrary.syncForCloudTarget({ dirId: targetDirId, path: targetPath }),
   },
 });
 const downloadUrlCache = createDownloadUrlCache({
@@ -2362,6 +2387,31 @@ const virtualLibrary = createVirtualLibraryService({
     getDownloadUrl: (fileId, options) => downloadUrlCache.get(String(fileId), options),
   },
 });
+const telegram = createTelegramService({
+  database,
+  env: process.env,
+  fetchImpl: undiciFetch,
+  getProxyUrl: () => networkPreferences.proxy_url,
+  logBuffer,
+  version: appVersion,
+  platform: 'Docker/Web',
+  runtime: {
+    snapshot: () => state(),
+    organizer: () => organizer,
+    virtualLibraryInfo: () => virtualLibrary.info(),
+    webdavInfo: () => ({ configured: webdavAccessControl.required(), port: webdavPublicPort }),
+    isLoggedIn: () => Boolean(token),
+    startDeviceLogin,
+    pollDeviceLogin,
+    pushStatus: status,
+    updateInfo: async () => [
+      `当前版本：v${appVersion}（Docker/Web 版）`,
+      'Docker/Web 版本随镜像更新，请拉取最新镜像升级；',
+      'Windows 桌面端支持应用内自动更新。',
+    ].join('\n'),
+  },
+});
+eventObservers.add((payload) => telegram.observeEvent(payload));
 async function resolveMappingPath(mapping, value, expectedType = null) {
   const mappingRoot = await fsp.realpath(mapping.local_path);
   if (!samePath(mappingRoot, mapping.local_path)
@@ -2428,19 +2478,41 @@ async function collectServerUploadFiles(values) {
   const selected = Array.isArray(values) ? [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))] : [];
   if (!selected.length) throw new Error('请至少选择一个服务器文件或文件夹');
   const files = new Map();
+  const skips = [];
   const visitedDirectories = new Set();
   const addDirectory = async (absolute, remoteBase) => {
-    const current = await resolveServerPath(absolute, 'directory');
-    if (visitedDirectories.has(current.absolute)) return;
+    let current;
+    try { current = await resolveServerPath(absolute, 'directory'); }
+    catch (error) {
+      skips.push({ path: absolute, reason: error.message || String(error) });
+      return;
+    }
+    if (visitedDirectories.has(current.absolute)) {
+      skips.push({ path: absolute, reason: '检测到循环链接，已跳过' });
+      return;
+    }
     visitedDirectories.add(current.absolute);
-    for (const entry of await fsp.readdir(current.absolute, { withFileTypes: true })) {
+    let entries;
+    try { entries = await fsp.readdir(current.absolute, { withFileTypes: true }); }
+    catch (error) {
+      skips.push({ path: current.absolute, reason: `读取目录失败：${error.message || error}` });
+      return;
+    }
+    for (const entry of entries) {
+      const childPath = path.join(current.absolute, entry.name);
       let child;
-      try { child = await resolveServerPath(path.join(current.absolute, entry.name)); } catch { continue; }
+      try { child = await resolveServerPath(childPath); }
+      catch (error) {
+        skips.push({ path: childPath, reason: error.message || String(error) });
+        continue;
+      }
       if (child.stat.isDirectory()) await addDirectory(child.absolute, normalizeRemote(path.posix.join(remoteBase, entry.name)));
       else if (child.stat.isFile()) {
         const remoteDir = normalizeRemote(remoteBase);
         files.set(`${child.absolute}::${remoteDir}`, { absolute: child.absolute, remoteDir });
         if (files.size > 10_000) throw new Error('一次最多选择 10000 个服务器文件');
+      } else {
+        skips.push({ path: child.absolute, reason: '不是普通文件或目录' });
       }
     }
   };
@@ -2449,10 +2521,10 @@ async function collectServerUploadFiles(values) {
     if (resolved.stat.isFile()) files.set(`${resolved.absolute}::`, { absolute: resolved.absolute, remoteDir: '' });
     else if (resolved.stat.isDirectory()) await addDirectory(resolved.absolute, path.basename(value));
   }
-  return [...files.values()];
+  return { files: [...files.values()], skips };
 }
 async function queueServerUploads(values, parentId) {
-  const files = await collectServerUploadFiles(values);
+  const { files, skips } = await collectServerUploadFiles(values);
   let queued = 0;
   let skipped = 0;
   for (const file of files) {
@@ -2470,7 +2542,13 @@ async function queueServerUploads(values, parentId) {
     publish({ type: 'file', state: token ? 'queued' : 'waiting-login', file_path: item.file_path, mapping_id: mappingId, uploaded_bytes: 0, total_bytes: item.size });
   }
   pump();
-  return { queued, skipped, total: files.length };
+  return {
+    queued,
+    skipped,
+    total: files.length,
+    scan_skipped: skips.length,
+    scan_skips: skips.slice(0, 20),
+  };
 }
 function ignore(file) { const base = path.basename(file).toLowerCase(); return base.startsWith('~$') || ['.tmp', '.part', '.crdownload', '.download', '.swp', '.ds_store'].some((suffix) => base.endsWith(suffix)); }
 function headers() {
@@ -2516,6 +2594,11 @@ function apiRetryDelayMs(attempt) {
 
 // 业务 POST 的有界退避重试外壳。旧实现只给错误打 retryable 标记但从不消费，
 // 一次 502/429/网络抖动就把错误直接抛给 UI。
+const API_THROTTLED_CODE = 120;
+const API_THROTTLE_RETRIES = 6;
+function apiThrottled(error) {
+  return error?.apiCode === API_THROTTLED_CODE || String(error?.message || '').includes('缺少clientId');
+}
 async function apiPost(
   endpoint,
   body,
@@ -2526,19 +2609,26 @@ async function apiPost(
 ) {
   const readOnly = endpointIsReadOnly(endpoint);
   const attempts = readOnly ? API_RETRY_ATTEMPTS : 3;
-  let lastError = null;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, apiRetryDelayMs(attempt - 1)));
+  let attempt = 0;
+  let throttleRetries = 0;
+  for (;;) {
     try {
       return await apiPostOnce(endpoint, body, allowed, allowRefresh, timeoutMs, invalidateOnAuthFailure);
     } catch (error) {
+      // 云端全局限流（业务码 120，msg“缺少clientId”，文案有误导）：
+      // 请求被风控拒绝且未执行，读写接口都可以安全退避重试。
+      if (apiThrottled(error) && throttleRetries < API_THROTTLE_RETRIES) {
+        throttleRetries += 1;
+        await new Promise((resolve) => setTimeout(resolve, apiRetryDelayMs(throttleRetries - 1)));
+        continue;
+      }
       const mutationSafe = error?.notDelivered === true || error?.httpStatus === 429 || error?.httpStatus === 503;
       const retryable = readOnly ? error?.retryable === true : mutationSafe;
       if (!retryable || attempt + 1 >= attempts) throw error;
-      lastError = error;
+      attempt += 1;
+      await new Promise((resolve) => setTimeout(resolve, apiRetryDelayMs(attempt - 1)));
     }
   }
-  throw lastError;
 }
 
 async function apiPostOnce(
@@ -4924,8 +5014,15 @@ async function collectExistingFiles(mapping, root) {
     let entries = [];
     try { entries = await fsp.readdir(directory.absolute, { withFileTypes: true }); } catch { return; }
     for (const entry of entries) {
-      if (entry.isSymbolicLink()) continue;
       const file = path.join(directory.absolute, entry.name);
+      if (entry.isSymbolicLink()) {
+        try {
+          const target = await fsp.stat(file);
+          if (target.isDirectory()) await visit(file);
+          else if (target.isFile() && !ignore(file) && shouldSync(file, mapping.sync_types)) result.push(file);
+        } catch { /* 链接目标不可读或已跳出任务目录 */ }
+        continue;
+      }
       if (entry.isDirectory()) await visit(file);
       else if (entry.isFile() && !ignore(file) && shouldSync(file, mapping.sync_types)) result.push(file);
     }
@@ -5424,6 +5521,7 @@ async function organizerUploadBuffer(parentId, name, bytes) {
     if (completed) await fsp.rm(temporaryRoot, { recursive: true, force: true });
   }
 }
+// 云端 rename 对并发同样敏感；限流重试统一由 apiPost 的业务码 120 退避处理。
 async function renameRemote(fileId, newName) { await apiPost('/userres/v1/file/rename', { fileId, newName }); }
 async function batchRename(renames) {
   const work = (Array.isArray(renames) ? renames : []).map((item) => ({ fileId: String(item.fileId || ''), currentName: String(item.currentName || ''), newName: String(item.newName || '') })).filter((item) => item.currentName !== item.newName);
@@ -5688,6 +5786,64 @@ const readWebDavFile = createWebDavFileReader({
   redirectMode: webdavRedirectMode,
   timeoutMs: ossTimeoutMs,
 });
+/** UTF-8（含 BOM）优先，按 BOM 识别 UTF-16，其余回退 GB18030（中文歌词/文本常见编码）。 */
+function decodeCloudTextBuffer(buffer) {
+  const hasUtf8Bom = buffer.length >= 3 && buffer[0] === 0xEF && buffer[1] === 0xBB && buffer[2] === 0xBF;
+  const bytes = hasUtf8Bom ? buffer.subarray(3) : buffer;
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch {}
+  if (buffer.length >= 2 && buffer[0] === 0xFF && buffer[1] === 0xFE) {
+    try { return new TextDecoder('utf-16le').decode(buffer.subarray(2)); } catch {}
+  }
+  if (buffer.length >= 2 && buffer[0] === 0xFE && buffer[1] === 0xFF) {
+    try { return new TextDecoder('utf-16be').decode(buffer.subarray(2)); } catch {}
+  }
+  try { return new TextDecoder('gb18030').decode(bytes); } catch { return bytes.toString('utf8'); }
+}
+/**
+ * 读取云端小文件文本（歌词、文本/JSON 预览）：Range 拉取前 maxBytes 字节，
+ * 403/410（直链过期）强制刷新重试一次；服务器忽略 Range 时流式读取到上限即停。
+ */
+async function readCloudTextFile(fileId, maxBytes) {
+  const fetchCdn = createProxiedFetch(networkPreferences.proxy_url, undiciFetch);
+  const send = async (force) => {
+    const target = await downloadUrlCache.get(String(fileId), { force });
+    return fetchCdn(target, {
+      method: 'GET',
+      headers: { range: `bytes=0-${maxBytes - 1}` },
+      signal: AbortSignal.timeout(60_000),
+    });
+  };
+  let upstream = await send(false);
+  if ([403, 410].includes(upstream.status)) {
+    await upstream.body?.cancel();
+    upstream = await send(true);
+  }
+  if (!upstream.ok) {
+    await upstream.body?.cancel();
+    throw new Error(`读取云端文件失败：HTTP ${upstream.status}`);
+  }
+  const chunks = [];
+  let received = 0;
+  if (upstream.body) {
+    for await (const chunk of upstream.body) {
+      const piece = Buffer.from(chunk);
+      const remain = maxBytes - received;
+      if (piece.length >= remain) {
+        chunks.push(piece.subarray(0, remain));
+        received = maxBytes;
+        break;
+      }
+      chunks.push(piece);
+      received += piece.length;
+    }
+  }
+  const totalFromRange = Number(String(upstream.headers.get('content-range') || '').split('/').pop());
+  const totalFromLength = upstream.status === 200 ? Number(upstream.headers.get('content-length')) : Number.NaN;
+  const size = Number.isFinite(totalFromRange) && totalFromRange > 0
+    ? totalFromRange
+    : Number.isFinite(totalFromLength) && totalFromLength > 0 ? totalFromLength : received;
+  return { text: decodeCloudTextBuffer(Buffer.concat(chunks)), truncated: received < size, size };
+}
 const handleWebDav = createWebDavHandler({
   prefix: '/dav',
   listChildren: listWebDavChildren,
@@ -5765,6 +5921,19 @@ async function routeApiV2(request, response, url) {
     });
     return json(response, 200, result, { 'cache-control': 'no-store' });
   }
+  if (request.method === 'GET' && url.pathname === '/api/telegram/settings') {
+    return json(response, 200, telegram.publicSettings(), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/telegram/settings') {
+    const body = await readBody(request, { maxBytes: 16 * 1024 });
+    return json(response, 200, telegram.updateSettings(body), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/telegram/test') {
+    return json(response, 200, await telegram.sendTest(), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'GET' && url.pathname === '/api/logs') {
+    return json(response, 200, { list: logBuffer.list(url.searchParams.get('limit') || 50) }, { 'cache-control': 'no-store' });
+  }
   if (request.method === 'GET' && url.pathname === '/api/organizer') {
     return json(response, 200, organizer.state(), { 'cache-control': 'no-store' });
   }
@@ -5779,6 +5948,10 @@ async function routeApiV2(request, response, url) {
   if (request.method === 'POST' && url.pathname === '/api/organizer/scrape-selected') {
     const body = await readBody(request, { maxBytes: 128 * 1024 });
     return json(response, 200, await organizer.scrapeSelected(body), { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/organizer/test-recognition') {
+    const body = await readBody(request, { maxBytes: 128 * 1024 });
+    return json(response, 200, await organizer.testRecognition(body), { 'cache-control': 'no-store' });
   }
   if (request.method === 'POST' && url.pathname === '/api/organizer/mappings') {
     const body = await readBody(request, { maxBytes: 32 * 1024 });
@@ -6109,6 +6282,18 @@ async function routeApiV2(request, response, url) {
     return json(response, 200, readGcidExportDiagnosticLog(gcidExportDiagnosticFile), { 'cache-control': 'no-store' });
   }
   if (request.method === 'POST' && url.pathname === '/api/files/download') { const body = await readBody(request); return json(response, 200, await getCloudDownload(body)); }
+  if (request.method === 'POST' && url.pathname === '/api/files/play-urls') {
+    const body = await readBody(request);
+    const fileIds = validateFileIds(body.file_ids);
+    return json(response, 200, {
+      urls: fileIds.map((fileId) => ({ file_id: fileId, url: virtualLibrary.strmPathFor(fileId) })),
+    }, { 'cache-control': 'no-store' });
+  }
+  if (request.method === 'GET' && url.pathname === '/api/files/text') {
+    const fileId = validateIdentifier(url.searchParams.get('fileId'), '文件 ID');
+    const maxBytes = queryInteger(url, 'maxBytes', 512 * 1024, { minimum: 1, maximum: 4 * 1024 * 1024 });
+    return json(response, 200, await readCloudTextFile(fileId, maxBytes), { 'cache-control': 'no-store' });
+  }
   if (request.method === 'POST' && url.pathname === '/api/share') { const body = await readBody(request); return json(response, 200, await createManualShare(body)); }
   if (request.method === 'GET' && url.pathname === '/api/shares') return json(response, 200, await listAllShares());
   if (request.method === 'POST' && url.pathname === '/api/shares/delete') {
@@ -6341,12 +6526,18 @@ restoreUploadCheckpoints();
 await restartWatchers();
 await organizer.initialize();
 virtualLibrary.start();
+telegram.initialize();
 restorePendingAutoShares();
 resumeHdhiveReceiptPolling();
 resumeDeveloperTransfers();
 pump();
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+  if (url.pathname === '/webhooks/emby') {
+    // Emby 服务器主动推送，来源 Host 不是回环地址；自带 secret 校验，跳过管理端鉴权。
+    try { return await telegram.handleEmbyWebhook(request, response, url); }
+    catch (error) { return json(response, 400, { error: error.message }); }
+  }
   if (!enforceLoopbackHost(request, response) || !enforceMutationOrigin(request, response)) return;
   try {
     if (request.method === 'GET' && url.pathname === '/api/access/status') {
@@ -6424,6 +6615,11 @@ const embyGatewayServer = http.createServer(async (request, response) => {
       await virtualLibrary.handleStrm(request, response, url);
       return;
     }
+    if (url.pathname === '/guangya/webhooks/emby') {
+      // 网关端口通常对 Emby 所在网络可达；路径前缀避开 Emby 命名空间。
+      await telegram.handleEmbyWebhook(request, response, url);
+      return;
+    }
     await virtualLibrary.handleGateway(request, response, url);
   } catch (error) {
     response.writeHead(502, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
@@ -6453,6 +6649,7 @@ webdavServer.listen(webdavPort, webdavHost, () => {
 server.listen(port, listenHost, async () => {
   const displayHost = listenHost.includes(':') ? `[${listenHost}]` : listenHost;
   console.log(`Guangya Web listening on http://${displayHost}:${port}, file roots: ${fileRoots.join(', ')}, uploads: ${uploadConcurrency}, multipart: ${multipartMode}, OSS timeout: ${ossTimeoutMs}ms, retries: ${ossRetryMax}, parallel: ${ossParallel}, cloud confirm timeout: ${cloudConfirmTimeoutMs}ms, admin auth: ${accessControl.required() ? `enabled (${adminUsername})` : 'disabled (loopback only)'}`);
+  logBuffer.push('info', `Web 服务已启动：http://${displayHost}:${port}（v${appVersion}）`);
   if (refreshToken) {
     try { await refreshSavedSession(); }
     catch (error) { status('warning', `已恢复上次登录，但刷新会话失败：${error.message}`); }
@@ -6464,6 +6661,7 @@ server.listen(port, listenHost, async () => {
     console.log(`SELF_TEST ${response.status} ${await response.text()}`);
     nativeMountManager.shutdown();
     virtualLibrary.close();
+    await telegram.close();
     await new Promise((resolve) => server.close(resolve));
     await new Promise((resolve) => webdavServer.close(resolve));
     await new Promise((resolve) => embyGatewayServer.close(resolve));

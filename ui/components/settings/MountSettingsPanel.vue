@@ -46,6 +46,7 @@ interface VirtualLibraryMapping {
   source_dir_id: string
   source_path: string
   local_path: string
+  emby_path?: string
   include_metadata: boolean
   enabled: boolean
 }
@@ -67,6 +68,7 @@ interface VirtualLibraryInfo {
   strm_error?: string | null
   strm_configured?: boolean
   emby_upstream: string
+  emby_api_key_configured?: boolean
   gateway_endpoint?: string
   gateway_running?: boolean
   gateway_error?: string | null
@@ -126,6 +128,7 @@ const virtual = reactive<VirtualLibraryInfo>({
   strm_error: null,
   strm_configured: false,
   emby_upstream: 'http://127.0.0.1:8096',
+  emby_api_key_configured: false,
   gateway_endpoint: '',
   gateway_running: false,
   gateway_error: null,
@@ -134,6 +137,7 @@ const virtual = reactive<VirtualLibraryInfo>({
   mappings: [],
   statuses: {},
 })
+const embyApiKeyInput = shallowRef('')
 const virtualBusy = reactive<Record<string, boolean>>({})
 const virtualForm = reactive({
   open: false,
@@ -143,6 +147,7 @@ const virtualForm = reactive({
   source_path: '',
   source_label: '',
   local_path: '',
+  emby_path: '',
   include_metadata: false,
   enabled: true,
   cloudPickerOpen: false,
@@ -174,20 +179,26 @@ const strmPlaceholder = computed(() => (isTauri
 const gatewayEndpoint = computed(() => virtual.gateway_endpoint || (virtual.strm_base_url ? `${virtual.strm_base_url}/` : ''))
 
 const strmStatus = computed(() => {
-  const playbackHint = `Emby 客户端连接网关 ${gatewayEndpoint.value} 可全程 302 直链播放（播放数据直连云盘 CDN，其余请求转发到 ${virtual.emby_upstream}）；STRM 内容指向 ${strmEndpoint.value}<fileId>?sign=…，直连 Emby 原生端口也能播放。`
   if (isTauri) {
     if (virtual.strm_error) return { type: 'error' as const, title: 'STRM 直链与 Emby 网关未运行', detail: virtual.strm_error }
-    if (virtual.strm_running) return { type: 'success' as const, title: 'STRM 直链与 Emby 网关运行中', detail: playbackHint }
+    if (virtual.strm_running) return { type: 'success' as const, title: 'STRM 直链与 Emby 网关运行中', detail: '' }
     return { type: 'warning' as const, title: 'STRM 直链服务正在启动', detail: '' }
   }
   if (virtual.gateway_error) return { type: 'error' as const, title: 'Emby 网关未运行', detail: virtual.gateway_error }
-  if (virtual.strm_configured) return { type: 'success' as const, title: 'STRM 直链已配置，Emby 网关运行中', detail: playbackHint }
+  if (virtual.strm_configured) return { type: 'success' as const, title: 'STRM 直链已配置，Emby 网关运行中', detail: '' }
   return {
     type: 'warning' as const,
     title: '请先填写 STRM 直链地址',
     detail: '填写 Emby 服务器和播放客户端都能访问到本服务的地址（例如 http://192.168.1.10:8080），保存后再同步虚拟库。',
   }
 })
+
+/** 端点信息（紧凑展示 + 复制），替代原先塞进状态条的大段文字。 */
+const virtualEndpoints = computed(() => [
+  { label: 'Emby 网关', value: gatewayEndpoint.value, hint: '客户端把它当 Emby 服务器，播放全程 302 直链' },
+  { label: 'STRM 直链', value: strmEndpoint.value ? `${strmEndpoint.value}<fileId>?sign=…` : '', copy: strmEndpoint.value, hint: 'STRM 文件内容指向这里' },
+  { label: 'Emby 上游', value: virtual.emby_upstream, hint: '浏览 / 搜索 / 元数据请求转发目标' },
+].filter((item) => item.value))
 
 async function loadInfo() {
   loading.value = true
@@ -316,6 +327,7 @@ function resetVirtualForm() {
     source_path: '',
     source_label: '',
     local_path: '',
+    emby_path: '',
     include_metadata: false,
     enabled: true,
     cloudPickerOpen: false,
@@ -331,6 +343,7 @@ function editVirtualMapping(mapping: VirtualLibraryMapping) {
     source_path: mapping.source_path,
     source_label: mapping.source_path || mapping.name,
     local_path: mapping.local_path,
+    emby_path: mapping.emby_path || '',
     include_metadata: mapping.include_metadata,
     enabled: mapping.enabled,
     cloudPickerOpen: false,
@@ -366,6 +379,7 @@ async function saveVirtualMapping() {
         source_dir_id: virtualForm.source_dir_id,
         source_path: virtualForm.source_path,
         local_path: virtualForm.local_path,
+        emby_path: virtualForm.emby_path,
         include_metadata: virtualForm.include_metadata,
         enabled: virtualForm.enabled,
       },
@@ -384,7 +398,9 @@ async function saveVirtualSettings() {
       refresh_minutes: virtual.refresh_minutes,
       strm_base_url: virtual.strm_base_url,
       emby_upstream: virtual.emby_upstream,
+      emby_api_key: embyApiKeyInput.value,
     })) as VirtualLibraryInfo)
+    embyApiKeyInput.value = ''
     message.success('虚拟库设置已保存，下次同步会按新直链地址重写 STRM')
   }
   catch (reason) { message.error(errorText(reason)) }
@@ -450,29 +466,50 @@ onBeforeUnmount(() => unsubscribe?.())
         :type="strmStatus.type"
         show-icon
         :message="strmStatus.title"
-        :description="strmStatus.detail"
+        :description="strmStatus.detail || undefined"
         class="mount-alert"
       />
+
+      <div v-if="virtualEndpoints.length" class="endpoint-list">
+        <div v-for="endpoint in virtualEndpoints" :key="endpoint.label" class="endpoint-row">
+          <span class="endpoint-label">{{ endpoint.label }}</span>
+          <code class="endpoint-value" :title="endpoint.hint">{{ endpoint.value }}</code>
+          <CopyOutlined class="copy-icon" @click="copyText(endpoint.copy || endpoint.value)" />
+          <small>{{ endpoint.hint }}</small>
+        </div>
+      </div>
 
       <div class="virtual-toolbar">
         <div>
           <strong>云端目录 → 本地 STRM 虚拟库</strong>
-          <span>视频和音频生成同名 <code>.strm</code>，内容是带签名的播放直链；元数据可按每个虚拟库选择下载或排除。</span>
+          <span>视频/音频生成同名 <code>.strm</code> 直链文件，Emby 只需加入这一个目录。</span>
         </div>
         <a-button type="primary" @click="resetVirtualForm"><PlusOutlined />添加虚拟库</a-button>
       </div>
 
-      <a-form class="virtual-settings" layout="inline">
-        <a-form-item label="STRM 直链地址">
-          <a-input v-model:value="virtual.strm_base_url" :placeholder="strmPlaceholder" class="strm-base-input" />
-        </a-form-item>
-        <a-form-item label="Emby 原始地址">
-          <a-input v-model:value="virtual.emby_upstream" placeholder="http://127.0.0.1:8096" class="strm-base-input" />
-        </a-form-item>
-        <a-form-item label="自动刷新">
-          <a-input-number v-model:value="virtual.refresh_minutes" :min="1" :max="1440" addon-after="分钟" />
-        </a-form-item>
-        <a-button :loading="virtualBusy.settings" @click="saveVirtualSettings">保存设置</a-button>
+      <a-form class="virtual-settings" layout="vertical">
+        <div class="virtual-settings-grid">
+          <a-form-item label="STRM 直链地址">
+            <a-input v-model:value="virtual.strm_base_url" :placeholder="strmPlaceholder" />
+          </a-form-item>
+          <a-form-item label="Emby 原始地址">
+            <a-input v-model:value="virtual.emby_upstream" placeholder="http://127.0.0.1:8096" />
+          </a-form-item>
+          <a-form-item label="Emby API 密钥">
+            <a-input-password
+              v-model:value="embyApiKeyInput"
+              autocomplete="off"
+              :placeholder="virtual.emby_api_key_configured ? '已配置；留空保持不变，输入 off 清除' : 'Emby 后台 → API 密钥 中生成'"
+            />
+          </a-form-item>
+          <a-form-item label="自动刷新间隔">
+            <a-input-number v-model:value="virtual.refresh_minutes" :min="1" :max="1440" addon-after="分钟" class="refresh-input" />
+          </a-form-item>
+        </div>
+        <div class="virtual-settings-actions">
+          <span>配置了 API 密钥后，同步有变更会自动通知 Emby 增量扫描。</span>
+          <a-button type="primary" :loading="virtualBusy.settings" @click="saveVirtualSettings">保存设置</a-button>
+        </div>
       </a-form>
 
       <a-empty v-if="!virtual.mappings.length" description="尚未配置虚拟库" class="virtual-empty" />
@@ -507,15 +544,19 @@ onBeforeUnmount(() => unsubscribe?.())
         </article>
       </div>
 
-      <a-alert
-        type="info"
-        show-icon
-        message="Emby 使用方式"
-        :description="isTauri
-          ? `把本地虚拟库目录作为媒体库加入 Emby——只需这一个目录，不需要映射挂载盘。播放有两种方式：客户端连接 Emby 兼容网关 ${gatewayEndpoint || 'http://<本机>:18096/'}（推荐，播放全程 302 直链，数据不经过 Emby 和本机）；或直连 Emby 原生地址（如 8096），部分客户端的播放数据会经 Emby 服务器中转。Emby 在 Docker 容器或其他机器上时，把 STRM 直链地址改成本机局域网地址（如 http://192.168.x.x:18096），保存后服务会自动监听所有网卡并在下次同步重写 STRM。`
-          : `把 ${virtual.virtual_root || '/virtual-library'} 映射给 Emby 容器并作为媒体库加入——只需这一个目录，不需要映射挂载盘。播放推荐让客户端连接 Emby 兼容网关端口（默认 18096，播放全程 302 直链）；直连 Emby 原生端口（如 8096）也能播放，部分客户端的播放数据会经 Emby 服务器中转。STRM 直链地址必须是 Emby 和播放设备都能访问到的本服务地址。`"
-        class="support-alert"
-      />
+      <a-collapse ghost class="usage-collapse">
+        <a-collapse-panel key="emby-usage" header="Emby 使用说明">
+          <ul class="usage-list">
+            <li v-if="isTauri">把本地虚拟库目录作为媒体库加入 Emby——只需这一个目录，不需要映射挂载盘。</li>
+            <li v-else>把 {{ virtual.virtual_root || '/virtual-library' }} 映射给 Emby 容器并作为媒体库加入——只需这一个目录。</li>
+            <li><strong>推荐播放方式</strong>：客户端把上方“Emby 网关”地址当作 Emby 服务器，播放全程 302 直链，数据不经过 Emby 和本机。</li>
+            <li>直连 Emby 原生地址（如 8096）也能播放，部分客户端的播放数据会经 Emby 服务器中转。</li>
+            <li v-if="isTauri">Emby 在 Docker 或其他机器上时，把 STRM 直链地址改成本机局域网地址（如 http://192.168.x.x:18096），保存后自动监听所有网卡。</li>
+            <li v-else>STRM 直链地址必须是 Emby 和播放设备都能访问到的本服务地址。</li>
+            <li>修改直链地址后，下次同步会自动重写全部 STRM；同步不会删除目录里非光鸭生成的文件。</li>
+          </ul>
+        </a-collapse-panel>
+      </a-collapse>
     </template>
 
     <template v-else-if="mountMode === 'native'">
@@ -709,14 +750,9 @@ onBeforeUnmount(() => unsubscribe?.())
       </div>
     </template>
 
-    <a-alert
-      v-if="mountMode !== 'virtual'"
-      type="info"
-      show-icon
-      message="文件操作范围"
-      description="读取、列目录、创建、覆盖、重命名、移动、复制和删除都会映射到光鸭云盘；只读原生挂载会在本地文件系统层阻止所有修改。"
-      class="support-alert"
-    />
+    <p v-if="mountMode !== 'virtual'" class="section-footnote">
+      读取、列目录、创建、覆盖、重命名、移动、复制和删除都会映射到光鸭云盘；只读原生挂载会在本地文件系统层阻止所有修改。
+    </p>
 
     <a-modal v-model:open="virtualForm.open" :title="virtualForm.id ? '编辑虚拟库' : '添加虚拟库'" width="min(680px, 94vw)" ok-text="保存" cancel-text="取消" :confirm-loading="virtualBusy[virtualForm.id || 'new']" @ok="saveVirtualMapping">
       <a-form layout="vertical">
@@ -730,7 +766,11 @@ onBeforeUnmount(() => unsubscribe?.())
           <a-input v-model:value="virtualForm.local_path" :placeholder="isTauri ? '选择 Emby 扫描的本地目录' : `${virtual.virtual_root || '/virtual-library'}/movies`">
             <template v-if="isTauri" #suffix><FolderOpenOutlined class="copy-icon" @click="selectVirtualTarget" /></template>
           </a-input>
-          <div class="field-help">STRM 写入带签名的播放直链（<code>…/strm/&lt;fileId&gt;?sign=…</code>），修改直链地址后下次同步会自动重写。同步只会清理清单中由光鸭生成、但云端已不存在的文件；不会删除目录里的其他文件。</div>
+          <div class="field-help">同步只清理光鸭生成且云端已删除的文件，不影响目录里的其他文件。</div>
+        </a-form-item>
+        <a-form-item label="Emby 内路径（刷新通知）">
+          <a-input v-model:value="virtualForm.emby_path" :placeholder="isTauri ? '与本地目录相同，或 Emby 容器内路径，如 /visual_media' : '/visual_media'" />
+          <div class="field-help">该目录在 Emby 看到的路径，用于变更后通知增量扫描（需 API 密钥）；留空则等 Emby 定时扫描。</div>
         </a-form-item>
         <div class="virtual-option-row">
           <span><strong>保留元数据</strong><small>开启后下载 NFO、海报、字幕等小文件；关闭后只生成视频/音频 STRM。</small></span>
@@ -776,9 +816,21 @@ onBeforeUnmount(() => unsubscribe?.())
 .virtual-toolbar { display: flex; max-width: 780px; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 14px; }
 .virtual-toolbar > div { display: grid; gap: 4px; }
 .virtual-toolbar span { color: var(--text-3, #737373); font-size: 12px; }
-.virtual-settings { display: flex; max-width: 780px; align-items: flex-end; margin-bottom: 16px; padding: 12px; border: 1px solid var(--line, #e5e5e5); border-radius: 10px; background: var(--surface-muted, #fafafa); }
-.virtual-settings :deep(.ant-form-item) { margin-bottom: 0; }
-.strm-base-input { min-width: 250px; }
+.endpoint-list { display: grid; max-width: 780px; gap: 6px; margin-bottom: 18px; padding: 12px 14px; border: 1px solid var(--line, #e5e5e5); border-radius: 10px; background: var(--surface, #fff); }
+.endpoint-row { display: flex; min-width: 0; align-items: center; gap: 10px; }
+.endpoint-label { flex: 0 0 76px; color: var(--text-3, #737373); font-size: 12px; }
+.endpoint-value { min-width: 0; overflow: hidden; padding: 2px 6px; border-radius: 4px; background: var(--surface-muted, #fafafa); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.endpoint-row small { overflow: hidden; flex: 1; color: var(--text-3, #737373); font-size: 11px; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+.virtual-settings { max-width: 780px; margin-bottom: 16px; padding: 14px 16px 12px; border: 1px solid var(--line, #e5e5e5); border-radius: 10px; background: var(--surface-muted, #fafafa); }
+.virtual-settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+.virtual-settings-grid :deep(.ant-form-item) { margin-bottom: 12px; }
+.refresh-input { width: 100%; }
+.virtual-settings-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.virtual-settings-actions span { color: var(--text-3, #737373); font-size: 12px; }
+.usage-collapse { max-width: 780px; margin-top: 18px; }
+.usage-collapse :deep(.ant-collapse-header) { padding-inline-start: 0 !important; color: var(--text-2, #525252); font-size: 13px; }
+.usage-list { margin: 0; padding-left: 18px; color: var(--text-2, #525252); font-size: 12px; line-height: 1.9; }
+.section-footnote { max-width: 720px; margin: 18px 0 0; color: var(--text-3, #737373); font-size: 12px; line-height: 1.6; }
 .virtual-empty { max-width: 780px; padding: 32px 0; }
 .virtual-list { display: grid; max-width: 780px; gap: 12px; }
 .virtual-card { display: grid; gap: 12px; padding: 15px; border: 1px solid var(--line, #e5e5e5); border-radius: 12px; background: var(--surface, #fff); }

@@ -280,6 +280,7 @@ pub(crate) fn run() {
             ));
             tauri::async_runtime::spawn(auto_share_loop(app_handle.clone(), state.clone()));
             tauri::async_runtime::spawn(token_refresh_loop(app_handle.clone(), state.clone()));
+            crate::telegram::start(app_handle.clone(), state.clone());
             tauri::async_runtime::spawn(offline_name_restore_loop(state.clone()));
             tauri::async_runtime::spawn(virtual_library_refresh_loop(
                 app_handle.clone(),
@@ -358,6 +359,11 @@ pub(crate) fn run() {
             crate::downloads::pause_download,
             crate::downloads::resume_download,
             crate::downloads::cancel_download,
+            crate::open_file::get_play_urls,
+            crate::open_file::read_cloud_text,
+            crate::open_file::open_cloud_file_with_system,
+            crate::open_file::list_local_players,
+            crate::open_file::open_in_player,
             crate::offline::resolve_offline_resource,
             crate::offline::create_offline_task,
             crate::offline::list_offline_tasks,
@@ -413,10 +419,15 @@ pub(crate) fn run() {
             crate::organizer::rearchive_organizer_job,
             crate::organizer::share_organizer_job,
             crate::organizer::scrape_selected_files,
+            crate::organizer::test_media_recognition,
             crate::queue::resume_queue,
             crate::updates::get_app_version,
             crate::updates::fetch_app_update,
-            crate::updates::install_app_update
+            crate::updates::install_app_update,
+            crate::telegram::get_telegram_settings,
+            crate::telegram::update_telegram_settings,
+            crate::telegram::test_telegram_message,
+            crate::telegram::get_recent_logs
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

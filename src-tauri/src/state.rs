@@ -155,6 +155,10 @@ pub(crate) struct RuntimeState {
 
 
 pub(crate) fn emit(app: &tauri::AppHandle, payload: impl Serialize + Clone) {
+    // Telegram 渠道观察同一事件流：status 进日志缓冲，state 变化用于登录态跟踪。
+    if let Ok(value) = serde_json::to_value(&payload) {
+        crate::telegram::observe_event(&value);
+    }
     let _ = app.emit("sync-event", payload);
 }
 pub(crate) fn status(app: &tauri::AppHandle, level: &str, message: impl Into<String>) {

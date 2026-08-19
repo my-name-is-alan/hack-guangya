@@ -126,6 +126,7 @@ pub(crate) fn update_virtual_library_settings(
     refresh_minutes: u64,
     strm_base_url: Option<String>,
     emby_upstream: Option<String>,
+    emby_api_key: Option<String>,
 ) -> Result<VirtualLibraryInfo, String> {
     let mut guard = state.lock().map_err(|error| error.to_string())?;
     guard.virtual_library.set_refresh_minutes(refresh_minutes)?;
@@ -135,6 +136,15 @@ pub(crate) fn update_virtual_library_settings(
     guard
         .virtual_library
         .set_emby_upstream(emby_upstream.unwrap_or_default())?;
+    // API Key 留空保持不变（不回显）；提交 "off" 清除。
+    if let Some(value) = emby_api_key {
+        let trimmed = value.trim().to_string();
+        if !trimmed.is_empty() {
+            guard
+                .virtual_library
+                .set_emby_api_key(if trimmed == "off" { String::new() } else { trimmed });
+        }
+    }
     save_config(&guard);
     // 直链地址决定 STRM 服务监听范围（回环 / 所有网卡），通知其重新绑定。
     guard.strm_rebind.send_modify(|value| *value = value.wrapping_add(1));
@@ -175,6 +185,11 @@ pub(crate) fn publish_virtual_library(app: &tauri::AppHandle, state: &SharedStat
     }
 }
 
+fn virtual_library_pending_resync() -> &'static Mutex<HashSet<String>> {
+    static PENDING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 pub(crate) fn spawn_virtual_library_sync(
     app: tauri::AppHandle,
     state: SharedState,
@@ -197,8 +212,8 @@ pub(crate) fn spawn_virtual_library_sync(
         let result = virtual_library::sync_mapping(&state, &mapping).await;
         let outcome_message = match &result {
             Ok(summary) => format!(
-                "虚拟库同步完成：{}（{} 个 STRM，{} 个元数据）",
-                mapping.name, summary.strm_files, summary.metadata_files
+                "虚拟库同步完成：{}（{} 个 STRM，{} 个元数据，{} 项变更）",
+                mapping.name, summary.strm_files, summary.metadata_files, summary.changes.total
             ),
             Err(error) => format!("虚拟库同步失败：{}：{error}", mapping.name),
         };
@@ -211,8 +226,113 @@ pub(crate) fn spawn_virtual_library_sync(
             outcome_message,
         );
         publish_virtual_library(&app, &state);
+        if let Ok(summary) = &result {
+            // 同步有变更且配置了 Emby API Key 与 Emby 内路径时，按目录精确通知增量扫描。
+            let (upstream, api_key) = state
+                .lock()
+                .ok()
+                .map(|guard| {
+                    let options = guard.virtual_library.options();
+                    (options.emby_upstream, options.emby_api_key)
+                })
+                .unwrap_or_default();
+            let notify = virtual_library::notify_emby(
+                &upstream,
+                &api_key,
+                &mapping.emby_path,
+                &summary.changes,
+            )
+            .await;
+            match notify {
+                Ok(Some(count)) => {
+                    if let Ok(mut guard) = state.lock() {
+                        guard
+                            .virtual_library
+                            .set_emby_notify_result(&id, Some(count), None);
+                    }
+                    publish_virtual_library(&app, &state);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if let Ok(mut guard) = state.lock() {
+                        guard
+                            .virtual_library
+                            .set_emby_notify_result(&id, None, Some(error.clone()));
+                    }
+                    status(&app, "warning", format!("{}：{error}", mapping.name));
+                    publish_virtual_library(&app, &state);
+                }
+            }
+        }
+        // 同步期间又有触发请求：当前轮结束后自动再同步一次。
+        let should_resync = virtual_library_pending_resync()
+            .lock()
+            .map(|mut pending| pending.remove(&id))
+            .unwrap_or(false);
+        if should_resync {
+            let _ = queue_virtual_library_sync(app.clone(), state.clone(), id.clone());
+        }
     });
     Ok(())
+}
+
+/// 触发同步；若该虚拟库正在同步则记为待重跑，当前轮结束后自动再同步一次。
+pub(crate) fn queue_virtual_library_sync(
+    app: tauri::AppHandle,
+    state: SharedState,
+    id: String,
+) -> bool {
+    match spawn_virtual_library_sync(app, state.clone(), id.clone()) {
+        Ok(()) => true,
+        Err(_) => {
+            let running = state
+                .lock()
+                .ok()
+                .map(|guard| {
+                    guard
+                        .virtual_library
+                        .info()
+                        .statuses
+                        .get(&id)
+                        .is_some_and(|status| status.running)
+                })
+                .unwrap_or(false);
+            if running {
+                if let Ok(mut pending) = virtual_library_pending_resync().lock() {
+                    pending.insert(id);
+                }
+                return true;
+            }
+            false
+        }
+    }
+}
+
+/// 整理器等云端写入方完成后调用：找出覆盖该云端目录的虚拟库并触发同步。
+pub(crate) fn sync_virtual_libraries_for_cloud_target(
+    app: &tauri::AppHandle,
+    state: &SharedState,
+    dir_id: &str,
+    cloud_path: &str,
+) -> Vec<String> {
+    let mappings = state
+        .lock()
+        .ok()
+        .map(|guard| guard.virtual_library.options().mappings)
+        .unwrap_or_default();
+    let matched: Vec<String> = mappings
+        .into_iter()
+        .filter(|mapping| {
+            mapping.enabled
+                && ((!dir_id.trim().is_empty() && mapping.source_dir_id == dir_id.trim())
+                    || virtual_library::cloud_paths_overlap(&mapping.source_path, cloud_path))
+        })
+        .map(|mapping| mapping.id)
+        .collect();
+    for id in &matched {
+        let _ = queue_virtual_library_sync(app.clone(), state.clone(), id.clone());
+    }
+    matched
 }
 
 #[tauri::command]

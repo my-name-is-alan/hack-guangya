@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fetch as undiciFetch } from 'undici';
 import COUNTRY_NAMES_ZH from '../shared/countries-zh.json' with { type: 'json' };
 
-export const NATIVE_ENGINE_VERSION = 'guangya-cloud-native-v3';
+export const NATIVE_ENGINE_VERSION = 'guangya-cloud-native-v4';
 
 export const VIDEO_EXTENSIONS = new Set([
   '.3gp', '.asf', '.avi', '.f4v', '.flv', '.iso', '.m2ts', '.m4v', '.mkv', '.mov', '.mp4', '.mpeg', '.mpg', '.mts', '.rm', '.rmvb', '.strm', '.tp', '.ts', '.vob', '.webm', '.wmv',
@@ -43,6 +43,8 @@ export const DEFAULT_ORGANIZER_SETTINGS = Object.freeze({
   release_groups: '',
   render_words: '',
   capture_groups: '',
+  upgrade_criteria: Object.freeze(['resolution', 'dynamic_range', 'release_group', 'size']),
+  upgrade_release_groups: '',
   include_media_info: true,
   movie_folder_format: '{title} ({year})',
   movie_file_format: '{title} ({year}){edition}{quality}{part}',
@@ -364,7 +366,15 @@ function knownReleaseGroup(value, settings = {}) {
     if (capture) return cleanText(capture.slice(1).find(Boolean) || capture[0]);
   }
   const trailing = /-([A-Za-z0-9][A-Za-z0-9@._-]{1,48})$/.exec(source)?.[1];
-  if (trailing && !RELEASE_WORDS.has(trailing.toLowerCase())) return trailing;
+  // “WEB-DL.AAC”这类技术串结尾会被尾缀正则误当制作组（-DL.AAC）：
+  // 首段是发布技术词（dl/aac/265 等）时一律拒绝。
+  if (trailing) {
+    const firstPart = trailing.split(/[._ ]/)[0].toLowerCase();
+    if (!RELEASE_WORDS.has(trailing.toLowerCase()) && !RELEASE_WORDS.has(firstPart)
+      && !/^(?:h|x)?26[45]$/i.test(firstPart) && !/^(?:dl|rip|hd|ma|dv|hdr\d*|\d+bit|\d+fps)$/i.test(firstPart)) {
+      return trailing;
+    }
+  }
   const leading = /^\[([^\]]{2,48})\]/.exec(source)?.[1];
   return cleanText(leading);
 }
@@ -457,39 +467,567 @@ function cleanTitle(value) {
     .trim();
 }
 
+// ---------------------------------------------------------------------------
+// 分词式标题识别（移植自 MoviePilot v2 的 MetaVideo 状态机）：
+// 把文件名按分隔符拆成 token 流，逐个判定标题/年份/分辨率/季/集/资源类型，
+// 中文与英文标题分开累计，供 TMDB 分别搜索。
+// ---------------------------------------------------------------------------
+
+const CN_NUM_CHARS = { 零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+
+export function chineseNumeral(text) {
+  const value = cleanText(text);
+  if (!value) return null;
+  if (/^\d+$/.test(value)) return Number(value);
+  if (!/^[零一二两三四五六七八九十百千]+$/.test(value)) return null;
+  let total = 0;
+  let section = 0;
+  let digit = null;
+  for (const char of value) {
+    if (char in CN_NUM_CHARS) {
+      digit = CN_NUM_CHARS[char];
+    } else if (char === '十') {
+      section += (digit ?? 1) * 10;
+      digit = null;
+    } else if (char === '百') {
+      section += (digit ?? 1) * 100;
+      digit = null;
+    } else if (char === '千') {
+      section += (digit ?? 1) * 1000;
+      digit = null;
+    }
+  }
+  total = section + (digit ?? 0);
+  return Number.isInteger(total) ? total : null;
+}
+
+function isChineseText(value) {
+  return /[\u3400-\u9fff]/.test(String(value || ''));
+}
+
+function isAllChineseText(value) {
+  const text = cleanText(value);
+  return Boolean(text) && /^[\u3400-\u9fff0-9：·]+$/.test(text.replace(/\s+/g, ''));
+}
+
+const SEASON_FULL_RE = /^(?:Season\s+|S)(\d{1,3})$/i;
+const FIRST_BRACKET_RE = /^[[【](.+?)[\]】]/;
+const BRACKET_DOT_TITLE_RE = /[A-Za-z]+\..+(?:19|20)\d{2}/;
+const BRACKET_RESOURCE_RE = /(?:2160|1080|720|480)[PIpi]|4K|UHD|Blu[-.]?ray|REMUX|WEB[-.]?DL|HDTV/i;
+const YEAR_RANGE_RE = /([\s.]+)(\d{4})-(\d{4})/;
+const FILE_SIZE_RE = /[0-9.]+\s*[MGT]i?B(?![A-Z]+)/gi;
+const DATE_RE = /\d{4}[\s._-]\d{1,2}[\s._-]\d{1,2}/g;
+const MEDIA_TOKEN_SPLIT_RE = /[.\s()[\]\-【】/～;&|#_「」~]+/;
+const NAME_SE_WORDS = ['共', '第', '季', '集', '话', '話', '期'];
+const NAME_MOVIE_WORDS_RE = /剧场版|劇場版|电影版|電影版/i;
+const NAME_NO_CHINESE_RE = /.*版|.*字幕/i;
+const SM_SEASON_RE = /S(\d{3})|^S(\d{1,3})$|S(\d{1,3})E/i;
+const SM_EPISODE_RE = /EP?(\d{2,4})$|^EP?(\d{1,4})$|^S\d{1,2}EP?(\d{1,4})$|S\d{2}EP?(\d{2,4})/i;
+const SM_PART_RE = /^PART[0-9ABI]{0,2}$|^CD[0-9]{0,2}$|^DVD[0-9]{0,2}$|^DISK[0-9]{0,2}$|^DISC[0-9]{0,2}$/i;
+const SM_ROMAN_RE = /^(?=[MDCLXVI])M*(?:C[MD]|D?C{0,3})(?:X[CL]|L?X{0,3})(?:I[XV]|V?I{0,3})$/;
+const SM_SOURCE_RE = /^BLURAY$|^HDTV$|^UHDTV$|^HDDVD$|^WEBRIP$|^DVDRIP$|^BDRIP$|^BLU$|^WEB$|^BD$|^HDRip$|^REMUX$|^UHD$/i;
+const SM_EFFECT_RE = /^SDR$|^HDR\d*$|^HDRVIVID$|^DOLBY$|^DOVI$|^DV$|^3D$|^REPACK$|^HLG$|^HDR10(?:\+|Plus)$|^HDR10P$|^VIVID$|^EDR$|^HQ$/i;
+const SM_PIX_RE = /^[SBUHD]*(\d{3,4}[PI]+)|\d{3,4}X(\d{3,4})/i;
+const SM_PIX2_RE = /^([248]+K)/i;
+const SM_VIDEO_ENCODE_RE = /^H26[45]$|^x26[45]$|^AVC$|^HEVC$|^VC\d?$|^MPEG\d?$|^Xvid$|^DivX$|^AV1$|^AVS(?:\+|[23])$/i;
+const SM_AUDIO_ENCODE_RE = /^DTS\d?$|^DTSHD$|^DTSHDMA$|^Atmos$|^TrueHD\d?$|^AC3$|^\dAudios?$|^DDP\d?$|^DD\+\d?$|^DD\d?$|^LPCM\d?$|^AAC\d?$|^FLAC\d?$|^HD\d?$|^MA\d?$|^HR\d?$|^Opus\d?$|^Vorbis\d?$|^AV[3S]A$/i;
+// 从中文标题中剔除的干扰词（季集提示、栏目/清晰度/字幕组等），对齐 MoviePilot 的 _name_nostring_re。
+const NAME_NOSTRING_RE = new RegExp([
+  '^PTS|^JADE|^AOD|^CHC|^[A-Z]{1,4}TV[-0-9UVHDK]*',
+  '\\d{1,2}th|\\d{1,2}bit|IMAX|^3D|\\s+3D|\\s+DC$',
+  '[第\\s共]+[0-9一二三四五六七八九十\\-\\s]+季',
+  '[第\\s共]+[0-9一二三四五六七八九十百零\\-\\s]+[集话話]',
+  '连载|日剧|美剧|电视剧|动画片|动漫|欧美|西德|日韩|超高清|高清|无水印|下载|蓝光|翡翠台|★?\\d*月?新番',
+  '最终季|合集|[多中国英葡法俄日韩德意西印泰台港粤双文语简繁体特效内封官译外挂]+字幕|版本|出品|台版|港版|\\w+字幕组|\\w+字幕社',
+  '未删减版|UNCUT$|UNRATE$|WITH EXTRAS$|RERIP$|SUBBED$|PROPER$|REPACK$|SEASON$|EPISODE$|Complete$|Extended$|Extended Version$',
+  'S\\d{2}\\s*-\\s*S\\d{2}|S\\d{2}|\\s+S\\d{1,2}|EP?\\d{2,4}\\s*-\\s*EP?\\d{2,4}|EP?\\d{2,4}|\\s+EP?\\d{1,4}',
+  'CD[\\s.]*[1-9]|DVD[\\s.]*[1-9]|DISK[\\s.]*[1-9]|DISC[\\s.]*[1-9]',
+  '[248]K|\\d{3,4}[PIX]+',
+  '\\s+GB',
+].join('|'), 'gi');
+const SUBTITLE_SEASON_ALL_RE = /[全共]\s*([0-9一二三四五六七八九十]+)\s*季/;
+const SUBTITLE_SEASON_RE = /[第\s]+([0-9一二三四五六七八九十S\-]+)\s*季(?!\s*[全共])/i;
+const SUBTITLE_EPISODE_RE = /[第\s]+([0-9一二三四五六七八九十百零EP]+)\s*[集话話期幕](?!\s*[全共])/i;
+const SUBTITLE_EPISODE_BETWEEN_RE = /第*\s*([0-9一二三四五六七八九十百零]+)\s*[集话話期幕]?\s*-\s*第*\s*([0-9一二三四五六七八九十百零]+)\s*[集话話期幕]/;
+const SUBTITLE_EPISODE_ALL_RE = /([0-9一二三四五六七八九十百零]+)\s*集\s*全|[全共]\s*([0-9一二三四五六七八九十百零]+)\s*[集话話期幕]/;
+const EPISODE_RANGE_FIN_RE = /(?<!\d)\[?\s*(\d{1,4})\s*-\s*(\d{1,4})\s*(?:(?:Fin|End)(?![a-z0-9])|完结(?![\u4e00-\u9fff]))/i;
+
+/** 预清洗（MoviePilot 同款）：去首个方括号、年份区间、文件大小、日期。 */
+function precleanMediaTitle(value) {
+  let title = String(value || '');
+  const bracket = FIRST_BRACKET_RE.exec(title);
+  if (bracket) {
+    const content = bracket[1];
+    if (BRACKET_DOT_TITLE_RE.test(content) && BRACKET_RESOURCE_RE.test(content)) {
+      title = content + title.slice(bracket.index + bracket[0].length);
+    } else {
+      title = title.slice(bracket.index + bracket[0].length);
+    }
+  }
+  title = title.replace(YEAR_RANGE_RE, '$1$2');
+  title = title.replace(FILE_SIZE_RE, '');
+  title = title.replace(DATE_RE, '');
+  return title;
+}
+
+function smNumbersFrom(match) {
+  for (const group of match.slice(1)) {
+    if (group !== undefined && /^\d+$/.test(group)) return Number(group);
+  }
+  return null;
+}
+
+/**
+ * token 状态机主体：返回 { cnName, enName, year, beginSeason, endSeason,
+ * beginEpisode, endEpisode, part, isTv }。
+ */
+function parseNameTokens(preclean, { isFile = false } = {}) {
+  const state = {
+    cnName: null, enName: null, year: null,
+    beginSeason: null, endSeason: null, beginEpisode: null, endEpisode: null,
+    part: null, isTv: false,
+  };
+  const seasonFull = SEASON_FULL_RE.exec(cleanText(preclean));
+  if (seasonFull) {
+    state.isTv = true;
+    state.beginSeason = Number(seasonFull[1]);
+    return state;
+  }
+  if (isFile && /^\d{1,4}$/.test(cleanText(preclean))) {
+    state.isTv = true;
+    state.beginEpisode = Number(cleanText(preclean));
+    return state;
+  }
+  const tokens = preclean.split(MEDIA_TOKEN_SPLIT_RE).filter(Boolean);
+  let stopName = false;
+  let stopCnName = false;
+  let lastTokenType = '';
+  let lastToken = '';
+  let unknownName = '';
+  let source = '';
+  const name = () => (state.cnName && isAllChineseText(state.cnName) ? state.cnName : state.enName || state.cnName || '');
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    let continueFlag = true;
+
+    // Part
+    if (name() && (state.year || state.beginSeason != null || state.beginEpisode != null)) {
+      const partMatch = SM_PART_RE.exec(token);
+      if (partMatch) {
+        if (!state.part) state.part = partMatch[0];
+        const next = tokens[index + 1];
+        if (next && ((/^\d$/.test(next) || (/^0\d$/.test(next))) || ['A', 'B', 'C', 'I', 'II', 'III'].includes(next.toUpperCase()))) {
+          state.part = `${state.part}${next}`;
+          index += 1;
+        }
+        lastTokenType = 'part';
+        continueFlag = false;
+      }
+    }
+
+    // 标题
+    if (continueFlag) {
+      if (unknownName) {
+        if (!state.cnName) {
+          if (!state.enName) state.enName = unknownName;
+          else if (unknownName !== String(state.year || '')) state.enName = `${state.enName} ${unknownName}`;
+          lastTokenType = 'enname';
+        }
+        unknownName = '';
+      }
+      if (!stopName) {
+        if (token.toUpperCase() === 'AKA') {
+          stopName = true;
+          continueFlag = false;
+        } else if (NAME_SE_WORDS.includes(token)) {
+          lastTokenType = 'name_se_words';
+        } else if (isChineseText(token)) {
+          lastTokenType = 'cnname';
+          if (!state.cnName) {
+            state.cnName = token;
+          } else if (!stopCnName) {
+            if (NAME_MOVIE_WORDS_RE.test(token)
+              || (!NAME_NO_CHINESE_RE.test(token) && !NAME_SE_WORDS.some((word) => token.includes(word)))) {
+              state.cnName = `${state.cnName} ${token}`;
+            }
+            stopCnName = true;
+          }
+        } else {
+          const isRoman = SM_ROMAN_RE.test(token);
+          if (/^\d+$/.test(token) || isRoman) {
+            if (lastTokenType === 'name_se_words') {
+              // 第/季/集 后面的数字不进标题
+            } else if (name()) {
+              if (token.startsWith('0')) {
+                // 名字后面以 0 开头的数字极可能是集号
+              } else if (!isRoman && lastTokenType === 'cnname' && Number(token) < 1900) {
+                // 中文名后面跟的非年份数字极可能是集号
+              } else if ((token.length < 4 && /^\d+$/.test(token)) || isRoman) {
+                if (lastTokenType === 'cnname') state.cnName = `${state.cnName} ${token}`;
+                else if (lastTokenType === 'enname') state.enName = `${state.enName} ${token}`;
+                continueFlag = false;
+              } else if (token.length === 4 && /^\d+$/.test(token)) {
+                if (!unknownName) unknownName = token;
+              }
+            } else if (!unknownName) {
+              unknownName = token;
+            }
+          } else if (SM_SEASON_RE.test(token)) {
+            if (state.enName && /SEASON$/i.test(state.enName)) state.enName += ' ';
+            stopName = true;
+          } else if (SM_EPISODE_RE.test(token) || SM_SOURCE_RE.test(token) || SM_EFFECT_RE.test(token) || SM_PIX_RE.test(token)) {
+            stopName = true;
+          } else if (!VIDEO_EXTENSIONS.has(`.${token.toLowerCase()}`) && !SUBTITLE_EXTENSIONS.has(`.${token.toLowerCase()}`) && !AUDIO_EXTENSIONS.has(`.${token.toLowerCase()}`)) {
+            if (state.enName) state.enName = `${state.enName} ${token}`;
+            else state.enName = token;
+            lastTokenType = 'enname';
+          }
+        }
+      }
+    }
+
+    // 年份
+    if (continueFlag && name() && /^\d{4}$/.test(token)) {
+      const numeric = Number(token);
+      if (numeric > 1900 && numeric < 2050) {
+        if (state.year) {
+          if (state.enName) state.enName = `${state.enName.trim()} ${state.year}`;
+          else if (state.cnName) state.cnName = `${state.cnName} ${state.year}`;
+        } else if (state.enName && /SEASON$/i.test(state.enName)) {
+          state.enName += ' ';
+        }
+        state.year = numeric;
+        lastTokenType = 'year';
+        continueFlag = false;
+        stopName = true;
+      }
+    }
+
+    // 分辨率
+    if (continueFlag && name()) {
+      const pixMatch = SM_PIX_RE.exec(token);
+      if (pixMatch) {
+        lastTokenType = 'pix';
+        continueFlag = false;
+        stopName = true;
+      } else if (SM_PIX2_RE.test(token)) {
+        lastTokenType = 'pix';
+        continueFlag = false;
+        stopName = true;
+      }
+    }
+
+    // 季
+    if (continueFlag) {
+      const seasonMatches = token.match(new RegExp(SM_SEASON_RE.source, 'gi'));
+      if (seasonMatches) {
+        lastTokenType = 'season';
+        state.isTv = true;
+        stopName = true;
+        for (const fragment of seasonMatches) {
+          const single = SM_SEASON_RE.exec(fragment);
+          const value = single ? smNumbersFrom(single) : null;
+          if (value == null) continue;
+          if (state.beginSeason == null) {
+            state.beginSeason = value;
+          } else if (value > state.beginSeason) {
+            state.endSeason = value;
+            if (isFile && state.endSeason != null) state.endSeason = null;
+          }
+        }
+      } else if (/^\d+$/.test(token) && lastTokenType === 'SEASON' && state.beginSeason == null && token.length < 3) {
+        state.beginSeason = Number(token);
+        lastTokenType = 'season';
+        stopName = true;
+        continueFlag = false;
+        state.isTv = true;
+      } else if (token.toUpperCase() === 'SEASON' && state.beginSeason == null) {
+        lastTokenType = 'SEASON';
+      }
+    }
+
+    // 集
+    if (continueFlag) {
+      const episodeMatches = token.match(new RegExp(SM_EPISODE_RE.source, 'gi'));
+      if (episodeMatches) {
+        lastTokenType = 'episode';
+        continueFlag = false;
+        stopName = true;
+        state.isTv = true;
+        for (const fragment of episodeMatches) {
+          const single = SM_EPISODE_RE.exec(fragment);
+          const value = single ? smNumbersFrom(single) : null;
+          if (value == null) continue;
+          if (state.beginEpisode == null) {
+            state.beginEpisode = value;
+          } else if (value > state.beginEpisode) {
+            state.endEpisode = value;
+            if (isFile && (state.endEpisode - state.beginEpisode) > 1) state.endEpisode = null;
+          }
+        }
+      } else if (/^\d+$/.test(token)) {
+        if (state.beginEpisode != null && state.endEpisode == null && token.length < 5
+          && Number(token) > state.beginEpisode && lastTokenType === 'episode') {
+          state.endEpisode = Number(token);
+          if (isFile && (state.endEpisode - state.beginEpisode) > 1) state.endEpisode = null;
+          continueFlag = false;
+          state.isTv = true;
+        } else if (state.beginEpisode == null && token.length > 1 && token.length < 4
+          && lastTokenType !== 'year' && lastTokenType !== 'videoencode' && token !== unknownName) {
+          state.beginEpisode = Number(token);
+          lastTokenType = 'episode';
+          continueFlag = false;
+          stopName = true;
+          state.isTv = true;
+        } else if (lastTokenType === 'EPISODE' && state.beginEpisode == null && token.length < 5) {
+          state.beginEpisode = Number(token);
+          lastTokenType = 'episode';
+          continueFlag = false;
+          stopName = true;
+          state.isTv = true;
+        }
+      } else if (token.toUpperCase() === 'EPISODE') {
+        lastTokenType = 'EPISODE';
+      }
+    }
+
+    // 资源类型（WEB-DL/BluRay 组合词，用于停名 + 组合判定）
+    if (continueFlag && name()) {
+      if (token.toUpperCase() === 'DL' && lastTokenType === 'source' && lastToken === 'WEB') {
+        source = 'WEB-DL';
+        continueFlag = false;
+      } else if (token.toUpperCase() === 'RAY' && lastTokenType === 'source' && lastToken === 'BLU') {
+        source = source === 'UHD' ? 'UHD BluRay' : 'BluRay';
+        continueFlag = false;
+      } else if (token.toUpperCase() === 'WEBDL') {
+        source = 'WEB-DL';
+        continueFlag = false;
+      } else if (token.toUpperCase() === 'REMUX' && source === 'BluRay') {
+        source = 'BluRay REMUX';
+        continueFlag = false;
+      } else if (token.toUpperCase() === 'BLURAY' && source === 'UHD') {
+        source = 'UHD BluRay';
+        continueFlag = false;
+      } else {
+        const sourceMatch = SM_SOURCE_RE.exec(token);
+        if (sourceMatch) {
+          lastTokenType = 'source';
+          continueFlag = false;
+          stopName = true;
+          if (!source) source = sourceMatch[0];
+          lastToken = source.toUpperCase();
+        } else {
+          const effectMatch = SM_EFFECT_RE.exec(token);
+          if (effectMatch) {
+            lastTokenType = 'effect';
+            continueFlag = false;
+            stopName = true;
+            lastToken = effectMatch[0].toUpperCase();
+          }
+        }
+      }
+    }
+
+    // 视频编码（仅用于停名与 videoencode 标记，具体值仍由 technicalMetadata 提取）
+    if (continueFlag && name() && (state.year || state.beginSeason != null || state.beginEpisode != null || lastTokenType === 'pix' || source)) {
+      if (SM_VIDEO_ENCODE_RE.test(token)) {
+        continueFlag = false;
+        stopName = true;
+        lastTokenType = 'videoencode';
+        lastToken = token.toUpperCase();
+      } else if (['H', 'X'].includes(token.toUpperCase())) {
+        continueFlag = false;
+        stopName = true;
+        lastTokenType = 'videoencode';
+        lastToken = token.toUpperCase();
+      } else if (['264', '265'].includes(token) && lastTokenType === 'videoencode' && ['H', 'X'].includes(lastToken)) {
+        continueFlag = false;
+      } else if (token.toUpperCase() === '10BIT') {
+        lastTokenType = 'videoencode';
+        continueFlag = false;
+      }
+    }
+
+    // 音频编码
+    if (continueFlag && name() && (state.year || state.beginSeason != null || state.beginEpisode != null || lastTokenType === 'pix' || source)) {
+      const audioMatch = SM_AUDIO_ENCODE_RE.exec(token);
+      if (audioMatch) {
+        continueFlag = false;
+        stopName = true;
+        lastTokenType = 'audioencode';
+        lastToken = audioMatch[0].toUpperCase();
+      } else if (/^\d+$/.test(token) && lastTokenType === 'audioencode') {
+        lastToken = token;
+      }
+    }
+  }
+
+  // 名称收尾：去干扰词，过短纯数字标题按集处理
+  const fixName = (rawName) => {
+    if (!rawName) return rawName;
+    let fixed = rawName.replace(NAME_NOSTRING_RE, '').replace(/\s+/g, ' ').trim();
+    if (/^\d+$/.test(fixed) && Number(fixed) < 1800 && !state.year && state.beginSeason == null) {
+      if (state.beginEpisode == null) {
+        state.beginEpisode = Number(fixed);
+        state.isTv = true;
+      }
+      fixed = '';
+    }
+    return fixed || null;
+  };
+  state.cnName = fixName(state.cnName);
+  state.enName = fixName(state.enName);
+  if (state.part && state.part.toUpperCase() === 'PART') state.part = null;
+  return state;
+}
+
+/** 中文季集副标题识别（第x季/第x-x集/全x集/x集全/01-26Fin），对齐 MoviePilot init_subtitle。 */
+function applyChineseSeasonEpisode(text, state) {
+  const padded = ` ${String(text || '')} `;
+  const episodeTitle = /Episode\s+(\d{1,4})/i.exec(padded);
+  if (episodeTitle) {
+    const episode = Number(episodeTitle[1]);
+    if (episode < 10000 && state.beginEpisode == null) {
+      state.beginEpisode = episode;
+      state.isTv = true;
+    }
+    return;
+  }
+  if (/[全第季集话話期幕]/.test(padded)) {
+    const seasonAll = SUBTITLE_SEASON_ALL_RE.exec(padded);
+    if (seasonAll && state.beginSeason == null && state.beginEpisode == null) {
+      const total = chineseNumeral(seasonAll[1] || seasonAll[2]);
+      if (total) {
+        state.beginSeason = 1;
+        state.endSeason = total > 1 ? total : null;
+        state.isTv = true;
+      }
+      return;
+    }
+    const season = SUBTITLE_SEASON_RE.exec(padded);
+    if (season) {
+      const value = season[1].toUpperCase().replaceAll('S', '').trim();
+      const parts = value.split('-');
+      const begin = chineseNumeral(parts[0]);
+      const end = parts.length > 1 ? chineseNumeral(parts[1]) : null;
+      if (begin != null && begin <= 100 && (end == null || end <= 100)) {
+        if (state.beginSeason == null) state.beginSeason = begin;
+        if (state.beginSeason != null && state.endSeason == null && end != null && end !== state.beginSeason) state.endSeason = end;
+        state.isTv = true;
+      }
+    }
+    const between = SUBTITLE_EPISODE_BETWEEN_RE.exec(padded);
+    if (between) {
+      const begin = chineseNumeral(between[1]);
+      const end = chineseNumeral(between[2]);
+      if (begin != null && end != null && begin < 10000 && end < 10000) {
+        if (state.beginEpisode == null) state.beginEpisode = begin;
+        if (state.beginEpisode != null && state.endEpisode == null && end !== state.beginEpisode) state.endEpisode = end;
+        state.isTv = true;
+        return;
+      }
+    }
+    const episode = SUBTITLE_EPISODE_RE.exec(padded);
+    if (episode) {
+      const value = episode[1].toUpperCase().replaceAll('E', '').replaceAll('P', '').trim();
+      const parts = value.split('-');
+      const begin = chineseNumeral(parts[0]);
+      const end = parts.length > 1 ? chineseNumeral(parts[1]) : null;
+      if (begin != null && begin < 10000) {
+        if (state.beginEpisode == null) state.beginEpisode = begin;
+        if (state.beginEpisode != null && state.endEpisode == null && end != null && end !== state.beginEpisode) state.endEpisode = end;
+        state.isTv = true;
+        return;
+      }
+    }
+    const episodeAll = SUBTITLE_EPISODE_ALL_RE.exec(padded);
+    if (episodeAll) {
+      state.isTv = true;
+      return;
+    }
+  }
+  const rangeFin = EPISODE_RANGE_FIN_RE.exec(padded);
+  if (rangeFin) {
+    const begin = Number(rangeFin[1]);
+    const end = Number(rangeFin[2]);
+    if (begin >= 1 && begin <= end && end < 10000 && !(begin >= 1900 && end <= 2155) && state.beginEpisode == null) {
+      state.beginEpisode = begin;
+      state.endEpisode = end;
+      state.isTv = true;
+    }
+  }
+}
+
+const EMBEDDED_TMDB_RE = /[{[(【]?\s*tmdb(?:id)?\s*[-=＝:：]?\s*(\d{1,10})\s*[}\])】]?/i;
+
 export function parseMediaName(value, options = {}) {
-  const rawOriginal = stemOf(value);
+  const rawName = pathName(value);
+  const rawExtension = path.extname(rawName).toLowerCase();
+  const isFile = VIDEO_EXTENSIONS.has(rawExtension) || SUBTITLE_EXTENSIONS.has(rawExtension) || AUDIO_EXTENSIONS.has(rawExtension);
+  // 只剥真实媒体扩展名：目录名“赌金.Gold Land (2026) [tmdbid-1]”最后一个
+  // 点后的整段不是扩展名，盲剥会把标题和内嵌 ID 一起丢掉。
+  const rawOriginal = isFile ? stemOf(value) : rawName;
   const auxiliary = applyAuxiliaryRecognition(rawOriginal, options);
-  const original = auxiliary.value || rawOriginal;
+  let original = auxiliary.value || rawOriginal;
+  // HDHive/Emby 风格的内嵌 TMDB ID：{tmdb-123}、{tmdbid=123}、[tmdb-123]、-Tmdb123 等
+  let embeddedTmdbId = null;
+  const tmdbTag = EMBEDDED_TMDB_RE.exec(original);
+  if (tmdbTag) {
+    const parsedId = Number(tmdbTag[1]);
+    if (Number.isInteger(parsedId) && parsedId > 0) embeddedTmdbId = parsedId;
+    original = normalizeSpaces(`${original.slice(0, tmdbTag.index)} ${original.slice(tmdbTag.index + tmdbTag[0].length)}`) || original;
+  }
   const hint = cleanText(options.media_type).toLowerCase();
-  const technical = stripTechnicalBrackets(original);
-  const numbers = tvNumbers(technical, hint);
-  const yearMatch = /(?:^|[^0-9])(19\d{2}|20\d{2}|21\d{2})(?:$|[^0-9pP])/.exec(technical);
-  const year = options.year == null ? (yearMatch ? Number(yearMatch[1]) : null) : Number(options.year);
-  const cutIndexes = [numbers.marker_index, yearMatch?.index ?? -1].filter((index) => index >= 0);
-  let titleSource = cutIndexes.length ? technical.slice(0, Math.min(...cutIndexes)) : technical;
-  titleSource = titleSource.replace(/(?:^|[ ._\-])(?:Season|S)[ ._\-]?\d{1,3}(?:$|[ ._\-])/i, ' ');
-  let title = cleanTitle(titleSource);
+  const preclean = precleanMediaTitle(original);
+  const state = parseNameTokens(preclean, { isFile });
+  // 中文季集与完结区间标记（token 流无法覆盖的中文表达；用原始串保留括号内容）
+  if (state.beginSeason == null || state.beginEpisode == null) applyChineseSeasonEpisode(original, state);
+  // 兼容 1x02 / Season x Episode y 等旧格式
+  if (state.beginEpisode == null) {
+    const legacy = /(?:^|[^0-9])(\d{1,3})x(\d{1,4})(?:[ ._\-]*(?:x|-)(\d{1,4}))?(?:$|[^0-9])/i.exec(preclean)
+      || /Season[ ._\-]*(\d{1,3})[^0-9]{0,12}(?:Episode|EP?)[ ._\-]*(\d{1,4})(?:[ ._\-]*(?:-|EP?)(\d{1,4}))?/i.exec(preclean);
+    if (legacy) {
+      state.beginSeason = state.beginSeason ?? Number(legacy[1]);
+      state.beginEpisode = Number(legacy[2]);
+      state.endEpisode = legacy[3] ? Number(legacy[3]) : state.endEpisode;
+      state.isTv = true;
+    }
+  }
+  // 动漫“- 05”集号（确定为剧集时）
+  if (state.beginEpisode == null && (hint === 'tv' || state.isTv)) {
+    const anime = /(?:^|\s)[\-–—]\s*(\d{1,4})(?:v\d+)?(?:\s|$)/i.exec(original);
+    if (anime) {
+      state.beginEpisode = Number(anime[1]);
+      state.isTv = true;
+    }
+  }
+  const cnName = state.cnName;
+  const enName = state.enName;
+  let title = cnName && isAllChineseText(cnName) ? cnName : (enName || cnName || '');
   if (!title || /^(?:season|episode|ep|complete|disc|disk|part)\s*\d*$/i.test(title)) title = cleanTitle(options.fallback_title || '');
+  const year = options.year == null ? state.year : Number(options.year);
   const forcedSeason = options.season === '' || options.season == null ? null : Number(options.season);
   const forcedEpisode = options.episode === '' || options.episode == null ? null : Number(options.episode);
   const forcedEpisodeEnd = options.episode_end === '' || options.episode_end == null ? null : Number(options.episode_end);
-  const season = forcedSeason ?? auxiliary.directives.season ?? numbers.season;
-  const episode = forcedEpisode ?? auxiliary.directives.episode ?? numbers.episode;
-  const episodeEnd = forcedEpisodeEnd ?? numbers.episode_end;
-  const mediaType = hint || auxiliary.directives.media_type || ((episode != null || numbers.season != null) ? 'tv' : 'movie');
+  const season = forcedSeason ?? auxiliary.directives.season ?? state.beginSeason;
+  const episode = forcedEpisode ?? auxiliary.directives.episode ?? state.beginEpisode;
+  const episodeEnd = forcedEpisodeEnd ?? state.endEpisode;
+  const mediaType = hint || auxiliary.directives.media_type || ((episode != null || state.beginSeason != null || state.isTv) ? 'tv' : 'movie');
   return {
     original,
     title,
+    cn_name: cnName || '',
+    en_name: enName || '',
     year: Number.isInteger(year) ? year : null,
     media_type: mediaType,
     season: Number.isInteger(season) ? season : null,
     episode: Number.isInteger(episode) ? episode : null,
     episode_end: Number.isInteger(episodeEnd) ? episodeEnd : null,
-    tmdb_id: Number.isInteger(auxiliary.directives.tmdb_id) ? auxiliary.directives.tmdb_id : null,
+    tmdb_id: Number.isInteger(auxiliary.directives.tmdb_id) ? auxiliary.directives.tmdb_id : embeddedTmdbId,
     edition: releaseEdition(original),
     quality: releaseQuality(original),
-    part: releasePart(original),
+    part: releasePart(original) ?? (state.part ? state.part.replace(/^(?:DISC|DISK|DVD)/i, 'CD').replace(/^PART/i, 'Part') : null),
     ...technicalMetadata(original, options),
   };
 }
@@ -603,6 +1141,18 @@ function mostUsefulTitle(parsedItems, fallback) {
   return [...counts.values()].sort((left, right) => right.count - left.count || right.title.length - left.title.length)[0]?.title || fallback;
 }
 
+/** 中文名、英文名分别取众数，作为 TMDB 的备用搜索名（中文优先）。 */
+function titleCandidatesFrom(parsedItems, group) {
+  const names = [];
+  const push = (value) => {
+    const text = cleanText(value);
+    if (text && !names.some((item) => normalizeSearchTitle(item) === normalizeSearchTitle(text))) names.push(text);
+  };
+  push(mostUsefulTitle(parsedItems.map((item) => ({ title: item.cn_name })), group?.cn_name || ''));
+  push(mostUsefulTitle(parsedItems.map((item) => ({ title: item.en_name })), group?.en_name || ''));
+  return names;
+}
+
 function parentSeason(filePath, candidatePath) {
   const relative = path.relative(candidatePath, path.dirname(filePath));
   const match = relative.match(/(?:^|[\\/])(?:Season|S)[ ._\-]?(\d{1,3})(?:$|[\\/])/i)
@@ -679,6 +1229,7 @@ export async function analyzeMediaCandidate(candidatePath, overrides = {}, setti
     candidate_type: candidateStat.isFile() ? 'file' : 'dir',
     media_type: mediaType,
     title,
+    title_candidates: titleCandidatesFrom(preliminary.map((item) => item.parsed), group),
     year: Number.isInteger(year) ? year : null,
     tmdb_id: group.tmdb_id || preliminary.find((item) => item.parsed.tmdb_id)?.parsed.tmdb_id || null,
     videos,
@@ -800,6 +1351,14 @@ export function analyzeCloudMediaCandidate({ candidate, entries = [] }, override
     }),
     extra_kind: extraKind(entry.path),
   }));
+  // 集偏移：识别出的集号统一加偏移量（可为负），用于源命名与 TMDB 集数错位的剧集
+  const episodeOffset = Number(overrides.episode_offset || 0);
+  if (Number.isInteger(episodeOffset) && episodeOffset !== 0) {
+    for (const video of videos) {
+      if (video.parsed.episode != null) video.parsed.episode = Math.max(0, video.parsed.episode + episodeOffset);
+      if (video.parsed.episode_end != null) video.parsed.episode_end = Math.max(0, video.parsed.episode_end + episodeOffset);
+    }
+  }
   const videoByPath = new Map(videos.map((video) => [video.source, video]));
   const sidecars = [...subtitles.map((entry) => ({ entry, kind: 'subtitle' })), ...audio.map((entry) => ({ entry, kind: 'audio' }))]
     .map(({ entry, kind }) => {
@@ -823,6 +1382,7 @@ export function analyzeCloudMediaCandidate({ candidate, entries = [] }, override
     candidate_type: root.is_directory ? 'dir' : 'file',
     media_type: mediaType,
     title,
+    title_candidates: titleCandidatesFrom(preliminary.map((item) => item.parsed), group),
     year: Number.isInteger(year) ? year : null,
     tmdb_id: group.tmdb_id || preliminary.find((item) => item.parsed.tmdb_id)?.parsed.tmdb_id || null,
     videos,
@@ -1066,6 +1626,37 @@ export function createTmdbClient({ apiKey, language = 'zh-CN', imageLanguage = '
       .map((item) => normalizeTmdbCandidate(item, mediaType, query, imageUrl))
       .sort((left, right) => right.score - left.score || right.popularity - left.popularity);
   }
+  /** /search/multi：类型未知或电影/剧集回退都失败时使用，电影排前、按年份降序。 */
+  async function searchMulti(query) {
+    const payload = await request('search/multi', { query: query.title, include_adult: includeAdult, page: 1 });
+    return (payload.results || [])
+      .filter((item) => item.media_type === 'movie' || item.media_type === 'tv')
+      .slice(0, 20)
+      .map((item) => normalizeTmdbCandidate(item, item.media_type, query, imageUrl))
+      .sort((left, right) => {
+        const leftKey = `${left.media_type === 'movie' ? 1 : 0}${left.release_date || left.first_air_date || '0000-00-00'}`;
+        const rightKey = `${right.media_type === 'movie' ? 1 : 0}${right.release_date || right.first_air_date || '0000-00-00'}`;
+        return rightKey.localeCompare(leftKey);
+      });
+  }
+  /** 拉取 TMDB 的别名与多语言译名，用于第二轮精确匹配。 */
+  async function alternativeNames(mediaType, tmdbId) {
+    const type = mediaType === 'tv' ? 'tv' : 'movie';
+    const payload = await request(`${type}/${Number(tmdbId)}`, { append_to_response: 'alternative_titles,translations' });
+    const names = [];
+    const push = (value) => {
+      const text = cleanText(value);
+      if (text && !names.includes(text)) names.push(text);
+    };
+    push(payload.title || payload.name);
+    push(payload.original_title || payload.original_name);
+    const alternatives = type === 'movie'
+      ? payload.alternative_titles?.titles || []
+      : payload.alternative_titles?.results || [];
+    for (const item of alternatives) push(item?.title);
+    for (const item of payload.translations?.translations || []) push(item?.data?.title || item?.data?.name);
+    return names;
+  }
   async function details(mediaType, tmdbId) {
     const type = mediaType === 'tv' ? 'tv' : 'movie';
     const payload = await request(`${type}/${Number(tmdbId)}`, {
@@ -1099,7 +1690,7 @@ export function createTmdbClient({ apiKey, language = 'zh-CN', imageLanguage = '
       })),
     };
   }
-  return { request, test, search, details, season, imageUrl };
+  return { request, test, search, searchMulti, alternativeNames, details, season, imageUrl };
 }
 
 function segmentedSearchTitles(value) {
@@ -1125,6 +1716,110 @@ function isExactTmdbCandidate(candidate, query) {
     && (!query.year || !candidate?.year || Number(query.year) === Number(candidate.year));
 }
 
+/** 名称精确比较（MoviePilot __compare_names 语义）：去特殊字符、大小写不敏感后全等。 */
+function exactNameHit(name, candidate, { yearTolerance = 1, year = null } = {}) {
+  const target = normalizeSearchTitle(name);
+  if (!target) return false;
+  const titles = [candidate?.title, candidate?.original_title].map(normalizeSearchTitle).filter(Boolean);
+  if (!titles.includes(target)) return false;
+  if (!year || !candidate?.year) return true;
+  return Math.abs(Number(year) - Number(candidate.year)) <= yearTolerance;
+}
+
+function dedupeCandidates(lists) {
+  const unique = new Map();
+  for (const candidate of lists.flat()) {
+    const key = `${candidate.media_type}:${candidate.tmdb_id}`;
+    if (!unique.has(key)) unique.set(key, candidate);
+  }
+  return [...unique.values()];
+}
+
+/**
+ * 单个搜索名的 TMDB 匹配（MoviePilot _search_by_name 策略）：
+ * 剧集=带年份搜剧集→去年份重试；电影=电影→剧集→multi 兜底。
+ * 返回 { hit, candidates }：hit 是 TMDB 标题/原名精确命中（TMDB 级别优先）。
+ */
+async function searchOneName(client, name, query) {
+  const rounds = [];
+  if (query.media_type === 'tv') {
+    rounds.push({ media_type: 'tv', year: query.year });
+    if (query.year) rounds.push({ media_type: 'tv', year: null });
+  } else {
+    rounds.push({ media_type: 'movie', year: query.year });
+    rounds.push({ media_type: 'tv', year: query.year });
+    rounds.push({ media_type: 'multi', year: null });
+  }
+  const collected = [];
+  for (const round of rounds) {
+    const roundQuery = { title: name, year: round.year, media_type: round.media_type === 'tv' ? 'tv' : 'movie' };
+    const results = round.media_type === 'multi'
+      ? await client.searchMulti({ title: name, year: query.year, media_type: query.media_type })
+      : await client.search(roundQuery);
+    collected.push(results);
+    // TMDB 级别优先：标题/原始标题精确命中直接采用（年份允许 ±1）
+    const ordered = round.media_type === 'multi'
+      ? results
+      : [...results].sort((left, right) => String(right.release_date || right.first_air_date || '').localeCompare(String(left.release_date || left.first_air_date || '')));
+    const hit = ordered.find((candidate) => exactNameHit(name, candidate, { year: round.year ?? query.year }));
+    if (hit) return { hit, candidates: dedupeCandidates(collected) };
+  }
+  return { hit: null, candidates: dedupeCandidates(collected) };
+}
+
+/**
+ * 强制 TMDB ID 的类型消歧（MoviePilot _disambiguate_by_meta 语义）：
+ * 内嵌 ID 不带类型，电影/剧集都查一遍，用标题与年份评分选择。
+ */
+async function detailsWithTypeFallback(client, mediaType, tmdbId, { names = [], year = null, typeForced = false } = {}) {
+  const primary = mediaType === 'tv' ? 'tv' : 'movie';
+  const secondary = primary === 'tv' ? 'movie' : 'tv';
+  const fetchDetails = async (type) => {
+    try {
+      const details = await client.details(type, tmdbId);
+      return details?.tmdb_id ? details : null;
+    } catch {
+      return null;
+    }
+  };
+  const primaryDetails = await fetchDetails(primary);
+  if (typeForced) {
+    if (!primaryDetails) throw new Error(`TMDB 未找到该 ${primary === 'tv' ? '剧集' : '电影'} ID：${tmdbId}`);
+    return { mediaType: primary, details: primaryDetails };
+  }
+  const secondaryDetails = await fetchDetails(secondary);
+  if (primaryDetails && !secondaryDetails) return { mediaType: primary, details: primaryDetails };
+  if (!primaryDetails && secondaryDetails) return { mediaType: secondary, details: secondaryDetails };
+  if (!primaryDetails && !secondaryDetails) throw new Error(`TMDB 未找到该 ID：${tmdbId}`);
+  const score = (details) => {
+    let value = 0;
+    const titles = [details.title, details.original_title].map(normalizeSearchTitle).filter(Boolean);
+    if (names.some((name) => titles.includes(normalizeSearchTitle(name)))) value += 2;
+    if (year && details.year && Math.abs(Number(details.year) - Number(year)) <= 1) value += 1;
+    return value;
+  };
+  return score(secondaryDetails) > score(primaryDetails)
+    ? { mediaType: secondary, details: secondaryDetails }
+    : { mediaType: primary, details: primaryDetails };
+}
+
+/** 第二轮：用 TMDB 别名/译名精确匹配（只查前几个候选，避免放大请求量）。 */
+async function matchByAlternativeNames(client, names, candidates, limit = 5) {
+  for (const candidate of candidates.slice(0, limit)) {
+    let aliases;
+    try {
+      aliases = await client.alternativeNames(candidate.media_type, candidate.tmdb_id);
+    } catch {
+      continue;
+    }
+    const normalized = aliases.map(normalizeSearchTitle).filter(Boolean);
+    for (const name of names) {
+      if (normalized.includes(normalizeSearchTitle(name))) return candidate;
+    }
+  }
+  return null;
+}
+
 export async function resolveTmdbMatch({ analysis, client, settings = DEFAULT_ORGANIZER_SETTINGS, overrides = {} }) {
   const mediaType = cleanText(overrides.media_type || analysis.media_type) === 'tv' ? 'tv' : 'movie';
   const query = {
@@ -1132,32 +1827,70 @@ export async function resolveTmdbMatch({ analysis, client, settings = DEFAULT_OR
     year: overrides.year == null || overrides.year === '' ? analysis.year : Number(overrides.year),
     media_type: mediaType,
   };
+  // 中文名/英文名分别搜索（用户手动输入名称时只用输入值）
+  const searchNames = cleanText(overrides.title)
+    ? [cleanText(overrides.title)]
+    : [...new Set([query.title, ...(analysis.title_candidates || [])].map(cleanText).filter(Boolean))];
   const recognizedTmdbId = analysis.tmdb_id ?? analysis.query?.tmdb_id;
   if (!query.title && overrides.tmdb_id == null && recognizedTmdbId == null) return { ready: false, error_code: 'title_required', message: '无法从文件名提取媒体名称，请输入名称或 TMDB ID', query, candidates: [] };
   let candidates = [];
   let selected = null;
   const forcedId = overrides.tmdb_id == null || overrides.tmdb_id === '' ? Number(recognizedTmdbId) || null : Number(overrides.tmdb_id);
   if (forcedId) {
-    const details = await client.details(mediaType, forcedId);
-    selected = { tmdb_id: details.tmdb_id, media_type: mediaType, title: details.title, original_title: details.original_title, year: details.year, release_date: details.release_date, overview: details.overview, vote_average: details.vote_average, popularity: 0, poster_path: details.poster_path, poster_url: details.poster_url, score: 1, forced: true };
+    // 人工同时指定了类型 + ID 时只查指定类型；文件名内嵌 ID 不带类型，需要消歧
+    const typeForced = Boolean(cleanText(overrides.media_type)) && Number(overrides.tmdb_id) > 0;
+    const resolved = await detailsWithTypeFallback(client, mediaType, forcedId, {
+      names: searchNames,
+      year: query.year,
+      typeForced,
+    });
+    const details = resolved.details;
+    query.media_type = resolved.mediaType;
+    selected = { tmdb_id: details.tmdb_id, media_type: resolved.mediaType, title: details.title, original_title: details.original_title, year: details.year, release_date: details.release_date, overview: details.overview, vote_average: details.vote_average, popularity: 0, poster_path: details.poster_path, poster_url: details.poster_url, score: 1, forced: true };
     candidates = [selected];
   } else {
-    candidates = await client.search(query);
-    if (!candidates.length && settings.word_segment_search !== false) {
-      const extra = [];
-      for (const title of segmentedSearchTitles(query.title)) {
-        extra.push(...await client.search({ ...query, title }));
-        if (extra.length >= 20) break;
+    const collected = [];
+    for (const name of searchNames) {
+      const { hit, candidates: roundCandidates } = await searchOneName(client, name, query);
+      collected.push(roundCandidates);
+      if (hit) {
+        selected = hit;
+        break;
       }
-      const unique = new Map(extra.map((candidate) => [`${candidate.media_type}:${candidate.tmdb_id}`, candidate]));
-      candidates = [...unique.values()].sort((left, right) => right.score - left.score || right.popularity - left.popularity).slice(0, 20);
     }
-    const minimumScore = Number(settings.minimum_match_score ?? DEFAULT_ORGANIZER_SETTINGS.minimum_match_score);
-    const first = candidates[0];
-    const second = candidates[1];
-    const exact = first && isExactTmdbCandidate(first, query);
-    if (settings.similarity_match === false) selected = candidates.find((candidate) => isExactTmdbCandidate(candidate, query)) || null;
-    else if (first && first.score >= minimumScore && (exact || !second || first.score - second.score >= 0.06)) selected = first;
+    candidates = dedupeCandidates(collected);
+    // 第二轮：别名/译名精确匹配
+    if (!selected && candidates.length) {
+      selected = await matchByAlternativeNames(client, searchNames, candidates);
+    }
+    // TMDB 排序优先（HDHive 语义）：有年份时信任 TMDB 相关度排序，取 ±1 年窗口内第一个
+    if (!selected && query.year && candidates.length) {
+      selected = candidates.find((candidate) => candidate.year && Math.abs(Number(candidate.year) - Number(query.year)) <= 1) || null;
+    }
+    // 分词回退：整名搜不到时拆中文/英文/括号段再搜
+    if (!selected && !candidates.length && settings.word_segment_search !== false) {
+      const extra = [];
+      for (const name of searchNames) {
+        for (const title of segmentedSearchTitles(name)) {
+          extra.push(...await client.search({ ...query, title }));
+          if (extra.length >= 20) break;
+        }
+      }
+      candidates = dedupeCandidates([extra]).sort((left, right) => right.score - left.score || right.popularity - left.popularity).slice(0, 20);
+      selected = candidates.find((candidate) => searchNames.some((name) => exactNameHit(name, candidate, { year: query.year }))) || null;
+    }
+    // 最后回退：本地相似度评分门槛（保持原有可调设置与人工复核链路）
+    if (!selected) {
+      candidates = candidates
+        .map((candidate) => ({ ...candidate, score: Math.max(...searchNames.map((name) => scoreTmdbCandidate({ title: name, year: query.year }, candidate))) }))
+        .sort((left, right) => right.score - left.score || right.popularity - left.popularity);
+      const minimumScore = Number(settings.minimum_match_score ?? DEFAULT_ORGANIZER_SETTINGS.minimum_match_score);
+      const first = candidates[0];
+      const second = candidates[1];
+      const exact = first && isExactTmdbCandidate(first, query);
+      if (settings.similarity_match === false) selected = candidates.find((candidate) => isExactTmdbCandidate(candidate, query)) || null;
+      else if (first && first.score >= minimumScore && (exact || !second || first.score - second.score >= 0.06)) selected = first;
+    }
     if (!selected) {
       return {
         ready: false,
@@ -1168,8 +1901,11 @@ export async function resolveTmdbMatch({ analysis, client, settings = DEFAULT_OR
       };
     }
   }
-  const metadata = await client.details(mediaType, selected.tmdb_id);
-  if (mediaType === 'tv') {
+  // 精确命中可能来自电影→剧集/multi 回退，详情按选中项的实际类型拉取
+  const selectedType = cleanText(selected.media_type) === 'tv' ? 'tv' : (cleanText(selected.media_type) === 'movie' ? 'movie' : mediaType);
+  query.media_type = selectedType;
+  const metadata = await client.details(selectedType, selected.tmdb_id);
+  if (selectedType === 'tv') {
     const seasons = [...new Set(analysis.videos.map((video) => video.parsed.season).filter((value) => Number.isInteger(value)))];
     if (!seasons.length && overrides.season != null && overrides.season !== '') seasons.push(Number(overrides.season));
     for (const seasonNumber of seasons) {
@@ -1364,6 +2100,7 @@ function cleanRenderedSegment(value) {
     .replace(/\s+-\s+-\s+/g, ' - ')
     .replace(/(?:\s+-\s*)+$/g, '')
     .replace(/\.{2,}/g, '.')
+    .replace(/-+\./g, '.')
     .replace(/\s+/g, ' '));
 }
 
@@ -1395,6 +2132,52 @@ function cloudTargetKey(value) {
   return String(value || '').replaceAll('\\', '/').replace(/^\/+|\/+$/g, '').toLocaleLowerCase();
 }
 
+/**
+ * 洗版目标解析：在目标目录中找同一内容的旧版本，按优先级比较后决定
+ * 替换（action=upgrade，附带 replaces 清单）或压制跳过（suppressed）。
+ */
+async function resolveUpgradeTarget(relativePath, video, mediaType, settings, upgradeOptions, claimed, targetExists, listTargetChildren) {
+  const normalized = String(relativePath || '').replaceAll('\\', '/').replace(/^\/+|\/+$/g, '');
+  const key = cloudTargetKey(normalized);
+  if (claimed.has(key)) {
+    // 同一批内多个来源渲染出同一目标：退化为“保留两份”，避免相互覆盖。
+    return resolveCloudTarget(relativePath, video.source_id || video.source, 'rename', claimed, targetExists);
+  }
+  const parentRelative = path.posix.dirname(normalized) === '.' ? '' : path.posix.dirname(normalized);
+  const siblings = await listTargetChildren(parentRelative);
+  const versions = findExistingCloudVersions({ mediaType, parsed: video.parsed, entries: siblings, settings });
+  if (!versions.length) {
+    return resolveCloudTarget(relativePath, video.source_id || video.source, 'skip', claimed, targetExists);
+  }
+  let upgradedBy = null;
+  for (const version of versions) {
+    const verdict = compareMediaVersions({ parsed: video.parsed, size: video.size }, version, upgradeOptions);
+    if (verdict.winner !== 'next') {
+      claimed.add(key);
+      return {
+        target_relative: normalized,
+        action: 'skip',
+        exists: true,
+        existing_id: version.entry.id || null,
+        suppressed: true,
+        suppressed_by: verdict.criterion,
+        suppressed_existing: version.entry.name,
+      };
+    }
+    if (!upgradedBy) upgradedBy = verdict.criterion;
+  }
+  claimed.add(key);
+  const replaces = collectReplacedCloudFiles(versions, siblings);
+  return {
+    target_relative: normalized,
+    action: 'upgrade',
+    exists: versions.some((version) => cloudTargetKey(version.entry.name) === cloudTargetKey(path.posix.basename(normalized))),
+    existing_id: null,
+    replaces,
+    upgraded_by: upgradedBy,
+  };
+}
+
 async function resolveCloudTarget(relativePath, sourceIdentity, conflictPolicy, claimed, targetExists) {
   const normalized = String(relativePath || '').replaceAll('\\', '/').replace(/^\/+|\/+$/g, '');
   const key = cloudTargetKey(normalized);
@@ -1424,6 +2207,129 @@ async function resolveCloudTarget(relativePath, sourceIdentity, conflictPolicy, 
     return { target_relative: candidate, action: 'create', exists: false, existing_id: null, renamed_for_conflict: true };
   }
   throw new Error('目标目录同名文件过多，无法生成安全名称');
+}
+
+export const UPGRADE_CRITERIA = Object.freeze(['resolution', 'dynamic_range', 'release_group', 'size']);
+const UPGRADE_CRITERION_LABELS = Object.freeze({
+  resolution: '分辨率',
+  dynamic_range: '动态范围',
+  release_group: '制作组',
+  size: '文件大小',
+});
+
+export function upgradeCriterionLabel(value) {
+  return UPGRADE_CRITERION_LABELS[cleanText(value).toLowerCase()] || cleanText(value);
+}
+
+export function normalizeUpgradeCriteria(value) {
+  const source = Array.isArray(value) ? value : String(value || '').split(/[,，\n]/);
+  const normalized = [...new Set(source.map((item) => cleanText(item).toLowerCase()).filter((item) => UPGRADE_CRITERIA.includes(item)))];
+  return normalized.length ? normalized : [...UPGRADE_CRITERIA];
+}
+
+export function upgradeReleaseGroupList(value) {
+  const source = Array.isArray(value) ? value : String(value || '').split(/[,，\n]/);
+  return [...new Set(source.map((item) => cleanText(item).toLowerCase()).filter((item) => item && !item.startsWith('#')))].slice(0, 200);
+}
+
+const RESOLUTION_RANKS = Object.freeze({ '2160p': 4, '1080p': 3, '720p': 2, '480p': 1 });
+
+function resolutionRank(parsed) {
+  return RESOLUTION_RANKS[cleanText(parsed?.video_format).toLowerCase()] || 0;
+}
+
+function dynamicRangeRank(parsed) {
+  if (cleanText(parsed?.dolby_vision)) return 4;
+  const range = cleanText(parsed?.dynamic_range).toUpperCase();
+  if (range === 'HDR10+') return 3;
+  if (range === 'HDR10' || range === 'HDR') return 2;
+  if (range === 'HLG') return 1;
+  return 0;
+}
+
+function releaseGroupRank(parsed, priorities) {
+  const group = cleanText(parsed?.release_group).toLowerCase();
+  if (!group) return 0;
+  const index = priorities.indexOf(group);
+  return index >= 0 ? priorities.length - index : 0;
+}
+
+/**
+ * 洗版比较：按配置的优先级维度逐项比较，首个分出胜负的维度定结果。
+ * 双方参数形态为 { parsed, size }；全部持平视为同版本。
+ */
+export function compareMediaVersions(next, existing, { criteria, releaseGroups } = {}) {
+  const order = normalizeUpgradeCriteria(criteria);
+  const priorities = upgradeReleaseGroupList(releaseGroups);
+  for (const criterion of order) {
+    let left = 0;
+    let right = 0;
+    if (criterion === 'resolution') {
+      left = resolutionRank(next?.parsed);
+      right = resolutionRank(existing?.parsed);
+    } else if (criterion === 'dynamic_range') {
+      left = dynamicRangeRank(next?.parsed);
+      right = dynamicRangeRank(existing?.parsed);
+    } else if (criterion === 'release_group') {
+      if (!priorities.length) continue;
+      left = releaseGroupRank(next?.parsed, priorities);
+      right = releaseGroupRank(existing?.parsed, priorities);
+    } else if (criterion === 'size') {
+      left = Number(next?.size || 0);
+      right = Number(existing?.size || 0);
+    }
+    if (left > right) return { winner: 'next', criterion };
+    if (right > left) return { winner: 'existing', criterion };
+  }
+  return { winner: 'tie', criterion: null };
+}
+
+function sameEpisodeNumbers(left, right) {
+  const normalize = (value) => (value == null ? null : Number(value));
+  return normalize(left?.season) === normalize(right?.season)
+    && normalize(left?.episode) === normalize(right?.episode);
+}
+
+/**
+ * 在目标目录的既有条目中找出与新文件"同一内容"的旧版本视频：
+ * 电影 = 同一影片文件夹内同 part 的视频；剧集 = 同季同集。
+ */
+export function findExistingCloudVersions({ mediaType, parsed, entries = [], settings = DEFAULT_ORGANIZER_SETTINGS }) {
+  const options = auxiliaryParserOptions(settings);
+  const versions = [];
+  for (const entry of entries) {
+    if (!entry || entry.is_directory) continue;
+    const extension = path.posix.extname(String(entry.name || '')).toLowerCase();
+    if (!VIDEO_EXTENSIONS.has(extension)) continue;
+    const entryParsed = parseMediaName(entry.name, { ...options, media_type: mediaType });
+    if (mediaType === 'tv') {
+      if (!sameEpisodeNumbers(entryParsed, parsed)) continue;
+    } else if (cleanText(entryParsed.part).toLowerCase() !== cleanText(parsed?.part).toLowerCase()) {
+      continue;
+    }
+    versions.push({ entry, parsed: entryParsed, size: Number(entry.size || 0) });
+  }
+  return versions;
+}
+
+/** 被替换旧版本连同其同名前缀的字幕/NFO 等伴随文件一起清理。 */
+export function collectReplacedCloudFiles(versions, entries = []) {
+  const seen = new Set();
+  const replaces = [];
+  for (const version of versions) {
+    const stem = stemOf(String(version.entry.name || '')).toLowerCase();
+    for (const sibling of entries) {
+      if (!sibling || sibling.is_directory || !sibling.id || seen.has(sibling.id)) continue;
+      const extension = path.posix.extname(String(sibling.name || '')).toLowerCase();
+      const isVersionFile = sibling.id === version.entry.id;
+      const isSidecar = !VIDEO_EXTENSIONS.has(extension)
+        && stemOf(String(sibling.name || '')).toLowerCase().startsWith(stem);
+      if (!isVersionFile && !isSidecar) continue;
+      seen.add(sibling.id);
+      replaces.push({ id: sibling.id, name: sibling.name });
+    }
+  }
+  return replaces;
 }
 
 function commonTargetDirectory(paths) {
@@ -1478,7 +2384,7 @@ function enabledScrapeTypes(mapping) {
   return new Set(values.map((value) => cleanText(value).toLowerCase()));
 }
 
-export async function buildCloudNativePreview({ analysis, match, mapping, settings = DEFAULT_ORGANIZER_SETTINGS, mappingSignature, sourceSignature, targetExists = async () => null }) {
+export async function buildCloudNativePreview({ analysis, match, mapping, settings = DEFAULT_ORGANIZER_SETTINGS, mappingSignature, sourceSignature, targetExists = async () => null, listTargetChildren = async () => [] }) {
   if (!match.ready || !match.metadata) {
     return {
       success: false,
@@ -1504,6 +2410,10 @@ export async function buildCloudNativePreview({ analysis, match, mapping, settin
   const claimed = new Set();
   const items = [];
   const videoTargets = new Map();
+  const videoItems = new Map();
+  const upgradeOptions = { criteria: settings.upgrade_criteria, releaseGroups: settings.upgrade_release_groups };
+  // 洗版策略只作用于主视频；字幕/刮削产物遇同名默认跳过。
+  const generatedConflictPolicy = conflictPolicy === 'upgrade' ? 'skip' : conflictPolicy;
   for (const video of analysis.videos) {
     if (metadata.media_type === 'tv' && !video.extra_kind && (video.parsed.season == null || video.parsed.episode == null)) {
       items.push({ success: false, kind: 'video', source: video.source, source_id: video.source_id, target: '', target_relative: '', operation: transferType, action: 'error', exists: false, error_code: 'episode_required', message: '未识别到季集号，请人工填写季号/集号或调整文件名' });
@@ -1519,7 +2429,9 @@ export async function buildCloudNativePreview({ analysis, match, mapping, settin
       const extraDirectory = video.extra_kind === 'trailer' ? 'trailers' : 'extras';
       relative = path.posix.join(baseDirectory, extraDirectory, cleanRenderedSegment(video.source_name || path.posix.basename(video.source)));
     }
-    const planned = await resolveCloudTarget(relative, video.source_id || video.source, conflictPolicy, claimed, targetExists);
+    const planned = conflictPolicy === 'upgrade' && !video.extra_kind
+      ? await resolveUpgradeTarget(relative, video, metadata.media_type, settings, upgradeOptions, claimed, targetExists, listTargetChildren)
+      : await resolveCloudTarget(relative, video.source_id || video.source, video.extra_kind ? generatedConflictPolicy : conflictPolicy, claimed, targetExists);
     const item = {
       success: true,
       kind: video.extra_kind || 'video',
@@ -1535,18 +2447,38 @@ export async function buildCloudNativePreview({ analysis, match, mapping, settin
       episode: video.parsed.episode,
       episode_end: video.parsed.episode_end,
       ...planned,
-      message: planned.action === 'skip' ? '目标已存在，将跳过' : planned.renamed_for_conflict ? '目标冲突，已追加短标识' : '可执行',
+      message: planned.action === 'upgrade'
+        ? `洗版：${upgradeCriterionLabel(planned.upgraded_by)}更优，将替换 ${planned.replaces.map((entry) => entry.name).join('、')}`
+        : planned.suppressed
+          ? (planned.suppressed_by
+            ? `现有版本${upgradeCriterionLabel(planned.suppressed_by)}更优，已跳过（${planned.suppressed_existing}）`
+            : `已存在相同版本，已跳过（${planned.suppressed_existing}）`)
+          : planned.action === 'skip' ? '目标已存在，将跳过' : planned.renamed_for_conflict ? '目标冲突，已追加短标识' : '可执行',
     };
     items.push(item);
     videoTargets.set(video.source_id || video.source, item.target_relative);
+    videoItems.set(video.source_id || video.source, item);
   }
   if (mapping.sync_extras !== false) {
     for (const sidecar of analysis.sidecars) {
       const videoTarget = videoTargets.get(sidecar.video_source_id || sidecar.video_source);
       if (!videoTarget) continue;
+      const videoItem = videoItems.get(sidecar.video_source_id || sidecar.video_source);
       const extension = path.posix.extname(sidecar.source_name || sidecar.source).toLowerCase();
       const targetRelative = `${videoTarget.slice(0, -path.posix.extname(videoTarget).length)}${languageSuffix(sidecar.source)}${extension}`;
-      const planned = await resolveCloudTarget(targetRelative, sidecar.source_id || sidecar.source, conflictPolicy, claimed, targetExists);
+      let planned;
+      if (conflictPolicy === 'upgrade' && videoItem?.suppressed) {
+        const normalizedRelative = targetRelative.replaceAll('\\', '/').replace(/^\/+|\/+$/g, '');
+        claimed.add(cloudTargetKey(normalizedRelative));
+        planned = { target_relative: normalizedRelative, action: 'skip', exists: false, existing_id: null, suppressed: true };
+      } else if (conflictPolicy === 'upgrade' && videoItem?.action === 'upgrade') {
+        // 旧版本的伴随文件已随主视频列入替换清单；同名残留由执行期备份交换兜底。
+        const normalizedRelative = targetRelative.replaceAll('\\', '/').replace(/^\/+|\/+$/g, '');
+        claimed.add(cloudTargetKey(normalizedRelative));
+        planned = { target_relative: normalizedRelative, action: 'upgrade', exists: false, existing_id: null, replaces: [] };
+      } else {
+        planned = await resolveCloudTarget(targetRelative, sidecar.source_id || sidecar.source, generatedConflictPolicy, claimed, targetExists);
+      }
       items.push({
         success: true,
         kind: sidecar.kind,
@@ -1559,7 +2491,9 @@ export async function buildCloudNativePreview({ analysis, match, mapping, settin
         target_name: path.posix.basename(planned.target_relative),
         operation: transferType,
         ...planned,
-        message: planned.action === 'skip' ? '目标已存在，将跳过' : '跟随主视频整理',
+        message: planned.suppressed ? '主视频被现有版本压制，跟随跳过'
+          : planned.action === 'upgrade' ? '跟随主视频洗版'
+            : planned.action === 'skip' ? '目标已存在，将跳过' : '跟随主视频整理',
       });
     }
   }
@@ -1567,7 +2501,7 @@ export async function buildCloudNativePreview({ analysis, match, mapping, settin
   const mediaRoot = mediaRootForCloudTargets(metadata.media_type, mainVideos);
   const scrapeTypes = enabledScrapeTypes(mapping);
   const addGenerated = async ({ relative, kind, operation, source = null, generator = null, imageRole = null, season = null, episode = null, message }) => {
-    const planned = await resolveCloudTarget(relative, source || `${kind}:${metadata.tmdb_id}:${season ?? ''}:${episode ?? ''}`, conflictPolicy, claimed, targetExists);
+    const planned = await resolveCloudTarget(relative, source || `${kind}:${metadata.tmdb_id}:${season ?? ''}:${episode ?? ''}`, generatedConflictPolicy, claimed, targetExists);
     items.push({ success: true, kind, source, source_id: null, target: cloudPreviewTarget(mapping, planned.target_relative), target_parent_relative: path.posix.dirname(planned.target_relative) === '.' ? '' : path.posix.dirname(planned.target_relative), target_name: path.posix.basename(planned.target_relative), operation, generator, image_role: imageRole, season, episode, ...planned, message });
   };
   if (scrapeTypes.size && mediaRoot) {
@@ -1596,9 +2530,11 @@ export async function buildCloudNativePreview({ analysis, match, mapping, settin
   }
   const failed = items.filter((item) => !item.success).length;
   const skipped = items.filter((item) => item.action === 'skip').length;
+  const upgraded = items.filter((item) => item.action === 'upgrade' && item.kind === 'video').length;
+  const suppressed = items.filter((item) => item.suppressed).length;
   const probeWarnings = Array.isArray(analysis.media_probe_warnings) ? analysis.media_probe_warnings : [];
   const warnings = skipped + analysis.ignored_samples.length + probeWarnings.length + Object.values(metadata.seasons || {}).filter((season) => season.error).length;
-  const message = failed ? `有 ${failed} 项无法生成目标，请人工修正` : `已生成 ${items.length} 项云端整理预览${warnings ? `，${warnings} 项提示` : ''}`;
+  const message = failed ? `有 ${failed} 项无法生成目标，请人工修正` : `已生成 ${items.length} 项云端整理预览${upgraded ? `，洗版替换 ${upgraded} 项` : ''}${warnings ? `，${warnings} 项提示` : ''}`;
   return {
     success: failed === 0 && mainVideos.length > 0,
     engine: NATIVE_ENGINE_VERSION,
@@ -1618,7 +2554,7 @@ export async function buildCloudNativePreview({ analysis, match, mapping, settin
     error_code: failed ? items.find((item) => !item.success)?.error_code || 'preview_failed' : null,
     message,
     ignored_samples: analysis.ignored_samples,
-    data: { summary: { total: items.length, success: items.length - failed, failed, warnings, skipped }, items },
+    data: { summary: { total: items.length, success: items.length - failed, failed, warnings, skipped, upgraded, suppressed }, items },
   };
 }
 

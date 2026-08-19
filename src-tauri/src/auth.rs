@@ -120,6 +120,7 @@ pub(crate) fn invalidate_auth_session(app: &tauri::AppHandle, state: &SharedStat
     };
     let result = clear_persisted_auth_session(&db_path);
     emit_state(app, state);
+    crate::telegram::notify_auth_expired("登录态已失效，请重新扫码登录");
     result
 }
 

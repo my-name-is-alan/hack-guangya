@@ -1090,33 +1090,80 @@ pub(crate) async fn pending_upload_recovery_loop(app: tauri::AppHandle, state: S
 }
 
 
-pub(crate) fn collect_manual_uploads(path: &Path, remote_prefix: &str, files: &mut Vec<(PathBuf, String)>) {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
+const MAX_REPORTED_SCAN_SKIPS: usize = 20;
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct QueueUploadPathsResult {
+    pub queued: usize,
+    pub skipped: usize,
+    pub skips: Vec<UploadScanSkip>,
+}
+
+pub(crate) fn collect_manual_uploads(
+    path: &Path,
+    remote_prefix: &str,
+    files: &mut Vec<(PathBuf, String)>,
+    skips: &mut Vec<UploadScanSkip>,
+    visited: &mut HashSet<PathIdentity>,
+) {
+    let Some((kind, readable)) = inspect_local_entry(path, skips) else {
         return;
     };
-    if metadata.file_type().is_symlink() || ignored(path) {
-        return;
-    }
-    if metadata.is_file() {
-        files.push((path.to_path_buf(), normalize_remote_path(remote_prefix)));
-        return;
-    }
-    if !metadata.is_dir() {
-        return;
-    }
-    let Some(folder_name) = path.file_name().and_then(|value| value.to_str()) else {
-        return;
-    };
-    let folder_prefix = [remote_prefix, folder_name]
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>()
-        .join("/");
-    let Ok(entries) = fs::read_dir(path) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        collect_manual_uploads(&entry.path(), &folder_prefix, files);
+    match kind {
+        LocalEntryKind::File => {
+            if ignored(path) {
+                skips.push(UploadScanSkip::new(path, "临时或下载中的文件"));
+                return;
+            }
+            files.push((
+                user_visible_path(path),
+                normalize_remote_path(remote_prefix),
+            ));
+        }
+        LocalEntryKind::Directory => {
+            if !visited.insert(path_identity(&readable)) {
+                skips.push(UploadScanSkip::new(path, "检测到循环链接，已跳过"));
+                return;
+            }
+            let Some(folder_name) = path
+                .file_name()
+                .map(|value| value.to_string_lossy().into_owned())
+                .filter(|value| !value.is_empty())
+            else {
+                skips.push(UploadScanSkip::new(path, "无法读取目录名"));
+                return;
+            };
+            let folder_prefix = [remote_prefix, folder_name.as_str()]
+                .into_iter()
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join("/");
+            let entries = match fs::read_dir(&readable) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    skips.push(UploadScanSkip::new(
+                        path,
+                        format!("读取目录失败：{error}"),
+                    ));
+                    return;
+                }
+            };
+            for entry in entries {
+                match entry {
+                    Ok(entry) => collect_manual_uploads(
+                        &entry.path(),
+                        &folder_prefix,
+                        files,
+                        skips,
+                        visited,
+                    ),
+                    Err(error) => skips.push(UploadScanSkip::new(
+                        path,
+                        format!("读取目录项失败：{error}"),
+                    )),
+                }
+            }
+        }
     }
 }
 
@@ -1144,7 +1191,7 @@ pub(crate) fn queue_upload_paths(
     state: tauri::State<'_, SharedState>,
     paths: Vec<String>,
     parent_id: String,
-) -> Result<usize, String> {
+) -> Result<QueueUploadPathsResult, String> {
     if paths.is_empty() {
         return Err("没有选择需要上传的文件".into());
     }
@@ -1152,21 +1199,35 @@ pub(crate) fn queue_upload_paths(
         return Err("请先登录光鸭云盘".into());
     }
     let mut files = Vec::new();
+    let mut skips = Vec::new();
+    let mut visited = HashSet::new();
     for input in paths {
         let path = PathBuf::from(input);
-        if !path.exists() {
+        if !path.exists() && !extended_length_path(&path).exists() {
             return Err(format!("本地路径不存在：{}", path.display()));
         }
-        collect_manual_uploads(&path, "", &mut files);
+        collect_manual_uploads(&path, "", &mut files, &mut skips, &mut visited);
     }
     if files.is_empty() {
-        return Err("选中的路径中没有可上传文件".into());
+        if skips.is_empty() {
+            return Err("选中的路径中没有可上传文件".into());
+        }
+        let preview = skips
+            .iter()
+            .take(3)
+            .map(|skip| format!("{}：{}", skip.path, skip.reason))
+            .collect::<Vec<_>>()
+            .join("；");
+        return Err(format!(
+            "选中的路径中没有可上传文件；已跳过 {} 个路径。{preview}",
+            skips.len()
+        ));
     }
     let mut count = 0usize;
     {
         let mut guard = state.lock().map_err(|e| e.to_string())?;
         for (path, remote_dir) in files {
-            let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+            let metadata = fs::metadata(readable_fs_path(&path)).map_err(|e| e.to_string())?;
             let item = UploadItem {
                 mapping_id: "__manual__".into(),
                 file_path: path,
@@ -1200,13 +1261,35 @@ pub(crate) fn queue_upload_paths(
             count += 1;
         }
     }
+    let skipped = skips.len();
+    if skipped > 0 {
+        let preview = skips
+            .iter()
+            .take(3)
+            .map(|skip| format!("{}：{}", skip.path, skip.reason))
+            .collect::<Vec<_>>()
+            .join("；");
+        status(
+            &app,
+            "warning",
+            format!("扫描时跳过 {skipped} 个路径，未加入上传队列。{preview}"),
+        );
+    }
     if count == 0 {
-        return Ok(0);
+        return Ok(QueueUploadPathsResult {
+            queued: 0,
+            skipped,
+            skips: skips.into_iter().take(MAX_REPORTED_SCAN_SKIPS).collect(),
+        });
     }
     status(&app, "info", format!("已加入上传队列：{count} 个文件"));
     emit_state(&app, state.inner());
     drain_queue(app, state.inner().clone());
-    Ok(count)
+    Ok(QueueUploadPathsResult {
+        queued: count,
+        skipped,
+        skips: skips.into_iter().take(MAX_REPORTED_SCAN_SKIPS).collect(),
+    })
 }
 
 

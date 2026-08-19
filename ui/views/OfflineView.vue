@@ -1,7 +1,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
 import { message, Modal } from 'antdv-next';
-import { DeleteOutlined, DownloadOutlined, FolderOpenOutlined, InboxOutlined, RedoOutlined, ReloadOutlined, StopOutlined } from '@antdv-next/icons';
+import { DeleteOutlined, DownloadOutlined, FolderOpenOutlined, InboxOutlined, RedoOutlined, ReloadOutlined, SearchOutlined, StopOutlined } from '@antdv-next/icons';
 import CloudFolderPicker from '../components/cloud/CloudFolderPicker.vue';
 import PageHeader from '../components/layout/PageHeader.vue';
 import { appState } from '../store.js';
@@ -38,13 +38,32 @@ const offlineForm = reactive({
   pickerOpen: false,
 });
 const offlineColumns = [
-  { title: '任务', key: 'name', ellipsis: true },
+  { title: '任务', key: 'name', ellipsis: true, width: 260 },
   { title: '大小', key: 'size', width: 110 },
   { title: '状态', key: 'status', width: 110 },
   { title: '进度', key: 'progress', width: 180 },
   { title: '错误', key: 'error', ellipsis: true, width: 200 },
-  { title: '操作', key: 'actions', width: 190 },
+  { title: '操作', key: 'actions', width: 190, fixed: 'right' },
 ];
+
+const offlineFilters = reactive({ status: 'all', keyword: '' });
+const offlineStatusFilterOptions = [
+  { label: '全部', value: 'all' },
+  { label: '进行中', value: 'running' },
+  { label: '需重试', value: 'retryable' },
+  { label: '已完成', value: 'done' },
+];
+const filteredOfflineTasks = computed(() => {
+  const keyword = offlineFilters.keyword.trim().toLowerCase();
+  return offlineTasks.value.filter((record) => {
+    if (offlineFilters.status === 'running' && !isRunningTask(record)) return false;
+    if (offlineFilters.status === 'retryable' && !isRetryableTask(record)) return false;
+    if (offlineFilters.status === 'done' && (!isTerminalTask(record) || isRetryableTask(record))) return false;
+    if (!keyword) return true;
+    return [pick(record, ['fileName', 'name', 'taskName', 'title'], ''), offlineError(record)]
+      .some((value) => String(value || '').toLowerCase().includes(keyword));
+  });
+});
 
 function taskId(record) {
   return pick(record, ['taskId', 'id', 'fileId'], '');
@@ -465,14 +484,22 @@ onBeforeUnmount(() => {
     <a-alert v-if="offlineLoadError" class="offline-alert" type="error" show-icon :message="offlineLoadError">
       <template #action><a-button size="small" @click="loadOffline()">重试</a-button></template>
     </a-alert>
+    <div class="table-filter-bar">
+      <a-segmented v-model:value="offlineFilters.status" :options="offlineStatusFilterOptions" aria-label="按状态筛选离线任务" />
+      <a-input v-model:value="offlineFilters.keyword" allow-clear placeholder="搜索任务名 / 错误信息" class="filter-keyword" aria-label="搜索离线任务">
+        <template #prefix><SearchOutlined /></template>
+      </a-input>
+      <span v-if="offlineFilters.status !== 'all' || offlineFilters.keyword" class="filter-count">{{ filteredOfflineTasks.length }} / {{ offlineTasks.length }} 条</span>
+    </div>
     <a-table
       :columns="offlineColumns"
-      :data-source="offlineTasks"
+      :data-source="filteredOfflineTasks"
       :loading="offlineLoading"
       :row-key="taskId"
       :row-selection="rowSelection"
       :on-row="taskRowProps"
       :pagination="false"
+      :scroll="{ x: 1050 }"
       size="small"
     >
       <template #emptyText><a-empty description="暂无离线任务" /></template>

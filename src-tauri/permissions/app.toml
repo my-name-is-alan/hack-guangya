@@ -69,6 +69,11 @@ commands.allow = [
   "pause_download",
   "resume_download",
   "cancel_download",
+  "get_play_urls",
+  "read_cloud_text",
+  "open_cloud_file_with_system",
+  "list_local_players",
+  "open_in_player",
   "resolve_offline_resource",
   "create_offline_task",
   "list_offline_tasks",
@@ -123,10 +128,15 @@ commands.allow = [
   "rearchive_organizer_job",
   "share_organizer_job",
   "scrape_selected_files",
+  "test_media_recognition",
   "resume_queue",
   "get_app_version",
   "fetch_app_update",
-  "install_app_update"
+  "install_app_update",
+  "get_telegram_settings",
+  "update_telegram_settings",
+  "test_telegram_message",
+  "get_recent_logs"
 ]
 
 [[permission]]

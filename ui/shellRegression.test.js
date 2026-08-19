@@ -9,7 +9,8 @@ test('organizer task table remains constrained by its card', async () => {
 
   assert.match(source, /class="organizer-spin"/)
   assert.match(source, /:scroll="\{ x: 990 \}"/)
-  assert.doesNotMatch(source, /fixed: 'right'/)
+  // 操作列固定在右侧（需要配合 scroll.x 才能生效，卡片约束保持不变）
+  assert.match(source, /key: 'actions', width: 330, fixed: 'right'/)
   assert.match(source, /\.organizer-spin, \.organizer-page \{ width: 100%; min-width: 0; max-width: 100%; \}/)
   assert.match(source, /\.jobs-block \{ overflow: hidden;/)
   assert.match(source, /\.jobs-block :deep\(\.ant-table-wrapper\) \{ width: 100%; min-width: 0; max-width: 100%; margin-inline: 0; \}/)

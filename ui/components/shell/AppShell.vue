@@ -16,15 +16,22 @@ import {
 } from '@antdv-next/icons'
 import { formatSize } from '../../formatters.js'
 import { formatUploadSpeed } from '../../uploadProgress.js'
+import { useOrganizerActivityStore } from '../../stores/organizerActivity'
 import { useSessionStore } from '../../stores/session'
 import { useTransfersStore } from '../../stores/transfers'
 import GlobalSearch from '../search/GlobalSearch.vue'
 import NetworkTestDialog from '../network/NetworkTestDialog.vue'
+import RecognitionTestDialog from '../network/RecognitionTestDialog.vue'
+import AudioPlayerBar from '../files/AudioPlayerBar.vue'
+import ImageViewerModal from '../files/ImageViewerModal.vue'
+import TextPreviewModal from '../files/TextPreviewModal.vue'
+import VideoPlayerPicker from '../files/VideoPlayerPicker.vue'
 
 const route = useRoute()
 const router = useRouter()
 const session = useSessionStore()
 const transfers = useTransfersStore()
+const organizerActivity = useOrganizerActivityStore()
 const { userName, userAvatar, usedSpace, totalSpace, quotaPercent } = storeToRefs(session)
 const { activeUploads, activeDownloads, uploadSpeed, overallPercent } = storeToRefs(transfers)
 const searchOpen = shallowRef(false)
@@ -64,14 +71,17 @@ const accountMenu = {
   },
 }
 
+const recognitionTestOpen = shallowRef(false)
 const networkMenu = {
   items: [
     { key: 'test', label: '检测网络可用性' },
+    { key: 'recognition', label: '识别测试工具' },
     { type: 'divider' },
     { key: 'settings', label: '打开网络偏好' },
   ],
   onClick: ({ key }: { key: string }) => {
     if (key === 'test') { networkTestOpen.value = true; return }
+    if (key === 'recognition') { recognitionTestOpen.value = true; return }
     if (key === 'settings') { void router.push({ name: 'settings', query: { tab: 'network' } }); return }
   },
 }
@@ -91,8 +101,14 @@ function openTransfers() {
   void router.push({ name: 'transfers', query: { tab: activeUploads.value.length ? 'upload' : 'download' } })
 }
 
-onMounted(() => window.addEventListener('keydown', handleGlobalKeydown))
-onBeforeUnmount(() => window.removeEventListener('keydown', handleGlobalKeydown))
+onMounted(() => {
+  window.addEventListener('keydown', handleGlobalKeydown)
+  void organizerActivity.start()
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', handleGlobalKeydown)
+  organizerActivity.dispose()
+})
 </script>
 
 <template>
@@ -126,6 +142,17 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleGlobalKeydown)
         </button>
 
         <div class="top-actions">
+          <button
+            v-if="organizerActivity.active"
+            type="button"
+            class="organizer-activity"
+            :title="`识别中 ${organizerActivity.recognizing} · 整理中 ${organizerActivity.running}${organizerActivity.ready ? ` · 待执行 ${organizerActivity.ready}` : ''}`"
+            aria-label="查看整理进度"
+            @click="router.push({ name: 'organizer' })"
+          >
+            <SyncOutlined spin />
+            <span>整理 {{ organizerActivity.active }}</span>
+          </button>
           <button v-if="activeTransferCount" type="button" class="transfer-summary" @click="openTransfers">
             <span class="transfer-label">{{ activeTransferCount }} 个任务</span>
             <span class="transfer-bar"><i :style="{ width: `${overallPercent}%` }" /></span>
@@ -162,6 +189,11 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleGlobalKeydown)
 
     <GlobalSearch v-model:open="searchOpen" />
     <NetworkTestDialog v-model:open="networkTestOpen" />
+    <RecognitionTestDialog v-model:open="recognitionTestOpen" />
+    <ImageViewerModal />
+    <TextPreviewModal />
+    <VideoPlayerPicker />
+    <AudioPlayerBar />
   </div>
 </template>
 
@@ -185,6 +217,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleGlobalKeydown)
 .top-actions { display: flex; align-items: center; gap: 14px; }
 .network-tools-trigger { display: grid; width: 30px; height: 30px; place-items: center; border: 0; border-radius: 8px; color: var(--text-2, #525252); background: transparent; font-size: 17px; cursor: pointer; }
 .network-tools-trigger:hover { color: var(--text-1, #262626); background: var(--surface-hover, #f5f5f5); }
+.organizer-activity { display: flex; align-items: center; gap: 6px; padding: 4px 10px; border: 1px solid var(--line, #e5e5e5); border-radius: 99px; color: var(--text-2, #525252); background: transparent; font-size: 11px; font-weight: 600; cursor: pointer; }
+.organizer-activity:hover { color: var(--text-1, #262626); background: var(--surface-hover, #f5f5f5); }
 .transfer-summary { display: grid; min-width: 136px; grid-template-columns:1fr auto; align-items: center; gap: 3px 8px; padding: 3px 0; border: 0; color: var(--text-2, #525252); background: transparent; cursor: pointer; }
 .transfer-label { font-size: 11px; text-align: left; }
 .transfer-summary small { grid-column:2; grid-row:1 / span 2; color: var(--text-3, #737373); font-size: 10px; }

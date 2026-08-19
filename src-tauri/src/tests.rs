@@ -1042,6 +1042,102 @@
         fs::remove_dir_all(root).expect("remove directory event fixture");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn extended_length_path_round_trips_drive_and_unc_prefixes() {
+        assert_eq!(
+            user_visible_path(&extended_length_path(Path::new(r"D:\Media\Show"))),
+            PathBuf::from(r"D:\Media\Show")
+        );
+        assert_eq!(
+            user_visible_path(Path::new(r"\\?\D:\Media\Show")),
+            PathBuf::from(r"D:\Media\Show")
+        );
+        assert_eq!(
+            user_visible_path(Path::new(r"\\?\UNC\server\share\folder")),
+            PathBuf::from(r"\\server\share\folder")
+        );
+        assert_eq!(
+            extended_length_path(Path::new(r"\\server\share\folder")),
+            PathBuf::from(r"\\?\UNC\server\share\folder")
+        );
+    }
+
+    fn try_create_directory_link(original: &Path, link: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_dir(original, link).is_ok() {
+                return true;
+            }
+            std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &link.to_string_lossy(),
+                    &original.to_string_lossy(),
+                ])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(original, link).is_ok()
+        }
+    }
+
+    #[test]
+    fn manual_upload_scan_follows_directory_links_and_reports_skips() {
+        let root = std::env::temp_dir().join(format!(
+            "guangya-manual-scan-{}",
+            Uuid::new_v4().simple()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "guangya-manual-scan-target-{}",
+            Uuid::new_v4().simple()
+        ));
+        let real = root.join("real");
+        let nested = real.join("season 1");
+        fs::create_dir_all(&nested).expect("create nested fixture");
+        fs::create_dir_all(&outside).expect("create link target");
+        fs::write(nested.join("episode.mkv"), b"video").expect("write video");
+        fs::write(real.join("notes.tmp"), b"temp").expect("write ignored temp");
+        fs::write(outside.join("extra.mkv"), b"linked").expect("write linked video");
+        let link = root.join("linked");
+        let linked = try_create_directory_link(&outside, &link);
+
+        let mut files = Vec::new();
+        let mut skips = Vec::new();
+        let mut visited = HashSet::new();
+        collect_manual_uploads(&root, "", &mut files, &mut skips, &mut visited);
+
+        assert!(
+            files.iter().any(|(path, remote_dir)| {
+                path.file_name().and_then(|value| value.to_str()) == Some("episode.mkv")
+                    && remote_dir.replace('\\', "/").ends_with("real/season 1")
+            }),
+            "real nested file should be scanned: {files:?}"
+        );
+        if linked {
+            assert!(
+                files.iter().any(|(path, remote_dir)| {
+                    path.file_name().and_then(|value| value.to_str()) == Some("extra.mkv")
+                        && remote_dir.replace('\\', "/").ends_with("linked")
+                }),
+                "directory link should be followed: {files:?}"
+            );
+        }
+        assert!(
+            skips
+                .iter()
+                .any(|skip| skip.reason.contains("临时或下载中的文件")),
+            "ignored temp files should be reported: {skips:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
     #[test]
     fn invalid_or_empty_sync_types_fall_back_to_media() {
         assert_eq!(normalize_sync_types(&[]), default_sync_types());

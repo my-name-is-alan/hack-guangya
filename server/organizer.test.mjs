@@ -7,9 +7,14 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import {
   NATIVE_ENGINE_VERSION,
+  DEFAULT_ORGANIZER_SETTINGS,
   classifyNativePreview,
+  collectReplacedCloudFiles,
+  compareMediaVersions,
   executeNativePreview,
   analyzeCloudMediaCandidate,
+  findExistingCloudVersions,
+  normalizeUpgradeCriteria,
   parseMediaName,
   renderNfo,
   normalizeOrganizerCloudEntry,
@@ -17,10 +22,103 @@ import {
   planCloudScrapeCandidates,
   resolveMediaCategory,
   renderOrganizerPathTemplate,
+  resolveTmdbMatch,
   scoreTmdbCandidate,
   titleSimilarity,
 } from './organizer-core.mjs';
 import { createOrganizerService, parseFfprobeTechnicalData } from './organizer.mjs';
+
+test('洗版比较器按配置的优先级维度逐项分胜负', () => {
+  assert.deepEqual(normalizeUpgradeCriteria(['size', 'resolution']), ['size', 'resolution']);
+  assert.deepEqual(normalizeUpgradeCriteria([]), ['resolution', 'dynamic_range', 'release_group', 'size']);
+  assert.deepEqual(normalizeUpgradeCriteria(['bogus']), ['resolution', 'dynamic_range', 'release_group', 'size']);
+
+  const parse = (name) => ({ parsed: parseMediaName(name), size: 0 });
+  // 分辨率优先：2160p 胜 1080p
+  assert.deepEqual(
+    compareMediaVersions(parse('Movie.2020.2160p.WEB-DL.mkv'), parse('Movie.2020.1080p.BluRay.mkv'), {}),
+    { winner: 'next', criterion: 'resolution' },
+  );
+  // 同分辨率时动态范围决定：DV 胜 HDR10，HDR10 胜 SDR
+  assert.deepEqual(
+    compareMediaVersions(parse('Movie.2020.2160p.DV.mkv'), parse('Movie.2020.2160p.HDR10.mkv'), {}),
+    { winner: 'next', criterion: 'dynamic_range' },
+  );
+  assert.deepEqual(
+    compareMediaVersions(parse('Movie.2020.2160p.mkv'), parse('Movie.2020.2160p.HDR.mkv'), {}),
+    { winner: 'existing', criterion: 'dynamic_range' },
+  );
+  // 制作组名单顺序：FRDS 优先于 WiKi；未配置名单时跳过该维度
+  assert.deepEqual(
+    compareMediaVersions(
+      parse('Movie.2020.1080p.BluRay-FRDS.mkv'),
+      parse('Movie.2020.1080p.BluRay-WiKi.mkv'),
+      { releaseGroups: 'FRDS\nWiKi' },
+    ),
+    { winner: 'next', criterion: 'release_group' },
+  );
+  // 大小兜底
+  assert.deepEqual(
+    compareMediaVersions(
+      { parsed: parseMediaName('Movie.2020.1080p.mkv'), size: 200 },
+      { parsed: parseMediaName('Movie.2020.1080p.mkv'), size: 100 },
+      {},
+    ),
+    { winner: 'next', criterion: 'size' },
+  );
+  // 全部持平 = 同版本
+  assert.deepEqual(compareMediaVersions(parse('A.2020.1080p.mkv'), parse('B.2020.1080p.mkv'), {}), { winner: 'tie', criterion: null });
+  // 自定义顺序：大小在前时优先比大小
+  assert.deepEqual(
+    compareMediaVersions(
+      { parsed: parseMediaName('Movie.2020.1080p.mkv'), size: 500 },
+      { parsed: parseMediaName('Movie.2020.2160p.mkv'), size: 100 },
+      { criteria: ['size', 'resolution'] },
+    ),
+    { winner: 'next', criterion: 'size' },
+  );
+});
+
+test('同一版本识别：电影按 part、剧集按季集匹配，并连带伴随文件进入替换清单', () => {
+  const movieEntries = [
+    { id: 'old-video', name: 'Movie (2020) - 1080p BluRay x264.mkv', is_directory: false, size: 100 },
+    { id: 'old-sub', name: 'Movie (2020) - 1080p BluRay x264.chs.srt', is_directory: false, size: 1 },
+    { id: 'old-nfo', name: 'Movie (2020) - 1080p BluRay x264.nfo', is_directory: false, size: 1 },
+    { id: 'poster', name: 'poster.jpg', is_directory: false, size: 1 },
+    { id: 'cd2', name: 'Movie (2020) - 1080p BluRay x264 - CD2.mkv', is_directory: false, size: 100 },
+    { id: 'dir', name: 'extras', is_directory: true, size: 0 },
+  ];
+  const movieVersions = findExistingCloudVersions({
+    mediaType: 'movie',
+    parsed: parseMediaName('Movie.2020.2160p.WEB-DL.mkv'),
+    entries: movieEntries,
+  });
+  assert.deepEqual(movieVersions.map((version) => version.entry.id), ['old-video']);
+  const replaces = collectReplacedCloudFiles(movieVersions, movieEntries);
+  assert.deepEqual(replaces.map((entry) => entry.id).sort(), ['old-nfo', 'old-sub', 'old-video']);
+
+  const tvEntries = [
+    { id: 'e1', name: 'Show - S01E01 - 1080p.mkv', is_directory: false, size: 10 },
+    { id: 'e2', name: 'Show - S01E02 - 1080p.mkv', is_directory: false, size: 10 },
+  ];
+  const tvVersions = findExistingCloudVersions({
+    mediaType: 'tv',
+    parsed: parseMediaName('Show.S01E02.2160p.mkv'),
+    entries: tvEntries,
+  });
+  assert.deepEqual(tvVersions.map((version) => version.entry.id), ['e2']);
+});
+
+test('集偏移把识别出的集号统一平移', () => {
+  const analysis = analyzeCloudMediaCandidate({
+    candidate: { fileId: 'dir', fileName: 'Show (2024)', resType: 2, path: 'Show (2024)' },
+    entries: [
+      { fileId: 'v1', fileName: 'Show.S01E01.1080p.mkv', resType: 1, path: 'Show (2024)/Show.S01E01.1080p.mkv', fileSize: 10 },
+      { fileId: 'v2', fileName: 'Show.S01E02.1080p.mkv', resType: 1, path: 'Show (2024)/Show.S01E02.1080p.mkv', fileSize: 10 },
+    ],
+  }, { media_type: 'tv', episode_offset: 12 });
+  assert.deepEqual(analysis.videos.map((video) => video.parsed.episode), [13, 14]);
+});
 
 test('FFprobe streams become the technical naming suffix fields', () => {
   assert.deepEqual(parseFfprobeTechnicalData({ streams: [
@@ -156,6 +254,120 @@ test('native parser extracts movie, season, episode range, quality and edition',
   assert.equal(movie.title, 'Blade Runner');
   assert.equal(movie.year, 1982);
   assert.equal(movie.edition, 'Director’s Cut');
+});
+
+test('分词状态机拆分中英文标题并识别字幕组/动漫命名', () => {
+  // 中英混合：中文名与英文名分别累计
+  const mixed = parseMediaName('凡人修仙传.The.Immortal.Ascension.2020.S01E05.2160p.WEB-DL.mkv');
+  assert.equal(mixed.cn_name, '凡人修仙传');
+  assert.equal(mixed.en_name, 'The Immortal Ascension');
+  assert.equal(mixed.title, '凡人修仙传');
+  assert.equal(mixed.year, 2020);
+  assert.equal(mixed.season, 1);
+  assert.equal(mixed.episode, 5);
+  // 字幕组多括号 + 动漫集号
+  const anime = parseMediaName('【幻月字幕组】【4月新番】【天国大魔境 Tengoku Daimakyou】【01】【1080P】【简日双语】.mp4');
+  assert.equal(anime.cn_name, '天国大魔境');
+  assert.equal(anime.en_name, 'Tengoku Daimakyou');
+  assert.equal(anime.episode, 1);
+  assert.equal(anime.media_type, 'tv');
+  // 英文动漫 "- 05" 集号
+  const subs = parseMediaName('[SubsPlease] Kaiju No. 8 - 05 (1080p) [E02DE726].mkv');
+  assert.equal(subs.title, 'Kaiju No 8');
+  assert.equal(subs.episode, 5);
+  // 纯数字标题不误判为集号（300 是标题，2006 是年份）
+  const numeric = parseMediaName('300.2006.1080p.BluRay.x264.mkv');
+  assert.equal(numeric.title, '300');
+  assert.equal(numeric.year, 2006);
+  assert.equal(numeric.media_type, 'movie');
+  // HDHive/Emby 风格内嵌 TMDB ID（{tmdb-x}/{tmdbid-x}/[tmdb=x]/-Tmdbx）
+  assert.equal(parseMediaName('遥远的桥 (1977) {tmdb-5902}').tmdb_id, 5902);
+  assert.equal(parseMediaName('苦尽柑来遇见你 (2025) {tmdbid-219246}').tmdb_id, 219246);
+  assert.equal(parseMediaName('热血青春 (2014) {tmdb=252067}').tmdb_id, 252067);
+  assert.equal(parseMediaName('哦我的鬼神大人 (2015)-Tmdb63119').tmdb_id, 63119);
+  assert.equal(parseMediaName('赌金.Gold Land (2026) [tmdbid-278113]').tmdb_id, 278113);
+  // 中文数字季 + 完结区间
+  const chineseSeason = parseMediaName('披荆斩棘的哥哥.第三季.EP01.2023.1080p.WEB-DL.mp4', { media_type: 'tv' });
+  assert.equal(chineseSeason.season, 3);
+  assert.equal(chineseSeason.episode, 1);
+  const finRange = parseMediaName('[01-26Fin] 某动画 1080p');
+  assert.equal(finRange.episode, 1);
+  assert.equal(finRange.episode_end, 26);
+});
+
+test('TMDB 匹配：中英文名逐个搜索、精确命中优先、电影→剧集→multi 回退', async (t) => {
+  const calls = [];
+  const makeClient = (handlers) => ({
+    async search(query) { calls.push(['search', query.media_type, query.title, query.year ?? null]); return handlers.search?.(query) || []; },
+    async searchMulti(query) { calls.push(['multi', query.title]); return handlers.searchMulti?.(query) || []; },
+    async alternativeNames(mediaType, tmdbId) { calls.push(['names', mediaType, tmdbId]); return handlers.alternativeNames?.(mediaType, tmdbId) || []; },
+    async details(mediaType, tmdbId) { return { tmdb_id: tmdbId, media_type: mediaType, title: `T${tmdbId}`, original_title: `T${tmdbId}`, year: 2020, release_date: '2020-01-01', overview: '', vote_average: 8, poster_path: '', poster_url: '', seasons: {} }; },
+    async season() { return { season_number: 1, episodes: [] }; },
+  });
+  const analysisBase = { title: '凡人修仙传', title_candidates: ['凡人修仙传', 'The Immortal Ascension'], year: 2020, media_type: 'tv', tmdb_id: null, videos: [], query: {} };
+
+  await t.test('中文名精确命中直接采用（TMDB 级别优先）', async () => {
+    const client = makeClient({
+      search: (query) => query.title === '凡人修仙传'
+        ? [{ tmdb_id: 91557, media_type: 'tv', title: '凡人修仙传', original_title: 'Fan Ren Xiu Xian Zhuan', year: 2020, release_date: '2020-07-25', popularity: 50, score: 0.5 }]
+        : [],
+    });
+    const match = await resolveTmdbMatch({ analysis: analysisBase, client, settings: DEFAULT_ORGANIZER_SETTINGS });
+    assert.equal(match.ready, true);
+    assert.equal(match.selected.tmdb_id, 91557);
+  });
+
+  await t.test('中文名无结果时用英文名命中', async () => {
+    const client = makeClient({
+      search: (query) => query.title === 'The Immortal Ascension'
+        ? [{ tmdb_id: 91557, media_type: 'tv', title: 'The Immortal Ascension', original_title: '凡人修仙传', year: 2020, release_date: '2020-07-25', popularity: 50, score: 0.5 }]
+        : [],
+    });
+    const match = await resolveTmdbMatch({ analysis: analysisBase, client, settings: DEFAULT_ORGANIZER_SETTINGS });
+    assert.equal(match.ready, true);
+    assert.equal(match.selected.tmdb_id, 91557);
+  });
+
+  await t.test('电影查不到时回退剧集，multi 兜底', async () => {
+    const analysis = { ...analysisBase, media_type: 'movie', title: 'Some Movie', title_candidates: ['Some Movie'], year: null };
+    const client = makeClient({
+      searchMulti: () => [{ tmdb_id: 777, media_type: 'tv', title: 'Some Movie', original_title: 'Some Movie', year: 2021, release_date: '2021-01-01', popularity: 10, score: 0.4 }],
+    });
+    const match = await resolveTmdbMatch({ analysis, client, settings: DEFAULT_ORGANIZER_SETTINGS });
+    assert.equal(match.ready, true);
+    assert.equal(match.selected.tmdb_id, 777);
+    // 详情按选中项的实际类型（tv）拉取
+    assert.equal(match.query.media_type, 'tv');
+  });
+
+  await t.test('别名/译名第二轮精确匹配', async () => {
+    const analysis = { ...analysisBase, title: '沙丘2', title_candidates: ['沙丘2'], year: null, media_type: 'movie' };
+    const client = makeClient({
+      search: (query) => query.media_type === 'movie' && query.title === '沙丘2'
+        ? [{ tmdb_id: 693134, media_type: 'movie', title: 'Dune: Part Two', original_title: 'Dune: Part Two', year: 2024, release_date: '2024-02-27', popularity: 500, score: 0.3 }]
+        : [],
+      alternativeNames: () => ['Dune: Part Two', '沙丘2', '沙丘：第二部'],
+    });
+    const match = await resolveTmdbMatch({ analysis, client, settings: DEFAULT_ORGANIZER_SETTINGS });
+    assert.equal(match.ready, true);
+    assert.equal(match.selected.tmdb_id, 693134);
+  });
+
+  await t.test('有年份时信任 TMDB 排序取 ±1 年首个（HDHive 语义）', async () => {
+    const analysis = { ...analysisBase, title: '某剧完全不同名', title_candidates: ['某剧完全不同名'], year: 2020, media_type: 'tv' };
+    const client = makeClient({
+      search: (query) => query.title === '某剧完全不同名' && query.media_type === 'tv'
+        ? [
+          { tmdb_id: 1, media_type: 'tv', title: '别的名字A', original_title: 'Other A', year: 2015, release_date: '2015-01-01', popularity: 5, score: 0.2 },
+          { tmdb_id: 2, media_type: 'tv', title: '别的名字B', original_title: 'Other B', year: 2021, release_date: '2021-01-01', popularity: 5, score: 0.2 },
+        ]
+        : [],
+      alternativeNames: () => [],
+    });
+    const match = await resolveTmdbMatch({ analysis, client, settings: DEFAULT_ORGANIZER_SETTINGS });
+    assert.equal(match.ready, true);
+    assert.equal(match.selected.tmdb_id, 2);
+  });
 });
 
 test('auxiliary recognition applies capture math, forced TMDB and rich naming metadata', () => {
@@ -504,7 +716,8 @@ test('cloud-native organizer moves A to B, scrapes selected types and creates a 
   assert.equal(completed.status, 'completed');
   assert.equal(completed.result.transferred, 2);
   assert.deepEqual(batchMoves, [['movie-file', 'subtitle-file']]);
-  assert.ok(maximumConcurrentRenames >= 2);
+  // 云端 rename 接口有并发风控（业务码 120），改名必须串行执行
+  assert.equal(maximumConcurrentRenames, 1);
   assert.equal(completed.result.scraped, 2);
   assert.equal(completed.result.share.share_url, 'https://share.example/fresh-b');
   assert.equal(shares.length, 1);
@@ -529,4 +742,104 @@ test('cloud-native organizer moves A to B, scrapes selected types and creates a 
   assert.equal(nodes.has('movie-dir'), false);
   assert.equal(organizedTargetIds.every((id) => !nodes.has(id)), true);
   assert.equal(service.state().jobs.some((job) => job.id === completed.id), false);
+});
+
+test('rearchiving a completed job cleans previous outputs and empty directories before re-organizing', async (context) => {
+  const fake = await startFakeTmdb();
+  const database = new DatabaseSync(':memory:');
+  const nodes = new Map([
+    ['a', { id: 'a', name: 'A', parent_id: '', is_directory: true, size: 0, modified_ms: '1' }],
+    ['b', { id: 'b', name: 'B', parent_id: '', is_directory: true, size: 0, modified_ms: '1' }],
+    ['movie-dir', { id: 'movie-dir', name: 'The.Matrix.1999', parent_id: 'a', is_directory: true, size: 0, modified_ms: '2' }],
+    ['movie-file', { id: 'movie-file', name: 'The.Matrix.1999.1080p.mkv', parent_id: 'movie-dir', is_directory: false, size: 32, modified_ms: '3' }],
+  ]);
+  let sequence = 0;
+  const children = (parentId) => [...nodes.values()].filter((entry) => entry.parent_id === parentId).map((entry) => ({ ...entry }));
+  const cloud = {
+    isAuthenticated: () => true,
+    listChildren: async (parentId) => children(parentId),
+    createDirectory: async (parentId, name) => {
+      const id = `dir-${++sequence}`;
+      const node = { id, name, parent_id: parentId, is_directory: true, size: 0, modified_ms: String(Date.now()) };
+      nodes.set(id, node);
+      return { ...node };
+    },
+    copyEntry: async (id, parentId) => {
+      const source = nodes.get(id);
+      const copy = { ...source, id: `copy-${++sequence}`, parent_id: parentId, modified_ms: String(Date.now()) };
+      nodes.set(copy.id, copy);
+      return { ...copy };
+    },
+    moveEntry: async (id, parentId) => { nodes.get(id).parent_id = parentId; },
+    renameEntry: async (id, name) => { nodes.get(id).name = name; },
+    deleteEntry: async (id) => {
+      if (!nodes.has(id)) throw new Error('文件不存在');
+      nodes.delete(id);
+    },
+    uploadBuffer: async (parentId, name, bytes) => {
+      const id = `upload-${++sequence}`;
+      nodes.set(id, { id, name, parent_id: parentId, is_directory: false, size: bytes.length, modified_ms: String(Date.now()) });
+      return { id };
+    },
+  };
+  const service = createOrganizerService({
+    database,
+    cloud,
+    publish: () => {},
+    env: { TMDB_API_BASE: fake.apiBase, TMDB_IMAGE_BASE: fake.imageBase },
+    fetchImpl: async (url, options) => {
+      if (String(url).includes('/image/')) return new Response(Buffer.from([0xff, 0xd8, 0xff, 0xd9]), { status: 200, headers: { 'content-type': 'image/jpeg' } });
+      return fetch(url, options);
+    },
+  });
+  context.after(async () => {
+    await service.close();
+    database.close();
+    await new Promise((resolve) => fake.server.close(resolve));
+  });
+  service.updateSettings({
+    api_key: 'unit-key',
+    word_segment_search: false,
+    similarity_match: false,
+    scrape_targets: [{ id: 'library-b', name: '主媒体库', dir_id: 'b', path: '/B' }],
+  });
+  const mapping = await service.addMapping({
+    source_dir_id: 'a',
+    target_dir_id: 'b',
+    source_path: '/A',
+    target_path: '/B',
+    transfer_type: 'copy',
+    media_type: 'movie',
+    conflict_policy: 'rename',
+    scrape: true,
+    scrape_types: ['movie_nfo', 'poster'],
+    scan_existing: true,
+    auto_execute: true,
+    settle_seconds: 5,
+  });
+  const completed = await waitFor(() => service.state().jobs.find((job) => job.mapping_id === mapping.id && job.status === 'completed'));
+  // 执行结果必须携带完整产物清单（视频 + NFO + 海报），供重新归档时清理。
+  const firstItems = completed.result.created_items;
+  assert.equal(Array.isArray(firstItems), true);
+  assert.deepEqual([...new Set(firstItems.map((item) => item.kind))].sort(), ['image', 'nfo', 'video']);
+  assert.equal(firstItems.every((item) => item.target_relative.length > 0), true);
+  const firstVideoId = firstItems.find((item) => item.kind === 'video').id;
+  assert.equal(nodes.has(firstVideoId), true);
+  const firstMovieDirId = nodes.get(firstVideoId).parent_id;
+
+  await service.rearchiveJob(completed.id);
+  const again = await waitFor(() => {
+    const job = service.state().jobs.find((item) => item.id === completed.id);
+    return job && job.status === 'completed' && job.result?.created_items?.some((item) => item.kind === 'video' && item.id !== firstVideoId) ? job : null;
+  });
+  // 旧视频与旧媒体目录（清空后）被回收，新一轮落位使用重建的目录。
+  assert.equal(nodes.has(firstVideoId), false);
+  assert.equal(nodes.has(firstMovieDirId), false);
+  const secondVideoId = again.result.created_items.find((item) => item.kind === 'video').id;
+  assert.equal(nodes.has(secondVideoId), true);
+  const rebuiltDir = nodes.get(nodes.get(secondVideoId).parent_id);
+  assert.match(rebuiltDir.name, /The Matrix/);
+  // 老产物清理后不应留下重复文件：目标目录只有一份视频。
+  const videosInDir = children(rebuiltDir.id).filter((entry) => entry.name.endsWith('.mkv'));
+  assert.equal(videosInDir.length, 1);
 });

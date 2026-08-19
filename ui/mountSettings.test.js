@@ -62,7 +62,7 @@ test('桌面 ACL 放行全部 WebDAV 与原生挂载命令', () => {
 
 test('虚拟库生成签名直链 STRM，网关播放 302 直链且只映射一个目录', () => {
   assert.match(mountPanel, /Emby 虚拟库（STRM）/)
-  assert.match(mountPanel, /视频和音频生成同名/)
+  assert.match(mountPanel, /视频\/音频生成同名/)
   assert.match(mountPanel, /保留元数据/)
   assert.match(mountPanel, /排除所有元数据，只生成 STRM/)
   assert.match(mountPanel, /内容是带签名的播放直链/)

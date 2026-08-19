@@ -1,7 +1,7 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { message, Modal } from 'antdv-next';
-import { DeleteOutlined, FileOutlined, ReloadOutlined, RollbackOutlined } from '@antdv-next/icons';
+import { DeleteOutlined, FileOutlined, ReloadOutlined, RollbackOutlined, SearchOutlined } from '@antdv-next/icons';
 import { bridge } from '../../bridge.js';
 import { useFilesStore } from '../../stores/files.ts';
 import { errorText, fileId, formatSize, formatTime, pick, unwrapData } from '../../formatters.js';
@@ -25,13 +25,20 @@ const selectedKeys = ref([]);
 const focusedRowId = ref('');
 
 const columns = [
-  { title: '名称', key: 'name', ellipsis: true },
+  { title: '名称', key: 'name', ellipsis: true, width: 260 },
   { title: '类型', key: 'ext', width: 90 },
   { title: '大小', key: 'size', width: 110 },
   { title: '删除时间', key: 'time', width: 170 },
   { title: '剩余时间', key: 'leftTime', width: 120 },
-  { title: '操作', key: 'actions', width: 150 },
+  { title: '操作', key: 'actions', width: 110, fixed: 'right' },
 ];
+
+const recycleKeyword = ref('');
+const filteredRecords = computed(() => {
+  const keyword = recycleKeyword.value.trim().toLowerCase();
+  if (!keyword) return records.value;
+  return records.value.filter((record) => String(record.fileName || '').toLowerCase().includes(keyword));
+});
 const pagination = computed(() => ({
   current: page.value + 1,
   pageSize,
@@ -241,6 +248,9 @@ watch(() => filesStore.recycleBinVersion, () => {
         <span>到期项目会由光鸭自动清理</span>
       </div>
       <a-space wrap>
+        <a-input v-model:value="recycleKeyword" allow-clear placeholder="筛选本页文件名" class="recycle-search" aria-label="筛选回收站文件">
+          <template #prefix><SearchOutlined /></template>
+        </a-input>
         <template v-if="selectedKeys.length">
           <a-button :loading="actionBusy" @click="confirmRestore(selectedRecords())"><template #icon><RollbackOutlined /></template>恢复</a-button>
           <a-button danger :loading="actionBusy" @click="confirmPermanentDelete(selectedRecords())"><template #icon><DeleteOutlined /></template>彻底删除</a-button>
@@ -255,12 +265,13 @@ watch(() => filesStore.recycleBinVersion, () => {
     </a-alert>
     <a-table
       :columns="columns"
-      :data-source="records"
+      :data-source="filteredRecords"
       :loading="loading"
       :row-key="recordId"
       :row-selection="rowSelection"
       :on-row="rowProps"
       :pagination="pagination"
+      :scroll="{ x: 880 }"
       size="small"
       @change="tableChange"
     >
@@ -289,6 +300,7 @@ watch(() => filesStore.recycleBinVersion, () => {
 
 <style scoped>
 .files-panel { min-height: 0; }
+.recycle-search { width: 200px; }
 .panel-summary strong, .panel-summary span { display: block; }
 .panel-summary span { margin-top: 2px; color: var(--text-3, #737373); font-size: 12px; }
 .selection-summary { color: var(--text-2, #525252); }

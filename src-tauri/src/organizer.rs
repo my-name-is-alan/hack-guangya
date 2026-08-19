@@ -35,7 +35,9 @@ const MAX_CLOUD_DEPTH: usize = 64;
 const MAX_SCRAPE_CANDIDATES: usize = 1_000;
 const SCRAPE_RECOGNITION_CONCURRENCY: usize = 4;
 const SCRAPE_EXECUTION_CONCURRENCY: usize = 3;
-const ORGANIZER_RENAME_CONCURRENCY: usize = 4;
+// 云端 rename 接口对并发敏感（并发过高会触发业务码 120 限流，msg 为“缺少clientId”），
+// 串行执行并在 cloud_rename 里做退避重试兜底。
+const ORGANIZER_RENAME_CONCURRENCY: usize = 1;
 const MAX_JOB_LIST: i64 = 100;
 const MOVIE_PATH_TEMPLATE: &str = "{category}/{country}/{year}/{title} ({year}) [tmdb-{tmdb_id}]/{title} ({year}){edition}{quality}{part}.{ext}";
 const TV_PATH_TEMPLATE: &str = "{category}/{country}/{year}/{title} ({year}) [tmdb-{tmdb_id}]/Season {season:02}/{title}.S{season:02}E{episode:02}{episode_end}.{ext}";
@@ -75,6 +77,8 @@ struct OrganizerSecrets {
     scrape_targets: Vec<Value>,
     default_scrape_types: Vec<String>,
     include_media_info: bool,
+    upgrade_criteria: Vec<String>,
+    upgrade_release_groups: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +112,9 @@ pub struct OrganizerPublicSettings {
     category_rules: Vec<Value>,
     scrape_targets: Vec<Value>,
     default_scrape_types: Vec<String>,
+    upgrade_criteria: Vec<String>,
+    upgrade_release_groups: String,
+    upgrade_criteria_options: Vec<Value>,
     template_examples: Value,
     path_presets: Vec<Value>,
     scrape_type_options: Vec<Value>,
@@ -217,6 +224,14 @@ impl OrganizerSecrets {
             category_rules: self.category_rules.clone(),
             scrape_targets: self.scrape_targets.clone(),
             default_scrape_types: self.default_scrape_types.clone(),
+            upgrade_criteria: self.upgrade_criteria.clone(),
+            upgrade_release_groups: self.upgrade_release_groups.clone(),
+            upgrade_criteria_options: crate::organizer_core::UPGRADE_CRITERIA
+                .iter()
+                .map(|value| {
+                    json!({ "value": value, "label": crate::organizer_core::upgrade_criterion_label(value) })
+                })
+                .collect(),
             template_examples: standard_template_examples(self),
             path_presets: vec![
                 json!({ "id": "reference-media-info", "name": "参考完整命名（媒体信息后缀）", "movie": "{category}/{country}/{title} ({year}) {tmdb-{tmdbid}}/{en_title}.{year}.{videoFormat}.{resourceType}.{effect}.{audioInfo}.{videoCodec}.{audioCodec}-{releaseGroup}{fileExt}", "tv": "{category}/{country}/{title} ({year}) {tmdb-{tmdbid}}/Season {season}/{en_title}.{year}.{season_episode}.{videoFormat}.{source}.{release_type}.{high_quality}.{dolby_vision}.{dynamic_range}.{frame_rate}.{color_depth}.{video_codec}.{audioCodec}-{releaseGroup}{fileExt}" }),
@@ -280,6 +295,16 @@ struct PreviewSummary {
     failed: usize,
     warnings: usize,
     skipped: usize,
+    #[serde(default)]
+    upgraded: usize,
+    #[serde(default)]
+    suppressed: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ReplacedFile {
+    id: String,
+    name: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -306,6 +331,16 @@ struct CloudPreviewItem {
     season: Option<i64>,
     episode: Option<i64>,
     episode_end: Option<i64>,
+    #[serde(default)]
+    replaces: Vec<ReplacedFile>,
+    #[serde(default)]
+    upgraded_by: Option<String>,
+    #[serde(default)]
+    suppressed: bool,
+    #[serde(default)]
+    suppressed_by: Option<String>,
+    #[serde(default)]
+    suppressed_existing: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -347,6 +382,22 @@ struct OrganizerExecutionResult {
     warnings: Vec<String>,
     targets: Vec<String>,
     share: Option<Value>,
+    /// 本次执行创建的全部云端产物（转移文件 + 刮削元数据），
+    /// 供“重新归档”清理上一次的落位结果。
+    #[serde(default)]
+    created_items: Vec<CreatedOutputItem>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CreatedOutputItem {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    target_relative: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -367,6 +418,8 @@ pub struct OrganizerJob {
     season: Option<i64>,
     episode: Option<i64>,
     episode_end: Option<i64>,
+    episode_offset: Option<i64>,
+    recognition_words: Option<String>,
     query_title: Option<String>,
     query_year: Option<i64>,
     preview: Option<CloudPreview>,
@@ -412,6 +465,8 @@ pub struct OrganizerSettingsInput {
     category_rules: Option<Vec<Value>>,
     scrape_targets: Option<Vec<Value>>,
     default_scrape_types: Option<Vec<String>>,
+    upgrade_criteria: Option<Vec<String>>,
+    upgrade_release_groups: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -443,6 +498,8 @@ pub struct OrganizerJobInput {
     season: Option<i64>,
     episode: Option<i64>,
     episode_end: Option<i64>,
+    episode_offset: Option<i64>,
+    recognition_words: Option<String>,
     #[serde(default)]
     clear_tmdb_id: bool,
     #[serde(default)]
@@ -455,6 +512,10 @@ pub struct OrganizerJobInput {
     clear_episode: bool,
     #[serde(default)]
     clear_episode_end: bool,
+    #[serde(default)]
+    clear_episode_offset: bool,
+    #[serde(default)]
+    clear_recognition_words: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -590,7 +651,9 @@ pub fn init_database(path: &Path) -> Result<(), String> {
                movie_category TEXT NOT NULL DEFAULT '电影', tv_category TEXT NOT NULL DEFAULT '电视剧',
                tmdb_api_base TEXT NOT NULL DEFAULT '', tmdb_image_base TEXT NOT NULL DEFAULT '',
                category_rules TEXT NOT NULL DEFAULT '[]', scrape_targets TEXT NOT NULL DEFAULT '[]',
-               default_scrape_types TEXT NOT NULL DEFAULT '[\"movie_nfo\",\"tvshow_nfo\",\"poster\",\"fanart\"]', updated_at INTEGER NOT NULL
+               default_scrape_types TEXT NOT NULL DEFAULT '[\"movie_nfo\",\"tvshow_nfo\",\"poster\",\"fanart\"]',
+               upgrade_criteria TEXT NOT NULL DEFAULT '[\"resolution\",\"dynamic_range\",\"release_group\",\"size\"]',
+               upgrade_release_groups TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS organizer_mappings (
                id TEXT PRIMARY KEY, source_path TEXT NOT NULL, target_path TEXT NOT NULL DEFAULT '',
@@ -611,6 +674,7 @@ pub fn init_database(path: &Path) -> Result<(), String> {
                share_after_requested INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, media_type TEXT,
                tmdb_id TEXT, season INTEGER, episode INTEGER, episode_end INTEGER, query_title TEXT,
                query_year INTEGER, preview_json TEXT, result_json TEXT, error_code TEXT, message TEXT,
+               episode_offset INTEGER, recognition_words TEXT,
                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS organizer_jobs_mapping_status ON organizer_jobs(mapping_id, status, updated_at);
@@ -637,6 +701,11 @@ pub fn init_database(path: &Path) -> Result<(), String> {
             "default_scrape_types",
             "TEXT NOT NULL DEFAULT '[\"movie_nfo\",\"tvshow_nfo\",\"poster\",\"fanart\"]'",
         ),
+        (
+            "upgrade_criteria",
+            "TEXT NOT NULL DEFAULT '[\"resolution\",\"dynamic_range\",\"release_group\",\"size\"]'",
+        ),
+        ("upgrade_release_groups", "TEXT NOT NULL DEFAULT ''"),
     ] {
         ensure_column(&connection, "organizer_settings", column, definition)?;
     }
@@ -660,6 +729,8 @@ pub fn init_database(path: &Path) -> Result<(), String> {
         ("query_year", "INTEGER"),
         ("result_json", "TEXT"),
         ("error_code", "TEXT"),
+        ("episode_offset", "INTEGER"),
+        ("recognition_words", "TEXT"),
     ] {
         ensure_column(&connection, "organizer_jobs", column, definition)?;
     }
@@ -1112,8 +1183,8 @@ fn normalize_conflict_policy(value: &str) -> Result<String, String> {
         value.trim()
     };
     match value.to_lowercase().as_str() {
-        "skip" | "overwrite" | "rename" => Ok(value.to_lowercase()),
-        _ => Err("冲突策略必须是跳过、覆盖或保留两份".to_string()),
+        "skip" | "overwrite" | "rename" | "upgrade" => Ok(value.to_lowercase()),
+        _ => Err("冲突策略必须是跳过、覆盖、保留两份或洗版".to_string()),
     }
 }
 
@@ -1242,7 +1313,8 @@ fn load_secrets(path: &Path) -> Result<OrganizerSecrets, String> {
             "SELECT tmdb_api_key, language, image_language, include_adult, minimum_match_score,
                     word_segment_search, similarity_match, recognition_words, release_groups, render_words, capture_groups,
                     movie_path_template, tv_path_template, movie_category, tv_category,
-                    tmdb_api_base, tmdb_image_base, category_rules, scrape_targets, default_scrape_types, include_media_info
+                    tmdb_api_base, tmdb_image_base, category_rules, scrape_targets, default_scrape_types, include_media_info,
+                    upgrade_criteria, upgrade_release_groups
              FROM organizer_settings WHERE id=1",
             [],
             |row| {
@@ -1268,6 +1340,8 @@ fn load_secrets(path: &Path) -> Result<OrganizerSecrets, String> {
                     row.get::<_, String>(18)?,
                     row.get::<_, String>(19)?,
                     row.get::<_, i64>(20)? != 0,
+                    row.get::<_, String>(21)?,
+                    row.get::<_, String>(22)?,
                 ))
             },
         )
@@ -1296,6 +1370,8 @@ fn load_secrets(path: &Path) -> Result<OrganizerSecrets, String> {
                 "[]".to_string(),
                 "[\"movie_nfo\",\"tvshow_nfo\",\"poster\",\"fanart\"]".to_string(),
                 true,
+                "[\"resolution\",\"dynamic_range\",\"release_group\",\"size\"]".to_string(),
+                String::new(),
             )
         });
     let environment_key = std::env::var("TMDB_API_KEY")
@@ -1386,6 +1462,10 @@ fn load_secrets(path: &Path) -> Result<OrganizerSecrets, String> {
         scrape_targets,
         default_scrape_types,
         include_media_info: stored.20,
+        upgrade_criteria: crate::organizer_core::normalize_upgrade_criteria(
+            &parse_json::<Vec<String>>(Some(stored.21.clone())).unwrap_or_default(),
+        ),
+        upgrade_release_groups: normalize_rule_text(&stored.22, "洗版制作组优先级")?,
     })
 }
 
@@ -1458,7 +1538,8 @@ fn get_mapping(path: &Path, id: &str) -> Result<Option<OrganizerMapping>, String
 const JOB_SELECT: &str = "SELECT id, mapping_id, source_path, source_id, source_parent_id,
     source_size, source_modified_ms, source_file_count, source_signature, share_after_requested,
     status, media_type, tmdb_id, season, episode, episode_end, query_title, query_year,
-    preview_json, result_json, error_code, message, created_at, updated_at FROM organizer_jobs";
+    preview_json, result_json, error_code, message, created_at, updated_at,
+    episode_offset, recognition_words FROM organizer_jobs";
 
 fn row_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<OrganizerJob> {
     let tmdb_raw = row.get::<_, Option<String>>(12)?.unwrap_or_default();
@@ -1487,6 +1568,8 @@ fn row_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<OrganizerJob> {
         message: row.get(21)?,
         created_at: row.get(22)?,
         updated_at: row.get(23)?,
+        episode_offset: row.get(24)?,
+        recognition_words: row.get::<_, Option<String>>(25)?.filter(|value| !value.trim().is_empty()),
     })
 }
 
@@ -1522,6 +1605,8 @@ fn emit(app: &tauri::AppHandle, event: &str, detail: Value) {
     if let (Some(target), Some(source)) = (payload.as_object_mut(), detail.as_object()) {
         target.extend(source.clone());
     }
+    // Telegram 渠道观察整理事件：job-updated 的完成/失败状态会触发通知。
+    crate::telegram::observe_event(&payload);
     let _ = app.emit("sync-event", payload);
 }
 
@@ -1977,6 +2062,12 @@ async fn probe_media_url(
             input,
         ]);
         command.kill_on_drop(true);
+        // 识别时探测媒体信息不能弹出控制台窗口
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
         match timeout(Duration::from_secs(45), command.output()).await {
             Ok(Ok(output)) => {
                 available = true;
@@ -2233,14 +2324,7 @@ async fn cloud_delete(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
 
 async fn cloud_rename(app: &tauri::AppHandle, id: &str, name: &str) -> Result<(), String> {
     let (token, device_id) = auth_context(app)?;
-    let response = api_post(
-        &token,
-        &device_id,
-        "/userres/v1/file/rename",
-        json!({ "fileId": id, "newName": name }),
-        &[],
-    )
-    .await?;
+    let response = crate::files::rename_remote_response(&token, &device_id, id, name).await?;
     finish_operation_response(&token, &device_id, response).await?;
     publish_cloud_mutation(
         app,
@@ -3173,6 +3257,18 @@ fn analyze_cloud_candidate(
         .into_iter()
         .map(|entry| (entry.logical_path.clone(), entry))
         .collect();
+    // 集偏移：识别出的集号统一加偏移量（可为负），用于源命名与 TMDB 集数错位的剧集
+    let mut analyzed_videos = analyzed_videos;
+    if let Some(offset) = overrides.episode_offset.filter(|value| *value != 0) {
+        for video in &mut analyzed_videos {
+            if let Some(episode) = video.parsed.episode {
+                video.parsed.episode = Some((episode + offset).max(0));
+            }
+            if let Some(episode_end) = video.parsed.episode_end {
+                video.parsed.episode_end = Some((episode_end + offset).max(0));
+            }
+        }
+    }
     Ok((
         CandidateAnalysis {
             candidate_path: loaded.candidate.logical_path.clone(),
@@ -3183,6 +3279,13 @@ fn analyze_cloud_candidate(
             },
             media_type: media_type.clone(),
             title: title.clone(),
+            title_candidates: crate::organizer_core::title_candidates_from(
+                &analyzed_videos
+                    .iter()
+                    .map(|item| item.parsed.clone())
+                    .collect::<Vec<_>>(),
+                &group,
+            ),
             year,
             tmdb_id: group
                 .tmdb_id
@@ -3282,19 +3385,23 @@ fn render_path_template(
         return Err("整理路径模板不能包含相对目录跳转".to_string());
     }
     // 对齐 Node cleanRenderedSegment：清理空值残留的悬空连接符，
-    // 避免剧集标题为空时产出 "剧名 - .mkv" 这类文件名。
+    // 避免剧集标题为空时产出 "剧名 - .mkv"、空字段产出 "WEB-DL..59fps"
+    // 或空制作组产出 "AAC-.mkv" 这类文件名。
     let double_dash = Regex::new(r"\s+-\s+-\s+").expect("double dash regex");
     let trailing_dash = Regex::new(r"(?:\s+-\s*)+$").expect("trailing dash regex");
+    let repeated_dots = Regex::new(r"\.{2,}").expect("repeated dots regex");
+    let dash_dot = Regex::new(r"-+\.").expect("dash dot regex");
     let parts = raw_parts
         .into_iter()
         .map(|part| {
             let collapsed = part
                 .replace("()", "")
                 .replace("[]", "")
-                .replace("..", ".")
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
+            let collapsed = repeated_dots.replace_all(&collapsed, ".").to_string();
+            let collapsed = dash_dot.replace_all(&collapsed, ".").to_string();
             let collapsed = double_dash.replace_all(&collapsed, " - ").to_string();
             let collapsed = trailing_dash.replace_all(&collapsed, "").to_string();
             sanitize_component(&collapsed, "Unknown")
@@ -3818,6 +3925,7 @@ async fn plan_target(
     mapping: &OrganizerMapping,
     relative: &str,
     source_identity: &str,
+    conflict_policy: &str,
     claimed: &mut HashSet<String>,
     resolver: &mut TargetResolver,
 ) -> Result<(String, String, bool, Option<String>, bool), String> {
@@ -3833,7 +3941,7 @@ async fn plan_target(
         claimed.insert(key);
         return Ok((target_relative, "create".to_string(), false, None, false));
     }
-    if !claimed.contains(&key) && mapping.conflict_policy == "skip" {
+    if !claimed.contains(&key) && conflict_policy == "skip" {
         claimed.insert(key);
         return Ok((
             target_relative,
@@ -3843,7 +3951,7 @@ async fn plan_target(
             false,
         ));
     }
-    if !claimed.contains(&key) && mapping.conflict_policy == "overwrite" {
+    if !claimed.contains(&key) && conflict_policy == "overwrite" {
         claimed.insert(key);
         return Ok((
             target_relative,
@@ -3882,6 +3990,265 @@ async fn plan_target(
         return Ok((target_relative, "create".to_string(), false, None, true));
     }
     Err("目标目录同名文件过多，无法生成安全名称".to_string())
+}
+
+/// 列出目标相对路径对应目录的现有子项；任一层级不存在时返回空列表（不创建目录）。
+async fn list_target_children(
+    app: &tauri::AppHandle,
+    mapping: &OrganizerMapping,
+    parent_relative: &str,
+    resolver: &mut TargetResolver,
+) -> Result<Vec<CloudEntry>, String> {
+    let mut parent_id = mapping.target_dir_id.clone();
+    for part in path_parts(parent_relative) {
+        let children = resolver.list(app, &parent_id, false).await?;
+        let Some(entry) = children
+            .into_iter()
+            .find(|entry| entry.is_directory && (entry.name == part || entry.name.eq_ignore_ascii_case(part)))
+        else {
+            return Ok(Vec::new());
+        };
+        parent_id = entry.id;
+    }
+    resolver.list(app, &parent_id, false).await
+}
+
+fn file_stem_lower(name: &str) -> String {
+    let extension = path_extension(name);
+    let stem = if extension.is_empty() {
+        name
+    } else {
+        &name[..name.len().saturating_sub(extension.len() + 1)]
+    };
+    stem.to_lowercase()
+}
+
+/// 在目标目录的既有条目中找出与新文件“同一内容”的旧版本视频：
+/// 电影 = 同 part 的视频；剧集 = 同季同集。
+fn find_existing_cloud_versions(
+    media_type: &str,
+    parsed: &crate::organizer_core::ParsedMediaName,
+    entries: &[CloudEntry],
+    settings: &NativeSettings,
+) -> Vec<(CloudEntry, crate::organizer_core::ParsedMediaName)> {
+    let overrides = crate::organizer_core::RecognitionOverrides {
+        media_type: Some(media_type.to_string()),
+        ..Default::default()
+    };
+    let mut versions = Vec::new();
+    for entry in entries {
+        if entry.is_directory || !video_extension(&entry.name) {
+            continue;
+        }
+        let entry_parsed = crate::organizer_core::parse_media_name_with_settings(
+            &entry.name,
+            &overrides,
+            settings,
+        );
+        if media_type == "tv" {
+            if entry_parsed.season != parsed.season || entry_parsed.episode != parsed.episode {
+                continue;
+            }
+        } else {
+            let entry_part = entry_parsed.part.as_deref().unwrap_or("").trim().to_lowercase();
+            let next_part = parsed.part.as_deref().unwrap_or("").trim().to_lowercase();
+            if entry_part != next_part {
+                continue;
+            }
+        }
+        versions.push((entry.clone(), entry_parsed));
+    }
+    versions
+}
+
+/// 被替换旧版本连同其同名前缀的字幕/NFO 等伴随文件一起列入清理清单。
+fn collect_replaced_cloud_files(
+    versions: &[(CloudEntry, crate::organizer_core::ParsedMediaName)],
+    entries: &[CloudEntry],
+) -> Vec<ReplacedFile> {
+    let mut seen = HashSet::new();
+    let mut replaces = Vec::new();
+    for (version, _) in versions {
+        let stem = file_stem_lower(&version.name);
+        for sibling in entries {
+            if sibling.is_directory || sibling.id.is_empty() || seen.contains(&sibling.id) {
+                continue;
+            }
+            let is_version_file = sibling.id == version.id;
+            let is_sidecar =
+                !video_extension(&sibling.name) && file_stem_lower(&sibling.name).starts_with(&stem);
+            if !is_version_file && !is_sidecar {
+                continue;
+            }
+            seen.insert(sibling.id.clone());
+            replaces.push(ReplacedFile {
+                id: sibling.id.clone(),
+                name: sibling.name.clone(),
+            });
+        }
+    }
+    replaces
+}
+
+#[cfg(test)]
+mod upgrade_version_tests {
+    use super::*;
+
+    fn entry(id: &str, name: &str, is_directory: bool, size: i64) -> CloudEntry {
+        CloudEntry {
+            id: id.to_string(),
+            name: name.to_string(),
+            is_directory,
+            size,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn movie_versions_match_by_part_and_take_sidecars_into_replacement_list() {
+        let settings = NativeSettings::default();
+        let entries = vec![
+            entry("old-video", "Movie (2020) - 1080p BluRay x264.mkv", false, 100),
+            entry("old-sub", "Movie (2020) - 1080p BluRay x264.chs.srt", false, 1),
+            entry("old-nfo", "Movie (2020) - 1080p BluRay x264.nfo", false, 1),
+            entry("poster", "poster.jpg", false, 1),
+            entry("cd2", "Movie (2020) - 1080p BluRay x264 - CD2.mkv", false, 100),
+            entry("dir", "extras", true, 0),
+        ];
+        let parsed = crate::organizer_core::parse_media_name(
+            "Movie.2020.2160p.WEB-DL.mkv",
+            &crate::organizer_core::RecognitionOverrides::default(),
+        );
+        let versions = find_existing_cloud_versions("movie", &parsed, &entries, &settings);
+        assert_eq!(
+            versions.iter().map(|(entry, _)| entry.id.as_str()).collect::<Vec<_>>(),
+            vec!["old-video"]
+        );
+        let mut replaced = collect_replaced_cloud_files(&versions, &entries)
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        replaced.sort();
+        assert_eq!(replaced, vec!["old-nfo", "old-sub", "old-video"]);
+    }
+
+    #[test]
+    fn tv_versions_match_by_season_and_episode() {
+        let settings = NativeSettings::default();
+        let entries = vec![
+            entry("e1", "Show - S01E01 - 1080p.mkv", false, 10),
+            entry("e2", "Show - S01E02 - 1080p.mkv", false, 10),
+        ];
+        let parsed = crate::organizer_core::parse_media_name(
+            "Show.S01E02.2160p.mkv",
+            &crate::organizer_core::RecognitionOverrides::default(),
+        );
+        let versions = find_existing_cloud_versions("tv", &parsed, &entries, &settings);
+        assert_eq!(
+            versions.iter().map(|(entry, _)| entry.id.as_str()).collect::<Vec<_>>(),
+            vec!["e2"]
+        );
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PlannedUpgrade {
+    planned: (String, String, bool, Option<String>, bool),
+    replaces: Vec<ReplacedFile>,
+    upgraded_by: Option<String>,
+    suppressed: bool,
+    suppressed_by: Option<String>,
+    suppressed_existing: Option<String>,
+}
+
+/// 洗版目标解析：在目标目录中找同一内容的旧版本，按优先级比较后决定
+/// 替换（action=upgrade，附带 replaces 清单）或压制跳过（suppressed）。
+#[allow(clippy::too_many_arguments)]
+async fn plan_upgrade_target(
+    app: &tauri::AppHandle,
+    mapping: &OrganizerMapping,
+    relative: &str,
+    source_identity: &str,
+    media_type: &str,
+    parsed: &crate::organizer_core::ParsedMediaName,
+    size: i64,
+    secrets: &OrganizerSecrets,
+    claimed: &mut HashSet<String>,
+    resolver: &mut TargetResolver,
+) -> Result<PlannedUpgrade, String> {
+    let normalized = relative.trim_matches('/').replace('\\', "/");
+    let key = target_key(&normalized);
+    if claimed.contains(&key) {
+        // 同一批内多个来源渲染出同一目标：退化为“保留两份”，避免相互覆盖。
+        let planned = plan_target(app, mapping, &normalized, source_identity, "rename", claimed, resolver).await?;
+        return Ok(PlannedUpgrade { planned, ..Default::default() });
+    }
+    let parent_relative = path_parent(&normalized);
+    let siblings = list_target_children(app, mapping, &parent_relative, resolver).await?;
+    let versions = find_existing_cloud_versions(media_type, parsed, &siblings, &secrets.native);
+    if versions.is_empty() {
+        let planned = plan_target(app, mapping, &normalized, source_identity, "skip", claimed, resolver).await?;
+        return Ok(PlannedUpgrade { planned, ..Default::default() });
+    }
+    let mut upgraded_by: Option<String> = None;
+    for (entry, entry_parsed) in &versions {
+        let verdict = crate::organizer_core::compare_media_versions(
+            (parsed, size),
+            (entry_parsed, entry.size),
+            &secrets.upgrade_criteria,
+            &secrets.upgrade_release_groups,
+        );
+        match verdict {
+            crate::organizer_core::UpgradeVerdict::NextWins(criterion) => {
+                if upgraded_by.is_none() {
+                    upgraded_by = Some(criterion.to_string());
+                }
+            }
+            crate::organizer_core::UpgradeVerdict::ExistingWins(criterion) => {
+                claimed.insert(key);
+                return Ok(PlannedUpgrade {
+                    planned: (
+                        normalized,
+                        "skip".to_string(),
+                        true,
+                        Some(entry.id.clone()).filter(|id| !id.is_empty()),
+                        false,
+                    ),
+                    suppressed: true,
+                    suppressed_by: Some(criterion.to_string()),
+                    suppressed_existing: Some(entry.name.clone()),
+                    ..Default::default()
+                });
+            }
+            crate::organizer_core::UpgradeVerdict::Tie => {
+                claimed.insert(key);
+                return Ok(PlannedUpgrade {
+                    planned: (
+                        normalized,
+                        "skip".to_string(),
+                        true,
+                        Some(entry.id.clone()).filter(|id| !id.is_empty()),
+                        false,
+                    ),
+                    suppressed: true,
+                    suppressed_existing: Some(entry.name.clone()),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    claimed.insert(key);
+    let replaces = collect_replaced_cloud_files(&versions, &siblings);
+    let target_name_key = target_key(&path_name(&normalized));
+    let exists = versions
+        .iter()
+        .any(|(entry, _)| target_key(&entry.name) == target_name_key);
+    Ok(PlannedUpgrade {
+        planned: (normalized, "upgrade".to_string(), exists, None, false),
+        replaces,
+        upgraded_by,
+        ..Default::default()
+    })
 }
 
 fn add_preview_item(
@@ -3928,6 +4295,7 @@ fn add_preview_item(
         season,
         episode,
         episode_end,
+        ..Default::default()
     });
 }
 
@@ -3959,7 +4327,9 @@ fn mapping_signature(mapping: &OrganizerMapping, secrets: &OrganizerSecrets) -> 
         secrets.image_base,
         secrets.category_rules,
         secrets.scrape_targets,
-        secrets.default_scrape_types
+        secrets.default_scrape_types,
+        secrets.upgrade_criteria,
+        secrets.upgrade_release_groups
     ]);
     hex::encode(Sha256::digest(
         serde_json::to_vec(&payload).unwrap_or_default(),
@@ -4019,6 +4389,15 @@ async fn build_preview(
     let mut resolver = TargetResolver::new();
     let mut items = Vec::new();
     let mut video_targets = HashMap::new();
+    // 洗版策略只作用于主视频；字幕/刮削产物遇同名默认跳过。
+    let upgrade_policy = mapping.conflict_policy == "upgrade";
+    let generated_conflict_policy = if upgrade_policy {
+        "skip"
+    } else {
+        mapping.conflict_policy.as_str()
+    };
+    // 主视频洗版结论（suppressed / upgraded），字幕等伴随文件跟随。
+    let mut video_flags: HashMap<String, (bool, bool)> = HashMap::new();
     for video in &analysis.videos {
         if metadata.media_type == "tv"
             && video.extra_kind.is_empty()
@@ -4065,7 +4444,61 @@ async fn build_preview(
                 &sanitize_component(&source_entry.name, "extra"),
             ]);
         }
-        let planned = plan_target(app, mapping, &relative, &source_entry.id, &mut claimed, &mut resolver).await?;
+        let upgrade_meta = if upgrade_policy && video.extra_kind.is_empty() {
+            Some(
+                plan_upgrade_target(
+                    app,
+                    mapping,
+                    &relative,
+                    &source_entry.id,
+                    &metadata.media_type,
+                    &video.parsed,
+                    source_entry.size,
+                    secrets,
+                    &mut claimed,
+                    &mut resolver,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let planned = match &upgrade_meta {
+            Some(meta) => meta.planned.clone(),
+            None => {
+                let policy = if video.extra_kind.is_empty() {
+                    mapping.conflict_policy.as_str()
+                } else {
+                    generated_conflict_policy
+                };
+                plan_target(app, mapping, &relative, &source_entry.id, policy, &mut claimed, &mut resolver).await?
+            }
+        };
+        let message = match &upgrade_meta {
+            Some(meta) if planned.1 == "upgrade" => format!(
+                "洗版：{}更优，将替换 {}",
+                crate::organizer_core::upgrade_criterion_label(
+                    meta.upgraded_by.as_deref().unwrap_or("")
+                ),
+                meta.replaces
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ),
+            Some(meta) if meta.suppressed => match &meta.suppressed_by {
+                Some(criterion) => format!(
+                    "现有版本{}更优，已跳过（{}）",
+                    crate::organizer_core::upgrade_criterion_label(criterion),
+                    meta.suppressed_existing.as_deref().unwrap_or("")
+                ),
+                None => format!(
+                    "已存在相同版本，已跳过（{}）",
+                    meta.suppressed_existing.as_deref().unwrap_or("")
+                ),
+            },
+            _ => "可执行".to_string(),
+        };
         let target_relative = planned.0.clone();
         add_preview_item(
             &mut items,
@@ -4087,8 +4520,21 @@ async fn build_preview(
             video.parsed.season,
             video.parsed.episode,
             video.parsed.episode_end,
-            "可执行".to_string(),
+            message,
         );
+        if let Some(meta) = upgrade_meta {
+            video_flags.insert(
+                video.source.clone(),
+                (meta.suppressed, meta.planned.1 == "upgrade"),
+            );
+            if let Some(last) = items.last_mut() {
+                last.replaces = meta.replaces;
+                last.upgraded_by = meta.upgraded_by;
+                last.suppressed = meta.suppressed;
+                last.suppressed_by = meta.suppressed_by;
+                last.suppressed_existing = meta.suppressed_existing;
+            }
+        }
         video_targets.insert(video.source.clone(), target_relative);
     }
     if mapping.sync_extras {
@@ -4119,8 +4565,40 @@ async fn build_preview(
                     format!(".{extension}")
                 }
             );
-            let planned =
-                plan_target(app, mapping, &relative, &source_entry.id, &mut claimed, &mut resolver).await?;
+            let (follow_suppressed, follow_upgraded) = sidecar
+                .video_source
+                .as_ref()
+                .and_then(|source| video_flags.get(source))
+                .copied()
+                .unwrap_or((false, false));
+            let planned = if upgrade_policy && follow_suppressed {
+                let normalized = relative.trim_matches('/').replace('\\', "/");
+                claimed.insert(target_key(&normalized));
+                (normalized, "skip".to_string(), false, None, false)
+            } else if upgrade_policy && follow_upgraded {
+                // 旧版本的伴随文件已随主视频列入替换清单；同名残留由执行期备份交换兜底。
+                let normalized = relative.trim_matches('/').replace('\\', "/");
+                claimed.insert(target_key(&normalized));
+                (normalized, "upgrade".to_string(), false, None, false)
+            } else {
+                plan_target(
+                    app,
+                    mapping,
+                    &relative,
+                    &source_entry.id,
+                    generated_conflict_policy,
+                    &mut claimed,
+                    &mut resolver,
+                )
+                .await?
+            };
+            let message = if upgrade_policy && follow_suppressed {
+                "主视频被现有版本压制，跟随跳过"
+            } else if planned.1 == "upgrade" {
+                "跟随主视频洗版"
+            } else {
+                "跟随主视频整理"
+            };
             add_preview_item(
                 &mut items,
                 mapping,
@@ -4137,8 +4615,13 @@ async fn build_preview(
                 None,
                 None,
                 None,
-                "跟随主视频整理".to_string(),
+                message.to_string(),
             );
+            if upgrade_policy && follow_suppressed {
+                if let Some(last) = items.last_mut() {
+                    last.suppressed = true;
+                }
+            }
         }
     }
     let main_videos = items
@@ -4277,6 +4760,7 @@ async fn build_preview(
             mapping,
             &relative,
             source.as_deref().unwrap_or(&relative),
+            generated_conflict_policy,
             &mut claimed,
             &mut resolver,
         )
@@ -4306,6 +4790,11 @@ async fn build_preview(
     }
     let skipped = items.iter().filter(|item| item.action == "skip").count();
     let failed_items = items.iter().filter(|item| !item.success).count();
+    let upgraded = items
+        .iter()
+        .filter(|item| item.action == "upgrade" && item.kind == "video")
+        .count();
+    let suppressed = items.iter().filter(|item| item.suppressed).count();
     let warnings = skipped + analysis.ignored_samples.len() + media_probe_warnings.len();
     let share_title = format!(
         "{}{}",
@@ -4339,8 +4828,13 @@ async fn build_preview(
             format!("有 {failed_items} 项无法生成目标，请人工修正")
         } else {
             format!(
-                "已生成 {} 项云端整理预览{}",
+                "已生成 {} 项云端整理预览{}{}",
                 items.len(),
+                if upgraded > 0 {
+                    format!("，洗版替换 {upgraded} 项")
+                } else {
+                    String::new()
+                },
                 if warnings > 0 {
                     format!("，{warnings} 项提示")
                 } else {
@@ -4357,6 +4851,8 @@ async fn build_preview(
                 failed: failed_items,
                 warnings,
                 skipped,
+                upgraded,
+                suppressed,
             },
             items,
         },
@@ -4457,6 +4953,8 @@ struct TransferStep {
     source_parent_id: String,
     source_name: String,
     target_name: String,
+    kind: String,
+    target_relative: String,
     backup: Option<(String, String)>,
 }
 
@@ -4491,7 +4989,7 @@ async fn execute_transfers(
     mapping: &OrganizerMapping,
     preview: &CloudPreview,
     resolver: &mut TargetResolver,
-) -> Result<(usize, usize, Vec<String>), String> {
+) -> Result<(usize, usize, Vec<CreatedOutputItem>), String> {
     let mut transaction = Vec::new();
     let mut unattached_backups: Vec<(String, String)> = Vec::new();
     let mut transferred = 0usize;
@@ -4524,6 +5022,19 @@ async fn execute_transfers(
                 ensure_target_directory(app, mapping, &target_parent_relative, resolver).await?;
             let mut prepared = Vec::new();
             for item in items {
+                if item.action == "skip" && item.suppressed {
+                    skipped += 1;
+                    continue;
+                }
+                // 洗版：转移前把被替换的旧版本及其伴随文件移入回收站。
+                if item.action == "upgrade" && !item.replaces.is_empty() {
+                    for replaced in &item.replaces {
+                        cloud_delete(app, &replaced.id).await.map_err(|error| {
+                            format!("洗版删除旧版本失败（{}）：{error}", replaced.name)
+                        })?;
+                    }
+                    resolver.invalidate(&target_parent_id);
+                }
                 let existing = resolve_target(app, mapping, &item.target_relative, resolver).await?;
                 if item.action == "skip" && existing.is_some() {
                     skipped += 1;
@@ -4605,6 +5116,8 @@ async fn execute_transfers(
                     source_parent_id: item.source_parent_id.unwrap_or_default(),
                     source_name,
                     target_name: item.target_name,
+                    kind: item.kind.clone(),
+                    target_relative: item.target_relative.clone(),
                     backup,
                 });
             }
@@ -4639,7 +5152,12 @@ async fn execute_transfers(
         skipped,
         transaction
             .iter()
-            .map(|step| step.created_id.clone())
+            .map(|step| CreatedOutputItem {
+                id: step.created_id.clone(),
+                name: step.target_name.clone(),
+                kind: step.kind.clone(),
+                target_relative: step.target_relative.clone(),
+            })
             .collect(),
     ))
 }
@@ -4693,9 +5211,14 @@ async fn execute_scrape(
     preview: &CloudPreview,
     proxy: &str,
     resolver: &mut TargetResolver,
-) -> (usize, usize, Vec<String>) {
+) -> (usize, usize, Vec<String>, Vec<CreatedOutputItem>) {
     let Some(metadata) = preview.metadata.as_ref() else {
-        return (0, 0, vec!["没有可用的 TMDB 元数据，已跳过刮削".to_string()]);
+        return (
+            0,
+            0,
+            vec!["没有可用的 TMDB 元数据，已跳过刮削".to_string()],
+            Vec::new(),
+        );
     };
     let generated = preview
         .data
@@ -4709,6 +5232,7 @@ async fn execute_scrape(
     let mut scraped = 0usize;
     let mut skipped = 0usize;
     let mut warnings = Vec::new();
+    let mut created = Vec::new();
     for item in generated {
         let parent_id =
             match ensure_target_directory(app, mapping, &item.target_parent_relative, resolver)
@@ -4794,8 +5318,14 @@ async fn execute_scrape(
         }
         resolver.invalidate(&parent_id);
         scraped += 1;
+        created.push(CreatedOutputItem {
+            id: String::new(),
+            name: item.target_name.clone(),
+            kind: item.kind.clone(),
+            target_relative: item.target_relative.clone(),
+        });
     }
-    (scraped, skipped, warnings)
+    (scraped, skipped, warnings, created)
 }
 
 async fn create_fresh_organizer_share(
@@ -5077,6 +5607,19 @@ fn update_settings(
             .unwrap_or(&current.default_scrape_types),
         true,
     )?;
+    let upgrade_criteria = crate::organizer_core::normalize_upgrade_criteria(
+        input
+            .upgrade_criteria
+            .as_deref()
+            .unwrap_or(&current.upgrade_criteria),
+    );
+    let upgrade_release_groups = normalize_rule_text(
+        input
+            .upgrade_release_groups
+            .as_deref()
+            .unwrap_or(&current.upgrade_release_groups),
+        "洗版制作组优先级",
+    )?;
     let previous_target_ids = current
         .scrape_targets
         .iter()
@@ -5108,8 +5651,9 @@ fn update_settings(
              (id, tmdb_api_key, language, image_language, include_adult, minimum_match_score,
               word_segment_search, similarity_match, recognition_words, release_groups, render_words, capture_groups,
               movie_path_template, tv_path_template, movie_category, tv_category,
-              tmdb_api_base, tmdb_image_base, category_rules, scrape_targets, default_scrape_types, include_media_info, updated_at)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+              tmdb_api_base, tmdb_image_base, category_rules, scrape_targets, default_scrape_types, include_media_info,
+              upgrade_criteria, upgrade_release_groups, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
              ON CONFLICT(id) DO UPDATE SET tmdb_api_key=excluded.tmdb_api_key,
               language=excluded.language, image_language=excluded.image_language,
               include_adult=excluded.include_adult, minimum_match_score=excluded.minimum_match_score,
@@ -5121,6 +5665,7 @@ fn update_settings(
                tmdb_api_base=excluded.tmdb_api_base, tmdb_image_base=excluded.tmdb_image_base,
                category_rules=excluded.category_rules, scrape_targets=excluded.scrape_targets,
                default_scrape_types=excluded.default_scrape_types, include_media_info=excluded.include_media_info,
+              upgrade_criteria=excluded.upgrade_criteria, upgrade_release_groups=excluded.upgrade_release_groups,
               updated_at=excluded.updated_at",
             params![
                 api_key,
@@ -5144,6 +5689,8 @@ fn update_settings(
                 serde_json::to_string(&scrape_targets).map_err(|error| format!("序列化刮削目标失败：{error}"))?,
                 serde_json::to_string(&default_scrape_types).map_err(|error| format!("序列化默认刮削类型失败：{error}"))?,
                 i64::from(include_media_info),
+                serde_json::to_string(&upgrade_criteria).map_err(|error| format!("序列化洗版优先级失败：{error}"))?,
+                upgrade_release_groups,
                 now_seconds()
             ],
         )
@@ -5228,8 +5775,10 @@ fn normalize_mapping_input(
         .share_risk_acknowledged
         .or_else(|| current.map(|item| item.share_risk_acknowledged))
         .unwrap_or(false);
-    if (transfer_type == "move" || conflict_policy == "overwrite") && !risk {
-        return Err("移动或覆盖可能使已有分享失效，请先确认分享失效风险".to_string());
+    if (transfer_type == "move" || conflict_policy == "overwrite" || conflict_policy == "upgrade")
+        && !risk
+    {
+        return Err("移动、覆盖或洗版可能使已有分享失效，请先确认分享失效风险".to_string());
     }
     let scrape = input
         .scrape
@@ -5404,6 +5953,20 @@ fn resolved_overrides(
         } else {
             input.episode_end.or(job.episode_end)
         },
+        episode_offset: if input.clear_episode_offset {
+            None
+        } else {
+            input.episode_offset.or(job.episode_offset)
+        },
+        recognition_words: if input.clear_recognition_words {
+            None
+        } else {
+            input
+                .recognition_words
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| job.recognition_words.clone())
+        },
     }
 }
 
@@ -5512,6 +6075,8 @@ async fn recognize_job(
             ("season", json!(overrides.season)),
             ("episode", json!(overrides.episode)),
             ("episode_end", json!(overrides.episode_end)),
+            ("episode_offset", json!(overrides.episode_offset)),
+            ("recognition_words", json!(overrides.recognition_words.clone())),
             ("query_title", json!(overrides.title.clone())),
             ("query_year", json!(overrides.year)),
             ("preview_json", Value::Null),
@@ -5525,7 +6090,7 @@ async fn recognize_job(
         "job-updated",
         json!({ "job_id": id, "mapping_id": mapping.id, "status": "recognizing" }),
     );
-    let secrets = load_secrets(&path)?;
+    let mut secrets = load_secrets(&path)?;
     if secrets.api_key.trim().is_empty() {
         update_job_fields(
             &path,
@@ -5538,6 +6103,19 @@ async fn recognize_job(
         )?;
         return get_job(&path, id)?.ok_or_else(|| "整理任务不存在".to_string());
     }
+    // 临时识别词只对本任务生效，且优先于全局规则执行
+    if let Some(words) = overrides
+        .recognition_words
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        secrets.native.recognition_words = if secrets.native.recognition_words.trim().is_empty() {
+            words.to_string()
+        } else {
+            format!("{words}\n{}", secrets.native.recognition_words)
+        };
+    }
+    let secrets = secrets;
     let recognition = async {
         let (mut analysis, _) = analyze_cloud_candidate(&loaded, &overrides, &secrets.native)?;
         let media_probe_warnings = if secrets.include_media_info {
@@ -5774,7 +6352,16 @@ async fn execute_job(
         .await?
         .ok_or_else(|| "待整理云端项目已经不存在".to_string())?;
     if loaded.fingerprint.signature != preview.source_signature {
-        return Err("待整理云端内容在预览后发生变化，请先重新识别".to_string());
+        // 源内容在预览后发生变化（常见于上传仍在进行）：自动按最新内容重新识别
+        // 并执行，而不是报错卡在待执行。相互递归需要 Box::pin 打断 future 循环。
+        return Box::pin(recognize_job(
+            app,
+            state,
+            id,
+            OrganizerJobInput::default(),
+            true,
+        ))
+        .await;
     }
     {
         let mut runtime = state.lock().map_err(|error| error.to_string())?;
@@ -5799,10 +6386,18 @@ async fn execute_job(
     let outcome = async {
         // 转移、刮削与分享共享同一份目标目录缓存，写操作后按父目录精确失效。
         let mut resolver = TargetResolver::new();
-        let (transferred, skipped, targets) =
+        let (transferred, skipped, transferred_items) =
             execute_transfers(app, &mapping, &preview, &mut resolver).await?;
-        let (scraped, scrape_skipped, mut warnings) =
+        let (scraped, scrape_skipped, mut warnings, scraped_items) =
             execute_scrape(app, &mapping, &preview, &secrets.tmdb_proxy, &mut resolver).await;
+        let targets = transferred_items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        let created_items = transferred_items
+            .into_iter()
+            .chain(scraped_items)
+            .collect::<Vec<_>>();
         let mut share = None;
         if job.share_after_requested || mapping.share_after_organize {
             match ensure_target_directory(app, &mapping, &preview.share_relative_path, &mut resolver)
@@ -5834,6 +6429,7 @@ async fn execute_job(
             warnings,
             targets,
             share,
+            created_items,
         })
     }
     .await;
@@ -5916,6 +6512,16 @@ async fn execute_job(
         "job-updated",
         json!({ "job_id": id, "mapping_id": mapping.id, "status": status }),
     );
+    // 通知虚拟库同步覆盖 B 目录的 STRM 并刷新 Emby；失败不影响整理结果。
+    if result.transferred > 0 {
+        let shared = app.state::<SharedState>();
+        let _ = crate::mounts::sync_virtual_libraries_for_cloud_target(
+            app,
+            shared.inner(),
+            &mapping.target_dir_id,
+            &mapping.target_path,
+        );
+    }
     get_job(&path, id)?.ok_or_else(|| "整理任务不存在".to_string())
 }
 
@@ -6817,6 +7423,123 @@ pub async fn run_organizer_job(
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RecognitionTestInput {
+    #[serde(default)]
+    names: Vec<String>,
+    #[serde(default)]
+    recognition_words: String,
+    #[serde(default)]
+    media_type: String,
+    #[serde(default)]
+    with_match: bool,
+}
+
+/// 识别测试工具：用当前设置（可叠加临时识别词）解析文件名，
+/// 可选走完整 TMDB 匹配链做识别预览。不落库、不影响任务。
+#[tauri::command]
+pub async fn test_media_recognition(
+    state: tauri::State<'_, OrganizerSharedState>,
+    input: RecognitionTestInput,
+) -> Result<Value, String> {
+    let path = database_path(state.inner())?;
+    let mut secrets = load_secrets(&path)?;
+    if !input.recognition_words.trim().is_empty() {
+        validate_auxiliary_rule_block(&input.recognition_words, "临时识别词", true)?;
+        secrets.native.recognition_words = if secrets.native.recognition_words.trim().is_empty() {
+            input.recognition_words.clone()
+        } else {
+            format!(
+                "{}\n{}",
+                input.recognition_words, secrets.native.recognition_words
+            )
+        };
+    }
+    let hint = input.media_type.trim().to_lowercase();
+    let hint = matches!(hint.as_str(), "movie" | "tv").then_some(hint);
+    let mut items = Vec::new();
+    for name in input
+        .names
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .take(50)
+    {
+        let overrides = RecognitionOverrides {
+            media_type: hint.clone(),
+            ..Default::default()
+        };
+        let parsed = crate::organizer_core::parse_media_name_with_settings(
+            name,
+            &overrides,
+            &secrets.native,
+        );
+        let mut row = json!({ "name": name, "parsed": parsed });
+        if input.with_match {
+            if secrets.api_key.trim().is_empty() {
+                row["match"] = json!({ "ready": false, "message": "请先配置 TMDB API Key" });
+            } else {
+                let analysis = CandidateAnalysis {
+                    candidate_path: name.to_string(),
+                    candidate_type: "file".to_string(),
+                    media_type: parsed.media_type.clone(),
+                    title: parsed.title.clone(),
+                    title_candidates: [parsed.cn_name.clone(), parsed.en_name.clone()]
+                        .into_iter()
+                        .filter(|value| !value.is_empty())
+                        .collect(),
+                    year: parsed.year,
+                    tmdb_id: parsed.tmdb_id,
+                    videos: Vec::new(),
+                    sidecars: Vec::new(),
+                    ignored_samples: Vec::new(),
+                    query: MediaQuery {
+                        title: parsed.title.clone(),
+                        year: parsed.year,
+                        media_type: parsed.media_type.clone(),
+                        tmdb_id: parsed.tmdb_id,
+                    },
+                };
+                let match_overrides = RecognitionOverrides {
+                    media_type: hint.clone(),
+                    ..Default::default()
+                };
+                match resolve_tmdb_match(
+                    &analysis,
+                    &secrets.client()?,
+                    &secrets.native,
+                    &match_overrides,
+                )
+                .await
+                {
+                    Ok(resolution) => {
+                        row["match"] = json!({
+                            "ready": resolution.ready,
+                            "message": resolution.message,
+                            "title": resolution.metadata.as_ref().map(|value| value.title.clone()),
+                            "original_title": resolution.metadata.as_ref().map(|value| value.original_title.clone()),
+                            "year": resolution.metadata.as_ref().and_then(|value| value.year),
+                            "tmdb_id": resolution.selected.as_ref().map(|value| value.tmdb_id),
+                            "media_type": resolution.query.media_type,
+                            "candidates": resolution.candidates.iter().take(5).map(|candidate| json!({
+                                "tmdb_id": candidate.tmdb_id,
+                                "title": candidate.title,
+                                "year": candidate.year,
+                                "media_type": candidate.media_type,
+                            })).collect::<Vec<_>>(),
+                        });
+                    }
+                    Err(error) => {
+                        row["match"] = json!({ "ready": false, "message": error });
+                    }
+                }
+            }
+        }
+        items.push(row);
+    }
+    Ok(json!({ "items": items }))
+}
+
 #[tauri::command]
 pub async fn retry_organizer_job(
     app: tauri::AppHandle,
@@ -6838,6 +7561,166 @@ pub async fn retry_organizer_job(
         }
     }
     recognize_job(&app, state.inner(), &id, input, false).await
+}
+
+/// 目录（含一层子目录）内是否还有视频文件：决定共享刮削元数据（tvshow.nfo、
+/// 海报等）是否可以随重新归档一并清理。
+async fn directory_still_has_video(
+    app: &tauri::AppHandle,
+    mapping: &OrganizerMapping,
+    relative: &str,
+    resolver: &mut TargetResolver,
+) -> bool {
+    let Ok(Some(entry)) = resolve_target(app, mapping, relative, resolver).await else {
+        return false;
+    };
+    if !entry.is_directory {
+        return false;
+    }
+    let Ok(children) = resolver.list(app, &entry.id, true).await else {
+        return true;
+    };
+    if children
+        .iter()
+        .any(|child| !child.is_directory && video_extension(&child.name))
+    {
+        return true;
+    }
+    for child in children.iter().filter(|child| child.is_directory) {
+        if let Ok(grand) = resolver.list(app, &child.id, false).await {
+            if grand
+                .iter()
+                .any(|item| !item.is_directory && video_extension(&item.name))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 重新归档前清理上一次执行创建的产物：
+/// 1. 删除转移落位的视频/字幕等文件（按 ID，容忍已不存在）；
+/// 2. 与被删视频同名前缀的单集元数据一并删除；共享元数据（tvshow.nfo、海报）
+///    只在所在目录已无其他视频时删除——单集纠错不会破坏剧集的其余内容；
+/// 3. 自底向上删除因此变空的目录，到整理目标根为止。
+async fn cleanup_previous_outputs(
+    app: &tauri::AppHandle,
+    mapping: &OrganizerMapping,
+    job: &OrganizerJob,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(result) = &job.result else {
+        return warnings;
+    };
+    // 旧版本任务只记录了转移文件 ID：按 ID 清理，跳过目录收敛。
+    let items: Vec<CreatedOutputItem> = if result.created_items.is_empty() {
+        result
+            .targets
+            .iter()
+            .filter(|id| !id.is_empty())
+            .map(|id| CreatedOutputItem {
+                id: id.clone(),
+                kind: "video".to_string(),
+                ..Default::default()
+            })
+            .collect()
+    } else {
+        result.created_items.clone()
+    };
+    if items.is_empty() {
+        return warnings;
+    }
+    let media_kinds = ["video", "subtitle", "audio", "trailer", "extra"];
+    let mut resolver = TargetResolver::new();
+    let mut deleted_stems: HashSet<String> = HashSet::new();
+    let mut affected_dirs: HashSet<String> = HashSet::new();
+    for item in items
+        .iter()
+        .filter(|item| media_kinds.contains(&item.kind.as_str()) || item.kind.is_empty())
+    {
+        if item.id.is_empty() {
+            continue;
+        }
+        match cloud_delete(app, &item.id).await {
+            Ok(()) => {
+                if !item.target_relative.is_empty() {
+                    deleted_stems.insert(file_stem_lower(&path_name(&item.target_relative)));
+                    affected_dirs.insert(path_parent(&item.target_relative));
+                }
+            }
+            Err(error) => {
+                // 已被手动删除/洗版替换的文件直接跳过
+                if !error.contains("不存在") {
+                    warnings.push(format!("清理旧文件 {} 失败：{error}", item.name));
+                }
+            }
+        }
+    }
+    for item in items
+        .iter()
+        .filter(|item| item.kind == "nfo" || item.kind == "image")
+    {
+        if item.target_relative.is_empty() {
+            continue;
+        }
+        let stem = file_stem_lower(&path_name(&item.target_relative));
+        let parent_relative = path_parent(&item.target_relative);
+        let tied_to_deleted_video = deleted_stems
+            .iter()
+            .any(|deleted| stem.starts_with(deleted.as_str()));
+        let removable = if tied_to_deleted_video {
+            true
+        } else {
+            !directory_still_has_video(app, mapping, &parent_relative, &mut resolver).await
+        };
+        if !removable {
+            continue;
+        }
+        if let Ok(Some(entry)) =
+            resolve_target(app, mapping, &item.target_relative, &mut resolver).await
+        {
+            if !entry.is_directory {
+                if let Err(error) = cloud_delete(app, &entry.id).await {
+                    if !error.contains("不存在") {
+                        warnings.push(format!("清理旧元数据 {} 失败：{error}", item.name));
+                    }
+                }
+                resolver.invalidate(&entry.parent_id);
+                affected_dirs.insert(parent_relative);
+            }
+        }
+    }
+    // 空目录自底向上收敛：只删除确实变空的目录，有其他内容（其他版本、
+    // 其他集、非本任务文件）的目录原样保留。
+    let mut chains: HashSet<String> = HashSet::new();
+    for dir in &affected_dirs {
+        let mut current = dir.clone();
+        while !current.is_empty() {
+            chains.insert(current.clone());
+            current = path_parent(&current);
+        }
+    }
+    let mut ordered: Vec<String> = chains.into_iter().collect();
+    ordered.sort_by_key(|value| std::cmp::Reverse(value.split('/').count()));
+    for dir in ordered {
+        let mut fresh = TargetResolver::new();
+        let Ok(Some(entry)) = resolve_target(app, mapping, &dir, &mut fresh).await else {
+            continue;
+        };
+        if !entry.is_directory {
+            continue;
+        }
+        let Ok(children) = fresh.list(app, &entry.id, true).await else {
+            continue;
+        };
+        if children.is_empty() {
+            if let Err(error) = cloud_delete(app, &entry.id).await {
+                warnings.push(format!("清理空目录 {dir} 失败：{error}"));
+            }
+        }
+    }
+    warnings
 }
 
 #[tauri::command]
@@ -6892,8 +7775,31 @@ pub async fn rearchive_organizer_job(
     let task_state = state.inner().clone();
     let task_id = id.clone();
     let task_path = path.clone();
+    let task_mapping = mapping.clone();
+    let task_job = job.clone();
     tauri::async_runtime::spawn(async move {
         let result = async {
+            // 上次已经落位过的任务：先清理旧产物（含变空的目录），再重新识别，
+            // 避免错误版本的文件夹和元数据残留在媒体库。
+            if task_job
+                .result
+                .as_ref()
+                .is_some_and(|result| !result.targets.is_empty() || !result.created_items.is_empty())
+            {
+                let cleanup_warnings =
+                    cleanup_previous_outputs(&task_app, &task_mapping, &task_job).await;
+                if !cleanup_warnings.is_empty() {
+                    let _ = update_job_fields(
+                        &task_path,
+                        &task_id,
+                        &[("message", json!(format!(
+                            "旧产物清理有 {} 项提示：{}；继续重新识别",
+                            cleanup_warnings.len(),
+                            cleanup_warnings.join("；")
+                        )))],
+                    );
+                }
+            }
             let recognized = recognize_job(&task_app, &task_state, &task_id, input, false).await?;
             if recognized.status == "ready" {
                 let _ = execute_job(&task_app, &task_state, &task_id).await?;

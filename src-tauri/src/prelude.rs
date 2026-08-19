@@ -74,6 +74,7 @@ pub(crate) use crate::hashes::*;
 pub(crate) use crate::mappings::*;
 pub(crate) use crate::mounts::*;
 pub(crate) use crate::offline::*;
+pub(crate) use crate::open_file::*;
 pub(crate) use crate::oss::*;
 pub(crate) use crate::queue::*;
 pub(crate) use crate::recycle::*;

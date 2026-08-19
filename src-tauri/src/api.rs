@@ -432,7 +432,19 @@ async fn api_post_response_with(
     Ok((http_status, payload))
 }
 
-/// 业务 POST：自动重试传输层瞬时失败；登录态过期时刷新令牌并重放一次。
+/// 云端风控限流的业务码：请求被拒绝且未执行（msg 常为“缺少clientId”，
+/// 文案有误导），读写接口都可以安全退避重试。
+pub(crate) const API_THROTTLED_CODE: i64 = 120;
+const API_THROTTLE_RETRIES: u32 = 6;
+
+fn throttle_jitter_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| u64::from(value.subsec_nanos()) % 150)
+        .unwrap_or(75)
+}
+
+/// 业务 POST：自动重试传输层瞬时失败与云端限流；登录态过期时刷新令牌并重放一次。
 ///
 /// `allowed` 中的业务码不视为错误（由调用方自行处理）。
 pub(crate) async fn api_post(
@@ -443,16 +455,19 @@ pub(crate) async fn api_post(
     allowed: &[i64],
 ) -> Result<ApiResponse, String> {
     let mut active_token = token.to_string();
-    for replay in 0..2 {
-        let outcome =
-            api_post_response_with(&active_token, device_id, endpoint, &body).await;
+    let mut auth_replayed = false;
+    let mut throttle_retries = 0u32;
+    let mut throttle_delay = tokio::time::Duration::from_millis(250);
+    loop {
+        let outcome = api_post_response_with(&active_token, device_id, endpoint, &body).await;
         let auth_expired = match &outcome {
             Ok((http_status, payload)) => business_auth_expired(*http_status, payload.code),
             Err(BusinessRequestError::InvalidResponse { http_status: 401, .. }) => true,
             Err(_) => false,
         };
         if auth_expired {
-            if replay == 0 {
+            if !auth_replayed {
+                auth_replayed = true;
                 if let Some(fresh) = fresh_business_token(&active_token).await {
                     active_token = fresh;
                     continue;
@@ -464,9 +479,21 @@ pub(crate) async fn api_post(
             Ok(response) => response,
             Err(error) => return Err(error.into_message()),
         };
+        // 云端全局限流（业务码 120）：请求未被执行，指数退避后重试。
+        if payload.code == API_THROTTLED_CODE
+            && !allowed.contains(&API_THROTTLED_CODE)
+            && throttle_retries < API_THROTTLE_RETRIES
+        {
+            throttle_retries += 1;
+            tokio::time::sleep(
+                throttle_delay + tokio::time::Duration::from_millis(throttle_jitter_ms()),
+            )
+            .await;
+            throttle_delay = (throttle_delay * 2).min(tokio::time::Duration::from_secs(4));
+            continue;
+        }
         return finish_api_post(endpoint, &body, http_status, payload, allowed);
     }
-    Err(AUTH_EXPIRED_MESSAGE.into())
 }
 
 fn finish_api_post(

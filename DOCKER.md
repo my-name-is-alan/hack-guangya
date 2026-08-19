@@ -1,6 +1,6 @@
 # Docker Web 部署配置
 
-本文档适用于 Docker Hub 镜像 `94xhzy/guangya-sync:0.1.43`。容器提供光鸭云盘 Web 管理界面、服务器目录监控、断点续传、媒体整理、自动分享与 HDHive 投稿。
+本文档适用于 Docker Hub 镜像 `94xhzy/guangya-sync:0.1.44`。容器提供光鸭云盘 Web 管理界面、服务器目录监控、断点续传、媒体整理、自动分享与 HDHive 投稿。
 
 ## 1. 准备目录和配置
 
@@ -23,7 +23,7 @@ openssl rand -hex 24
 把结果写入 `.env`：
 
 ```dotenv
-GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.43
+GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.44
 GUANGYA_HTTP_PORT=8080
 GUANGYA_ADMIN_USERNAME=admin
 GUANGYA_ADMIN_PASSWORD=替换为上面生成的强随机密码
@@ -183,6 +183,8 @@ GUANGYA_EMBY_UPSTREAM=http://host.docker.internal:8096
 
 修改直链地址后，下一次同步会自动重写全部 STRM 内容。`/strm/` 端点免管理登录，但必须携带按实例密钥计算的 HMAC 签名；签名密钥保存在 `/data/state.sqlite3`，不通过状态接口回显。
 
+整理任务完成后会自动匹配输出目录所在的虚拟库并触发同步。在虚拟库设置中填写 Emby API Key 后，同步完成自动调用 Emby `/Library/Media/Updated` 按路径通知刷新；本容器写入 `/virtual-library`，而 Emby 容器挂载的路径通常不同（如 `/media/strm`），此时在虚拟库映射的“Emby 内部路径”里填 Emby 容器内看到的路径用于换算。
+
 ## 4. 光鸭登录
 
 推荐启动后在网页中扫码或使用验证码登录，登录状态会保存在 `/data/state.sqlite3`。
@@ -248,6 +250,30 @@ GUANGYA_AUTO_SHARE_QUIET_MS=30000
 - 每个光鸭账号应使用独立容器、独立 `/data`、独立实例 ID 和密钥。
 - 自动分享会等待同一顶层目录的文件全部完成云端入库，并在静默窗口结束后创建或更新分享。
 
+## 5.1 Telegram Bot 通知与交互
+
+Telegram Bot 可以在网页“设置 → Telegram”中配置；也可以使用环境变量托管（环境变量优先于设置页）：
+
+```dotenv
+TELEGRAM_ENABLED=1
+# bot_api（直接 Bot Token）或 mtproto（api_id/api_hash + Bot Token，MTProto 直连）
+TELEGRAM_MODE=bot_api
+TELEGRAM_BOT_TOKEN=123456789:AAF替换为BotFather下发的Token
+# bot_api 模式可选：自建反代地址，留空使用 https://api.telegram.org
+TELEGRAM_API_BASE_URL=
+# mtproto 模式必填：my.telegram.org → API development tools 获取
+TELEGRAM_API_ID=
+TELEGRAM_API_HASH=
+# 给机器人发送 /start 获取；多个用逗号分隔，第一个接收通知
+TELEGRAM_CHAT_ID=123456789
+```
+
+- 通知覆盖：整理入库、识别失败（带重新整理按钮，支持 `re <任务ID> tmdbid=…` 命令）、光鸭登录失效（可在 Telegram 中扫码重登）、Emby webhook 事件（入库/播放/登录）。
+- 命令菜单：`/status`、`/jobs`、`/logs`、`/update`、`/login`、`/help`。
+- Emby webhook 地址在设置页复制（带密钥），管理端口路径 `/webhooks/emby`，网关端口路径 `/guangya/webhooks/emby`；该端点自带密钥校验，不需要管理登录。
+- Bot API 模式走“网络偏好”的全局代理（HTTP/SOCKS5）；MTProto 模式仅支持 SOCKS5 代理，会话保存在 `/data`。
+- 同一个 Bot Token 不要同时在桌面端与 Docker 端启用，Bot API getUpdates 会返回 409 冲突。
+
 ## 6. 上传参数
 
 默认值适合普通网络环境：
@@ -282,13 +308,13 @@ docker compose logs --tail=100 guangya-sync
 生产环境建议固定版本标签或不可变摘要：
 
 ```dotenv
-GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.43
+GUANGYA_IMAGE=94xhzy/guangya-sync:0.1.44
 ```
 
-确认当前 `0.1.43` 与 `latest` 的远端摘要：
+确认当前 `0.1.44` 与 `latest` 的远端摘要：
 
 ```bash
-docker buildx imagetools inspect 94xhzy/guangya-sync:0.1.43
+docker buildx imagetools inspect 94xhzy/guangya-sync:0.1.44
 docker buildx imagetools inspect 94xhzy/guangya-sync:latest
 ```
 
@@ -346,5 +372,5 @@ docker compose logs -f guangya-sync
 docker compose restart guangya-sync
 docker compose down
 docker compose pull
-docker image inspect 94xhzy/guangya-sync:0.1.43
+docker image inspect 94xhzy/guangya-sync:0.1.44
 ```

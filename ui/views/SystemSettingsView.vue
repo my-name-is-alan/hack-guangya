@@ -10,6 +10,7 @@ import {
   KeyOutlined,
   LockOutlined,
   ReloadOutlined,
+  SendOutlined,
   SettingOutlined,
   SwapOutlined,
   UserOutlined,
@@ -28,6 +29,7 @@ const TransferSettingsPanel = defineAsyncComponent(() => import('../components/s
 const UpdateSettingsPanel = defineAsyncComponent(() => import('../components/settings/UpdateSettingsPanel.vue'))
 const OrganizerSettingsPanel = defineAsyncComponent(() => import('../components/settings/OrganizerSettingsPanel.vue'))
 const NetworkSettingsPanel = defineAsyncComponent(() => import('../components/settings/NetworkSettingsPanel.vue'))
+const TelegramSettingsPanel = defineAsyncComponent(() => import('../components/settings/TelegramSettingsPanel.vue'))
 
 const activeTab = shallowRef('account')
 const route = useRoute()
@@ -85,6 +87,11 @@ watch(() => route.query.tab, (value) => { if (typeof value === 'string' && value
       <a-tab-pane key="hdhive">
         <template #tab><span class="setting-tab"><CloudServerOutlined />HDHive</span></template>
         <HdhiveSettingsPanel />
+      </a-tab-pane>
+
+      <a-tab-pane key="telegram">
+        <template #tab><span class="setting-tab"><SendOutlined />Telegram</span></template>
+        <TelegramSettingsPanel />
       </a-tab-pane>
 
       <a-tab-pane key="cache">

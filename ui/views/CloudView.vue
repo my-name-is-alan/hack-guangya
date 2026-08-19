@@ -8,6 +8,7 @@ import {
   ArrowUpOutlined,
   CheckOutlined,
   CopyOutlined,
+  CustomerServiceOutlined,
   DeleteOutlined,
   DownloadOutlined,
   DragOutlined,
@@ -28,6 +29,8 @@ import {
   FolderOpenOutlined,
   FolderOutlined,
   InfoCircleOutlined,
+  PictureOutlined,
+  PlayCircleOutlined,
   ReloadOutlined,
   ScissorOutlined,
   ShareAltOutlined,
@@ -45,6 +48,8 @@ import GcidImportStatus from '../components/files/GcidImportStatus.vue';
 import ShareResultDialog from '../components/shares/ShareResultDialog.vue';
 import { bridge, isTauri } from '../bridge.js';
 import { useFileKeyboardShortcuts } from '../composables/useFileKeyboardShortcuts.js';
+import { useFileOpener } from '../composables/useFileOpener.js';
+import { OPEN_KIND, openKindOf } from '../fileOpen.js';
 import { FOLDER_OPEN_MODE, useFolderOpenPreference } from '../composables/useFolderOpenPreference.js';
 import { gcidImportPercent, shouldConvertPasteToFile } from '../gcidImport.js';
 import { normalizeDeveloperTransferJob } from '../developerTransfer.js';
@@ -80,6 +85,7 @@ const transfers = useTransfersStore();
 const route = useRoute();
 const router = useRouter();
 const { folderOpenMode } = useFolderOpenPreference();
+const { openFile } = useFileOpener();
 
 const selectedKeys = ref([]);
 const dragActive = ref(false);
@@ -104,6 +110,20 @@ const uploadMenuItems = computed(() => [
   { key: 'folder', label: '选择文件夹' },
   ...(!isTauri ? [{ type: 'divider' }, { key: 'server', label: '选择服务器文件' }] : []),
 ]);
+// 按打开类型给右键菜单第一项换文案和图标；不支持的类型不出现“打开”。
+const FILE_OPEN_MENU_PRESETS = {
+  [OPEN_KIND.VIDEO]: { label: '用播放器打开', icon: PlayCircleOutlined },
+  [OPEN_KIND.AUDIO]: { label: '播放', icon: CustomerServiceOutlined },
+  [OPEN_KIND.IMAGE]: { label: '查看图片', icon: PictureOutlined },
+  [OPEN_KIND.TEXT]: { label: '预览', icon: FileTextOutlined },
+};
+
+function fileOpenMenuEntries(record) {
+  const preset = FILE_OPEN_MENU_PRESETS[openKindOf(record)];
+  if (!preset) return [];
+  return [{ key: 'openFile', icon: () => h(preset.icon), label: preset.label }, { type: 'divider' }];
+}
+
 const fileContextMenuItems = computed(() => {
   const record = fileContextMenu.record;
   if (!record) return [
@@ -124,7 +144,7 @@ const fileContextMenuItems = computed(() => {
   return [
     ...(isFolder(record)
       ? [{ key: 'open', icon: () => h(FolderOpenOutlined), label: '打开文件夹' }, { type: 'divider' }]
-      : []),
+      : fileOpenMenuEntries(record)),
     { key: 'copy', icon: () => h(CopyOutlined), label: '复制 (Ctrl+C)' },
     { key: 'cut', icon: () => h(ScissorOutlined), label: '剪切 (Ctrl+X)' },
     { key: 'copyTo', icon: () => h(CopyOutlined), label: '复制到…' },
@@ -273,6 +293,14 @@ const folderPickerRowSelection = computed(() => ({
 }));
 
 
+// 加载失败的缩略图 URL；auth_key 过期后回退图标，列表刷新拿到新 URL 会自动重试。
+const failedThumbnails = reactive(new Set());
+
+function fileThumbnail(record) {
+  const url = String(record?.thumbnail || '').trim();
+  return url && !failedThumbnails.has(url) ? url : '';
+}
+
 function fileIcon(record) {
   if (isFolder(record)) return { icon: FolderOutlined, cls: 'folder' };
   const ext = pick(record, ['fileSuffix'], '').toLowerCase();
@@ -371,7 +399,11 @@ function fileRowProps(record, rowIndex) {
     onClick: (event) => handleFileRowClick(event, record),
     onFocus: () => { focusedRowId.value = id; },
     onDblclick: () => {
-      if (isFolder(record) && folderOpenMode.value === FOLDER_OPEN_MODE.DOUBLE_CLICK) enterFolder(record);
+      if (isFolder(record)) {
+        if (folderOpenMode.value === FOLDER_OPEN_MODE.DOUBLE_CLICK) enterFolder(record);
+        return;
+      }
+      openCloudFile(record);
     },
     onKeydown: (event) => {
       if (fileContextMenu.open) {
@@ -386,7 +418,7 @@ function fileRowProps(record, rowIndex) {
         enterFolder(record);
       } else if (event.key === 'Enter') {
         event.preventDefault();
-        openFileDetails(record);
+        openCloudFile(record);
       }
       if (event.key === ' ') {
         event.preventDefault();
@@ -824,6 +856,7 @@ async function handleFileContextMenuClick({ key }) {
   if (key === 'refresh') return loadCloudFiles(filesPage.value, { force: true, preserveCurrent: true });
   if (!record) return;
   if (key === 'open') return enterFolder(record);
+  if (key === 'openFile') return openCloudFile(record);
   if (key === 'copy') return setFileClipboard('copy', targets);
   if (key === 'cut') return setFileClipboard('move', targets);
   if (key === 'download') return downloadCloudFiles(targets);
@@ -968,6 +1001,16 @@ function handleFileTableChange(pagination) {
   void loadCloudFiles(nextPage);
 }
 
+function notifyQueuedUploads(result, fallbackCount = 0) {
+  const queued = Number(result && typeof result === 'object' ? result.queued : result) || Number(fallbackCount) || 0;
+  const skipped = Number(result && typeof result === 'object' ? result.skipped : 0) || 0;
+  const details = Array.isArray(result?.skips)
+    ? result.skips.slice(0, 2).map((item) => [item.path, item.reason].filter(Boolean).join('：')).filter(Boolean).join('；')
+    : '';
+  if (skipped) message.warning(`已加入上传队列：${queued} 个文件，另有 ${skipped} 个路径未扫描到${details ? `。${details}` : ''}`);
+  else message.success(`已加入上传队列：${queued} 个文件`);
+}
+
 async function triggerUpload(kind = 'files') {
   if (!appState.logged_in) return;
   if (!isTauri) {
@@ -981,8 +1024,7 @@ async function triggerUpload(kind = 'files') {
       : await bridge.selectUploadFiles();
     const paths = Array.isArray(selection) ? selection : selection ? [selection] : [];
     if (!paths.length) return;
-    const count = await bridge.invoke('queue_upload_paths', { paths, parent_id: currentFolderId.value });
-    message.success(`已加入上传队列：${Number(count || paths.length)} 个文件`);
+    notifyQueuedUploads(await bridge.invoke('queue_upload_paths', { paths, parent_id: currentFolderId.value }), paths.length);
   } catch (error) {
     message.error(errorText(error));
   } finally {
@@ -1057,8 +1099,21 @@ async function confirmServerUpload() {
     });
     const payload = await readJsonResponse(response, '加入服务器上传队列失败');
     serverFilePicker.open = false;
-    if (payload.queued) message.success(`已加入上传队列：${payload.queued} 个文件${payload.skipped ? `，跳过已上传 ${payload.skipped} 个` : ''}`);
-    else message.info(`没有需要上传的文件，已跳过 ${payload.skipped || 0} 个已上传文件`);
+    const scanSkipped = Number(payload.scan_skipped || 0);
+    const scanDetails = Array.isArray(payload.scan_skips)
+      ? payload.scan_skips.slice(0, 2).map((item) => [item.path, item.reason].filter(Boolean).join('：')).filter(Boolean).join('；')
+      : '';
+    if (payload.queued) {
+      const extra = [
+        payload.skipped ? `跳过已上传 ${payload.skipped} 个` : '',
+        scanSkipped ? `未扫描到 ${scanSkipped} 个${scanDetails ? `（${scanDetails}）` : ''}` : '',
+      ].filter(Boolean).join('，');
+      (scanSkipped ? message.warning : message.success)(`已加入上传队列：${payload.queued} 个文件${extra ? `，${extra}` : ''}`);
+    } else if (scanSkipped) {
+      message.warning(`没有需要上传的文件，未扫描到 ${scanSkipped} 个路径${scanDetails ? `。${scanDetails}` : ''}`);
+    } else {
+      message.info(`没有需要上传的文件，已跳过 ${payload.skipped || 0} 个已上传文件`);
+    }
   } catch (error) {
     message.error(errorText(error));
   } finally {
@@ -1135,6 +1190,18 @@ function openFileDetails(record) {
   detailsRecord.value = record;
   focusedRowId.value = String(fileId(record));
   detailsOpen.value = true;
+}
+
+/** 按类型打开文件（视频/图片/音频/文本），不支持的类型回落到详情抽屉。 */
+function openCloudFile(record) {
+  if (!record || isFolder(record) || !appState.logged_in) return;
+  void openFile(record, {
+    siblings: files.value,
+    total: filesTotal.value,
+    dirId: currentFolderId.value,
+  }).then((handled) => {
+    if (!handled) openFileDetails(record);
+  });
 }
 
 function handleDetailsClosed() {
@@ -1773,8 +1840,7 @@ onMounted(async () => {
         const paths = payload?.paths || [];
         if (!paths.length || !appState.logged_in) return;
         try {
-          const count = await bridge.invoke('queue_upload_paths', { paths, parent_id: currentFolderId.value });
-          message.success(`已加入上传队列：${Number(count || paths.length)} 个文件`);
+          notifyQueuedUploads(await bridge.invoke('queue_upload_paths', { paths, parent_id: currentFolderId.value }), paths.length);
         } catch (error) {
           message.error(errorText(error));
         }
@@ -1861,7 +1927,16 @@ onBeforeUnmount(() => {
           <template #bodyCell="{ column, record }">
             <template v-if="column.key === 'name'">
               <a-flex align="center" gap="small">
-                <div class="file-icon" :class="fileIcon(record).cls"><component :is="fileIcon(record).icon" /></div>
+                <img
+                  v-if="fileThumbnail(record)"
+                  class="file-thumb"
+                  :src="fileThumbnail(record)"
+                  alt=""
+                  loading="lazy"
+                  referrerpolicy="no-referrer"
+                  @error="failedThumbnails.add(String(record.thumbnail || '').trim())"
+                >
+                <div v-else class="file-icon" :class="fileIcon(record).cls"><component :is="fileIcon(record).icon" /></div>
                 <div class="file-name-wrap">
                   <span v-if="isFolder(record)" class="file-name clickable">{{ record.fileName }}</span>
                   <span v-else class="file-name">{{ record.fileName }}</span>

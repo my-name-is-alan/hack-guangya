@@ -140,7 +140,7 @@ impl FlashHashAccumulator {
 }
 
 pub(crate) async fn calculate_file_md5(path: &Path) -> Result<String, String> {
-    let mut file = tokio::fs::File::open(path)
+    let mut file = tokio::fs::File::open(readable_fs_path(path))
         .await
         .map_err(|error| format!("读取秒传文件失败：{error}"))?;
     let mut hasher = Md5::new();
@@ -163,7 +163,7 @@ pub(crate) async fn calculate_file_flash_hashes(
     path: &Path,
     file_size: u64,
 ) -> Result<FileHashes, String> {
-    let mut file = tokio::fs::File::open(path)
+    let mut file = tokio::fs::File::open(readable_fs_path(path))
         .await
         .map_err(|error| format!("读取秒传文件失败：{error}"))?;
     let chunk_size = gcid_chunk_size(file_size);

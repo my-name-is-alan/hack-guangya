@@ -133,6 +133,7 @@ export function organizerConflictLabel(value) {
     skip: '跳过已有文件',
     overwrite: '覆盖已有文件',
     rename: '保留两份',
+    upgrade: '洗版（替换旧版本）',
   }[value] || '跳过已有文件';
 }
 

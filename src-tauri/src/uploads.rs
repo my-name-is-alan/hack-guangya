@@ -202,7 +202,11 @@ where
 pub(crate) fn file_available_for_upload(path: &Path) -> Result<bool, String> {
     use std::os::windows::fs::OpenOptionsExt;
 
-    match fs::OpenOptions::new().read(true).share_mode(0).open(path) {
+    match fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(readable_fs_path(path))
+    {
         Ok(_) => Ok(true),
         Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => Ok(false),
         Err(error) => Err(format!("读取源文件失败：{error}")),
@@ -213,7 +217,7 @@ pub(crate) fn file_available_for_upload(path: &Path) -> Result<bool, String> {
 pub(crate) fn file_available_for_upload(path: &Path) -> Result<bool, String> {
     fs::OpenOptions::new()
         .read(true)
-        .open(path)
+        .open(readable_fs_path(path))
         .map(|_| true)
         .map_err(|error| format!("读取源文件失败：{error}"))
 }
@@ -290,8 +294,8 @@ pub(crate) async fn prepare_upload_item(
     if !file_available_for_upload(&item.file_path)? {
         return Ok(None);
     }
-    let first =
-        fs::metadata(&item.file_path).map_err(|error| format!("读取源文件失败：{error}"))?;
+    let first = fs::metadata(readable_fs_path(&item.file_path))
+        .map_err(|error| format!("读取源文件失败：{error}"))?;
     if !first.is_file() {
         return Err("源路径不是文件".into());
     }
@@ -299,8 +303,8 @@ pub(crate) async fn prepare_upload_item(
     if !file_available_for_upload(&item.file_path)? {
         return Ok(None);
     }
-    let second =
-        fs::metadata(&item.file_path).map_err(|error| format!("读取源文件失败：{error}"))?;
+    let second = fs::metadata(readable_fs_path(&item.file_path))
+        .map_err(|error| format!("读取源文件失败：{error}"))?;
     if first.len() != second.len() || modified_ms(&first) != modified_ms(&second) {
         return Ok(None);
     }

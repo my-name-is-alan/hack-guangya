@@ -1,7 +1,7 @@
 <script setup>
 import { computed, nextTick, onMounted, ref } from 'vue';
 import { message } from 'antdv-next';
-import { EyeOutlined, FileOutlined, FolderOutlined, ReloadOutlined } from '@antdv-next/icons';
+import { EyeOutlined, FileOutlined, FolderOutlined, ReloadOutlined, SearchOutlined } from '@antdv-next/icons';
 import { bridge } from '../../bridge.js';
 import { errorText, fileId, formatSize, formatTime, isFolder, pick, unwrapData } from '../../formatters.js';
 import FileDetailsDrawer from './FileDetailsDrawer.vue';
@@ -27,12 +27,20 @@ const rows = computed(() => actions.value.flatMap((action, actionIndex) => {
   }));
 }));
 const columns = [
-  { title: '名称', key: 'name', ellipsis: true },
+  { title: '名称', key: 'name', ellipsis: true, width: 260 },
   { title: '位置', key: 'location', ellipsis: true, width: 220 },
   { title: '大小', key: 'size', width: 110 },
   { title: '最近活动', key: 'time', width: 170 },
-  { title: '操作', key: 'actions', width: 80 },
+  { title: '操作', key: 'actions', width: 72, fixed: 'right' },
 ];
+
+const recentKeyword = ref('');
+const filteredRows = computed(() => {
+  const keyword = recentKeyword.value.trim().toLowerCase();
+  if (!keyword) return rows.value;
+  return rows.value.filter((record) => [record.fileName, record.parentName]
+    .some((value) => String(value || '').toLowerCase().includes(keyword)));
+});
 
 async function loadRecent(cursor = '', remember = false) {
   loading.value = true;
@@ -108,9 +116,14 @@ onMounted(() => loadRecent());
         <strong>云端最近</strong>
         <span>按光鸭云端行为记录展示，共 {{ total }} 组活动</span>
       </div>
-      <a-button :loading="loading" aria-label="刷新云端最近" @click="loadRecent(currentCursor)">
-        <template #icon><ReloadOutlined /></template>刷新
-      </a-button>
+      <a-space wrap>
+        <a-input v-model:value="recentKeyword" allow-clear placeholder="筛选本页文件名 / 位置" class="recent-search" aria-label="筛选云端最近文件">
+          <template #prefix><SearchOutlined /></template>
+        </a-input>
+        <a-button :loading="loading" aria-label="刷新云端最近" @click="loadRecent(currentCursor)">
+          <template #icon><ReloadOutlined /></template>刷新
+        </a-button>
+      </a-space>
     </div>
 
     <a-alert v-if="loadError" class="panel-alert" type="error" show-icon :message="loadError">
@@ -118,11 +131,12 @@ onMounted(() => loadRecent());
     </a-alert>
     <a-table
       :columns="columns"
-      :data-source="rows"
+      :data-source="filteredRows"
       :loading="loading"
       :row-key="(record) => record._rowKey"
       :on-row="rowProps"
       :pagination="false"
+      :scroll="{ x: 860 }"
       size="small"
     >
       <template #emptyText><a-empty description="暂无云端最近记录" /></template>
@@ -156,6 +170,7 @@ onMounted(() => loadRecent());
 
 <style scoped>
 .files-panel { min-height: 0; }
+.recent-search { width: 200px; }
 .panel-summary strong, .panel-summary span { display: block; }
 .panel-summary span { margin-top: 2px; color: var(--text-3, #737373); font-size: 12px; }
 .panel-alert { margin-bottom: 10px; }

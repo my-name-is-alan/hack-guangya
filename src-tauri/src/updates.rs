@@ -19,25 +19,15 @@ pub(crate) struct AppUpdateMetadata {
     published_at: Option<String>,
 }
 
-
-#[tauri::command]
-pub(crate) fn get_app_version() -> AppVersionInfo {
-    AppVersionInfo {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-    }
-}
-
-#[tauri::command]
-pub(crate) async fn fetch_app_update(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, SharedState>,
-    pending: tauri::State<'_, PendingAppUpdate>,
+/// 检查更新并把待安装包记入 PendingAppUpdate；供 tauri 命令与 Telegram /update 共用。
+pub(crate) async fn check_app_update_via_handle(
+    app: &tauri::AppHandle,
 ) -> Result<Option<AppUpdateMetadata>, String> {
-    let db_path = state
-        .lock()
-        .map_err(|error| error.to_string())?
-        .db_path
-        .clone();
+    let db_path = {
+        let state = app.state::<SharedState>();
+        let guard = state.lock().map_err(|error| error.to_string())?;
+        guard.db_path.clone()
+    };
     let global_proxy = load_global_network_proxy(&db_path)?;
     let mut updater = app.updater_builder().timeout(Duration::from_secs(30));
     if !global_proxy.trim().is_empty() {
@@ -52,26 +42,23 @@ pub(crate) async fn fetch_app_update(
         .check()
         .await
         .map_err(|error| format!("检查更新失败：{error}"))?;
-
     let metadata = update.as_ref().map(|item| AppUpdateMetadata {
         version: item.version.clone(),
         current_version: item.current_version.clone(),
         notes: item.body.clone().unwrap_or_default(),
         published_at: item.date.map(|date| date.to_string()),
     });
-    *pending
+    *app.state::<PendingAppUpdate>()
         .0
         .lock()
         .map_err(|_| "更新状态锁已损坏".to_string())? = update;
     Ok(metadata)
 }
 
-#[tauri::command]
-pub(crate) async fn install_app_update(
-    app: tauri::AppHandle,
-    pending: tauri::State<'_, PendingAppUpdate>,
-) -> Result<(), String> {
-    let update = pending
+/// 下载并安装 PendingAppUpdate 中的待装更新；供 tauri 命令与 Telegram 回调共用。
+pub(crate) async fn install_pending_update(app: &tauri::AppHandle) -> Result<(), String> {
+    let update = app
+        .state::<PendingAppUpdate>()
         .0
         .lock()
         .map_err(|_| "更新状态锁已损坏".to_string())?
@@ -120,4 +107,31 @@ pub(crate) async fn install_app_update(
         .map_err(|error| format!("下载或安装更新失败：{error}"))?;
 
     Ok(())
+}
+
+
+#[tauri::command]
+pub(crate) fn get_app_version() -> AppVersionInfo {
+    AppVersionInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn fetch_app_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+    pending: tauri::State<'_, PendingAppUpdate>,
+) -> Result<Option<AppUpdateMetadata>, String> {
+    let _ = (&state, &pending);
+    check_app_update_via_handle(&app).await
+}
+
+#[tauri::command]
+pub(crate) async fn install_app_update(
+    app: tauri::AppHandle,
+    pending: tauri::State<'_, PendingAppUpdate>,
+) -> Result<(), String> {
+    let _ = &pending;
+    install_pending_update(&app).await
 }

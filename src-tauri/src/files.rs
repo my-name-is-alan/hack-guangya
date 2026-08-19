@@ -464,12 +464,13 @@ pub(crate) async fn search_files(
 }
 
 
-pub(crate) async fn rename_remote(
+/// 云端 rename 对并发同样敏感；限流重试统一由 api_post 的业务码 120 退避处理。
+pub(crate) async fn rename_remote_response(
     token: &str,
     device_id: &str,
     file_id: &str,
     new_name: &str,
-) -> Result<(), String> {
+) -> Result<ApiResponse, String> {
     api_post(
         token,
         device_id,
@@ -477,7 +478,16 @@ pub(crate) async fn rename_remote(
         json!({ "fileId": file_id, "newName": new_name }),
         &[],
     )
-    .await?;
+    .await
+}
+
+pub(crate) async fn rename_remote(
+    token: &str,
+    device_id: &str,
+    file_id: &str,
+    new_name: &str,
+) -> Result<(), String> {
+    rename_remote_response(token, device_id, file_id, new_name).await?;
     Ok(())
 }
 

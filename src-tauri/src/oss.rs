@@ -363,7 +363,7 @@ pub(crate) async fn upload_oss(
         .creds
         .as_ref()
         .ok_or_else(|| "光鸭没有返回 OSS 临时凭证".to_string())?;
-    let size = fs::metadata(&item.file_path)
+    let size = fs::metadata(readable_fs_path(&item.file_path))
         .map_err(|error| error.to_string())?
         .len();
     let resumed = persisted.is_some();
@@ -471,11 +471,11 @@ pub(crate) async fn upload_oss(
         .map(|part| {
             let client = &client;
             let request_checkpoint = &request_checkpoint;
-            let file_path = &item.file_path;
+            let file_path = readable_fs_path(&item.file_path);
             async move {
                 let offset = u64::from(part - 1) * request_checkpoint.part_size;
                 let length = request_checkpoint.part_size.min(size - offset);
-                let mut file = tokio::fs::File::open(file_path)
+                let mut file = tokio::fs::File::open(&file_path)
                     .await
                     .map_err(|error| format!("打开上传文件失败：{error}"))?;
                 file.seek(SeekFrom::Start(offset))
@@ -502,7 +502,7 @@ pub(crate) async fn upload_oss(
                     Some(&query),
                     Some(buffer),
                     app,
-                    file_path,
+                    &file_path,
                     uploaded_at_start,
                     size,
                 )

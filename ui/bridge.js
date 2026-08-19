@@ -142,6 +142,15 @@ export const bridge = isTauri ? {
     if (command === 'export_gcid_json') return webRequest('/api/files/export-gcid', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'export_gcid_diagnostic_log') return webRequest('/api/files/export-gcid-log');
     if (command === 'get_cloud_download') return webRequest('/api/files/download', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'get_play_urls') return webRequest('/api/files/play-urls', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'read_cloud_text') {
+      const params = new URLSearchParams({ fileId: String(args.file_id || '') });
+      if (args.max_bytes) params.set('maxBytes', String(args.max_bytes));
+      return webRequest(`/api/files/text?${params}`);
+    }
+    if (command === 'list_local_players') return { players: [] };
+    if (command === 'open_in_player') throw new Error('浏览器无法直接启动本机播放器，请使用播放器协议按钮或复制播放链接');
+    if (command === 'open_cloud_file_with_system') throw new Error('浏览器无法调用本机程序打开云端文件，请下载后打开');
     if (command === 'create_share') return webRequest('/api/share', { method: 'POST', body: JSON.stringify(args) });
     if (command === 'list_shares') return webRequest('/api/shares');
     if (command === 'delete_shares') return webRequest('/api/shares/delete', { method: 'POST', body: JSON.stringify({ ...args, ids: args.ids || args.share_ids }) });
@@ -183,6 +192,10 @@ export const bridge = isTauri ? {
     if (command === 'update_mapping_auto_share') return webRequest(`/api/mappings/${encodeURIComponent(args.id)}`, { method: 'PATCH', body: JSON.stringify({ auto_share: args.auto_share }) });
     if (command === 'update_mapping_organizer') return webRequest(`/api/mappings/${encodeURIComponent(args.id)}`, { method: 'PATCH', body: JSON.stringify({ organizer_mapping_id: args.organizer_mapping_id || '' }) });
     if (command === 'update_hdhive_config') return webRequest('/api/hdhive/config', { method: 'POST', body: JSON.stringify(args) });
+    if (command === 'get_telegram_settings') return webRequest('/api/telegram/settings');
+    if (command === 'update_telegram_settings') return webRequest('/api/telegram/settings', { method: 'POST', body: JSON.stringify(args.input || args) });
+    if (command === 'test_telegram_message') return webRequest('/api/telegram/test', { method: 'POST', body: '{}' });
+    if (command === 'get_recent_logs') return webRequest(`/api/logs?limit=${encodeURIComponent(String(args.limit || 50))}`);
     if (command === 'backfill_auto_shares') return webRequest(`/api/mappings/${encodeURIComponent(args.id)}/auto-share-backfill`, { method: 'POST', body: '{}' });
     if (command === 'retry_auto_share_event') return webRequest(`/api/auto-share/events/${encodeURIComponent(args.event_id)}/retry`, { method: 'POST', body: JSON.stringify({ tmdb_id: args.tmdb_id, media_type: args.media_type }) });
     if (command === 'pause_queue') return webRequest('/api/queue/pause', { method: 'POST' });
@@ -226,6 +239,7 @@ export const bridge = isTauri ? {
     if (command === 'rearchive_organizer_job') return webRequest(`/api/organizer/jobs/${encodeURIComponent(args.id)}/rearchive`, { method: 'POST', body: JSON.stringify(args.input || {}) });
     if (command === 'share_organizer_job') return webRequest(`/api/organizer/jobs/${encodeURIComponent(args.id)}/share`, { method: 'POST', body: '{}' });
     if (command === 'scrape_selected_files') return webRequest('/api/organizer/scrape-selected', { method: 'POST', body: JSON.stringify(args.input || args) });
+    if (command === 'test_media_recognition') return webRequest('/api/organizer/test-recognition', { method: 'POST', body: JSON.stringify(args.input || args) });
     if (command === 'get_app_version') return { version: 'Docker Web' };
     if (command === 'fetch_app_update' || command === 'install_app_update') {
       throw new Error('Docker Web 版本随镜像更新，桌面自动更新仅在 Windows 客户端可用');

@@ -14,7 +14,7 @@ use std::{
 use tokio::fs as async_fs;
 use uuid::Uuid;
 
-pub const NATIVE_ENGINE_VERSION: &str = "guangya-cloud-native-v3";
+pub const NATIVE_ENGINE_VERSION: &str = "guangya-cloud-native-v4";
 pub const VIDEO_EXTENSIONS: &[&str] = &[
     "3gp", "asf", "avi", "f4v", "flv", "iso", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg",
     "mts", "rm", "rmvb", "strm", "tp", "ts", "vob", "webm", "wmv",
@@ -76,6 +76,131 @@ impl Default for NativeSettings {
     }
 }
 
+pub const UPGRADE_CRITERIA: &[&str] = &["resolution", "dynamic_range", "release_group", "size"];
+
+pub fn upgrade_criterion_label(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "resolution" => "分辨率".to_string(),
+        "dynamic_range" => "动态范围".to_string(),
+        "release_group" => "制作组".to_string(),
+        "size" => "文件大小".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn normalize_upgrade_criteria(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let normalized: Vec<String> = values
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| UPGRADE_CRITERIA.contains(&value.as_str()) && seen.insert(value.clone()))
+        .collect();
+    if normalized.is_empty() {
+        UPGRADE_CRITERIA
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect()
+    } else {
+        normalized
+    }
+}
+
+pub fn upgrade_release_group_list(value: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    value
+        .split(['\n', ',', '，'])
+        .map(|item| item.trim().to_ascii_lowercase())
+        .filter(|item| !item.is_empty() && !item.starts_with('#') && seen.insert(item.clone()))
+        .take(200)
+        .collect()
+}
+
+fn resolution_rank(parsed: &ParsedMediaName) -> i64 {
+    match parsed.video_format.trim().to_ascii_lowercase().as_str() {
+        "2160p" => 4,
+        "1080p" => 3,
+        "720p" => 2,
+        "480p" => 1,
+        _ => 0,
+    }
+}
+
+fn dynamic_range_rank(parsed: &ParsedMediaName) -> i64 {
+    if !parsed.dolby_vision.trim().is_empty() {
+        return 4;
+    }
+    match parsed.dynamic_range.trim().to_ascii_uppercase().as_str() {
+        "HDR10+" => 3,
+        "HDR10" | "HDR" => 2,
+        "HLG" => 1,
+        _ => 0,
+    }
+}
+
+fn release_group_rank(parsed: &ParsedMediaName, priorities: &[String]) -> i64 {
+    let group = parsed.release_group.trim().to_ascii_lowercase();
+    if group.is_empty() {
+        return 0;
+    }
+    priorities
+        .iter()
+        .position(|item| item == &group)
+        .map(|index| (priorities.len() - index) as i64)
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpgradeVerdict {
+    NextWins(&'static str),
+    ExistingWins(&'static str),
+    Tie,
+}
+
+/// 洗版比较：按配置的优先级维度逐项比较，首个分出胜负的维度定结果；
+/// 双方形态为（解析结果, 文件大小），全部持平视为同版本。
+pub fn compare_media_versions(
+    next: (&ParsedMediaName, i64),
+    existing: (&ParsedMediaName, i64),
+    criteria: &[String],
+    release_groups: &str,
+) -> UpgradeVerdict {
+    let order = normalize_upgrade_criteria(criteria);
+    let priorities = upgrade_release_group_list(release_groups);
+    for criterion in &order {
+        let (left, right, name): (i64, i64, &'static str) = match criterion.as_str() {
+            "resolution" => (
+                resolution_rank(next.0),
+                resolution_rank(existing.0),
+                "resolution",
+            ),
+            "dynamic_range" => (
+                dynamic_range_rank(next.0),
+                dynamic_range_rank(existing.0),
+                "dynamic_range",
+            ),
+            "release_group" => {
+                if priorities.is_empty() {
+                    continue;
+                }
+                (
+                    release_group_rank(next.0, &priorities),
+                    release_group_rank(existing.0, &priorities),
+                    "release_group",
+                )
+            }
+            "size" => (next.1.max(0), existing.1.max(0), "size"),
+            _ => continue,
+        };
+        if left > right {
+            return UpgradeVerdict::NextWins(name);
+        }
+        if right > left {
+            return UpgradeVerdict::ExistingWins(name);
+        }
+    }
+    UpgradeVerdict::Tie
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RecognitionOverrides {
     pub media_type: Option<String>,
@@ -85,12 +210,22 @@ pub struct RecognitionOverrides {
     pub season: Option<i64>,
     pub episode: Option<i64>,
     pub episode_end: Option<i64>,
+    /// 集偏移：识别出的每集集号统一加上该值（可为负），用于修正命名与 TMDB 集数错位。
+    #[serde(default)]
+    pub episode_offset: Option<i64>,
+    /// 临时识别词：仅对本次识别生效，格式与全局“自定义识别词”一致，优先于全局规则执行。
+    #[serde(default)]
+    pub recognition_words: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ParsedMediaName {
     pub original: String,
     pub title: String,
+    #[serde(default)]
+    pub cn_name: String,
+    #[serde(default)]
+    pub en_name: String,
     pub year: Option<i64>,
     pub media_type: String,
     pub season: Option<i64>,
@@ -147,6 +282,8 @@ pub struct CandidateAnalysis {
     pub candidate_type: String,
     pub media_type: String,
     pub title: String,
+    #[serde(default)]
+    pub title_candidates: Vec<String>,
     pub year: Option<i64>,
     #[serde(default)]
     pub tmdb_id: Option<i64>,
@@ -428,149 +565,67 @@ fn release_part(value: &str) -> Option<String> {
     ))
 }
 
-#[derive(Default)]
-struct TvNumbers {
-    season: Option<i64>,
-    episode: Option<i64>,
-    episode_end: Option<i64>,
-    marker_index: Option<usize>,
-}
-
-fn tv_numbers(value: &str, media_type_hint: &str) -> TvNumbers {
-    let patterns = [
-        r"(?i)(?:^|[^A-Za-z0-9])S(\d{1,3})[ ._\-]*E(\d{1,4})(?:[ ._\-]*(?:E|\-E?)(\d{1,4}))?(?:v\d+)?(?:$|[^A-Za-z0-9])",
-        r"(?i)(?:^|[^0-9])(\d{1,3})x(\d{1,4})(?:[ ._\-]*(?:x|\-)(\d{1,4}))?(?:$|[^0-9])",
-        r"第\s*(\d{1,3})\s*季[^0-9]{0,12}第?\s*(\d{1,4})(?:\s*[\-~至]\s*(\d{1,4}))?\s*[集話话]",
-        r"(?i)Season[ ._\-]*(\d{1,3})[^0-9]{0,12}(?:Episode|EP?)[ ._\-]*(\d{1,4})(?:[ ._\-]*(?:\-|EP?)(\d{1,4}))?",
-    ];
-    for pattern in patterns {
-        let matcher = regex(pattern);
-        if let Some(captures) = matcher.captures(value) {
-            let matched = captures.get(0);
-            return TvNumbers {
-                season: captures.get(1).and_then(|item| item.as_str().parse().ok()),
-                episode: captures.get(2).and_then(|item| item.as_str().parse().ok()),
-                episode_end: captures.get(3).and_then(|item| item.as_str().parse().ok()),
-                marker_index: matched.map(|item| item.start()),
-            };
-        }
-    }
-    let season_regex = regex(
-        r"(?i)(?:^|[^A-Za-z0-9])S(?:eason)?[ ._\-]?(\d{1,3})(?:$|[^A-Za-z0-9])|第\s*(\d{1,3})\s*季",
-    );
-    let season_capture = season_regex.captures(value);
-    let season = season_capture.as_ref().and_then(|captures| {
-        captures
-            .get(1)
-            .or_else(|| captures.get(2))
-            .and_then(|item| item.as_str().parse().ok())
+static RELEASE_WORD_SET: std::sync::LazyLock<HashSet<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        [
+            "bluray",
+            "blu-ray",
+            "bdrip",
+            "brrip",
+            "web",
+            "webdl",
+            "web-dl",
+            "webrip",
+            "hdtv",
+            "dvdrip",
+            "hdrip",
+            "remux",
+            "x264",
+            "x265",
+            "h264",
+            "h265",
+            "hevc",
+            "avc",
+            "av1",
+            "10bit",
+            "8bit",
+            "hdr",
+            "hdr10",
+            "hdr10plus",
+            "dv",
+            "dolbyvision",
+            "aac",
+            "ac3",
+            "eac3",
+            "ddp",
+            "dts",
+            "dtshd",
+            "truehd",
+            "atmos",
+            "flac",
+            "mp3",
+            "proper",
+            "repack",
+            "rerip",
+            "complete",
+            "internal",
+            "subbed",
+            "dubbed",
+            "multi",
+            "dual",
+            "国语",
+            "国英双语",
+            "中英字幕",
+            "中字",
+            "简繁",
+        ]
+        .into_iter()
+        .collect()
     });
-    let season_index = season_capture
-        .as_ref()
-        .and_then(|captures| captures.get(0))
-        .map(|item| item.start());
-    let episode_regex = regex(
-        r"(?i)(?:^|[^A-Za-z0-9])EP?[ ._\-]?(\d{1,4})(?:[ ._\-]*(?:\-|EP?)(\d{1,4}))?(?:v\d+)?(?:$|[^A-Za-z0-9])|第?\s*(\d{1,4})(?:\s*[\-~至]\s*(\d{1,4}))?\s*[集話话]",
-    );
-    let episode_capture = episode_regex.captures(value);
-    if let Some(captures) = episode_capture {
-        if media_type_hint == "tv" || season.is_some() {
-            let episode = captures
-                .get(1)
-                .or_else(|| captures.get(3))
-                .and_then(|item| item.as_str().parse().ok());
-            let episode_end = captures
-                .get(2)
-                .or_else(|| captures.get(4))
-                .and_then(|item| item.as_str().parse().ok());
-            let episode_index = captures.get(0).map(|item| item.start());
-            return TvNumbers {
-                season,
-                episode,
-                episode_end,
-                marker_index: match (season_index, episode_index) {
-                    (Some(left), Some(right)) => Some(left.min(right)),
-                    (left, right) => left.or(right),
-                },
-            };
-        }
-    }
-    if media_type_hint == "tv" {
-        if let Some(captures) =
-            regex(r"(?i)(?:^|\s)[\-–—]\s*(\d{1,4})(?:v\d+)?(?:\s|$)").captures(value)
-        {
-            return TvNumbers {
-                season: season.or(Some(1)),
-                episode: captures.get(1).and_then(|item| item.as_str().parse().ok()),
-                episode_end: None,
-                marker_index: captures.get(0).map(|item| item.start()),
-            };
-        }
-    }
-    TvNumbers {
-        season,
-        episode: None,
-        episode_end: None,
-        marker_index: season_index,
-    }
-}
 
 fn clean_title(value: &str) -> String {
     let stripped = strip_technical_brackets(value);
-    let release_words: HashSet<&str> = [
-        "bluray",
-        "blu-ray",
-        "bdrip",
-        "brrip",
-        "web",
-        "webdl",
-        "web-dl",
-        "webrip",
-        "hdtv",
-        "dvdrip",
-        "hdrip",
-        "remux",
-        "x264",
-        "x265",
-        "h264",
-        "h265",
-        "hevc",
-        "avc",
-        "av1",
-        "10bit",
-        "8bit",
-        "hdr",
-        "hdr10",
-        "hdr10plus",
-        "dv",
-        "dolbyvision",
-        "aac",
-        "ac3",
-        "eac3",
-        "ddp",
-        "dts",
-        "dtshd",
-        "truehd",
-        "atmos",
-        "flac",
-        "mp3",
-        "proper",
-        "repack",
-        "rerip",
-        "complete",
-        "internal",
-        "subbed",
-        "dubbed",
-        "multi",
-        "dual",
-        "国语",
-        "国英双语",
-        "中英字幕",
-        "中字",
-        "简繁",
-    ]
-    .into_iter()
-    .collect();
+    let release_words: &HashSet<&str> = &RELEASE_WORD_SET;
     let mut retained = Vec::new();
     let normalized_title = normalize_spaces(&stripped);
     for token in normalized_title.split_whitespace() {
@@ -590,6 +645,636 @@ fn clean_title(value: &str) -> String {
         retained.push(token);
     }
     normalize_spaces(&retained.join(" "))
+}
+
+// ---------------------------------------------------------------------------
+// 分词式标题识别（移植自 MoviePilot v2 的 MetaVideo 状态机，与 Node 端对齐）：
+// 把文件名按分隔符拆成 token 流，逐个判定标题/年份/分辨率/季/集/资源类型，
+// 中文与英文标题分开累计，供 TMDB 分别搜索。
+// ---------------------------------------------------------------------------
+
+pub fn chinese_numeral(text: &str) -> Option<i64> {
+    let value = text.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.chars().all(|character| character.is_ascii_digit()) {
+        return value.parse().ok();
+    }
+    let mut section = 0i64;
+    let mut digit: Option<i64> = None;
+    for character in value.chars() {
+        let simple = match character {
+            '零' => Some(0),
+            '一' => Some(1),
+            '二' | '两' => Some(2),
+            '三' => Some(3),
+            '四' => Some(4),
+            '五' => Some(5),
+            '六' => Some(6),
+            '七' => Some(7),
+            '八' => Some(8),
+            '九' => Some(9),
+            _ => None,
+        };
+        if let Some(simple) = simple {
+            digit = Some(simple);
+        } else if character == '十' {
+            section += digit.unwrap_or(1) * 10;
+            digit = None;
+        } else if character == '百' {
+            section += digit.unwrap_or(1) * 100;
+            digit = None;
+        } else if character == '千' {
+            section += digit.unwrap_or(1) * 1000;
+            digit = None;
+        } else {
+            return None;
+        }
+    }
+    Some(section + digit.unwrap_or(0))
+}
+
+fn is_chinese_text(value: &str) -> bool {
+    value
+        .chars()
+        .any(|character| ('\u{3400}'..='\u{9fff}').contains(&character))
+}
+
+fn is_all_chinese_text(value: &str) -> bool {
+    let text: String = value.chars().filter(|c| !c.is_whitespace()).collect();
+    !text.is_empty()
+        && text.chars().all(|character| {
+            ('\u{3400}'..='\u{9fff}').contains(&character)
+                || character.is_ascii_digit()
+                || character == '：'
+                || character == '·'
+        })
+}
+
+/** 预清洗（MoviePilot 同款）：去首个方括号、年份区间、文件大小、日期。 */
+fn preclean_media_title(value: &str) -> String {
+    let mut title = value.to_string();
+    if let Some(captures) = regex(r"^[\[【](.+?)[\]】]").captures(&title) {
+        let full = captures.get(0).map(|m| m.end()).unwrap_or(0);
+        let content = captures.get(1).map(|m| m.as_str()).unwrap_or("");
+        let dotted = regex(r"[A-Za-z]+\..+(?:19|20)\d{2}").is_match(content);
+        let resource = regex(r"(?i)(?:2160|1080|720|480)[PI]|4K|UHD|Blu[-.]?ray|REMUX|WEB[-.]?DL|HDTV").is_match(content);
+        title = if dotted && resource {
+            format!("{}{}", content, &title[full..])
+        } else {
+            title[full..].to_string()
+        };
+    }
+    title = regex(r"([\s.]+)(\d{4})-(\d{4})")
+        .replace(&title, "$1$2")
+        .to_string();
+    title = regex(r"(?i)[0-9.]+\s*[MGT]i?B")
+        .replace_all(&title, "")
+        .to_string();
+    title = regex(r"\d{4}[\s._-]\d{1,2}[\s._-]\d{1,2}")
+        .replace_all(&title, "")
+        .to_string();
+    title
+}
+
+#[derive(Debug, Default, Clone)]
+struct NameParseState {
+    cn_name: Option<String>,
+    en_name: Option<String>,
+    year: Option<i64>,
+    begin_season: Option<i64>,
+    end_season: Option<i64>,
+    begin_episode: Option<i64>,
+    end_episode: Option<i64>,
+    part: Option<String>,
+    is_tv: bool,
+}
+
+impl NameParseState {
+    fn name(&self) -> String {
+        if let Some(cn) = &self.cn_name {
+            if is_all_chinese_text(cn) {
+                return cn.clone();
+            }
+        }
+        if let Some(en) = &self.en_name {
+            return en.clone();
+        }
+        self.cn_name.clone().unwrap_or_default()
+    }
+}
+
+const NAME_SE_WORDS: [&str; 7] = ["共", "第", "季", "集", "话", "話", "期"];
+
+fn first_regex_number(fragment: &str, pattern: &str) -> Option<i64> {
+    regex(pattern).captures(fragment).and_then(|captures| {
+        for index in 1..captures.len() {
+            if let Some(group) = captures.get(index) {
+                if group.as_str().chars().all(|c| c.is_ascii_digit()) && !group.as_str().is_empty() {
+                    return group.as_str().parse().ok();
+                }
+            }
+        }
+        None
+    })
+}
+
+/// 从中文标题中剔除的干扰词（季集提示、栏目/清晰度/字幕组等），对齐 MoviePilot。
+fn fix_parsed_name(raw: &str, state: &mut NameParseState) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+    let pattern = concat!(
+        r"(?i)^PTS|^JADE|^AOD|^CHC|^[A-Z]{1,4}TV[\-0-9UVHDK]*",
+        r"|\d{1,2}th|\d{1,2}bit|IMAX|^3D|\s+3D|\s+DC$",
+        r"|[第\s共]+[0-9一二三四五六七八九十\-\s]+季",
+        r"|[第\s共]+[0-9一二三四五六七八九十百零\-\s]+[集话話]",
+        r"|连载|日剧|美剧|电视剧|动画片|动漫|欧美|西德|日韩|超高清|高清|无水印|下载|蓝光|翡翠台|★?\d*月?新番",
+        r"|最终季|合集|[多中国英葡法俄日韩德意西印泰台港粤双文语简繁体特效内封官译外挂]+字幕|版本|出品|台版|港版|\w+字幕组|\w+字幕社",
+        r"|未删减版|UNCUT$|UNRATE$|WITH EXTRAS$|RERIP$|SUBBED$|PROPER$|REPACK$|SEASON$|EPISODE$|Complete$|Extended$|Extended Version$",
+        r"|S\d{2}\s*-\s*S\d{2}|S\d{2}|\s+S\d{1,2}|EP?\d{2,4}\s*-\s*EP?\d{2,4}|EP?\d{2,4}|\s+EP?\d{1,4}",
+        r"|CD[\s.]*[1-9]|DVD[\s.]*[1-9]|DISK[\s.]*[1-9]|DISC[\s.]*[1-9]",
+        r"|[248]K|\d{3,4}[PIX]+",
+        r"|\s+GB",
+    );
+    let cleaned = regex(pattern).replace_all(raw, "").to_string();
+    let fixed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !fixed.is_empty()
+        && fixed.chars().all(|c| c.is_ascii_digit())
+        && fixed.parse::<i64>().map(|v| v < 1800).unwrap_or(false)
+        && state.year.is_none()
+        && state.begin_season.is_none()
+    {
+        if state.begin_episode.is_none() {
+            state.begin_episode = fixed.parse().ok();
+            state.is_tv = true;
+        }
+        return None;
+    }
+    if fixed.is_empty() {
+        None
+    } else {
+        Some(fixed)
+    }
+}
+
+/// token 状态机主体（对齐 Node parseNameTokens / MoviePilot MetaVideo）。
+fn parse_name_tokens(preclean: &str, is_file: bool) -> NameParseState {
+    let mut state = NameParseState::default();
+    let trimmed = preclean.trim();
+    if let Some(captures) = regex(r"(?i)^(?:Season\s+|S)(\d{1,3})$").captures(trimmed) {
+        state.is_tv = true;
+        state.begin_season = captures.get(1).and_then(|m| m.as_str().parse().ok());
+        return state;
+    }
+    if is_file && regex(r"^\d{1,4}$").is_match(trimmed) {
+        state.is_tv = true;
+        state.begin_episode = trimmed.parse().ok();
+        return state;
+    }
+    let tokens: Vec<String> = regex(r"[.\s()\[\]\-【】/～;&|#_「」~]+")
+        .split(preclean)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut stop_name = false;
+    let mut stop_cn_name = false;
+    let mut last_token_type = String::new();
+    let mut last_token = String::new();
+    let mut unknown_name = String::new();
+    let mut source = String::new();
+    let season_re = r"(?i)S(\d{3})|^S(\d{1,3})$|S(\d{1,3})E";
+    let episode_re = r"(?i)EP?(\d{2,4})$|^EP?(\d{1,4})$|^S\d{1,2}EP?(\d{1,4})$|S\d{2}EP?(\d{2,4})";
+    let source_re = r"(?i)^BLURAY$|^HDTV$|^UHDTV$|^HDDVD$|^WEBRIP$|^DVDRIP$|^BDRIP$|^BLU$|^WEB$|^BD$|^HDRip$|^REMUX$|^UHD$";
+    let effect_re = r"(?i)^SDR$|^HDR\d*$|^HDRVIVID$|^DOLBY$|^DOVI$|^DV$|^3D$|^REPACK$|^HLG$|^HDR10(?:\+|Plus)$|^HDR10P$|^VIVID$|^EDR$|^HQ$";
+    let pix_re = r"(?i)^[SBUHD]*(\d{3,4}[PI]+)|\d{3,4}X(\d{3,4})";
+    let pix2_re = r"(?i)^([248]+K)";
+    let video_encode_re = r"(?i)^H26[45]$|^x26[45]$|^AVC$|^HEVC$|^VC\d?$|^MPEG\d?$|^Xvid$|^DivX$|^AV1$|^AVS(?:\+|[23])$";
+    let audio_encode_re = r"(?i)^DTS\d?$|^DTSHD$|^DTSHDMA$|^Atmos$|^TrueHD\d?$|^AC3$|^\dAudios?$|^DDP\d?$|^DD\+\d?$|^DD\d?$|^LPCM\d?$|^AAC\d?$|^FLAC\d?$|^HD\d?$|^MA\d?$|^HR\d?$|^Opus\d?$|^Vorbis\d?$|^AV[3S]A$";
+    let roman_re = r"^(?:M*)(?:C[MD]|D?C{0,3})(?:X[CL]|L?X{0,3})(?:I[XV]|V?I{0,3})$";
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let token = tokens[index].clone();
+        let mut continue_flag = true;
+
+        // Part
+        if !state.name().is_empty()
+            && (state.year.is_some() || state.begin_season.is_some() || state.begin_episode.is_some())
+        {
+            if let Some(part) = regex(r"(?i)^PART[0-9ABI]{0,2}$|^CD[0-9]{0,2}$|^DVD[0-9]{0,2}$|^DISK[0-9]{0,2}$|^DISC[0-9]{0,2}$").find(&token) {
+                if state.part.is_none() {
+                    state.part = Some(part.as_str().to_string());
+                }
+                if let Some(next) = tokens.get(index + 1) {
+                    let upper = next.to_uppercase();
+                    if regex(r"^\d$|^0\d$").is_match(next) || ["A", "B", "C", "I", "II", "III"].contains(&upper.as_str()) {
+                        state.part = state.part.take().map(|part| format!("{part}{next}"));
+                        index += 1;
+                    }
+                }
+                last_token_type = "part".to_string();
+                continue_flag = false;
+            }
+        }
+
+        // 标题
+        if continue_flag {
+            if !unknown_name.is_empty() {
+                if state.cn_name.is_none() {
+                    if state.en_name.is_none() {
+                        state.en_name = Some(unknown_name.clone());
+                    } else if unknown_name != state.year.map(|y| y.to_string()).unwrap_or_default() {
+                        state.en_name = state.en_name.take().map(|en| format!("{en} {unknown_name}"));
+                    }
+                    last_token_type = "enname".to_string();
+                }
+                unknown_name.clear();
+            }
+            if !stop_name {
+                if token.to_uppercase() == "AKA" {
+                    stop_name = true;
+                    continue_flag = false;
+                } else if NAME_SE_WORDS.contains(&token.as_str()) {
+                    last_token_type = "name_se_words".to_string();
+                } else if is_chinese_text(&token) {
+                    last_token_type = "cnname".to_string();
+                    if state.cn_name.is_none() {
+                        state.cn_name = Some(token.clone());
+                    } else if !stop_cn_name {
+                        let movie_word = regex(r"剧场版|劇場版|电影版|電影版").is_match(&token);
+                        let no_chinese = regex(r".*版|.*字幕").is_match(&token);
+                        let has_se_word = NAME_SE_WORDS.iter().any(|word| token.contains(word));
+                        if movie_word || (!no_chinese && !has_se_word) {
+                            state.cn_name = state.cn_name.take().map(|cn| format!("{cn} {token}"));
+                        }
+                        stop_cn_name = true;
+                    }
+                } else {
+                    let is_digit = !token.is_empty() && token.chars().all(|c| c.is_ascii_digit());
+                    let is_roman = !is_digit
+                        && !token.is_empty()
+                        && regex(roman_re).is_match(&token.to_uppercase())
+                        && token.to_uppercase().chars().all(|c| "MDCLXVI".contains(c));
+                    if is_digit || is_roman {
+                        if last_token_type == "name_se_words" {
+                            // 第/季/集 后面的数字不进标题
+                        } else if !state.name().is_empty() {
+                            if token.starts_with('0') {
+                                // 名字后面以 0 开头的数字极可能是集号
+                            } else if !is_roman
+                                && last_token_type == "cnname"
+                                && token.parse::<i64>().map(|v| v < 1900).unwrap_or(false)
+                            {
+                                // 中文名后面跟的非年份数字极可能是集号
+                            } else if (is_digit && token.len() < 4) || is_roman {
+                                if last_token_type == "cnname" {
+                                    state.cn_name = state.cn_name.take().map(|cn| format!("{cn} {token}"));
+                                } else if last_token_type == "enname" {
+                                    state.en_name = state.en_name.take().map(|en| format!("{en} {token}"));
+                                }
+                                continue_flag = false;
+                            } else if is_digit && token.len() == 4 && unknown_name.is_empty() {
+                                unknown_name = token.clone();
+                            }
+                        } else if unknown_name.is_empty() {
+                            unknown_name = token.clone();
+                        }
+                    } else if regex(season_re).is_match(&token) {
+                        if state.en_name.as_deref().map(|en| regex(r"(?i)SEASON$").is_match(en)).unwrap_or(false) {
+                            state.en_name = state.en_name.take().map(|en| format!("{en} "));
+                        }
+                        stop_name = true;
+                    } else if regex(episode_re).is_match(&token)
+                        || regex(source_re).is_match(&token)
+                        || regex(effect_re).is_match(&token)
+                        || regex(pix_re).is_match(&token)
+                    {
+                        stop_name = true;
+                    } else {
+                        let lower = format!(".{}", token.to_lowercase());
+                        let is_media_ext = VIDEO_EXTENSIONS.contains(&token.to_lowercase().as_str())
+                            || SUBTITLE_EXTENSIONS.contains(&token.to_lowercase().as_str())
+                            || AUDIO_EXTENSIONS.contains(&token.to_lowercase().as_str())
+                            || lower.is_empty();
+                        if !is_media_ext {
+                            state.en_name = Some(match state.en_name.take() {
+                                Some(en) => format!("{en} {token}"),
+                                None => token.clone(),
+                            });
+                            last_token_type = "enname".to_string();
+                        }
+                    }
+                }
+            }
+        }
+
+        // 年份
+        if continue_flag && !state.name().is_empty() && token.len() == 4 && token.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(numeric) = token.parse::<i64>() {
+                if numeric > 1900 && numeric < 2050 {
+                    if let Some(previous_year) = state.year {
+                        if state.en_name.is_some() {
+                            state.en_name = state.en_name.take().map(|en| format!("{} {previous_year}", en.trim_end()));
+                        } else if state.cn_name.is_some() {
+                            state.cn_name = state.cn_name.take().map(|cn| format!("{cn} {previous_year}"));
+                        }
+                    } else if state.en_name.as_deref().map(|en| regex(r"(?i)SEASON$").is_match(en)).unwrap_or(false) {
+                        state.en_name = state.en_name.take().map(|en| format!("{en} "));
+                    }
+                    state.year = Some(numeric);
+                    last_token_type = "year".to_string();
+                    continue_flag = false;
+                    stop_name = true;
+                }
+            }
+        }
+
+        // 分辨率
+        if continue_flag && !state.name().is_empty() && (regex(pix_re).is_match(&token) || regex(pix2_re).is_match(&token)) {
+            last_token_type = "pix".to_string();
+            continue_flag = false;
+            stop_name = true;
+        }
+
+        // 季
+        if continue_flag {
+            let matches: Vec<i64> = regex(season_re)
+                .find_iter(&token)
+                .filter_map(|m| first_regex_number(m.as_str(), season_re))
+                .collect();
+            if !matches.is_empty() {
+                last_token_type = "season".to_string();
+                state.is_tv = true;
+                stop_name = true;
+                for value in matches {
+                    if state.begin_season.is_none() {
+                        state.begin_season = Some(value);
+                    } else if value > state.begin_season.unwrap_or(0) {
+                        state.end_season = Some(value);
+                        if is_file {
+                            state.end_season = None;
+                        }
+                    }
+                }
+            } else if token.chars().all(|c| c.is_ascii_digit())
+                && !token.is_empty()
+                && last_token_type == "SEASON"
+                && state.begin_season.is_none()
+                && token.len() < 3
+            {
+                state.begin_season = token.parse().ok();
+                last_token_type = "season".to_string();
+                stop_name = true;
+                continue_flag = false;
+                state.is_tv = true;
+            } else if token.to_uppercase() == "SEASON" && state.begin_season.is_none() {
+                last_token_type = "SEASON".to_string();
+            }
+        }
+
+        // 集
+        if continue_flag {
+            let matches: Vec<i64> = regex(episode_re)
+                .find_iter(&token)
+                .filter_map(|m| first_regex_number(m.as_str(), episode_re))
+                .collect();
+            if !matches.is_empty() {
+                last_token_type = "episode".to_string();
+                continue_flag = false;
+                stop_name = true;
+                state.is_tv = true;
+                for value in matches {
+                    if state.begin_episode.is_none() {
+                        state.begin_episode = Some(value);
+                    } else if value > state.begin_episode.unwrap_or(0) {
+                        state.end_episode = Some(value);
+                        if is_file && state.end_episode.unwrap_or(0) - state.begin_episode.unwrap_or(0) > 1 {
+                            state.end_episode = None;
+                        }
+                    }
+                }
+            } else if token.chars().all(|c| c.is_ascii_digit()) && !token.is_empty() {
+                let numeric: i64 = token.parse().unwrap_or(0);
+                if state.begin_episode.is_some()
+                    && state.end_episode.is_none()
+                    && token.len() < 5
+                    && numeric > state.begin_episode.unwrap_or(0)
+                    && last_token_type == "episode"
+                {
+                    state.end_episode = Some(numeric);
+                    if is_file && state.end_episode.unwrap_or(0) - state.begin_episode.unwrap_or(0) > 1 {
+                        state.end_episode = None;
+                    }
+                    continue_flag = false;
+                    state.is_tv = true;
+                } else if state.begin_episode.is_none()
+                    && token.len() > 1
+                    && token.len() < 4
+                    && last_token_type != "year"
+                    && last_token_type != "videoencode"
+                    && token != unknown_name
+                {
+                    state.begin_episode = Some(numeric);
+                    last_token_type = "episode".to_string();
+                    continue_flag = false;
+                    stop_name = true;
+                    state.is_tv = true;
+                } else if last_token_type == "EPISODE" && state.begin_episode.is_none() && token.len() < 5 {
+                    state.begin_episode = Some(numeric);
+                    last_token_type = "episode".to_string();
+                    continue_flag = false;
+                    stop_name = true;
+                    state.is_tv = true;
+                }
+            } else if token.to_uppercase() == "EPISODE" {
+                last_token_type = "EPISODE".to_string();
+            }
+        }
+
+        // 资源类型（WEB-DL/BluRay 组合词，用于停名 + 组合判定）
+        if continue_flag && !state.name().is_empty() {
+            let upper = token.to_uppercase();
+            if upper == "DL" && last_token_type == "source" && last_token == "WEB" {
+                source = "WEB-DL".to_string();
+                continue_flag = false;
+            } else if upper == "RAY" && last_token_type == "source" && last_token == "BLU" {
+                source = if source == "UHD" { "UHD BluRay".to_string() } else { "BluRay".to_string() };
+                continue_flag = false;
+            } else if upper == "WEBDL" {
+                source = "WEB-DL".to_string();
+                continue_flag = false;
+            } else if upper == "REMUX" && source == "BluRay" {
+                source = "BluRay REMUX".to_string();
+                continue_flag = false;
+            } else if upper == "BLURAY" && source == "UHD" {
+                source = "UHD BluRay".to_string();
+                continue_flag = false;
+            } else if regex(source_re).is_match(&token) {
+                last_token_type = "source".to_string();
+                continue_flag = false;
+                stop_name = true;
+                if source.is_empty() {
+                    source = token.clone();
+                }
+                last_token = source.to_uppercase();
+            } else if regex(effect_re).is_match(&token) {
+                last_token_type = "effect".to_string();
+                continue_flag = false;
+                stop_name = true;
+                last_token = token.to_uppercase();
+            }
+        }
+
+        // 视频/音频编码（仅用于停名与状态标记，具体值仍由技术字段正则提取）
+        let has_context = state.year.is_some()
+            || state.begin_season.is_some()
+            || state.begin_episode.is_some()
+            || last_token_type == "pix"
+            || !source.is_empty();
+        if continue_flag && !state.name().is_empty() && has_context {
+            let upper = token.to_uppercase();
+            if regex(video_encode_re).is_match(&token) || upper == "H" || upper == "X" {
+                continue_flag = false;
+                stop_name = true;
+                last_token_type = "videoencode".to_string();
+                last_token = upper;
+            } else if (token == "264" || token == "265")
+                && last_token_type == "videoencode"
+                && (last_token == "H" || last_token == "X")
+            {
+                continue_flag = false;
+            } else if upper == "10BIT" {
+                last_token_type = "videoencode".to_string();
+                continue_flag = false;
+            } else if regex(audio_encode_re).is_match(&token) {
+                continue_flag = false;
+                stop_name = true;
+                last_token_type = "audioencode".to_string();
+                last_token = upper;
+            } else if token.chars().all(|c| c.is_ascii_digit()) && !token.is_empty() && last_token_type == "audioencode" {
+                last_token = token.clone();
+            }
+        }
+
+        let _ = continue_flag;
+        index += 1;
+    }
+
+    state.cn_name = state.cn_name.take().and_then(|cn| fix_parsed_name(&cn, &mut state));
+    state.en_name = state.en_name.take().and_then(|en| fix_parsed_name(&en, &mut state));
+    if state.part.as_deref().map(|p| p.to_uppercase() == "PART").unwrap_or(false) {
+        state.part = None;
+    }
+    state
+}
+
+/// 中文季集副标题识别（第x季/第x-x集/全x集/x集全/01-26Fin），对齐 MoviePilot init_subtitle。
+fn apply_chinese_season_episode(text: &str, state: &mut NameParseState) {
+    let padded = format!(" {text} ");
+    if let Some(captures) = regex(r"(?i)Episode\s+(\d{1,4})").captures(&padded) {
+        if let Some(episode) = captures.get(1).and_then(|m| m.as_str().parse::<i64>().ok()) {
+            if episode < 10_000 && state.begin_episode.is_none() {
+                state.begin_episode = Some(episode);
+                state.is_tv = true;
+            }
+        }
+        return;
+    }
+    if regex(r"[全第季集话話期幕]").is_match(&padded) {
+        if let Some(captures) = regex(r"[全共]\s*([0-9一二三四五六七八九十]+)\s*季").captures(&padded) {
+            if state.begin_season.is_none() && state.begin_episode.is_none() {
+                if let Some(total) = captures.get(1).and_then(|m| chinese_numeral(m.as_str())) {
+                    if total >= 1 {
+                        state.begin_season = Some(1);
+                        state.end_season = if total > 1 { Some(total) } else { None };
+                        state.is_tv = true;
+                    }
+                }
+            }
+            return;
+        }
+        if let Some(captures) = regex(r"(?i)[第\s]+([0-9一二三四五六七八九十S\-]+)\s*季").captures(&padded) {
+            let value = captures
+                .get(1)
+                .map(|m| m.as_str().to_uppercase().replace('S', ""))
+                .unwrap_or_default();
+            let parts: Vec<&str> = value.split('-').collect();
+            let begin = parts.first().and_then(|part| chinese_numeral(part.trim()));
+            let end = parts.get(1).and_then(|part| chinese_numeral(part.trim()));
+            if let Some(begin) = begin {
+                if begin <= 100 && end.map(|value| value <= 100).unwrap_or(true) {
+                    if state.begin_season.is_none() {
+                        state.begin_season = Some(begin);
+                    }
+                    if state.begin_season.is_some() && state.end_season.is_none() {
+                        if let Some(end) = end {
+                            if end != state.begin_season.unwrap_or(0) {
+                                state.end_season = Some(end);
+                            }
+                        }
+                    }
+                    state.is_tv = true;
+                }
+            }
+        }
+        if let Some(captures) = regex(r"第*\s*([0-9一二三四五六七八九十百零]+)\s*[集话話期幕]?\s*-\s*第*\s*([0-9一二三四五六七八九十百零]+)\s*[集话話期幕]").captures(&padded) {
+            let begin = captures.get(1).and_then(|m| chinese_numeral(m.as_str()));
+            let end = captures.get(2).and_then(|m| chinese_numeral(m.as_str()));
+            if let (Some(begin), Some(end)) = (begin, end) {
+                if begin < 10_000 && end < 10_000 {
+                    if state.begin_episode.is_none() {
+                        state.begin_episode = Some(begin);
+                    }
+                    if state.begin_episode.is_some() && state.end_episode.is_none() && end != state.begin_episode.unwrap_or(0) {
+                        state.end_episode = Some(end);
+                    }
+                    state.is_tv = true;
+                    return;
+                }
+            }
+        }
+        if let Some(captures) = regex(r"(?i)[第\s]+([0-9一二三四五六七八九十百零EP]+)\s*[集话話期幕]").captures(&padded) {
+            let value = captures
+                .get(1)
+                .map(|m| m.as_str().to_uppercase().replace(['E', 'P'], ""))
+                .unwrap_or_default();
+            let parts: Vec<&str> = value.split('-').collect();
+            let begin = parts.first().and_then(|part| chinese_numeral(part.trim()));
+            let end = parts.get(1).and_then(|part| chinese_numeral(part.trim()));
+            if let Some(begin) = begin {
+                if begin < 10_000 {
+                    if state.begin_episode.is_none() {
+                        state.begin_episode = Some(begin);
+                    }
+                    if state.begin_episode.is_some() && state.end_episode.is_none() {
+                        if let Some(end) = end {
+                            if end != state.begin_episode.unwrap_or(0) {
+                                state.end_episode = Some(end);
+                            }
+                        }
+                    }
+                    state.is_tv = true;
+                    return;
+                }
+            }
+        }
+        if regex(r"([0-9一二三四五六七八九十百零]+)\s*集\s*全|[全共]\s*([0-9一二三四五六七八九十百零]+)\s*[集话話期幕]").is_match(&padded) {
+            state.is_tv = true;
+            return;
+        }
+    }
+    if let Some(captures) = regex(r"(?i)(?:^|[^0-9])\[?\s*(\d{1,4})\s*-\s*(\d{1,4})\s*(?:Fin|End|完结)(?:$|[^A-Za-z0-9\u{4e00}-\u{9fff}])").captures(&padded) {
+        let begin = captures.get(1).and_then(|m| m.as_str().parse::<i64>().ok());
+        let end = captures.get(2).and_then(|m| m.as_str().parse::<i64>().ok());
+        if let (Some(begin), Some(end)) = (begin, end) {
+            if begin >= 1 && begin <= end && end < 10_000 && !(begin >= 1900 && end <= 2155) && state.begin_episode.is_none() {
+                state.begin_episode = Some(begin);
+                state.end_episode = Some(end);
+                state.is_tv = true;
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -833,14 +1518,29 @@ fn known_release_group(value: &str, settings: &NativeSettings) -> String {
                 .unwrap_or_default();
         }
     }
-    regex(r"-([A-Za-z0-9][A-Za-z0-9@._-]{1,48})$")
+    // “WEB-DL.AAC”这类技术串结尾会被尾缀正则误当制作组（-DL.AAC）：
+    // 首段是发布技术词（dl/aac/265 等）时一律拒绝，退回首括号启发。
+    let trailing = regex(r"-([A-Za-z0-9][A-Za-z0-9@._-]{1,48})$")
         .captures(value)
         .and_then(|captures| captures.get(1))
-        .or_else(|| {
-            regex(r"^\[([^\]]{2,48})\]")
-                .captures(value)
-                .and_then(|captures| captures.get(1))
-        })
+        .map(|item| item.as_str().trim().to_string())
+        .filter(|candidate| {
+            let first_part = candidate
+                .split(['.', '_', ' '])
+                .next()
+                .unwrap_or_default()
+                .to_lowercase();
+            !RELEASE_WORD_SET.contains(candidate.to_lowercase().as_str())
+                && !RELEASE_WORD_SET.contains(first_part.as_str())
+                && !regex(r"(?i)^(?:h|x)?26[45]$").is_match(&first_part)
+                && !regex(r"(?i)^(?:dl|rip|hd|ma|dv|hdr\d*|\d+bit|\d+fps)$").is_match(&first_part)
+        });
+    if let Some(group) = trailing {
+        return group;
+    }
+    regex(r"^\[([^\]]{2,48})\]")
+        .captures(value)
+        .and_then(|captures| captures.get(1))
         .map(|item| item.as_str().trim().to_string())
         .unwrap_or_default()
 }
@@ -850,56 +1550,119 @@ pub fn parse_media_name_with_settings(
     options: &RecognitionOverrides,
     settings: &NativeSettings,
 ) -> ParsedMediaName {
-    let raw_original = stem_text(value);
+    let raw_name = file_name_text(value);
+    let raw_extension = Path::new(&raw_name)
+        .extension()
+        .and_then(|part| part.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    let is_file = VIDEO_EXTENSIONS.contains(&raw_extension.as_str())
+        || SUBTITLE_EXTENSIONS.contains(&raw_extension.as_str())
+        || AUDIO_EXTENSIONS.contains(&raw_extension.as_str());
+    // 只剥真实媒体扩展名：目录名“赌金.Gold Land (2026) [tmdbid-1]”最后一个
+    // 点后的整段不是扩展名，盲剥会把标题和内嵌 ID 一起丢掉。
+    let raw_original = if is_file {
+        stem_text(value)
+    } else {
+        raw_name.clone()
+    };
     let (recognized, directives) = apply_auxiliary_recognition(&raw_original, settings);
-    let original = if recognized.is_empty() {
+    let mut original = if recognized.is_empty() {
         raw_original
     } else {
         recognized
     };
+    // HDHive/Emby 风格的内嵌 TMDB ID：{tmdb-123}、{tmdbid=123}、[tmdb-123]、-Tmdb123 等
+    let mut embedded_tmdb_id: Option<i64> = None;
+    if let Some(captures) =
+        regex(r"(?i)[{\[(【]?\s*tmdb(?:id)?\s*[-=＝:：]?\s*(\d{1,10})\s*[}\])】]?").captures(&original)
+    {
+        if let Some(parsed_id) = captures.get(1).and_then(|m| m.as_str().parse::<i64>().ok()) {
+            if parsed_id > 0 {
+                embedded_tmdb_id = Some(parsed_id);
+                if let Some(full) = captures.get(0) {
+                    let cleaned = format!(
+                        "{} {}",
+                        &original[..full.start()],
+                        &original[full.end()..]
+                    );
+                    let cleaned = normalize_spaces(&cleaned);
+                    if !cleaned.is_empty() {
+                        original = cleaned;
+                    }
+                }
+            }
+        }
+    }
     let hint = options
         .media_type
         .clone()
         .unwrap_or_default()
         .to_lowercase();
-    let technical = strip_technical_brackets(&original);
-    let numbers = tv_numbers(&technical, &hint);
-    let year_capture =
-        regex(r"(?:^|[^0-9])(19\d{2}|20\d{2}|21\d{2})(?:$|[^0-9pP])").captures(&technical);
-    let parsed_year = year_capture
-        .as_ref()
-        .and_then(|capture| capture.get(1))
-        .and_then(|item| item.as_str().parse::<i64>().ok());
-    let year_index = year_capture
-        .as_ref()
-        .and_then(|capture| capture.get(0))
-        .map(|item| item.start());
-    let cut_index = [numbers.marker_index, year_index]
-        .into_iter()
-        .flatten()
-        .min();
-    let mut title = clean_title(
-        cut_index
-            .map(|index| &technical[..index])
-            .unwrap_or(&technical),
-    );
+    let preclean = preclean_media_title(&original);
+    let mut state = parse_name_tokens(&preclean, is_file);
+    // 中文季集与完结区间标记（token 流无法覆盖的中文表达；用原始串保留括号内容）
+    if state.begin_season.is_none() || state.begin_episode.is_none() {
+        apply_chinese_season_episode(&original, &mut state);
+    }
+    // 兼容 1x02 / Season x Episode y 等旧格式
+    if state.begin_episode.is_none() {
+        let legacy = regex(r"(?i)(?:^|[^0-9])(\d{1,3})x(\d{1,4})(?:[ ._\-]*(?:x|-)(\d{1,4}))?(?:$|[^0-9])")
+            .captures(&preclean)
+            .or_else(|| {
+                regex(r"(?i)Season[ ._\-]*(\d{1,3})[^0-9]{0,12}(?:Episode|EP?)[ ._\-]*(\d{1,4})(?:[ ._\-]*(?:-|EP?)(\d{1,4}))?")
+                    .captures(&preclean)
+            });
+        if let Some(captures) = legacy {
+            if state.begin_season.is_none() {
+                state.begin_season = captures.get(1).and_then(|m| m.as_str().parse().ok());
+            }
+            state.begin_episode = captures.get(2).and_then(|m| m.as_str().parse().ok());
+            if state.end_episode.is_none() {
+                state.end_episode = captures.get(3).and_then(|m| m.as_str().parse().ok());
+            }
+            state.is_tv = true;
+        }
+    }
+    // 动漫“- 05”集号（确定为剧集时）
+    if state.begin_episode.is_none() && (hint == "tv" || state.is_tv) {
+        if let Some(captures) =
+            regex(r"(?:^|\s)[\-–—]\s*(\d{1,4})(?:v\d+)?(?:\s|$)").captures(&original)
+        {
+            state.begin_episode = captures.get(1).and_then(|m| m.as_str().parse().ok());
+            state.is_tv = true;
+        }
+    }
+    let cn_name = state.cn_name.clone().unwrap_or_default();
+    let en_name = state.en_name.clone().unwrap_or_default();
+    let mut title = if !cn_name.is_empty() && is_all_chinese_text(&cn_name) {
+        cn_name.clone()
+    } else if !en_name.is_empty() {
+        en_name.clone()
+    } else {
+        cn_name.clone()
+    };
     if title.is_empty()
         || regex(r"(?i)^(?:season|episode|ep|complete|disc|disk|part)\s*\d*$").is_match(&title)
     {
-        title = options.title.clone().unwrap_or_default();
+        title = clean_title(&options.title.clone().unwrap_or_default());
     }
-    let season = options.season.or(directives.season).or(numbers.season);
-    let episode = options.episode.or(directives.episode).or(numbers.episode);
-    let episode_end = options.episode_end.or(numbers.episode_end);
+    let season = options.season.or(directives.season).or(state.begin_season);
+    let episode = options
+        .episode
+        .or(directives.episode)
+        .or(state.begin_episode);
+    let episode_end = options.episode_end.or(state.end_episode);
     let media_type = if !hint.is_empty() {
         hint
     } else if let Some(media_type) = directives.media_type {
         media_type
-    } else if episode.is_some() || season.is_some() {
+    } else if episode.is_some() || season.is_some() || state.is_tv {
         "tv".to_string()
     } else {
         "movie".to_string()
     };
+    let parsed_year = state.year;
     let video_format = technical_capture(
         &original,
         r"(?i)(?:^|[ ._\-])(2160p|1080p|720p|480p|4k|uhd)(?:$|[ ._\-])",
@@ -960,15 +1723,30 @@ pub fn parse_media_name_with_settings(
     ParsedMediaName {
         original: original.clone(),
         title,
+        cn_name,
+        en_name,
         year: options.year.or(parsed_year),
         media_type,
         season,
         episode,
         episode_end,
-        tmdb_id: directives.tmdb_id,
+        tmdb_id: directives.tmdb_id.or(embedded_tmdb_id),
         edition: release_edition(&original),
         quality: release_quality(&original),
-        part: release_part(&original),
+        part: release_part(&original).or_else(|| {
+            state.part.clone().map(|part| {
+                let upper = part.to_uppercase();
+                if upper.starts_with("PART") {
+                    format!("Part{}", &part[4..])
+                } else if upper.starts_with("DISC") || upper.starts_with("DISK") {
+                    format!("CD{}", &part[4..])
+                } else if upper.starts_with("DVD") {
+                    format!("CD{}", &part[3..])
+                } else {
+                    part
+                }
+            })
+        }),
         video_format,
         resource_type: resource_type.clone(),
         source,
@@ -1065,6 +1843,22 @@ pub fn score_tmdb_candidate(
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
     let popularity_score = ((popularity + 1.0).max(1.0).log10() / 3.0).clamp(0.0, 1.0);
+    (title_score * 0.79 + year_score * 0.16 + popularity_score * 0.05).clamp(0.0, 1.0)
+}
+
+fn rescore_candidate(name: &str, year: Option<i64>, candidate: &TmdbCandidate) -> f64 {
+    let title_score = title_similarity(name, &candidate.title)
+        .max(title_similarity(name, &candidate.original_title));
+    let year_score = match (year, candidate.year) {
+        (Some(left), Some(right)) => match (left - right).abs() {
+            0 => 1.0,
+            1 => 0.72,
+            2 => 0.35,
+            _ => 0.0,
+        },
+        _ => 0.55,
+    };
+    let popularity_score = ((candidate.popularity + 1.0).max(1.0).log10() / 3.0).clamp(0.0, 1.0);
     (title_score * 0.79 + year_score * 0.16 + popularity_score * 0.05).clamp(0.0, 1.0)
 }
 
@@ -1221,6 +2015,51 @@ fn most_useful_title(parsed: &[ParsedMediaName], fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
+fn most_useful_text(values: impl Iterator<Item = String>, fallback: &str) -> String {
+    let mut counts: HashMap<String, (String, usize)> = HashMap::new();
+    for value in values {
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            continue;
+        }
+        let key = normalize_search_title(&value);
+        let entry = counts.entry(key).or_insert((value.clone(), 0));
+        entry.1 += 1;
+        if value.len() > entry.0.len() {
+            entry.0 = value;
+        }
+    }
+    counts
+        .into_values()
+        .max_by(|left, right| left.1.cmp(&right.1).then(left.0.len().cmp(&right.0.len())))
+        .map(|item| item.0)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// 中文名、英文名分别取众数，作为 TMDB 的备用搜索名（中文优先）。
+pub fn title_candidates_from(parsed: &[ParsedMediaName], group: &ParsedMediaName) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut push = |value: String| {
+        let value = value.trim().to_string();
+        if !value.is_empty()
+            && !names
+                .iter()
+                .any(|item| normalize_search_title(item) == normalize_search_title(&value))
+        {
+            names.push(value);
+        }
+    };
+    push(most_useful_text(
+        parsed.iter().map(|item| item.cn_name.clone()),
+        &group.cn_name,
+    ));
+    push(most_useful_text(
+        parsed.iter().map(|item| item.en_name.clone()),
+        &group.en_name,
+    ));
+    names
+}
+
 fn best_sidecar_video(sidecar: &Path, videos: &[AnalyzedVideo]) -> Option<String> {
     if videos.is_empty() {
         return None;
@@ -1364,6 +2203,7 @@ pub fn analyze_candidate(
         candidate_type: if metadata.is_file() { "file" } else { "dir" }.to_string(),
         media_type: media_type.clone(),
         title: title.clone(),
+        title_candidates: title_candidates_from(&preliminary, &group),
         year,
         tmdb_id: group
             .tmdb_id
@@ -1568,6 +2408,110 @@ impl TmdbClient {
                 })
         });
         Ok(results)
+    }
+
+    /// /search/multi：类型未知或电影/剧集回退都失败时使用，电影排前、按年份降序。
+    pub async fn search_multi(&self, query: &MediaQuery) -> Result<Vec<TmdbCandidate>, String> {
+        let payload = self
+            .request(
+                "search/multi",
+                &[
+                    ("query", query.title.clone()),
+                    ("include_adult", self.include_adult.to_string()),
+                    ("page", "1".to_string()),
+                ],
+            )
+            .await?;
+        let mut results = payload
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|item| {
+                matches!(
+                    item.get("media_type").and_then(Value::as_str),
+                    Some("movie") | Some("tv")
+                )
+            })
+            .take(20)
+            .filter_map(|item| {
+                let media_type = item.get("media_type").and_then(Value::as_str)?.to_string();
+                self.normalize_candidate(&item, &media_type, query)
+            })
+            .collect::<Vec<_>>();
+        results.sort_by(|left, right| {
+            let left_key = format!(
+                "{}{}",
+                if left.media_type == "movie" { 1 } else { 0 },
+                if left.release_date.is_empty() { "0000-00-00" } else { &left.release_date }
+            );
+            let right_key = format!(
+                "{}{}",
+                if right.media_type == "movie" { 1 } else { 0 },
+                if right.release_date.is_empty() { "0000-00-00" } else { &right.release_date }
+            );
+            right_key.cmp(&left_key)
+        });
+        Ok(results)
+    }
+
+    /// 拉取 TMDB 的别名与多语言译名，用于第二轮精确匹配。
+    pub async fn alternative_names(
+        &self,
+        media_type: &str,
+        tmdb_id: i64,
+    ) -> Result<Vec<String>, String> {
+        let media_type = if media_type == "tv" { "tv" } else { "movie" };
+        let payload = self
+            .request(
+                &format!("{media_type}/{tmdb_id}"),
+                &[(
+                    "append_to_response",
+                    "alternative_titles,translations".to_string(),
+                )],
+            )
+            .await?;
+        let mut names: Vec<String> = Vec::new();
+        let mut push = |value: Option<&Value>| {
+            if let Some(text) = value.and_then(Value::as_str) {
+                let text = text.trim();
+                if !text.is_empty() && !names.iter().any(|item| item == text) {
+                    names.push(text.to_string());
+                }
+            }
+        };
+        push(payload.get("title").or_else(|| payload.get("name")));
+        push(
+            payload
+                .get("original_title")
+                .or_else(|| payload.get("original_name")),
+        );
+        let alternatives = if media_type == "movie" {
+            payload
+                .get("alternative_titles")
+                .and_then(|value| value.get("titles"))
+        } else {
+            payload
+                .get("alternative_titles")
+                .and_then(|value| value.get("results"))
+        };
+        if let Some(items) = alternatives.and_then(Value::as_array) {
+            for item in items {
+                push(item.get("title"));
+            }
+        }
+        if let Some(items) = payload
+            .get("translations")
+            .and_then(|value| value.get("translations"))
+            .and_then(Value::as_array)
+        {
+            for item in items {
+                push(item.get("data").and_then(|data| data.get("title")));
+                push(item.get("data").and_then(|data| data.get("name")));
+            }
+        }
+        Ok(names)
     }
 
     fn normalize_candidate(
@@ -1958,6 +2902,211 @@ fn exact_tmdb_candidate(candidate: &TmdbCandidate, query: &MediaQuery) -> bool {
         && (query.year.is_none() || candidate.year.is_none() || query.year == candidate.year)
 }
 
+/// 名称精确比较（MoviePilot __compare_names 语义）：去特殊字符、大小写不敏感后全等，年份允许 ±1。
+fn exact_name_hit(name: &str, candidate: &TmdbCandidate, year: Option<i64>) -> bool {
+    let target = normalize_search_title(name);
+    if target.is_empty() {
+        return false;
+    }
+    let matched = [candidate.title.as_str(), candidate.original_title.as_str()]
+        .into_iter()
+        .any(|title| normalize_search_title(title) == target);
+    if !matched {
+        return false;
+    }
+    match (year, candidate.year) {
+        (Some(expected), Some(actual)) => (expected - actual).abs() <= 1,
+        _ => true,
+    }
+}
+
+fn dedupe_candidates(collected: Vec<Vec<TmdbCandidate>>) -> Vec<TmdbCandidate> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+    for candidate in collected.into_iter().flatten() {
+        if seen.insert((candidate.media_type.clone(), candidate.tmdb_id)) {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+/// 单个搜索名的 TMDB 匹配（MoviePilot _search_by_name 策略）：
+/// 剧集=带年份搜剧集→去年份重试；电影=电影→剧集→multi 兜底。
+/// 返回 (精确命中, 累计候选)。
+async fn search_one_name(
+    client: &TmdbClient,
+    name: &str,
+    query: &MediaQuery,
+) -> Result<(Option<TmdbCandidate>, Vec<TmdbCandidate>), String> {
+    struct Round {
+        media_type: &'static str,
+        year: Option<i64>,
+    }
+    let rounds: Vec<Round> = if query.media_type == "tv" {
+        let mut rounds = vec![Round { media_type: "tv", year: query.year }];
+        if query.year.is_some() {
+            rounds.push(Round { media_type: "tv", year: None });
+        }
+        rounds
+    } else {
+        vec![
+            Round { media_type: "movie", year: query.year },
+            Round { media_type: "tv", year: query.year },
+            Round { media_type: "multi", year: None },
+        ]
+    };
+    let mut collected: Vec<Vec<TmdbCandidate>> = Vec::new();
+    for round in rounds {
+        let round_query = MediaQuery {
+            title: name.to_string(),
+            year: round.year,
+            media_type: if round.media_type == "tv" { "tv" } else { "movie" }.to_string(),
+            tmdb_id: None,
+        };
+        let results = if round.media_type == "multi" {
+            client
+                .search_multi(&MediaQuery {
+                    title: name.to_string(),
+                    year: query.year,
+                    media_type: query.media_type.clone(),
+                    tmdb_id: None,
+                })
+                .await?
+        } else {
+            client.search(&round_query).await?
+        };
+        collected.push(results.clone());
+        // TMDB 级别优先：标题/原始标题精确命中直接采用（年份允许 ±1）
+        let mut ordered = results;
+        if round.media_type != "multi" {
+            ordered.sort_by(|left, right| right.release_date.cmp(&left.release_date));
+        }
+        let expected_year = round.year.or(query.year);
+        if let Some(hit) = ordered
+            .into_iter()
+            .find(|candidate| exact_name_hit(name, candidate, expected_year))
+        {
+            return Ok((Some(hit), dedupe_candidates(collected)));
+        }
+    }
+    Ok((None, dedupe_candidates(collected)))
+}
+
+/// 第二轮：用 TMDB 别名/译名精确匹配（只查前几个候选，避免放大请求量）。
+async fn match_by_alternative_names(
+    client: &TmdbClient,
+    names: &[String],
+    candidates: &[TmdbCandidate],
+) -> Option<TmdbCandidate> {
+    for candidate in candidates.iter().take(5) {
+        let Ok(aliases) = client
+            .alternative_names(&candidate.media_type, candidate.tmdb_id)
+            .await
+        else {
+            continue;
+        };
+        let normalized: Vec<String> = aliases
+            .iter()
+            .map(|alias| normalize_search_title(alias))
+            .filter(|alias| !alias.is_empty())
+            .collect();
+        for name in names {
+            if normalized.contains(&normalize_search_title(name)) {
+                return Some(candidate.clone());
+            }
+        }
+    }
+    None
+}
+
+/// 强制 TMDB ID 的类型消歧（MoviePilot _disambiguate_by_meta 语义）：
+/// 内嵌 ID 不带类型，电影/剧集都查一遍，用标题与年份评分选择。
+async fn details_with_type_fallback(
+    client: &TmdbClient,
+    media_type: &str,
+    tmdb_id: i64,
+    names: &[String],
+    year: Option<i64>,
+    type_forced: bool,
+) -> Result<(String, MediaMetadata), String> {
+    let primary = if media_type == "tv" { "tv" } else { "movie" };
+    let secondary = if primary == "tv" { "movie" } else { "tv" };
+    let primary_details = client.details(primary, tmdb_id).await.ok();
+    if type_forced {
+        return match primary_details {
+            Some(details) => Ok((primary.to_string(), details)),
+            None => Err(format!(
+                "TMDB 未找到该{} ID：{tmdb_id}",
+                if primary == "tv" { "剧集" } else { "电影" }
+            )),
+        };
+    }
+    let secondary_details = client.details(secondary, tmdb_id).await.ok();
+    let score = |details: &MediaMetadata| {
+        let mut value = 0;
+        let titles = [
+            normalize_search_title(&details.title),
+            normalize_search_title(&details.original_title),
+        ];
+        if names
+            .iter()
+            .any(|name| titles.contains(&normalize_search_title(name)))
+        {
+            value += 2;
+        }
+        if let (Some(expected), Some(actual)) = (year, details.year) {
+            if (expected - actual).abs() <= 1 {
+                value += 1;
+            }
+        }
+        value
+    };
+    match (primary_details, secondary_details) {
+        (Some(details), None) => Ok((primary.to_string(), details)),
+        (None, Some(details)) => Ok((secondary.to_string(), details)),
+        (Some(primary_value), Some(secondary_value)) => {
+            if score(&secondary_value) > score(&primary_value) {
+                Ok((secondary.to_string(), secondary_value))
+            } else {
+                Ok((primary.to_string(), primary_value))
+            }
+        }
+        (None, None) => Err(format!("TMDB 未找到该 ID：{tmdb_id}")),
+    }
+}
+
+async fn finalize_seasons(
+    client: &TmdbClient,
+    analysis: &CandidateAnalysis,
+    overrides: &RecognitionOverrides,
+    selected: &TmdbCandidate,
+    metadata: &mut MediaMetadata,
+) {
+    let mut seasons: Vec<i64> = analysis
+        .videos
+        .iter()
+        .filter_map(|video| video.parsed.season)
+        .collect();
+    if let Some(season) = overrides.season {
+        seasons.push(season);
+    }
+    seasons.sort_unstable();
+    seasons.dedup();
+    for season_number in seasons {
+        let season = match client.season(selected.tmdb_id, season_number).await {
+            Ok(value) => value,
+            Err(error) => SeasonMetadata {
+                season_number,
+                name: format!("Season {season_number}"),
+                error: Some(error),
+                ..Default::default()
+            },
+        };
+        metadata.seasons.insert(season_number.to_string(), season);
+    }
+}
+
 pub async fn resolve_tmdb_match(
     analysis: &CandidateAnalysis,
     client: &TmdbClient,
@@ -1991,14 +3140,46 @@ pub async fn resolve_tmdb_match(
             metadata: None,
         });
     }
+    // 中文名/英文名分别搜索（用户手动输入名称时只用输入值）
+    let manual_title = overrides
+        .title
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    let search_names: Vec<String> = if let Some(manual) = &manual_title {
+        vec![manual.trim().to_string()]
+    } else {
+        let mut names = vec![query.title.clone()];
+        for candidate in &analysis.title_candidates {
+            names.push(candidate.clone());
+        }
+        let mut seen = HashSet::new();
+        names
+            .into_iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty() && seen.insert(normalize_search_title(name)))
+            .collect()
+    };
     let mut candidates;
     let selected;
     let metadata;
     if let Some(tmdb_id) = query.tmdb_id {
-        metadata = client.details(media_type, tmdb_id).await?;
+        // 人工同时指定了类型 + ID 时只查指定类型；文件名内嵌 ID 不带类型，需要消歧
+        let type_forced = overrides.media_type.is_some() && overrides.tmdb_id.is_some();
+        let (resolved_type, resolved_metadata) = details_with_type_fallback(
+            client,
+            media_type,
+            tmdb_id,
+            &search_names,
+            query.year,
+            type_forced,
+        )
+        .await?;
+        metadata = resolved_metadata;
+        let mut query = query;
+        query.media_type = resolved_type.clone();
         selected = TmdbCandidate {
             tmdb_id: metadata.tmdb_id,
-            media_type: media_type.to_string(),
+            media_type: resolved_type.clone(),
             title: metadata.title.clone(),
             original_title: metadata.original_title.clone(),
             year: metadata.year,
@@ -2012,21 +3193,94 @@ pub async fn resolve_tmdb_match(
             forced: true,
         };
         candidates = vec![selected.clone()];
-    } else {
-        candidates = client.search(&query).await?;
-        if candidates.is_empty() && settings.word_segment_search {
+        let mut metadata = metadata;
+        if resolved_type == "tv" {
+            finalize_seasons(client, analysis, overrides, &selected, &mut metadata).await;
+        }
+        return Ok(MatchResolution {
+            ready: true,
+            error_code: None,
+            message: format!(
+                "已匹配 {}{}",
+                metadata.title,
+                metadata
+                    .year
+                    .map(|year| format!(" ({year})"))
+                    .unwrap_or_default()
+            ),
+            query,
+            candidates,
+            selected: Some(selected),
+            metadata: Some(metadata),
+        });
+    }
+    {
+        let mut collected: Vec<Vec<TmdbCandidate>> = Vec::new();
+        let mut hit: Option<TmdbCandidate> = None;
+        for name in &search_names {
+            let (name_hit, name_candidates) = search_one_name(client, name, &query).await?;
+            collected.push(name_candidates);
+            if let Some(name_hit) = name_hit {
+                hit = Some(name_hit);
+                break;
+            }
+        }
+        candidates = dedupe_candidates(collected);
+        // 第二轮：别名/译名精确匹配
+        if hit.is_none() && !candidates.is_empty() {
+            hit = match_by_alternative_names(client, &search_names, &candidates).await;
+        }
+        // TMDB 排序优先（HDHive 语义）：有年份时信任 TMDB 相关度排序，取 ±1 年窗口内第一个
+        if hit.is_none() {
+            if let Some(expected) = query.year {
+                hit = candidates
+                    .iter()
+                    .find(|candidate| {
+                        candidate
+                            .year
+                            .map(|year| (year - expected).abs() <= 1)
+                            .unwrap_or(false)
+                    })
+                    .cloned();
+            }
+        }
+        // 分词回退：整名搜不到时拆中文/英文/括号段再搜
+        if hit.is_none() && candidates.is_empty() && settings.word_segment_search {
             let mut seen = HashSet::new();
-            for title in segmented_search_titles(&query.title) {
-                let mut segmented_query = query.clone();
-                segmented_query.title = title;
-                for candidate in client.search(&segmented_query).await? {
-                    if seen.insert((candidate.media_type.clone(), candidate.tmdb_id)) {
-                        candidates.push(candidate);
+            for name in &search_names {
+                for title in segmented_search_titles(name) {
+                    let mut segmented_query = query.clone();
+                    segmented_query.title = title;
+                    for candidate in client.search(&segmented_query).await? {
+                        if seen.insert((candidate.media_type.clone(), candidate.tmdb_id)) {
+                            candidates.push(candidate);
+                        }
+                    }
+                    if candidates.len() >= 20 {
+                        break;
                     }
                 }
-                if candidates.len() >= 20 {
-                    break;
-                }
+            }
+            candidates.truncate(20);
+            hit = candidates
+                .iter()
+                .find(|candidate| {
+                    search_names
+                        .iter()
+                        .any(|name| exact_name_hit(name, candidate, query.year))
+                })
+                .cloned();
+        }
+        // 最后回退：本地相似度评分门槛（保持原有可调设置与人工复核链路）
+        let automatic = if let Some(hit) = hit {
+            Some(hit)
+        } else {
+            for candidate in &mut candidates {
+                let best = search_names
+                    .iter()
+                    .map(|name| rescore_candidate(name, query.year, candidate))
+                    .fold(0.0f64, f64::max);
+                candidate.score = (best * 10_000.0).round() / 10_000.0;
             }
             candidates.sort_by(|left, right| {
                 right
@@ -2040,28 +3294,28 @@ pub async fn resolve_tmdb_match(
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
             });
-            candidates.truncate(20);
-        }
-        let first = candidates.first().cloned();
-        let second = candidates.get(1);
-        let exact = first
-            .as_ref()
-            .is_some_and(|item| exact_tmdb_candidate(item, &query));
-        let automatic = if settings.similarity_match {
-            first
+            let first = candidates.first().cloned();
+            let second = candidates.get(1);
+            let exact = first
                 .as_ref()
-                .filter(|item| {
-                    item.score >= settings.minimum_match_score
-                        && (exact
-                            || second.is_none()
-                            || item.score - second.map(|value| value.score).unwrap_or(0.0) >= 0.06)
-                })
-                .cloned()
-        } else {
-            candidates
-                .iter()
-                .find(|item| exact_tmdb_candidate(item, &query))
-                .cloned()
+                .is_some_and(|item| exact_tmdb_candidate(item, &query));
+            if settings.similarity_match {
+                first
+                    .as_ref()
+                    .filter(|item| {
+                        item.score >= settings.minimum_match_score
+                            && (exact
+                                || second.is_none()
+                                || item.score - second.map(|value| value.score).unwrap_or(0.0)
+                                    >= 0.06)
+                    })
+                    .cloned()
+            } else {
+                candidates
+                    .iter()
+                    .find(|item| exact_tmdb_candidate(item, &query))
+                    .cloned()
+            }
         };
         let Some(automatic) = automatic else {
             return Ok(MatchResolution {
@@ -2086,32 +3340,18 @@ pub async fn resolve_tmdb_match(
             });
         };
         selected = automatic;
-        metadata = client.details(media_type, selected.tmdb_id).await?;
+        // 精确命中可能来自电影→剧集/multi 回退，详情按选中项的实际类型拉取
+        metadata = client.details(&selected.media_type, selected.tmdb_id).await?;
     }
+    let mut query = query;
+    query.media_type = if selected.media_type == "tv" {
+        "tv".to_string()
+    } else {
+        "movie".to_string()
+    };
     let mut metadata = metadata;
-    if media_type == "tv" {
-        let mut seasons: Vec<i64> = analysis
-            .videos
-            .iter()
-            .filter_map(|video| video.parsed.season)
-            .collect();
-        if let Some(season) = overrides.season {
-            seasons.push(season);
-        }
-        seasons.sort_unstable();
-        seasons.dedup();
-        for season_number in seasons {
-            let season = match client.season(selected.tmdb_id, season_number).await {
-                Ok(value) => value,
-                Err(error) => SeasonMetadata {
-                    season_number,
-                    name: format!("Season {season_number}"),
-                    error: Some(error),
-                    ..Default::default()
-                },
-            };
-            metadata.seasons.insert(season_number.to_string(), season);
-        }
+    if query.media_type == "tv" {
+        finalize_seasons(client, analysis, overrides, &selected, &mut metadata).await;
     }
     Ok(MatchResolution {
         ready: true,
@@ -3440,6 +4680,192 @@ pub async fn execute_preview(
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn tokenizer_splits_cn_en_titles_and_recognizes_fansub_and_anime_names() {
+        let overrides = RecognitionOverrides::default();
+        // 中英混合：中文名与英文名分别累计
+        let mixed = parse_media_name(
+            "凡人修仙传.The.Immortal.Ascension.2020.S01E05.2160p.WEB-DL.mkv",
+            &overrides,
+        );
+        assert_eq!(mixed.cn_name, "凡人修仙传");
+        assert_eq!(mixed.en_name, "The Immortal Ascension");
+        assert_eq!(mixed.title, "凡人修仙传");
+        assert_eq!(mixed.year, Some(2020));
+        assert_eq!(mixed.season, Some(1));
+        assert_eq!(mixed.episode, Some(5));
+        // 字幕组多括号 + 动漫集号
+        let anime = parse_media_name(
+            "【幻月字幕组】【4月新番】【天国大魔境 Tengoku Daimakyou】【01】【1080P】【简日双语】.mp4",
+            &overrides,
+        );
+        assert_eq!(anime.cn_name, "天国大魔境");
+        assert_eq!(anime.en_name, "Tengoku Daimakyou");
+        assert_eq!(anime.episode, Some(1));
+        assert_eq!(anime.media_type, "tv");
+        // 英文动漫 "- 05" 集号
+        let subs = parse_media_name("[SubsPlease] Kaiju No. 8 - 05 (1080p) [E02DE726].mkv", &overrides);
+        assert_eq!(subs.title, "Kaiju No 8");
+        assert_eq!(subs.episode, Some(5));
+        // 纯数字标题不误判为集号（300 是标题，2006 是年份）
+        let numeric = parse_media_name("300.2006.1080p.BluRay.x264.mkv", &overrides);
+        assert_eq!(numeric.title, "300");
+        assert_eq!(numeric.year, Some(2006));
+        assert_eq!(numeric.media_type, "movie");
+        // HDHive/Emby 风格内嵌 TMDB ID（{tmdb-x}/{tmdbid-x}/[tmdb=x]/-Tmdbx）
+        assert_eq!(
+            parse_media_name("遥远的桥 (1977) {tmdb-5902}", &overrides).tmdb_id,
+            Some(5902)
+        );
+        assert_eq!(
+            parse_media_name("热血青春 (2014) {tmdb=252067}", &overrides).tmdb_id,
+            Some(252067)
+        );
+        assert_eq!(
+            parse_media_name("哦我的鬼神大人 (2015)-Tmdb63119", &overrides).tmdb_id,
+            Some(63119)
+        );
+        // 中文数字季 + 完结区间
+        let chinese_season = parse_media_name(
+            "披荆斩棘的哥哥.第三季.EP01.2023.1080p.WEB-DL.mp4",
+            &RecognitionOverrides {
+                media_type: Some("tv".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(chinese_season.season, Some(3));
+        assert_eq!(chinese_season.episode, Some(1));
+        let fin_range = parse_media_name("[01-26Fin] 某动画 1080p", &overrides);
+        assert_eq!(fin_range.episode, Some(1));
+        assert_eq!(fin_range.episode_end, Some(26));
+        // 中文季集
+        let chinese = parse_media_name(
+            "庆余年.第2季.第12集.1080p.mkv",
+            &RecognitionOverrides {
+                media_type: Some("tv".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(chinese.title, "庆余年");
+        assert_eq!(chinese.season, Some(2));
+        assert_eq!(chinese.episode, Some(12));
+    }
+
+    #[test]
+    fn chinese_numeral_parses_digits_and_compound_numbers() {
+        assert_eq!(chinese_numeral("12"), Some(12));
+        assert_eq!(chinese_numeral("三"), Some(3));
+        assert_eq!(chinese_numeral("十"), Some(10));
+        assert_eq!(chinese_numeral("二十三"), Some(23));
+        assert_eq!(chinese_numeral("一百零五"), Some(105));
+        assert_eq!(chinese_numeral("abc"), None);
+    }
+
+    #[test]
+    fn upgrade_criteria_normalization_falls_back_to_full_order() {
+        assert_eq!(
+            normalize_upgrade_criteria(&["size".to_string(), "resolution".to_string()]),
+            vec!["size".to_string(), "resolution".to_string()]
+        );
+        assert_eq!(
+            normalize_upgrade_criteria(&[]),
+            vec![
+                "resolution".to_string(),
+                "dynamic_range".to_string(),
+                "release_group".to_string(),
+                "size".to_string()
+            ]
+        );
+        assert_eq!(
+            normalize_upgrade_criteria(&["bogus".to_string()]),
+            vec![
+                "resolution".to_string(),
+                "dynamic_range".to_string(),
+                "release_group".to_string(),
+                "size".to_string()
+            ]
+        );
+        assert_eq!(
+            upgrade_release_group_list("# 注释\nFRDS\nwiki,FRDS"),
+            vec!["frds".to_string(), "wiki".to_string()]
+        );
+    }
+
+    #[test]
+    fn upgrade_comparator_resolves_by_priority_order() {
+        let parse = |name: &str| parse_media_name(name, &RecognitionOverrides::default());
+        let empty: Vec<String> = Vec::new();
+        // 分辨率优先：2160p 胜 1080p
+        assert_eq!(
+            compare_media_versions(
+                (&parse("Movie.2020.2160p.WEB-DL.mkv"), 0),
+                (&parse("Movie.2020.1080p.BluRay.mkv"), 0),
+                &empty,
+                "",
+            ),
+            UpgradeVerdict::NextWins("resolution")
+        );
+        // 同分辨率时动态范围决定：DV 胜 HDR10，SDR 负于 HDR
+        assert_eq!(
+            compare_media_versions(
+                (&parse("Movie.2020.2160p.DV.mkv"), 0),
+                (&parse("Movie.2020.2160p.HDR10.mkv"), 0),
+                &empty,
+                "",
+            ),
+            UpgradeVerdict::NextWins("dynamic_range")
+        );
+        assert_eq!(
+            compare_media_versions(
+                (&parse("Movie.2020.2160p.mkv"), 0),
+                (&parse("Movie.2020.2160p.HDR.mkv"), 0),
+                &empty,
+                "",
+            ),
+            UpgradeVerdict::ExistingWins("dynamic_range")
+        );
+        // 制作组名单顺序：FRDS 优先于 WiKi；未配置名单时跳过该维度
+        assert_eq!(
+            compare_media_versions(
+                (&parse("Movie.2020.1080p.BluRay-FRDS.mkv"), 0),
+                (&parse("Movie.2020.1080p.BluRay-WiKi.mkv"), 0),
+                &empty,
+                "FRDS\nWiKi",
+            ),
+            UpgradeVerdict::NextWins("release_group")
+        );
+        // 大小兜底
+        assert_eq!(
+            compare_media_versions(
+                (&parse("Movie.2020.1080p.mkv"), 200),
+                (&parse("Movie.2020.1080p.mkv"), 100),
+                &empty,
+                "",
+            ),
+            UpgradeVerdict::NextWins("size")
+        );
+        // 全部持平 = 同版本
+        assert_eq!(
+            compare_media_versions(
+                (&parse("A.2020.1080p.mkv"), 0),
+                (&parse("B.2020.1080p.mkv"), 0),
+                &empty,
+                "",
+            ),
+            UpgradeVerdict::Tie
+        );
+        // 自定义顺序：大小在前时优先比大小
+        assert_eq!(
+            compare_media_versions(
+                (&parse("Movie.2020.1080p.mkv"), 500),
+                (&parse("Movie.2020.2160p.mkv"), 100),
+                &["size".to_string(), "resolution".to_string()],
+                "",
+            ),
+            UpgradeVerdict::NextWins("size")
+        );
+    }
 
     #[test]
     fn parser_extracts_episode_range_and_movie_edition() {
